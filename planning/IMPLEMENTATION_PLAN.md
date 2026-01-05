@@ -48,30 +48,30 @@ This document outlines the phased implementation plan for `cl-hive`, a distribut
 
 ---
 
-## Phase 0: Foundation (Pre-MVP)
+## Phase 0: Foundation (Pre-MVP) ✅
 
 **Objective:** Establish plugin skeleton and database schema.
 
 ### 0.1 Plugin Skeleton
 **File:** `cl-hive.py`
 **Tasks:**
-- [ ] Create `cl-hive.py` with pyln-client plugin boilerplate
-- [ ] Create `modules/` directory structure
-- [ ] Add `requirements.txt` (pyln-client)
-- [ ] Implement thread-safe RPC proxy & graceful shutdown (copy from cl-revenue-ops)
+- [x] Create `cl-hive.py` with pyln-client plugin boilerplate
+- [x] Create `modules/` directory structure
+- [x] Add `requirements.txt` (pyln-client)
+- [x] Implement thread-safe RPC proxy & graceful shutdown (copy from cl-revenue-ops)
 
 ### 0.2 Database Schema
 **File:** `modules/database.py`
 **Tables:** `hive_members`, `intent_locks`, `hive_state`, `contribution_ledger`, `hive_bans`
 **Tasks:**
-- [ ] Implement schema initialization
-- [ ] Implement thread-local connection pattern
+- [x] Implement schema initialization
+- [x] Implement thread-local connection pattern
 
 ### 0.3 Configuration
 **File:** `modules/config.py`
 **Tasks:**
-- [ ] Create `HiveConfig` dataclass
-- [ ] Implement `ConfigSnapshot` pattern
+- [x] Create `HiveConfig` dataclass
+- [x] Implement `ConfigSnapshot` pattern
 
 ---
 
