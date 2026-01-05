@@ -81,9 +81,15 @@ This document outlines the phased implementation plan for `cl-hive`, a distribut
 
 ---
 
-## Phase 1: Protocol Layer (MVP Core) ✅
+## Phase 1: Protocol Layer (MVP Core) ✅ AUDITED
 
 **Objective:** Implement BOLT 8 custom messaging and the cryptographic handshake.
+
+**Audit Status:** ✅ **PASSED (With Commendation)** (Red Team Review: 2026-01-05)
+- Magic Prefix Enforcement: Peek & Check pattern correctly implemented
+- Crypto Safety: HSM-based `signmessage`/`checkmessage` - no keys in Python memory
+- Ticket Integrity: 3-layer validation (Expiry + Signature + Admin Status)
+- State Machine: HELLO→CHALLENGE→ATTEST→WELCOME flow correctly bound to session
 
 ### 1.1 Message Types
 **File:** `modules/protocol.py`
@@ -140,19 +146,61 @@ This document outlines the phased implementation plan for `cl-hive`, a distribut
 
 ## Phase 2: State Management (Anti-Entropy)
 
-**Objective:** Build the HiveMap and ensure consistency after network partitions.
+**Objective:** Build the HiveMap and ensure consistency after network partitions using Gossip and Anti-Entropy.
 
-### 2.1 HiveMap
+### 2.1 HiveMap & State Hashing
 **File:** `modules/state_manager.py`
+
+**State Hash Algorithm:** 
+To ensure deterministic comparison, the State Hash is calculated as:
+`SHA256( SortedJSON( [ {peer_id, version, timestamp}, ... ] ) )`
+*   Only essential metadata is hashed to detect drift.
+*   List must be sorted by `peer_id`.
+
 **Tasks:**
 - [ ] Implement `HivePeerState` dataclass.
-- [ ] Implement fleet aggregation methods.
+- [ ] Implement `update_peer_state(peer_id, gossip_data)`: Updates local DB if gossip version > local version.
+- [ ] Implement `calculate_fleet_hash()`: Computes the global checksum of the local Hive view.
+- [ ] Implement `get_missing_peers(remote_hash)`: Identifies divergence (naive full sync for MVP).
+- [ ] Database Integration: Persist state to `hive_state` table.
 
-### 2.2 Gossip Protocol (Threshold & Sync)
+### 2.2 Gossip Protocol (Thresholds)
 **File:** `modules/gossip.py`
-**Updates from Red Team:**
-- [ ] **Threshold Gossiping:** Only broadcast if capacity changes >10% or fee policy changes.
-- [ ] **Anti-Entropy:** On reconnection, peers exchange `State_Hash`. If mismatch, trigger `FULL_STATE_SYNC` to catch up on missed messages.
+
+**Threshold Rules:**
+1.  **Capacity:** Change > 10% from last broadcast.
+2.  **Fee:** Any change in `fee_policy`.
+3.  **Status:** Ban/Unban events.
+4.  **Heartbeat:** Force broadcast every `heartbeat_interval` (300s) if no other updates.
+
+**Tasks:**
+- [ ] Implement `should_broadcast(old_state, new_state)` logic.
+- [ ] Implement `create_gossip_payload()`: Bundles local state for transmission.
+- [ ] Implement `process_gossip(payload)`: Validates and passes to StateManager.
+
+### 2.3 Protocol Integration (cl-hive.py)
+**Context:** Wire up the message types defined in Phase 1 to the logic in Phase 2.
+
+**New Handlers:**
+1.  `HIVE_GOSSIP` (32777): Passive state update.
+2.  `HIVE_STATE_HASH` (32779): Active Anti-Entropy check (sent on reconnection).
+3.  `HIVE_FULL_SYNC` (32781): Response to hash mismatch.
+
+**Tasks:**
+- [ ] Register new message handlers in `on_custommsg`.
+- [ ] Implement `handle_gossip`: Update StateManager.
+- [ ] Implement `handle_state_hash`: Compare local vs remote hash. If mismatch -> Send `FULL_SYNC`.
+- [ ] Implement `handle_full_sync`: Bulk update StateManager.
+- [ ] Hook `peer_connected` event: Trigger `send_state_hash` on connection.
+
+### 2.4 Phase 2 Testing
+**File:** `tests/test_state.py`
+
+**Tasks:**
+- [ ] **Determinism Test:** Verify `calculate_fleet_hash` produces identical hashes for identical (but scrambled) inputs.
+- [ ] **Threshold Test:** Verify 9% capacity change returns `False` for broadcast, 11% returns `True`.
+- [ ] **Anti-Entropy Test:** Simulate two nodes with divergent state; verify `FULL_SYNC` restores consistency.
+- [ ] **Persistence Test:** Verify state survives plugin restart via SQLite.
 
 ---
 
