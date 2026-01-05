@@ -151,5 +151,24 @@ This proposal is supported by three detailed technical specifications:
 | **Economics** | [`PHASE9_3_ECONOMICS_SPEC.md`](./PHASE9_3_ECONOMICS_SPEC.md) | Incentives, Lifecycle, Consensus Banning. |
 
 ---
+
+## 9. Implementation Status
+
+| Document | Status |
+|----------|--------|
+| **Implementation Plan** | [`IMPLEMENTATION_PLAN.md`](../planning/IMPLEMENTATION_PLAN.md) | **APPROVED** (Red Team Hardened) |
+
+### Key Implementation Decisions:
+
+1. **Integration Bridge (Paranoid):** cl-hive calls `revenue-policy set` API rather than implementing duplicate fee logic. Circuit breaker prevents crashes if cl-revenue-ops is unavailable.
+
+2. **CLBoss Gateway Pattern:** cl-hive owns `clboss-ignore` for topology; cl-revenue-ops owns fee management via PolicyManager.
+
+3. **Anti-Entropy Sync:** Added `State_Hash` exchange on reconnection to handle network partitions (Red Team hardening).
+
+4. **Pre-requisite:** `cl-revenue-ops` v1.4.0+ with Strategic Rebalance Exemption and Policy-Driven Architecture.
+
+---
 *Specification Author: Lightning Goats Team*  
-*Architecture: Distributed Agent Model*
+*Architecture: Distributed Agent Model*  
+*Implementation Plan Approved: January 5, 2026*
