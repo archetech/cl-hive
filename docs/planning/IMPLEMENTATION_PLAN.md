@@ -83,29 +83,57 @@ This document outlines the phased implementation plan for `cl-hive`, a distribut
 
 ## Phase 1: Protocol Layer (MVP Core)
 
-**Objective:** Implement BOLT 8 custom messaging for Hive communication.
+**Objective:** Implement BOLT 8 custom messaging and the cryptographic handshake.
 
 ### 1.1 Message Types
 **File:** `modules/protocol.py`
 **Range:** 32769 (Odd) to avoid conflicts.
 **Magic Prefix:** `0x48495645` (ASCII "HIVE") - 4 bytes prepended to all messages.
-**Tasks:**
-- [ ] Define IntEnum for message types (HELLO, CHALLENGE, ATTEST, GOSSIP, INTENT, BAN).
-- [ ] Implement serialization/deserialization.
-- [ ] Implement Magic Byte Wrapping: All outgoing messages MUST be prefixed with `0x48495645`.
 
-### 1.2 Handshake Protocol & Genesis
-**File:** `modules/handshake.py`
 **Tasks:**
-- [ ] Implement `revenue-hive-genesis`: Initializes local DB as Admin, creates self-signed ticket.
-- [ ] Implement `generate_invite_ticket` / `verify_ticket`.
-- [ ] Implement `create_manifest` / `verify_manifest`.
+- [ ] Define IntEnum for MVP message types:
+    - `HELLO` (32769)
+    - `CHALLENGE` (32771)
+    - `ATTEST` (32773)
+    - `WELCOME` (32775)
+    - *Deferred to Phase 2:* `GOSSIP`
+    - *Deferred to Phase 3:* `INTENT`
+    - *Deferred to Phase 5:* `VOUCH`, `BAN`, `PROMOTION`
+- [ ] Implement `serialize(msg_type, payload) -> bytes` (JSON + Magic Prefix)
+- [ ] Implement `deserialize(bytes) -> (msg_type, payload)` with Magic check
+
+### 1.2 Handshake Protocol & Crypto
+**File:** `modules/handshake.py`
+**Crypto Strategy:** Use CLN RPC `signmessage` and `checkmessage`. Do not import external crypto libs.
+
+**Tasks:**
+- [ ] **Genesis:** Implement `revenue-hive-genesis` RPC.
+    - Creates self-signed "Genesis Ticket" using `signmessage`.
+    - Stores as Admin in DB.
+- [ ] **Ticket Logic:** 
+    - `generate_invite_ticket(params)`: Returns base64 encoded JSON + Sig.
+    - `verify_ticket(ticket)`: Validates Sig against Admin Pubkey.
+- [ ] **Manifest Logic:**
+    - `create_manifest(nonce)`: JSON of capabilities + `signmessage(nonce)`.
+    - `verify_manifest(manifest)`: Validates `checkmessage(sig, nonce)`.
+- [ ] **Active Probe:** (Optional/Post-MVP) Skip complex `splice_init` for v0.1.0; rely on signature verification.
 
 ### 1.3 Custom Message Hook
+**File:** `cl-hive.py`
+
 **Tasks:**
-- [ ] Register `custommsg` hook in `cl-hive.py`.
-- [ ] Implement Magic Byte Verification (Peek & Check): Read first 4 bytes, verify `0x48495645`. If mismatch, return `{"result": "continue"}` to pass message to other plugins.
-- [ ] Dispatch to protocol handler (only after magic verification passes).
+- [ ] Register `custommsg` hook.
+- [ ] **Security:** Implement "Peek & Check". Read first 4 bytes. If `!= HIVE_MAGIC`, return `continue` immediately.
+- [ ] Dispatch to `protocol.py`.
+
+### 1.4 Phase 1 Testing
+**File:** `tests/test_protocol.py`
+
+**Tasks:**
+- [ ] **Magic Byte Test:** Verify non-HIVE messages are ignored.
+- [ ] **Round Trip Test:** Serialize -> Deserialize preserves data.
+- [ ] **Crypto Test:** Verify `signmessage` output from one node verifies on another.
+- [ ] **Expiry Test:** Verify tickets are rejected after `valid_hours`.
 
 ---
 
