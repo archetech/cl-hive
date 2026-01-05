@@ -1,5 +1,12 @@
 # Phase 9.1 Spec: The Nervous System (Protocol & Auth)
 
+| Field | Value |
+|-------|-------|
+| **Focus** | Transport Layer, Wire Format, Authentication |
+| **Status** | **APPROVED** (Red Team Hardened) |
+
+---
+
 ## 1. Transport Layer
 All Hive communication occurs over **BOLT 8** (Encrypted Lightning Connection).
 *   **Mechanism:** `sendcustommsg` RPC.
@@ -69,11 +76,32 @@ When Candidate (A) connects to Member (B):
 5.  **B -> A (`HIVE_WELCOME`):** Session established.
 
 ## 3. Message Types
+
+### 3.1 Authentication (Phase 1)
 | ID | Name | Payload |
 | :--- | :--- | :--- |
 | 32769 | `HIVE_HELLO` | Ticket |
-| 32771 | `HIVE_CHALLENGE` | Nonce |
+| 32771 | `HIVE_CHALLENGE` | Nonce (32 bytes) |
 | 32773 | `HIVE_ATTEST` | Manifest + Sig |
-| 32775 | `HIVE_WELCOME` | HiveID |
-| 32777 | `HIVE_GOSSIP` | State Update (See 9.2) |
-| 32779 | `HIVE_INTENT` | Lock Request (See 9.2) |
+| 32775 | `HIVE_WELCOME` | HiveID + Member List |
+
+### 3.2 State Management (Phase 2)
+| ID | Name | Payload |
+| :--- | :--- | :--- |
+| 32777 | `HIVE_GOSSIP` | State Update (peer_id, capacity, fees, version) |
+| 32779 | `HIVE_STATE_HASH` | SHA256 Fleet Hash (32 bytes) |
+| 32781 | `HIVE_FULL_SYNC` | Complete HiveMap snapshot |
+
+### 3.3 Intent Lock (Phase 3)
+| ID | Name | Payload |
+| :--- | :--- | :--- |
+| 32783 | `HIVE_INTENT` | Lock Request (type, target, initiator, timestamp) |
+| 32785 | `HIVE_INTENT_ACK` | Lock Acknowledgement (reserved) |
+| 32787 | `HIVE_INTENT_ABORT` | Lock Yield (intent_id, reason) |
+
+### 3.4 Governance (Phase 5)
+| ID | Name | Payload |
+| :--- | :--- | :--- |
+| 32789 | `HIVE_VOUCH` | Promotion Vote (target_pubkey, vouch_sig) |
+| 32791 | `HIVE_BAN` | Ban Proposal (target_pubkey, reason, evidence) |
+| 32793 | `HIVE_PROMOTION` | Promotion Proof (vouches[], threshold_met) |
