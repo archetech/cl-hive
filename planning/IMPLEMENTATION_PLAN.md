@@ -206,9 +206,11 @@ To ensure deterministic comparison, the State Hash is calculated as:
 
 ---
 
-## Phase 3: Intent Lock Protocol
+## Phase 3: Intent Lock Protocol ✅ IMPLEMENTED
 
 **Objective:** Implement deterministic conflict resolution for coordinated actions to prevent "Thundering Herd" race conditions.
+
+**Implementation Status:** ✅ **COMPLETE** (Awaiting Red Team Audit)
 
 ### 3.1 Intent Manager Logic
 **File:** `modules/intent_manager.py`
@@ -219,11 +221,11 @@ To ensure deterministic comparison, the State Hash is calculated as:
 3.  `ban_peer`: Proposing a ban (requires consensus).
 
 **Tasks:**
-- [ ] Implement `Intent` dataclass (type, target, initiator, timestamp).
-- [ ] Implement `announce_intent(type, target)`:
+- [x] Implement `Intent` dataclass (type, target, initiator, timestamp).
+- [x] Implement `announce_intent(type, target)`:
     - Insert into `intent_locks` table (status='pending').
     - Broadcast `HIVE_INTENT` message.
-- [ ] Implement `handle_conflict(remote_intent)`:
+- [x] Implement `handle_conflict(remote_intent)`:
     - Query DB for local pending intents matching target.
     - If conflict found: Execute **Tie-Breaker** (Lowest Lexicographical Pubkey wins).
     - If we lose: Update DB status to 'aborted', broadcast `HIVE_INTENT_ABORT`, return False.
@@ -237,21 +239,21 @@ To ensure deterministic comparison, the State Hash is calculated as:
 2.  `HIVE_INTENT_ABORT` (32787): Remote node yielding the lock.
 
 **Tasks:**
-- [ ] Register handlers in `on_custommsg`.
-- [ ] `handle_intent`:
+- [x] Register handlers in `on_custommsg`.
+- [x] `handle_intent`:
     - Record remote intent in DB (for visibility).
     - Check for local conflicts via `intent_manager.check_conflicts`.
     - If conflict & we win: Do nothing (let them abort).
     - If conflict & we lose: Call `intent_manager.abort_local()`.
-- [ ] `handle_intent_abort`:
+- [x] `handle_intent_abort`:
     - Update remote intent status in DB to 'aborted'.
 
 ### 3.3 Timer Management (The Commit Loop)
 **Context:** We need a background task to finalize locks after the hold period.
 
 **Tasks:**
-- [ ] Add `intent_monitor_loop` to `cl-hive.py` threads.
-- [ ] Logic (Run every 5s):
+- [x] Add `intent_monitor_loop` to `cl-hive.py` threads.
+- [x] Logic (Run every 5s):
     - Query DB for `status='pending'` intents where `now > timestamp + hold_seconds`.
     - If no abort signal received/generated:
         - Update status to 'committed'.
@@ -262,10 +264,10 @@ To ensure deterministic comparison, the State Hash is calculated as:
 **File:** `tests/test_intent.py`
 
 **Tasks:**
-- [ ] **Tie-Breaker Test:** Verify `min(pubkey_A, pubkey_B)` logic allows the correct node to proceed 100% of the time.
-- [ ] **Race Condition Test:** Simulate receiving a conflicting `HIVE_INTENT` 1 second before local timer expires. Verify local abort.
-- [ ] **Silence Test:** Verify commit executes if no conflict messages are received during hold period.
-- [ ] **Cleanup Test:** Verify DB does not grow indefinitely with old locks.
+- [x] **Tie-Breaker Test:** Verify `min(pubkey_A, pubkey_B)` logic allows the correct node to proceed 100% of the time.
+- [x] **Race Condition Test:** Simulate receiving a conflicting `HIVE_INTENT` 1 second before local timer expires. Verify local abort.
+- [x] **Silence Test:** Verify commit executes if no conflict messages are received during hold period.
+- [x] **Cleanup Test:** Verify DB does not grow indefinitely with old locks.
 
 ---
 
