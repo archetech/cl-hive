@@ -333,58 +333,364 @@ To prevent cascading failures if a dependency hangs or crashes.
 
 ## Phase 5: Governance & Membership
 
-**Objective:** Implement the two-tier system and promotion protocol.
+**Objective:** Implement the two-tier membership system (Neophyte/Member) and the algorithmic promotion protocol.
 
-### 5.1 Membership Manager
+### 5.1 Membership Tiers
 **File:** `modules/membership.py`
-**Tasks:**
-- [ ] Implement Value-Add Equation (Reliability + Contribution + Topology).
-- [ ] Implement `HIVE_PROMOTION_REQUEST` and consensus vouching (51%).
 
-### 5.2 Contribution Tracking
-**File:** `modules/contribution.py`
+**Tier Definitions:**
+| Tier | Fees | Rebalancing | Data Access | Governance |
+|------|------|-------------|-------------|------------|
+| **Neophyte** | Discounted (50% of public) | Pull Only | Read-Only | None |
+| **Member** | Zero (0 PPM) or Floor (10 PPM) | Push & Pull | Read-Write | Voting Power |
+
+**Database Schema Update:**
+*   Add `tier` column to `hive_members` table: `ENUM('neophyte', 'member')`.
+*   Add `joined_at` timestamp for probation tracking.
+
 **Tasks:**
-- [ ] Hook into `forward_event`.
-- [ ] Calculate `Ratio = Forwarded / Received`.
-- [ ] Implement throttling signal for Bridge if Ratio < 0.5.
+- [ ] Implement `MembershipTier` enum.
+- [ ] Implement `get_tier(peer_id)` -> Returns current tier.
+- [ ] Implement `set_tier(peer_id, tier)` -> Updates DB + triggers Bridge policy update.
+- [ ] Implement `is_probation_complete(peer_id)` -> `joined_at + 30 days < now`.
+
+### 5.2 The Value-Add Equation (Promotion Criteria)
+**File:** `modules/membership.py`
+
+**Promotion Requirements (ALL must be satisfied):**
+1.  **Reliability:** Uptime > 99.5% over 30-day probation.
+    *   *Metric:* `(seconds_online / total_seconds) * 100`.
+    *   *Source:* Track via `peer_connected`/`peer_disconnected` events.
+2.  **Contribution Ratio:** Ratio >= 1.0.
+    *   *Formula:* `sats_forwarded_for_hive / sats_received_from_hive`.
+    *   *Interpretation:* Neophyte must route MORE for the fleet than they consume.
+3.  **Topological Uniqueness:** Connects to >= 1 peer the Hive doesn't already have.
+    *   *Check:* `neophyte_peers - union(all_member_peers) != empty`.
+
+**Tasks:**
+- [ ] Implement `calculate_uptime(peer_id)` -> float (0.0 to 100.0).
+- [ ] Implement `calculate_contribution_ratio(peer_id)` -> float.
+- [ ] Implement `get_unique_peers(peer_id)` -> list of pubkeys.
+- [ ] Implement `evaluate_promotion(peer_id)` -> `{eligible: bool, reasons: []}`.
+
+### 5.3 Promotion Protocol (Consensus Vouching)
+**File:** `modules/membership.py`
+
+**Message Flow:**
+1.  Neophyte calls `hive-request-promotion` RPC.
+2.  Plugin broadcasts `HIVE_PROMOTION_REQUEST` (32795) to all Members.
+3.  Each Member runs `evaluate_promotion()` locally.
+4.  If passed: Member broadcasts `HIVE_VOUCH` (32789) with signature.
+5.  Neophyte collects vouches. When threshold met: broadcasts `HIVE_PROMOTION` (32793).
+6.  All nodes update local DB tier to 'member'.
+
+**Consensus Threshold:**
+*   **Quorum:** `max(3, ceil(active_members * 0.51))`.
+*   *Example:* 5 members → need 3 vouches. 10 members → need 6 vouches.
+
+**Tasks:**
+- [ ] Implement `request_promotion()` -> Broadcasts request.
+- [ ] Implement `handle_promotion_request(peer_id)` -> Auto-evaluate and vouch if passed.
+- [ ] Implement `handle_vouch(vouch)` -> Collect and count.
+- [ ] Implement `handle_promotion(proof)` -> Validate vouches, update tier.
+- [ ] Implement `calculate_quorum()` -> int.
+
+### 5.4 Contribution Tracking
+**File:** `modules/contribution.py`
+
+**Tracking Logic:**
+*   Hook `forward_event` notification.
+*   For each forward, check if `in_channel` or `out_channel` belongs to a Hive member.
+*   Update `contribution_ledger` table.
+
+**Ledger Schema:**
+```sql
+CREATE TABLE contribution_ledger (
+    id INTEGER PRIMARY KEY,
+    peer_id TEXT NOT NULL,
+    direction TEXT NOT NULL,  -- 'forwarded' or 'received'
+    amount_msat INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL
+);
+```
+
+**Anti-Leech Throttling:**
+*   If `Ratio < 0.5` for a Member: Signal Bridge to reduce push rebalancing priority.
+*   If `Ratio < 0.3` for 7 consecutive days: Auto-trigger `HIVE_BAN` proposal.
+
+**Tasks:**
+- [ ] Register `forward_event` subscription.
+- [ ] Implement `record_forward(in_peer, out_peer, amount)`.
+- [ ] Implement `get_contribution_stats(peer_id)` -> `{forwarded, received, ratio}`.
+- [ ] Implement `check_leech_status(peer_id)` -> `{is_leech: bool, ratio: float}`.
+
+### 5.5 Phase 5 Testing
+**File:** `tests/test_membership.py`
+
+**Tasks:**
+- [ ] **Uptime Test:** Simulate 30 days with 99.6% uptime -> eligible. 99.4% -> rejected.
+- [ ] **Ratio Test:** Forward 100k, receive 90k -> ratio 1.11 -> eligible. Forward 80k, receive 100k -> ratio 0.8 -> rejected.
+- [ ] **Uniqueness Test:** Neophyte with peer not in Hive -> unique. All peers overlap -> not unique.
+- [ ] **Quorum Test:** 5 members, 3 vouches -> promoted. 2 vouches -> not promoted.
+- [ ] **Leech Test:** Ratio 0.4 for 7 days -> ban proposal triggered.
 
 ---
 
 ## Phase 6: Hive Planner (Topology Optimization)
 
-**Objective:** Implement the "Gardner" algorithm.
+**Objective:** Implement the "Gardner" algorithm for fleet-wide graph optimization.
 
-### 6.1 Planner
+### 6.1 Saturation Analysis
 **File:** `modules/planner.py`
+
+**Saturation Metric:**
+*   `Hive_Share(target) = sum(hive_capacity_to_target) / total_network_capacity_to_target`.
+*   **Threshold:** 20% (from PHASE9_3 spec).
+
+**Data Sources:**
+*   Local channels: `listpeerchannels`.
+*   Gossip state: `HiveMap` from Phase 2.
+*   Network capacity: Estimate from `listchannels` (cached, updated hourly).
+
 **Tasks:**
-- [ ] **Saturation Analysis:** Calculate fleet-wide capacity per target.
-- [ ] **Anti-Overlap:** Issue `clboss-ignore` via `ClbossBridge` if saturation met.
-- [ ] **Expansion:** Assign channel open task to node with most idle on-chain funds.
+- [ ] Implement `calculate_hive_share(target_pubkey)` -> float (0.0 to 1.0).
+- [ ] Implement `get_saturated_targets()` -> list of pubkeys where share > 0.20.
+- [ ] Implement `get_underserved_targets()` -> list of high-value peers with share < 0.05.
+
+### 6.2 Anti-Overlap (The Guard)
+**File:** `modules/planner.py`
+
+**Logic:**
+*   For each saturated target: Issue `clboss-ignore` to all fleet nodes EXCEPT those already connected.
+*   Prevents capital duplication on already-covered targets.
+
+**Tasks:**
+- [ ] Implement `enforce_saturation_limits()`:
+    *   Get saturated targets.
+    *   For each: Broadcast `HIVE_IGNORE_TARGET` (internal, not a wire message).
+    *   Call `clboss_bridge.ignore_peer()` for each.
+- [ ] Implement `release_saturation_limits()`:
+    *   If share drops below 15%, call `clboss_bridge.unignore_peer()`.
+
+### 6.3 Expansion (Capital Allocation)
+**File:** `modules/planner.py`
+
+**Logic:**
+*   Identify underserved targets (high-value, low Hive coverage).
+*   Select the node with the most idle on-chain funds.
+*   Trigger Intent Lock for `channel_open`.
+
+**Node Selection Criteria:**
+1.  `onchain_balance > min_channel_size * 2` (safety margin).
+2.  `pending_intents == 0` (not already busy).
+3.  `uptime > 99%` (reliable).
+
+**Tasks:**
+- [ ] Implement `get_idle_capital()` -> dict `{peer_id: onchain_sats}`.
+- [ ] Implement `select_opener(target_pubkey)` -> peer_id or None.
+- [ ] Implement `propose_expansion(target_pubkey)`:
+    *   Select opener.
+    *   Call `intent_manager.announce_intent('channel_open', target)`.
+
+### 6.4 Planner Schedule
+**File:** `cl-hive.py`
+
+**Execution:**
+*   Run `planner_loop` every **3600 seconds** (1 hour).
+*   On each run:
+    1.  Refresh network capacity cache.
+    2.  Calculate saturation for top 100 targets.
+    3.  Enforce/release ignore rules.
+    4.  Propose up to 1 expansion per cycle (rate limit).
+
+**Tasks:**
+- [ ] Add `planner_loop` to background threads.
+- [ ] Implement rate limiting: max 1 `channel_open` intent per hour.
+- [ ] Log all planner decisions to `hive_planner_log` table.
+
+### 6.5 Phase 6 Testing
+**File:** `tests/test_planner.py`
+
+**Tasks:**
+- [ ] **Saturation Test:** Mock Hive with 25% share to target X -> verify `clboss-ignore` called.
+- [ ] **Release Test:** Share drops to 14% -> verify `clboss-unignore` called.
+- [ ] **Expansion Test:** Underserved target + idle node -> verify Intent announced.
+- [ ] **Rate Limit Test:** 2 expansions in 1 hour -> verify second is queued, not executed.
 
 ---
 
 ## Phase 7: Governance Modes
 
-**Objective:** Implement the Decision Engine.
+**Objective:** Implement the configurable Decision Engine for action execution.
 
-### 7.1 Decision Engine
+### 7.1 Mode Definitions
 **File:** `modules/governance.py`
+
+**Modes:**
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| `ADVISOR` | Log + Notify, no execution | Cautious operators, learning phase |
+| `AUTONOMOUS` | Execute within safety limits | Trusted fleet, hands-off operation |
+| `ORACLE` | Delegate to external API | AI/ML integration, quant strategies |
+
+**Configuration:**
+*   `governance_mode`: enum in `HiveConfig`.
+*   Runtime switchable via `hive-set-mode` RPC.
+
+### 7.2 ADVISOR Mode (Human in the Loop)
+**File:** `modules/governance.py`
+
+**Flow:**
+1.  Planner/Intent proposes action.
+2.  Action saved to `pending_actions` table with `status='pending'`.
+3.  Notification sent (webhook or log).
+4.  Operator reviews via `hive-pending` RPC.
+5.  Operator approves via `hive-approve <action_id>` or rejects via `hive-reject <action_id>`.
+
+**Pending Actions Schema:**
+```sql
+CREATE TABLE pending_actions (
+    id INTEGER PRIMARY KEY,
+    action_type TEXT NOT NULL,  -- 'channel_open', 'rebalance', 'ban'
+    target TEXT NOT NULL,
+    proposed_by TEXT NOT NULL,
+    proposed_at INTEGER NOT NULL,
+    status TEXT DEFAULT 'pending',  -- 'pending', 'approved', 'rejected', 'expired'
+    expires_at INTEGER NOT NULL
+);
+```
+
 **Tasks:**
-- [ ] Implement modes: `ADVISOR` (Notify), `AUTONOMOUS` (Execute), `ORACLE` (API).
-- [ ] Implement `pending_actions` table for Advisor mode.
+- [ ] Implement `propose_action(action_type, target)` -> Saves to DB, sends notification.
+- [ ] Implement `get_pending_actions()` -> list.
+- [ ] Implement `approve_action(action_id)` -> Execute + update status.
+- [ ] Implement `reject_action(action_id)` -> Update status only.
+- [ ] Implement expiry: Actions older than 24h auto-expire.
+
+### 7.3 AUTONOMOUS Mode (Algorithmic Execution)
+**File:** `modules/governance.py`
+
+**Safety Constraints:**
+*   **Budget Cap:** Max `budget_per_day` sats for channel opens (default: 10M sats).
+*   **Rate Limit:** Max `actions_per_hour` (default: 2).
+*   **Confidence Threshold:** Only execute if `evaluate_promotion().confidence > 0.8`.
+
+**Tasks:**
+- [ ] Implement `check_budget(amount)` -> bool (within daily limit).
+- [ ] Implement `check_rate_limit()` -> bool (within hourly limit).
+- [ ] Implement `execute_if_safe(action)` -> Runs all checks, executes or rejects.
+- [ ] Track daily spend in memory, reset at midnight UTC.
+
+### 7.4 ORACLE Mode (External API)
+**File:** `modules/governance.py`
+
+**Flow:**
+1.  Planner proposes action.
+2.  Build `DecisionPacket` JSON.
+3.  POST to configured `oracle_url` with timeout (5s).
+4.  Parse response: `{"decision": "APPROVE"}` or `{"decision": "DENY", "reason": "..."}`.
+5.  Execute or reject based on response.
+
+**DecisionPacket Schema:**
+```json
+{
+    "action_type": "channel_open",
+    "target": "02abc...",
+    "context": {
+        "hive_share": 0.12,
+        "target_capacity": 50000000,
+        "opener_balance": 10000000
+    },
+    "timestamp": 1736100000
+}
+```
+
+**Fallback:** If API unreachable or timeout, fall back to `ADVISOR` mode.
+
+**Tasks:**
+- [ ] Implement `query_oracle(decision_packet)` -> `{"decision": str, "reason": str}`.
+- [ ] Implement timeout + retry (1 retry after 2s).
+- [ ] Implement fallback to ADVISOR on failure.
+- [ ] Log all oracle queries and responses.
+
+### 7.5 Phase 7 Testing
+**File:** `tests/test_governance.py`
+
+**Tasks:**
+- [ ] **Advisor Test:** Propose action -> verify saved to DB, not executed.
+- [ ] **Approve Test:** Approve pending action -> verify executed.
+- [ ] **Budget Test:** Exceed daily budget -> verify action rejected.
+- [ ] **Rate Limit Test:** 3 actions in 1 hour (limit=2) -> verify 3rd rejected.
+- [ ] **Oracle Test:** Mock API returns APPROVE -> verify executed. Returns DENY -> verify rejected.
+- [ ] **Oracle Timeout Test:** API hangs -> verify fallback to ADVISOR.
 
 ---
 
 ## Phase 8: RPC Commands
 
-**Objective:** Expose Hive functionality via CLI.
+**Objective:** Expose Hive functionality via CLI with consistent interface.
 
-### 8.1 Command List
+### 8.1 Core Commands
 **File:** `cl-hive.py`
+
+| Command | Parameters | Returns | Description |
+|---------|------------|---------|-------------|
+| `hive-genesis` | `--force` (optional) | `{hive_id, admin_pubkey}` | Initialize as Hive admin |
+| `hive-invite` | `--valid-hours=24` | `{ticket: base64}` | Generate invite ticket |
+| `hive-join` | `ticket=<base64>` | `{status, hive_id}` | Join Hive with ticket |
+| `hive-status` | *(none)* | `{hive_id, tier, members, mode}` | Current Hive status |
+| `hive-members` | `--tier=<filter>` | `[{pubkey, tier, uptime, ratio}]` | List members |
+
+### 8.2 Governance Commands
+**File:** `cl-hive.py`
+
+| Command | Parameters | Returns | Description |
+|---------|------------|---------|-------------|
+| `hive-pending` | *(none)* | `[{id, type, target, proposed_at}]` | List pending actions |
+| `hive-approve` | `action_id=<int>` | `{status, result}` | Approve pending action |
+| `hive-reject` | `action_id=<int>` | `{status}` | Reject pending action |
+| `hive-set-mode` | `mode=<advisor\|autonomous\|oracle>` | `{old_mode, new_mode}` | Change governance mode |
+
+### 8.3 Membership Commands
+**File:** `cl-hive.py`
+
+| Command | Parameters | Returns | Description |
+|---------|------------|---------|-------------|
+| `hive-request-promotion` | *(none)* | `{status, vouches_needed}` | Request promotion to Member |
+| `hive-vouch` | `peer_id=<pubkey>` | `{status}` | Manually vouch for a Neophyte |
+| `hive-ban` | `peer_id=<pubkey>`, `reason=<str>` | `{status, intent_id}` | Propose ban (starts Intent) |
+| `hive-contribution` | `peer_id=<pubkey>` (optional) | `{forwarded, received, ratio}` | View contribution stats |
+
+### 8.4 Topology Commands
+**File:** `cl-hive.py`
+
+| Command | Parameters | Returns | Description |
+|---------|------------|---------|-------------|
+| `hive-topology` | *(none)* | `{saturated: [], underserved: []}` | View topology analysis |
+| `hive-planner-log` | `--limit=10` | `[{timestamp, action, target, result}]` | View planner history |
+
+### 8.5 Permission Model
+**File:** `cl-hive.py`
+
+**Rules:**
+*   **Admin Only:** `hive-genesis`, `hive-invite`, `hive-ban`, `hive-set-mode`.
+*   **Member Only:** `hive-vouch`, `hive-approve`, `hive-reject`.
+*   **Any Tier:** `hive-status`, `hive-members`, `hive-contribution`, `hive-topology`.
+*   **Neophyte Only:** `hive-request-promotion`.
+
+**Implementation:**
+*   Check `get_tier(local_pubkey)` before executing.
+*   Return `{"error": "permission_denied", "required_tier": "member"}` if unauthorized.
+
+### 8.6 Phase 8 Testing
+**File:** `tests/test_rpc.py`
+
 **Tasks:**
-- [ ] Implement: `hive-status`, `hive-members`, `hive-invite`, `hive-join`, `hive-genesis`.
-- [ ] Implement: `hive-ban`, `hive-vouch`.
-- [ ] Implement: `hive-topology`.
+- [ ] **Genesis Test:** Call `hive-genesis` -> verify DB initialized, returns hive_id.
+- [ ] **Invite/Join Test:** Generate ticket on A, join on B -> verify B in members list.
+- [ ] **Status Test:** Verify all fields returned with correct types.
+- [ ] **Permission Test:** Neophyte calls `hive-ban` -> verify permission denied.
+- [ ] **Approve Flow:** Create pending action, approve -> verify executed.
 
 ---
 
