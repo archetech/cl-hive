@@ -77,38 +77,64 @@ shutdown_event = threading.Event()
 
 RPC_LOCK = threading.Lock()
 
+# X-01: Timeout for RPC lock acquisition to prevent global stalls
+RPC_LOCK_TIMEOUT_SECONDS = 10
+
+
+class RpcLockTimeoutError(TimeoutError):
+    """Raised when RPC lock cannot be acquired within timeout."""
+    pass
+
 
 class ThreadSafeRpcProxy:
     """
     A thread-safe proxy for the plugin's RPC interface.
-    
+
     Ensures all RPC calls are serialized through a lock, preventing
     race conditions when multiple background threads make concurrent
     calls to lightningd.
+
+    X-01: Uses timeout on lock acquisition to prevent global stalls.
     """
-    
+
     def __init__(self, rpc):
         """Wrap the original RPC object."""
         self._rpc = rpc
-    
+
     def __getattr__(self, name):
         """Intercept attribute access to wrap RPC method calls."""
         original_method = getattr(self._rpc, name)
-        
+
         if callable(original_method):
             def thread_safe_method(*args, **kwargs):
-                with RPC_LOCK:
+                # X-01: Use timeout to prevent indefinite blocking
+                acquired = RPC_LOCK.acquire(timeout=RPC_LOCK_TIMEOUT_SECONDS)
+                if not acquired:
+                    raise RpcLockTimeoutError(
+                        f"RPC lock acquisition timed out after {RPC_LOCK_TIMEOUT_SECONDS}s"
+                    )
+                try:
                     return original_method(*args, **kwargs)
+                finally:
+                    RPC_LOCK.release()
             return thread_safe_method
         else:
             return original_method
-    
+
     def call(self, method_name, payload=None):
         """Thread-safe wrapper for the generic RPC call method."""
-        with RPC_LOCK:
+        # X-01: Use timeout to prevent indefinite blocking
+        acquired = RPC_LOCK.acquire(timeout=RPC_LOCK_TIMEOUT_SECONDS)
+        if not acquired:
+            raise RpcLockTimeoutError(
+                f"RPC lock acquisition timed out after {RPC_LOCK_TIMEOUT_SECONDS}s"
+            )
+        try:
             if payload:
                 return self._rpc.call(method_name, payload)
             return self._rpc.call(method_name)
+        finally:
+            RPC_LOCK.release()
 
     def get_socket_path(self) -> Optional[str]:
         """Expose the underlying Lightning RPC socket path if available."""
@@ -733,13 +759,21 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle HIVE_GOSSIP message (state update from peer).
-    
+
     Process incoming gossip and update our local state cache.
     The GossipManager handles version validation and StateManager updates.
     """
     if not gossip_mgr:
         return {"result": "continue"}
-    
+
+    # P3-02: Verify sender is a Hive member before processing
+    if not database:
+        return {"result": "continue"}
+    member = database.get_member(peer_id)
+    if not member:
+        plugin.log(f"cl-hive: GOSSIP from non-member {peer_id[:16]}..., ignoring", level='warn')
+        return {"result": "continue"}
+
     accepted = gossip_mgr.process_gossip(peer_id, payload)
     
     if accepted:
@@ -866,7 +900,7 @@ def on_forward_event(plugin: Plugin, **payload):
 def handle_intent(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle HIVE_INTENT message (remote lock request).
-    
+
     When we receive an intent from another node:
     1. Record it for visibility
     2. Check for conflicts with our pending intents
@@ -875,7 +909,15 @@ def handle_intent(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     if not intent_mgr:
         return {"result": "continue"}
-    
+
+    # P3-02: Verify sender is a Hive member before processing
+    if not database:
+        return {"result": "continue"}
+    member = database.get_member(peer_id)
+    if not member:
+        plugin.log(f"cl-hive: INTENT from non-member {peer_id[:16]}..., ignoring", level='warn')
+        return {"result": "continue"}
+
     required_fields = ["intent_type", "target", "initiator", "timestamp"]
     for field in required_fields:
         if field not in payload:

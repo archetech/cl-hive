@@ -248,6 +248,21 @@ class HiveDatabase:
                 status TEXT DEFAULT 'pending'
             )
         """)
+
+        # =====================================================================
+        # PLANNER LOG TABLE (Phase 6)
+        # =====================================================================
+        # Audit log for automated planner decisions
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS hive_planner_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                target TEXT,
+                result TEXT NOT NULL,
+                details TEXT
+            )
+        """)
         
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
@@ -488,23 +503,42 @@ class HiveDatabase:
     # CONTRIBUTION TRACKING
     # =========================================================================
     
-    def record_contribution(self, peer_id: str, direction: str, 
-                            amount_sats: int) -> None:
+    # P5-03: Absolute cap on contribution ledger rows to prevent unbounded DB growth
+    MAX_CONTRIBUTION_ROWS = 500000
+
+    def record_contribution(self, peer_id: str, direction: str,
+                            amount_sats: int) -> bool:
         """
         Record a forwarding event for contribution tracking.
-        
+
+        P5-03: Rejects inserts if ledger exceeds MAX_CONTRIBUTION_ROWS.
+
         Args:
             peer_id: The Hive peer involved
             direction: 'forwarded' (we routed for them) or 'received' (they routed for us)
             amount_sats: Amount in satoshis
+
+        Returns:
+            True if recorded, False if rejected due to DB cap
         """
         conn = self._get_connection()
+
+        # P5-03: Check absolute row limit before inserting
+        row = conn.execute("SELECT COUNT(*) as cnt FROM contribution_ledger").fetchone()
+        if row and row['cnt'] >= self.MAX_CONTRIBUTION_ROWS:
+            self.plugin.log(
+                f"HiveDatabase: Contribution ledger at cap ({self.MAX_CONTRIBUTION_ROWS}), rejecting insert",
+                level='warn'
+            )
+            return False
+
         now = int(time.time())
-        
+
         conn.execute("""
             INSERT INTO contribution_ledger (peer_id, direction, amount_sats, timestamp)
             VALUES (?, ?, ?, ?)
         """, (peer_id, direction, amount_sats, now))
+        return True
 
     def get_contribution_stats(self, peer_id: str, window_days: int = 30) -> Dict[str, int]:
         """
@@ -888,3 +922,47 @@ class HiveDatabase:
             (now,)
         )
         return result.rowcount
+
+    # =========================================================================
+    # PLANNER LOGGING (Phase 6)
+    # =========================================================================
+
+    def log_planner_action(self, action_type: str, result: str, 
+                           target: Optional[str] = None, 
+                           details: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Log a decision made by the Planner.
+        
+        Args:
+            action_type: What the planner did (e.g., 'saturation_check', 'expansion')
+            result: Outcome ('success', 'skipped', 'failed', 'proposed')
+            target: Target peer related to the action
+            details: Additional context as dict
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        details_json = json.dumps(details) if details else None
+        
+        conn.execute("""
+            INSERT INTO hive_planner_log (timestamp, action_type, target, result, details)
+            VALUES (?, ?, ?, ?, ?)
+        """, (now, action_type, target, result, details_json))
+
+    def get_planner_logs(self, limit: int = 50) -> List[Dict]:
+        """Get recent planner logs."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM hive_planner_log 
+            ORDER BY timestamp DESC LIMIT ?
+        """, (limit,)).fetchall()
+        
+        results = []
+        for row in rows:
+            result = dict(row)
+            if result['details']:
+                try:
+                    result['details'] = json.loads(result['details'])
+                except json.JSONDecodeError:
+                    pass
+            results.append(result)
+        return results

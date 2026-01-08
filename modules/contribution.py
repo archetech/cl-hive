@@ -15,6 +15,9 @@ LEECH_WARN_RATIO = 0.5
 LEECH_BAN_RATIO = 0.4
 LEECH_WINDOW_DAYS = 7
 
+# P5-02: Global daily limit across all peers (anti-Sybil DoS protection)
+MAX_CONTRIB_EVENTS_PER_DAY_TOTAL = 10000
+
 
 class ContributionManager:
     """Tracks contribution stats and leech detection."""
@@ -27,6 +30,9 @@ class ContributionManager:
         self._channel_map: Dict[str, str] = {}
         self._last_refresh = 0
         self._rate_limits: Dict[str, Tuple[int, int]] = {}
+        # P5-02: Track global daily contribution event count
+        self._daily_count = 0
+        self._daily_window_start = int(time.time())
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
@@ -73,7 +79,28 @@ class ContributionManager:
         self._refresh_channel_map()
         return self._channel_map.get(channel_id)
 
+    def _allow_daily_global(self) -> bool:
+        """
+        P5-02: Check global daily limit across all peers.
+
+        Returns False if daily cap exceeded (resets after 24h).
+        """
+        now = int(time.time())
+        # Reset counter if 24h have passed
+        if now - self._daily_window_start >= 86400:
+            self._daily_window_start = now
+            self._daily_count = 0
+        if self._daily_count >= MAX_CONTRIB_EVENTS_PER_DAY_TOTAL:
+            return False
+        self._daily_count += 1
+        return True
+
     def _allow_record(self, peer_id: str) -> bool:
+        """Check per-peer rate limit and global daily limit."""
+        # P5-02: Check global daily limit first
+        if not self._allow_daily_global():
+            return False
+
         now = int(time.time())
         window_start, count = self._rate_limits.get(peer_id, (now, 0))
         if now - window_start >= 3600:

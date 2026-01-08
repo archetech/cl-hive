@@ -33,6 +33,9 @@ DEFAULT_HOLD_SECONDS = 60
 # Maximum age for stale intents before cleanup (seconds) - 1 hour
 STALE_INTENT_THRESHOLD = 3600
 
+# Maximum number of remote intents to cache (DoS protection - P3-01)
+MAX_REMOTE_INTENTS = 200
+
 # Intent status values
 STATUS_PENDING = 'pending'
 STATUS_COMMITTED = 'committed'
@@ -319,13 +322,29 @@ class IntentManager:
     def record_remote_intent(self, intent: Intent) -> None:
         """
         Record a remote intent for visibility/tracking.
-        
+
+        Enforces MAX_REMOTE_INTENTS limit with timestamp-based eviction (P3-01).
+
         Args:
             intent: Remote intent received from network
         """
         key = f"{intent.intent_type}:{intent.target}:{intent.initiator}"
+
+        # P3-01: Enforce cache size limit - evict oldest by timestamp before adding
+        if key not in self._remote_intents and len(self._remote_intents) >= MAX_REMOTE_INTENTS:
+            # Find and evict the oldest intent by timestamp
+            oldest_key = None
+            oldest_ts = float('inf')
+            for k, v in self._remote_intents.items():
+                if v.timestamp < oldest_ts:
+                    oldest_ts = v.timestamp
+                    oldest_key = k
+            if oldest_key:
+                del self._remote_intents[oldest_key]
+                self._log(f"Evicted oldest remote intent (cache full at {MAX_REMOTE_INTENTS})", level='debug')
+
         self._remote_intents[key] = intent
-        
+
         self._log(f"Recorded remote intent from {intent.initiator[:16]}...: "
                  f"{intent.intent_type} -> {intent.target[:16]}...", level='debug')
     
