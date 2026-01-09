@@ -574,11 +574,11 @@ CREATE TABLE pending_actions (
 ```
 
 **Tasks:**
-- [ ] Implement `propose_action(action_type, target)` -> Saves to DB, sends notification.
-- [ ] Implement `get_pending_actions()` -> list.
-- [ ] Implement `approve_action(action_id)` -> Execute + update status.
-- [ ] Implement `reject_action(action_id)` -> Update status only.
-- [ ] Implement expiry: Actions older than 24h auto-expire.
+- [x] Implement `propose_action(action_type, target)` -> Saves to DB, sends notification.
+- [x] Implement `get_pending_actions()` -> list.
+- [x] Implement `approve_action(action_id)` -> Execute + update status.
+- [x] Implement `reject_action(action_id)` -> Update status only.
+- [x] Implement expiry: Actions older than 24h auto-expire.
 
 ### 7.3 AUTONOMOUS Mode (Algorithmic Execution)
 **File:** `modules/governance.py`
@@ -589,10 +589,10 @@ CREATE TABLE pending_actions (
 *   **Confidence Threshold:** Only execute if `evaluate_promotion().confidence > 0.8`.
 
 **Tasks:**
-- [ ] Implement `check_budget(amount)` -> bool (within daily limit).
-- [ ] Implement `check_rate_limit()` -> bool (within hourly limit).
-- [ ] Implement `execute_if_safe(action)` -> Runs all checks, executes or rejects.
-- [ ] Track daily spend in memory, reset at midnight UTC.
+- [x] Implement `check_budget(amount)` -> bool (within daily limit).
+- [x] Implement `check_rate_limit()` -> bool (within hourly limit).
+- [x] Implement `execute_if_safe(action)` -> Runs all checks, executes or rejects.
+- [x] Track daily spend in memory, reset at midnight UTC.
 
 ### 7.4 ORACLE Mode (External API)
 **File:** `modules/governance.py`
@@ -621,21 +621,21 @@ CREATE TABLE pending_actions (
 **Fallback:** If API unreachable or timeout, fall back to `ADVISOR` mode.
 
 **Tasks:**
-- [ ] Implement `query_oracle(decision_packet)` -> `{"decision": str, "reason": str}`.
-- [ ] Implement timeout + retry (1 retry after 2s).
-- [ ] Implement fallback to ADVISOR on failure.
-- [ ] Log all oracle queries and responses.
+- [x] Implement `query_oracle(decision_packet)` -> `{"decision": str, "reason": str}`.
+- [x] Implement timeout + retry (1 retry after 2s).
+- [x] Implement fallback to ADVISOR on failure.
+- [x] Log all oracle queries and responses.
 
 ### 7.5 Phase 7 Testing
 **File:** `tests/test_governance.py`
 
 **Tasks:**
-- [ ] **Advisor Test:** Propose action -> verify saved to DB, not executed.
-- [ ] **Approve Test:** Approve pending action -> verify executed.
-- [ ] **Budget Test:** Exceed daily budget -> verify action rejected.
-- [ ] **Rate Limit Test:** 3 actions in 1 hour (limit=2) -> verify 3rd rejected.
-- [ ] **Oracle Test:** Mock API returns APPROVE -> verify executed. Returns DENY -> verify rejected.
-- [ ] **Oracle Timeout Test:** API hangs -> verify fallback to ADVISOR.
+- [x] **Advisor Test:** Propose action -> verify saved to DB, not executed.
+- [x] **Approve Test:** Approve pending action -> verify executed.
+- [x] **Budget Test:** Exceed daily budget -> verify action rejected.
+- [x] **Rate Limit Test:** 3 actions in 1 hour (limit=2) -> verify 3rd rejected.
+- [x] **Oracle Test:** Mock API returns APPROVE -> verify executed. Returns DENY -> verify rejected.
+- [x] **Oracle Timeout Test:** API hangs -> verify fallback to ADVISOR.
 
 ---
 
@@ -699,11 +699,11 @@ CREATE TABLE pending_actions (
 **File:** `tests/test_rpc.py`
 
 **Tasks:**
-- [ ] **Genesis Test:** Call `hive-genesis` -> verify DB initialized, returns hive_id.
-- [ ] **Invite/Join Test:** Generate ticket on A, join on B -> verify B in members list.
-- [ ] **Status Test:** Verify all fields returned with correct types.
-- [ ] **Permission Test:** Neophyte calls `hive-ban` -> verify permission denied.
-- [ ] **Approve Flow:** Create pending action, approve -> verify executed.
+- [x] **Genesis Test:** Call `hive-genesis` -> verify DB initialized, returns hive_id.
+- [x] **Invite/Join Test:** Generate ticket on A, join on B -> verify B in members list.
+- [x] **Status Test:** Verify all fields returned with correct types.
+- [x] **Permission Test:** Neophyte calls `hive-ban` -> verify permission denied.
+- [x] **Approve Flow:** Create pending action, approve -> verify executed.
 
 ---
 
@@ -728,4 +728,4 @@ CREATE TABLE pending_actions (
 3.  **Week 2:** Complete State + Anti-Entropy (Phase 2).
 
 ---
-*Plan Updated: January 5, 2026*
+*Plan Updated: January 9, 2026*
