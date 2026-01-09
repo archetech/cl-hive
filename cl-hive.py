@@ -1376,6 +1376,13 @@ def process_ready_intents():
 def membership_maintenance_loop():
     """
     Periodic pruning of membership-related data.
+
+    Runs hourly to clean up:
+    - Old contribution records (> 45 days)
+    - Old vouches (> VOUCH_TTL)
+    - Stale presence data
+    - Old planner logs (> 30 days)
+    - Expired/completed pending actions (> 7 days)
     """
     MAINTENANCE_INTERVAL = 3600  # seconds
     PRESENCE_WINDOW_SECONDS = 30 * 86400
@@ -1383,9 +1390,15 @@ def membership_maintenance_loop():
     while not shutdown_event.is_set():
         try:
             if database:
+                # Phase 5: Membership data pruning
                 database.prune_old_contributions(older_than_days=45)
                 database.prune_old_vouches(older_than_seconds=VOUCH_TTL_SECONDS)
                 database.prune_presence(window_seconds=PRESENCE_WINDOW_SECONDS)
+
+                # Phase 9: Planner and governance data pruning
+                database.cleanup_expired_actions()  # Mark expired as 'expired'
+                database.prune_planner_logs(older_than_days=30)
+                database.prune_old_actions(older_than_days=7)
         except Exception as e:
             if safe_plugin:
                 safe_plugin.log(f"Membership maintenance error: {e}", level='warn')

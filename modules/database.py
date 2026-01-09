@@ -1009,3 +1009,42 @@ class HiveDatabase:
                     pass
             results.append(result)
         return results
+
+    def prune_planner_logs(self, older_than_days: int = 30) -> int:
+        """
+        Remove planner logs older than specified days.
+
+        Args:
+            older_than_days: Delete logs older than this many days (default: 30)
+
+        Returns:
+            Number of records deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (older_than_days * 86400)
+        result = conn.execute(
+            "DELETE FROM hive_planner_log WHERE timestamp < ?",
+            (cutoff,)
+        )
+        return result.rowcount
+
+    def prune_old_actions(self, older_than_days: int = 7) -> int:
+        """
+        Remove non-pending actions older than specified days.
+
+        Only deletes actions that are already approved, rejected, or expired.
+        Pending actions are left alone (they may still be reviewed).
+
+        Args:
+            older_than_days: Delete actions older than this many days (default: 7)
+
+        Returns:
+            Number of records deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (older_than_days * 86400)
+        result = conn.execute("""
+            DELETE FROM pending_actions
+            WHERE status != 'pending' AND created_at < ?
+        """, (cutoff,))
+        return result.rowcount
