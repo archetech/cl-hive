@@ -1803,6 +1803,194 @@ def hive_set_mode(plugin: Plugin, mode: str):
     }
 
 
+@plugin.method("hive-vouch")
+def hive_vouch(plugin: Plugin, peer_id: str):
+    """
+    Manually vouch for a neophyte to support their promotion.
+
+    Args:
+        peer_id: Public key of the neophyte to vouch for
+
+    Returns:
+        Dict with vouch status.
+    """
+    if not config or not config.membership_enabled:
+        return {"error": "membership_disabled"}
+    if not membership_mgr or not our_pubkey or not database:
+        return {"error": "membership_unavailable"}
+
+    # Check our tier - must be member or admin to vouch
+    our_tier = membership_mgr.get_tier(our_pubkey)
+    if our_tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
+        return {"error": "permission_denied", "required_tier": "member or admin"}
+
+    # Check target is a neophyte
+    target = database.get_member(peer_id)
+    if not target:
+        return {"error": "peer_not_found", "peer_id": peer_id}
+    if target.get("tier") != MembershipTier.NEOPHYTE.value:
+        return {"error": "peer_not_neophyte", "current_tier": target.get("tier")}
+
+    # Check if target has a pending promotion request
+    requests = database.get_promotion_requests(peer_id)
+    pending_request = None
+    for req in requests:
+        if req.get("status") == "pending":
+            pending_request = req
+            break
+
+    if not pending_request:
+        return {"error": "no_pending_promotion_request", "peer_id": peer_id}
+
+    request_id = pending_request["request_id"]
+
+    # Check if we already vouched
+    existing_vouches = database.get_promotion_vouches(peer_id, request_id)
+    for vouch in existing_vouches:
+        if vouch.get("voucher_peer_id") == our_pubkey:
+            return {"error": "already_vouched", "peer_id": peer_id}
+
+    # Create and sign vouch
+    vouch_ts = int(time.time())
+    canonical = membership_mgr.build_vouch_message(peer_id, request_id, vouch_ts)
+
+    try:
+        sig = safe_plugin.rpc.signmessage(canonical)["signature"]
+    except Exception as e:
+        return {"error": f"Failed to sign vouch: {e}"}
+
+    # Store locally
+    database.add_promotion_vouch(peer_id, request_id, our_pubkey, sig, vouch_ts)
+
+    # Broadcast to members
+    vouch_payload = {
+        "target_pubkey": peer_id,
+        "request_id": request_id,
+        "timestamp": vouch_ts,
+        "voucher_pubkey": our_pubkey,
+        "sig": sig
+    }
+    vouch_msg = serialize(HiveMessageType.VOUCH, vouch_payload)
+    _broadcast_to_members(vouch_msg)
+
+    # Check if quorum reached
+    all_vouches = database.get_promotion_vouches(peer_id, request_id)
+    active_members = membership_mgr.get_active_members()
+    quorum = membership_mgr.calculate_quorum(len(active_members))
+
+    return {
+        "status": "vouched",
+        "peer_id": peer_id,
+        "request_id": request_id,
+        "vouch_count": len(all_vouches),
+        "quorum_needed": quorum,
+        "quorum_reached": len(all_vouches) >= quorum,
+    }
+
+
+@plugin.method("hive-ban")
+def hive_ban(plugin: Plugin, peer_id: str, reason: str):
+    """
+    Propose a ban for a peer.
+
+    Args:
+        peer_id: Public key of the peer to ban
+        reason: Reason for the ban
+
+    Returns:
+        Dict with ban status.
+    """
+    if not database or not our_pubkey:
+        return {"error": "Database not initialized"}
+
+    # Check if already banned
+    if database.is_banned(peer_id):
+        return {"error": "peer_already_banned", "peer_id": peer_id}
+
+    # Check if peer is a member
+    member = database.get_member(peer_id)
+    if not member:
+        return {"error": "peer_not_member", "peer_id": peer_id}
+
+    # Cannot ban admin
+    if member.get("tier") == MembershipTier.ADMIN.value:
+        return {"error": "cannot_ban_admin", "peer_id": peer_id}
+
+    # Sign the ban reason
+    now = int(time.time())
+    ban_message = f"BAN:{peer_id}:{reason}:{now}"
+
+    try:
+        sig = safe_plugin.rpc.signmessage(ban_message)["signature"]
+    except Exception as e:
+        return {"error": f"Failed to sign ban: {e}"}
+
+    # Add ban to database
+    expires_at = now + (365 * 86400)  # 1 year default
+    success = database.add_ban(
+        peer_id=peer_id,
+        reason=reason,
+        reporter=our_pubkey,
+        signature=sig,
+        expires_at=expires_at
+    )
+
+    if not success:
+        return {"error": "Failed to add ban", "peer_id": peer_id}
+
+    plugin.log(f"cl-hive: Banned peer {peer_id[:16]}... reason: {reason}")
+
+    return {
+        "status": "banned",
+        "peer_id": peer_id,
+        "reason": reason,
+        "reporter": our_pubkey,
+        "expires_at": expires_at,
+    }
+
+
+@plugin.method("hive-contribution")
+def hive_contribution(plugin: Plugin, peer_id: str = None):
+    """
+    View contribution stats for a peer or self.
+
+    Args:
+        peer_id: Optional peer to view (defaults to self)
+
+    Returns:
+        Dict with contribution statistics.
+    """
+    if not contribution_mgr or not database:
+        return {"error": "Contribution tracking not available"}
+
+    target_id = peer_id or our_pubkey
+    if not target_id:
+        return {"error": "No peer specified and our_pubkey not available"}
+
+    # Get contribution stats
+    stats = contribution_mgr.get_contribution_stats(target_id)
+
+    # Get member info
+    member = database.get_member(target_id)
+
+    # Get leech status
+    leech_status = contribution_mgr.check_leech_status(target_id)
+
+    result = {
+        "peer_id": target_id,
+        "forwarded_msat": stats["forwarded"],
+        "received_msat": stats["received"],
+        "contribution_ratio": round(stats["ratio"], 4),
+        "is_leech": leech_status["is_leech"],
+    }
+
+    if member:
+        result["tier"] = member.get("tier")
+        result["uptime_pct"] = member.get("uptime_pct")
+
+    return result
+
+
 @plugin.method("hive-request-promotion")
 def hive_request_promotion(plugin: Plugin):
     """

@@ -708,6 +708,16 @@ class HiveDatabase:
         """, (status, target_peer_id, request_id))
         return result.rowcount > 0
 
+    def get_promotion_requests(self, target_peer_id: str) -> List[Dict[str, Any]]:
+        """Get all promotion requests for a peer."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM promotion_requests
+            WHERE target_peer_id = ?
+            ORDER BY created_at DESC
+        """, (target_peer_id,)).fetchall()
+        return [dict(row) for row in rows]
+
     # =========================================================================
     # PEER PRESENCE
     # =========================================================================
