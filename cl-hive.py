@@ -1756,6 +1756,53 @@ def hive_reject_action(plugin: Plugin, action_id: int):
     }
 
 
+@plugin.method("hive-set-mode")
+def hive_set_mode(plugin: Plugin, mode: str):
+    """
+    Change the governance mode at runtime.
+
+    Args:
+        mode: New governance mode ('advisor', 'autonomous', or 'oracle')
+
+    Returns:
+        Dict with new mode and previous mode.
+    """
+    from modules.config import VALID_GOVERNANCE_MODES
+
+    if not config:
+        return {"error": "Config not initialized"}
+
+    # Validate mode
+    mode_lower = mode.lower()
+    if mode_lower not in VALID_GOVERNANCE_MODES:
+        return {
+            "error": f"Invalid mode: {mode}",
+            "valid_modes": list(VALID_GOVERNANCE_MODES)
+        }
+
+    # Check for oracle URL if switching to oracle mode
+    if mode_lower == 'oracle' and not config.oracle_url:
+        return {
+            "error": "Cannot switch to oracle mode: oracle_url not configured",
+            "hint": "Set hive-oracle-url option or configure oracle_url"
+        }
+
+    # Store previous mode
+    previous_mode = config.governance_mode
+
+    # Update config
+    config.governance_mode = mode_lower
+    config._version += 1
+
+    plugin.log(f"cl-hive: Governance mode changed from {previous_mode} to {mode_lower}")
+
+    return {
+        "status": "ok",
+        "previous_mode": previous_mode,
+        "current_mode": mode_lower,
+    }
+
+
 @plugin.method("hive-request-promotion")
 def hive_request_promotion(plugin: Plugin):
     """
