@@ -405,11 +405,36 @@ test_fees() {
     # Check revenue dashboard
     run_test "Revenue dashboard works" "hive_cli alice revenue-dashboard 2>/dev/null | jq -e '. != null' || echo '{}' | jq -e '. != null'"
 
-    # Get bob's pubkey for policy check
+    # Get pubkeys
     BOB_PUBKEY=$(hive_cli bob getinfo | jq -r '.id')
+    CAROL_PUBKEY=$(hive_cli carol getinfo | jq -r '.id')
+
+    # Check Bob (member) has HIVE strategy
     if [ -n "$BOB_PUBKEY" ] && [ "$BOB_PUBKEY" != "null" ]; then
-        # Check policy for hive peer
-        run_test "Revenue policy get works" "hive_cli alice revenue-policy get $BOB_PUBKEY 2>/dev/null | jq -e '. != null' || true"
+        run_test "Revenue policy get works" "hive_cli alice revenue-policy get $BOB_PUBKEY | jq -e '.policy'"
+
+        # Critical test: member should have HIVE strategy
+        BOB_STRATEGY=$(hive_cli alice revenue-policy get $BOB_PUBKEY | jq -r '.policy.strategy')
+        log_info "Bob's strategy: $BOB_STRATEGY (expected: hive)"
+        run_test "Member has HIVE strategy" "[ '$BOB_STRATEGY' = 'hive' ]"
+    fi
+
+    # Check Carol (neophyte) has dynamic strategy
+    if [ -n "$CAROL_PUBKEY" ] && [ "$CAROL_PUBKEY" != "null" ]; then
+        CAROL_STRATEGY=$(hive_cli alice revenue-policy get $CAROL_PUBKEY | jq -r '.policy.strategy')
+        log_info "Carol's strategy: $CAROL_STRATEGY (expected: dynamic)"
+        run_test "Neophyte has dynamic strategy" "[ '$CAROL_STRATEGY' = 'dynamic' ]"
+    fi
+
+    # Check policy sync worked on startup (via logs or status)
+    run_test "Hive status active" "hive_cli alice hive-status | jq -e '.status == \"active\"'"
+
+    # Test policy can be set manually (for manual override testing)
+    if [ -n "$CAROL_PUBKEY" ] && [ "$CAROL_PUBKEY" != "null" ]; then
+        # This tests the revenue-policy set command works
+        run_test "Manual policy set works" "hive_cli alice -k revenue-policy action=set peer_id=$CAROL_PUBKEY strategy=static 2>/dev/null | jq -e '.status == \"success\"'"
+        # Revert back to dynamic
+        hive_cli alice -k revenue-policy action=set peer_id=$CAROL_PUBKEY strategy=dynamic 2>/dev/null || true
     fi
 }
 
