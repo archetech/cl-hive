@@ -382,13 +382,27 @@ class Bridge:
     # =========================================================================
 
     def _call_via_lightning_cli(self, method: str, payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """Execute an RPC call via lightning-cli with a hard timeout."""
+        """Execute an RPC call via lightning-cli with a hard timeout.
+
+        Uses -k (keyword args) format to properly pass named parameters
+        to CLN methods.
+        """
         if not self._rpc_socket_path:
             raise BridgeDisabledError("RPC socket path unavailable")
 
-        cmd = ["lightning-cli", "--rpc-file", self._rpc_socket_path, method]
+        # Use -k for keyword args format: key=value
+        cmd = ["lightning-cli", "--rpc-file", self._rpc_socket_path, "-k", method]
         if payload:
-            cmd.append(json.dumps(payload, separators=(',', ':')))
+            for key, value in payload.items():
+                # Handle different value types
+                if value is None:
+                    continue
+                elif isinstance(value, bool):
+                    cmd.append(f"{key}={str(value).lower()}")
+                elif isinstance(value, (dict, list)):
+                    cmd.append(f"{key}={json.dumps(value, separators=(',', ':'))}")
+                else:
+                    cmd.append(f"{key}={value}")
 
         result = subprocess.run(
             cmd,

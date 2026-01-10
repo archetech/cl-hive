@@ -125,8 +125,12 @@ class ThreadSafeRpcProxy:
         else:
             return original_method
 
-    def call(self, method_name, payload=None):
-        """Thread-safe wrapper for the generic RPC call method."""
+    def call(self, method_name, payload=None, **kwargs):
+        """Thread-safe wrapper for the generic RPC call method.
+
+        Supports both positional payload dict and keyword arguments.
+        If kwargs are provided, they are merged with payload (kwargs take precedence).
+        """
         # X-01: Use timeout to prevent indefinite blocking
         acquired = RPC_LOCK.acquire(timeout=RPC_LOCK_TIMEOUT_SECONDS)
         if not acquired:
@@ -134,7 +138,11 @@ class ThreadSafeRpcProxy:
                 f"RPC lock acquisition timed out after {RPC_LOCK_TIMEOUT_SECONDS}s"
             )
         try:
-            if payload:
+            # Merge payload dict with kwargs
+            if kwargs:
+                merged = {**(payload or {}), **kwargs}
+                return self._rpc.call(method_name, merged)
+            elif payload:
                 return self._rpc.call(method_name, payload)
             return self._rpc.call(method_name)
         finally:
@@ -510,6 +518,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     planner_thread.start()
     plugin.log("cl-hive: Planner thread started")
+
+    # Sync fee policies for existing members (Phase 4 integration)
+    if bridge and bridge.status == BridgeStatus.ENABLED:
+        _sync_member_policies(plugin)
 
     # Set up graceful shutdown handler
     def handle_shutdown_signal(signum, frame):
@@ -1170,6 +1182,57 @@ def _broadcast_to_members(message_bytes: bytes) -> None:
             })
         except Exception as e:
             safe_plugin.log(f"Failed to send promotion msg to {member_id[:16]}...: {e}", level='debug')
+
+
+def _sync_member_policies(plugin: Plugin) -> None:
+    """
+    Sync fee policies for all existing members on startup.
+
+    Called during initialization to ensure all members have correct
+    fee policies set in cl-revenue-ops. This handles the case where
+    the plugin was restarted or policies were reset.
+
+    Policy assignment:
+    - Admin: HIVE strategy (0 PPM fees)
+    - Member: HIVE strategy (0 PPM fees)
+    - Neophyte: dynamic strategy (normal fee behavior)
+    """
+    if not database or not bridge or bridge.status != BridgeStatus.ENABLED:
+        return
+
+    members = database.get_all_members()
+    synced = 0
+
+    for member in members:
+        peer_id = member["peer_id"]
+        tier = member.get("tier")
+
+        # Skip ourselves
+        if peer_id == our_pubkey:
+            continue
+
+        # Determine if this peer should have HIVE strategy
+        # Both admin and member tiers get HIVE strategy
+        is_hive_member = tier in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value)
+
+        try:
+            # Use bypass_rate_limit=True for startup sync
+            success = bridge.set_hive_policy(peer_id, is_member=is_hive_member, bypass_rate_limit=True)
+            if success:
+                synced += 1
+                plugin.log(
+                    f"cl-hive: Synced policy for {peer_id[:16]}... "
+                    f"({'hive' if is_hive_member else 'dynamic'})",
+                    level='debug'
+                )
+        except Exception as e:
+            plugin.log(
+                f"cl-hive: Failed to sync policy for {peer_id[:16]}...: {e}",
+                level='debug'
+            )
+
+    if synced > 0:
+        plugin.log(f"cl-hive: Synced fee policies for {synced} member(s)")
 
 
 def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
@@ -1989,8 +2052,8 @@ def hive_vouch(plugin: Plugin, peer_id: str):
 
     # Auto-promote if quorum reached
     if quorum_reached and config.auto_promote_enabled:
-        # Update member tier
-        database.update_member(peer_id, tier=MembershipTier.MEMBER.value, promoted_at=int(time.time()))
+        # Update member tier via membership manager (triggers set_hive_policy)
+        membership_mgr.set_tier(peer_id, MembershipTier.MEMBER.value)
         database.update_promotion_request_status(peer_id, request_id, "accepted")
         plugin.log(f"cl-hive: Promoted {peer_id[:16]}... to member (quorum reached)")
 
