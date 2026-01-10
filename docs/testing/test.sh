@@ -611,9 +611,9 @@ test_reset() {
             hive_cli $node plugin stop cl-hive 2>/dev/null || true
             hive_cli $node plugin stop cl-revenue-ops 2>/dev/null || true
 
-            # Remove databases
-            docker exec polar-n${NETWORK_ID}-${node} rm -f /home/clightning/.lightning/regtest/cl_hive.db 2>/dev/null || true
-            docker exec polar-n${NETWORK_ID}-${node} rm -f /home/clightning/.lightning/regtest/revenue_ops.db 2>/dev/null || true
+            # Remove databases (handle WAL and SHM files too)
+            docker exec polar-n${NETWORK_ID}-${node} rm -f /home/clightning/.lightning/cl_hive.db /home/clightning/.lightning/cl_hive.db-shm /home/clightning/.lightning/cl_hive.db-wal 2>/dev/null || true
+            docker exec polar-n${NETWORK_ID}-${node} rm -f /home/clightning/.lightning/revenue_ops.db /home/clightning/.lightning/revenue_ops.db-shm /home/clightning/.lightning/revenue_ops.db-wal 2>/dev/null || true
 
             # Restart plugins
             hive_cli $node plugin start /home/clightning/.lightning/plugins/cl-revenue-ops/cl-revenue-ops.py 2>/dev/null || true
