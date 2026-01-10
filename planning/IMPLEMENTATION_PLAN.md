@@ -139,7 +139,7 @@ This document outlines the phased implementation plan for `cl-hive`, a distribut
 **Tasks:**
 - [x] **Magic Byte Test:** Verify non-HIVE messages are ignored.
 - [x] **Round Trip Test:** Serialize -> Deserialize preserves data.
-- [ ] **Crypto Test:** Verify `signmessage` output from one node verifies on another. (Requires integration test)
+- [x] **Crypto Test:** Verify `signmessage` output from one node verifies on another. (See `tests/test_crypto_integration.py`)
 - [x] **Expiry Test:** Verify tickets are rejected after `valid_hours`.
 
 ---
