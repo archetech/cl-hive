@@ -1211,7 +1211,7 @@ def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     vouch_ts = int(time.time())
     canonical = membership_mgr.build_vouch_message(target_pubkey, request_id, vouch_ts)
     try:
-        sig = safe_plugin.rpc.signmessage(canonical)["signature"]
+        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign vouch: {e}", level='warn')
         return {"result": "continue"}
@@ -1958,7 +1958,7 @@ def hive_vouch(plugin: Plugin, peer_id: str):
     canonical = membership_mgr.build_vouch_message(peer_id, request_id, vouch_ts)
 
     try:
-        sig = safe_plugin.rpc.signmessage(canonical)["signature"]
+        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
     except Exception as e:
         return {"error": f"Failed to sign vouch: {e}"}
 
@@ -2031,7 +2031,7 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     ban_message = f"BAN:{peer_id}:{reason}:{now}"
 
     try:
-        sig = safe_plugin.rpc.signmessage(ban_message)["signature"]
+        sig = safe_plugin.rpc.signmessage(ban_message)["zbase"]
     except Exception as e:
         return {"error": f"Failed to sign ban: {e}"}
 

@@ -220,7 +220,7 @@ class HandshakeManager:
         # Sign the ticket
         ticket_json = json.dumps(ticket_data, sort_keys=True, separators=(',', ':'))
         sig_result = self.rpc.signmessage(ticket_json)
-        signature = sig_result['signature']
+        signature = sig_result['zbase']
         
         # Create full ticket
         genesis_ticket = Ticket(
@@ -301,7 +301,7 @@ class HandshakeManager:
         ticket_json = json.dumps(ticket_data, sort_keys=True, separators=(',', ':'))
         sig_result = self.rpc.signmessage(ticket_json)
         
-        ticket = Ticket(**ticket_data, signature=sig_result['signature'])
+        ticket = Ticket(**ticket_data, signature=sig_result['zbase'])
         
         self.plugin.log(f"Generated invite ticket (expires in {valid_hours}h)")
         
@@ -383,8 +383,8 @@ class HandshakeManager:
         manifest_json = manifest.to_json()
         
         # Sign both the nonce and the full manifest
-        nonce_sig = self.rpc.signmessage(nonce)['signature']
-        manifest_sig = self.rpc.signmessage(manifest_json)['signature']
+        nonce_sig = self.rpc.signmessage(nonce)['zbase']
+        manifest_sig = self.rpc.signmessage(manifest_json)['zbase']
         
         return {
             "manifest": asdict(manifest),
