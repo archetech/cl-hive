@@ -482,7 +482,7 @@ class Bridge:
             if is_member:
                 # Set HIVE strategy with rebalancing enabled
                 result = self.safe_call("revenue-policy", {
-                    "subcommand": "set",
+                    "action": "set",
                     "peer_id": peer_id,
                     "strategy": "hive",
                     "rebalance": "enabled"
@@ -490,7 +490,7 @@ class Bridge:
             else:
                 # Revert to dynamic strategy
                 result = self.safe_call("revenue-policy", {
-                    "subcommand": "set",
+                    "action": "set",
                     "peer_id": peer_id,
                     "strategy": "dynamic"
                 })
@@ -510,35 +510,81 @@ class Bridge:
             self._log(f"Failed to set policy for {peer_id[:16]}...: {e}", level='warn')
             return False
     
-    def trigger_rebalance(self, target_peer: str, amount_sats: int) -> bool:
+    def _get_channel_scid(self, peer_id: str) -> Optional[str]:
+        """
+        Get the Short Channel ID for a channel with a peer.
+
+        Args:
+            peer_id: Node public key
+
+        Returns:
+            SCID string (e.g., "930866x2599x2") or None if no channel found
+        """
+        try:
+            result = self.rpc.listpeerchannels(id=peer_id)
+            channels = result.get('channels', [])
+
+            # Find an active channel
+            for ch in channels:
+                state = ch.get('state', '')
+                if state == 'CHANNELD_NORMAL':
+                    scid = ch.get('short_channel_id')
+                    if scid:
+                        return scid
+
+            return None
+        except Exception as e:
+            self._log(f"Failed to get SCID for {peer_id[:16]}...: {e}", level='debug')
+            return None
+
+    def trigger_rebalance(self, target_peer: str, amount_sats: int,
+                          source_peer: str) -> bool:
         """
         Trigger a rebalance toward a Hive peer.
-        
+
         Uses cl-revenue-ops Strategic Exemption to bypass profitability checks.
-        
+
         Args:
-            target_peer: Destination peer_id
+            target_peer: Destination peer_id (will lookup SCID automatically)
             amount_sats: Amount to rebalance in satoshis
-            
+            source_peer: Source peer_id to drain liquidity from (required)
+
         Returns:
             True if rebalance was initiated successfully
+
+        Note:
+            Both source_peer and target_peer are resolved to SCIDs before calling
+            cl-revenue-ops. The Strategic Exemption allows negative-EV rebalances
+            to Hive members up to the configured tolerance.
         """
         if self._status == BridgeStatus.DISABLED:
             return False
-        
+
+        # Look up target channel SCID
+        target_scid = self._get_channel_scid(target_peer)
+        if not target_scid:
+            self._log(f"No active channel found for target peer {target_peer[:16]}...")
+            return False
+
+        # Look up source channel SCID (required)
+        source_scid = self._get_channel_scid(source_peer)
+        if not source_scid:
+            self._log(f"No active channel found for source peer {source_peer[:16]}...")
+            return False
+
         try:
             result = self.safe_call("revenue-rebalance", {
-                "from": "auto",
-                "to": target_peer,
-                "amount": amount_sats
+                "from_channel": source_scid,
+                "to_channel": target_scid,
+                "amount_sats": amount_sats
             })
-            
+
             success = result.get("status") in ("success", "initiated", "pending")
             if success:
-                self._log(f"Rebalance initiated: {amount_sats} sats -> {target_peer[:16]}...")
-            
+                self._log(f"Rebalance initiated: {amount_sats} sats {source_scid} -> {target_scid}")
+
             return success
-            
+
         except CircuitOpenError:
             return False
         except Exception as e:
@@ -560,7 +606,7 @@ class Bridge:
         
         try:
             result = self.safe_call("revenue-policy", {
-                "subcommand": "get",
+                "action": "get",
                 "peer_id": peer_id
             })
             return result
