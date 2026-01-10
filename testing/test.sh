@@ -3,7 +3,7 @@
 # Automated test suite for cl-hive and cl-revenue-ops plugins
 #
 # Usage: ./test.sh [category] [network_id]
-# Categories: all, setup, genesis, join, promotion, sync, intent, channels, fees, clboss, contrib, cross, reset
+# Categories: all, setup, genesis, join, promotion, sync, intent, channels, fees, clboss, contrib, governance, planner, security, cross, recovery, reset
 #
 # Example: ./test.sh all 1
 # Example: ./test.sh genesis 1
@@ -594,6 +594,188 @@ test_cross() {
     fi
 }
 
+# Governance Tests - Mode switching and action management (L10)
+test_governance() {
+    echo ""
+    echo "========================================"
+    echo "GOVERNANCE TESTS (L10)"
+    echo "========================================"
+
+    # Reset mode to advisor before testing
+    hive_cli alice hive-set-mode mode=advisor 2>/dev/null || true
+
+    # L10.1 Check default mode
+    run_test "Mode starts as advisor" "hive_cli alice hive-status | jq -e '.governance_mode == \"advisor\"'"
+
+    # L10.2 Mode change test
+    # Change to autonomous
+    run_test "Can change to autonomous mode" "hive_cli alice hive-set-mode mode=autonomous | jq -e '.current_mode == \"autonomous\"'"
+    run_test "Mode is now autonomous" "hive_cli alice hive-status | jq -e '.governance_mode == \"autonomous\"'"
+
+    # Change back to advisor
+    run_test "Can change back to advisor mode" "hive_cli alice hive-set-mode mode=advisor | jq -e '.current_mode == \"advisor\"'"
+    run_test "Mode is now advisor" "hive_cli alice hive-status | jq -e '.governance_mode == \"advisor\"'"
+
+    # L10.3 ADVISOR mode behavior - actions are queued
+    run_test "Pending actions returns count" "hive_cli alice hive-pending-actions | jq -e '.count >= 0'"
+
+    # L10.4 Action approval command exists
+    run_test "approve-action command exists" "hive_cli alice help | grep -q 'hive-approve-action'"
+
+    # L10.5 Action rejection command exists
+    run_test "reject-action command exists" "hive_cli alice help | grep -q 'hive-reject-action'"
+
+    # L10.6 Check pending actions structure
+    PENDING_ACTIONS=$(hive_cli alice hive-pending-actions)
+    log_info "Pending actions: $(echo "$PENDING_ACTIONS" | jq '.count')"
+    run_test "Pending actions has actions array" "echo '$PENDING_ACTIONS' | jq -e '.actions != null'"
+
+    # L10.7 Bob also has governance mode
+    run_test "Bob has governance mode" "hive_cli bob hive-status | jq -e '.governance_mode'"
+
+    # L10.8 Carol has governance mode
+    run_test "Carol has governance mode" "hive_cli carol hive-status | jq -e '.governance_mode'"
+}
+
+# Planner Tests - Topology analysis and expansion planning (L11)
+test_planner() {
+    echo ""
+    echo "========================================"
+    echo "PLANNER TESTS (L11)"
+    echo "========================================"
+
+    # L11.1 Topology analysis
+    run_test "Topology works" "hive_cli alice hive-topology | jq -e '.saturated_count >= 0'"
+    run_test "Topology has config" "hive_cli alice hive-topology | jq -e '.config'"
+
+    # L11.2 Saturation tracking
+    TOPOLOGY=$(hive_cli alice hive-topology)
+    log_info "Saturated targets: $(echo "$TOPOLOGY" | jq '.saturated_count')"
+    run_test "Saturated targets array exists" "echo '$TOPOLOGY' | jq -e '.saturated_targets != null'"
+
+    # L11.3 Ignored peers tracking
+    log_info "Ignored peers: $(echo "$TOPOLOGY" | jq '.ignored_count')"
+    run_test "Ignored peers array exists" "echo '$TOPOLOGY' | jq -e '.ignored_peers != null'"
+
+    # L11.4 Planner log
+    run_test "Planner log works" "hive_cli alice hive-planner-log | jq -e '.logs'"
+    run_test "Planner log with limit" "hive_cli alice hive-planner-log limit=5 | jq -e '.limit == 5'"
+
+    # L11.5 Planner log structure
+    PLANNER_LOG=$(hive_cli alice hive-planner-log limit=3)
+    log_info "Planner log entries: $(echo "$PLANNER_LOG" | jq '.count')"
+    run_test "Planner log has count" "echo '$PLANNER_LOG' | jq -e '.count >= 0'"
+
+    # L11.6 Network cache info
+    run_test "Network cache size tracked" "hive_cli alice hive-topology | jq -e '.network_cache_size >= 0'"
+    run_test "Network cache age tracked" "hive_cli alice hive-topology | jq -e '.network_cache_age_seconds >= 0'"
+
+    # L11.7 Config values
+    run_test "Market share cap configured" "hive_cli alice hive-topology | jq -e '.config.market_share_cap_pct'"
+    run_test "Planner interval configured" "hive_cli alice hive-topology | jq -e '.config.planner_interval_seconds'"
+
+    # L11.8 Bob's topology view
+    run_test "Bob topology works" "hive_cli bob hive-topology | jq -e '.saturated_count >= 0'"
+
+    # L11.9 Carol's topology view
+    run_test "Carol topology works" "hive_cli carol hive-topology | jq -e '.saturated_count >= 0'"
+}
+
+# Security Tests - Ban functionality and leech detection (L12)
+test_security() {
+    echo ""
+    echo "========================================"
+    echo "SECURITY TESTS (L12)"
+    echo "========================================"
+
+    # L12.1 Ban command exists
+    run_test "Ban command exists" "hive_cli alice help | grep -q 'hive-ban'"
+
+    # L12.2 Contribution ratio for leech detection
+    ALICE_RATIO=$(hive_cli alice hive-contribution | jq '.contribution_ratio')
+    log_info "Alice contribution ratio: $ALICE_RATIO"
+    run_test "Contribution ratio is tracked" "hive_cli alice hive-contribution | jq -e '.contribution_ratio != null'"
+
+    # L12.3 Bob contribution
+    BOB_PUBKEY=$(hive_cli bob getinfo | jq -r '.id')
+    BOB_RATIO=$(hive_cli alice hive-contribution peer_id=$BOB_PUBKEY | jq '.contribution_ratio')
+    log_info "Bob contribution ratio: $BOB_RATIO"
+    run_test "Bob contribution tracked" "hive_cli alice hive-contribution peer_id=$BOB_PUBKEY | jq -e '.peer_id'"
+
+    # L12.4 Carol contribution (neophyte)
+    CAROL_PUBKEY=$(hive_cli carol getinfo | jq -r '.id')
+    run_test "Carol contribution tracked" "hive_cli alice hive-contribution peer_id=$CAROL_PUBKEY | jq -e '.peer_id'"
+
+    # L12.5 Version info available
+    run_test "Version info available" "hive_cli alice hive-status | jq -e '.version'"
+
+    # L12.6 Members limits are configured
+    run_test "Max members configured" "hive_cli alice hive-status | jq -e '.limits.max_members'"
+    run_test "Market share cap configured" "hive_cli alice hive-status | jq -e '.limits.market_share_cap'"
+
+    # Note: We don't actually ban anyone in automated tests to preserve the hive state
+    log_info "Skipping actual ban execution to preserve hive state"
+}
+
+# Recovery Tests - Plugin restart and state persistence (L14)
+test_recovery() {
+    echo ""
+    echo "========================================"
+    echo "RECOVERY TESTS (L14)"
+    echo "========================================"
+
+    # L14.1 Pre-restart state check
+    ALICE_STATUS_BEFORE=$(hive_cli alice hive-status | jq -r '.status')
+    ALICE_MEMBERS_BEFORE=$(hive_cli alice hive-members | jq '.count')
+    log_info "Before restart - Status: $ALICE_STATUS_BEFORE, Members: $ALICE_MEMBERS_BEFORE"
+
+    # L14.2 Stop cl-hive plugin
+    log_info "Stopping cl-hive plugin on Alice..."
+    hive_cli alice plugin stop /home/clightning/.lightning/plugins/cl-hive/cl-hive.py 2>/dev/null || true
+    sleep 2
+
+    # Verify plugin is stopped (or tolerate if already stopped)
+    if hive_cli alice plugin list 2>/dev/null | grep -q cl-hive; then
+        log_fail "cl-hive should be stopped"
+        ((TESTS_FAILED++))
+        FAILED_TESTS="$FAILED_TESTS\n  - cl-hive stopped"
+    else
+        log_pass "cl-hive stopped"
+        ((TESTS_PASSED++))
+    fi
+
+    # L14.3 Start cl-hive plugin
+    log_info "Starting cl-hive plugin on Alice..."
+    hive_cli alice plugin start /home/clightning/.lightning/plugins/cl-hive/cl-hive.py 2>/dev/null || true
+    sleep 3
+
+    # Verify plugin is running
+    run_test "cl-hive restarted" "hive_cli alice plugin list | grep -q cl-hive"
+
+    # L14.4 State persistence - status preserved
+    run_test "Status preserved after restart" "hive_cli alice hive-status | jq -e '.status == \"active\"'"
+
+    # L14.5 State persistence - members preserved
+    ALICE_MEMBERS_AFTER=$(hive_cli alice hive-members | jq '.count')
+    log_info "After restart - Members: $ALICE_MEMBERS_AFTER"
+    run_test "Member count preserved" "[ '$ALICE_MEMBERS_BEFORE' = '$ALICE_MEMBERS_AFTER' ]"
+
+    # L14.6 State persistence - tier preserved
+    run_test "Admin tier preserved" "hive_cli alice hive-members | jq -e '.members[] | select(.tier == \"admin\")'"
+
+    # L14.7 Governance mode preserved
+    run_test "Governance mode preserved" "hive_cli alice hive-status | jq -e '.governance_mode == \"advisor\"'"
+
+    # L14.8 Test Bob's connectivity after Alice restart
+    run_test "Bob still sees members" "hive_cli bob hive-members | jq -e '.count >= 1'"
+
+    # L14.9 Test Carol's connectivity after Alice restart
+    run_test "Carol still sees members" "hive_cli carol hive-members | jq -e '.count >= 1'"
+
+    # L14.10 Bridge reconnects (revenue-ops integration)
+    run_test "Revenue status works after restart" "hive_cli alice revenue-status | jq -e '.status'"
+}
+
 # Reset - Clean up for fresh test run
 test_reset() {
     echo ""
@@ -651,7 +833,11 @@ case $CATEGORY in
         test_fees
         test_clboss
         test_contrib
+        test_governance
+        test_planner
+        test_security
         test_cross
+        test_recovery
         ;;
     setup)
         test_setup
@@ -683,8 +869,20 @@ case $CATEGORY in
     contrib)
         test_contrib
         ;;
+    governance)
+        test_governance
+        ;;
+    planner)
+        test_planner
+        ;;
+    security)
+        test_security
+        ;;
     cross)
         test_cross
+        ;;
+    recovery)
+        test_recovery
         ;;
     reset)
         test_reset
@@ -692,7 +890,7 @@ case $CATEGORY in
         ;;
     *)
         echo "Unknown category: $CATEGORY"
-        echo "Valid categories: all, setup, genesis, join, promotion, sync, intent, channels, fees, clboss, contrib, cross, reset"
+        echo "Valid categories: all, setup, genesis, join, promotion, sync, intent, channels, fees, clboss, contrib, governance, planner, security, cross, recovery, reset"
         exit 1
         ;;
 esac
