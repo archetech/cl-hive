@@ -31,6 +31,7 @@ Author: Lightning Goats Team
 License: MIT
 """
 
+import json
 import os
 import signal
 import threading
@@ -820,27 +821,51 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle HIVE_WELCOME message (session established).
-    
+
     We've been accepted into the Hive!
     """
     hive_id = payload.get('hive_id')
     tier = payload.get('tier')
     member_count = payload.get('member_count')
-    
+
     plugin.log(
         f"cl-hive: WELCOME received! Joined '{hive_id}' as {tier} "
         f"(Hive has {member_count} members)"
     )
-    
+
     # Phase 4: Apply Hive fee policy to this peer
     if bridge and bridge.status == BridgeStatus.ENABLED:
         bridge.set_hive_policy(peer_id, is_member=True)
         # Also tell CLBoss about this peer (Gateway Pattern)
         if bridge._clboss_available:
             bridge.ignore_peer(peer_id)
-    
-    # TODO: Store Hive membership info, initiate state sync
-    
+
+    # Store Hive membership info for ourselves
+    if database and our_pubkey:
+        now = int(time.time())
+        # Add ourselves as a member with the tier assigned by the admin
+        database.add_member(our_pubkey, tier=tier or 'neophyte', joined_at=now)
+        # Store hive_id in metadata
+        database.update_member(our_pubkey, metadata=json.dumps({"hive_id": hive_id}))
+        plugin.log(f"cl-hive: Stored membership (tier={tier}, hive_id={hive_id})")
+
+        # Also add the peer that welcomed us (they're the admin or existing member)
+        database.add_member(peer_id, tier='admin', joined_at=now)
+
+    # Initiate state sync with the peer that welcomed us
+    if gossip_mgr and safe_plugin:
+        state_hash_payload = gossip_mgr.create_state_hash_payload()
+        state_hash_msg = serialize(HiveMessageType.STATE_HASH, state_hash_payload)
+
+        try:
+            safe_plugin.rpc.call("sendcustommsg", {
+                "node_id": peer_id,
+                "msg": state_hash_msg.hex()
+            })
+            plugin.log(f"cl-hive: STATE_HASH sent to {peer_id[:16]}... for anti-entropy sync")
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
+
     return {"result": "continue"}
 
 
