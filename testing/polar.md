@@ -18,9 +18,9 @@ Create the following 9 nodes in Polar before running the install script:
 
 | Node Name | Implementation | Version | Purpose | Plugins |
 |-----------|---------------|---------|---------|---------|
-| alice | Core Lightning | v25.12 | Hive Admin | clboss, cl-revenue-ops, cl-hive |
-| bob | Core Lightning | v25.12 | Hive Member | clboss, cl-revenue-ops, cl-hive |
-| carol | Core Lightning | v25.12 | Hive Member | clboss, cl-revenue-ops, cl-hive |
+| alice | Core Lightning | v25.12 | Hive Admin | clboss, sling, cl-revenue-ops, cl-hive |
+| bob | Core Lightning | v25.12 | Hive Member | clboss, sling, cl-revenue-ops, cl-hive |
+| carol | Core Lightning | v25.12 | Hive Member | clboss, sling, cl-revenue-ops, cl-hive |
 | dave | Core Lightning | v25.12 | External CLN | none (vanilla) |
 | erin | Core Lightning | v25.12 | External CLN | none (vanilla) |
 | lnd1 | LND | latest | External LND | none |
@@ -67,22 +67,25 @@ HIVE FLEET (with plugins)              EXTERNAL NODES (no hive plugins)
 ┌─────────────────────────────┐       ┌─────────────────────────────┐
 │  alice (CLN v25.12)         │       │  lnd1 (LND)                 │
 │  ├── clboss                 │       │  lnd2 (LND)                 │
-│  ├── cl-revenue-ops         │◄─────►│  eclair1 (Eclair)           │
-│  └── cl-hive                │       │  eclair2 (Eclair)           │
-│                             │       │  dave (CLN - vanilla)       │
-│  bob (CLN v25.12)           │       │  erin (CLN - vanilla)       │
-│  ├── clboss                 │       └─────────────────────────────┘
+│  ├── sling                  │◄─────►│  eclair1 (Eclair)           │
+│  ├── cl-revenue-ops         │       │  eclair2 (Eclair)           │
+│  └── cl-hive                │       │  dave (CLN - vanilla)       │
+│                             │       │  erin (CLN - vanilla)       │
+│  bob (CLN v25.12)           │       └─────────────────────────────┘
+│  ├── clboss                 │
+│  ├── sling                  │
 │  ├── cl-revenue-ops         │
 │  └── cl-hive                │
 │                             │
 │  carol (CLN v25.12)         │
 │  ├── clboss                 │
+│  ├── sling                  │
 │  ├── cl-revenue-ops         │
 │  └── cl-hive                │
 └─────────────────────────────┘
 ```
 
-**Plugin Load Order:** clboss → cl-revenue-ops → cl-hive
+**Plugin Load Order:** clboss → sling → cl-revenue-ops → cl-hive
 
 ---
 
@@ -222,7 +225,7 @@ CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest
 
 for node in alice bob carol; do
     echo "=== $node ==="
-    docker exec polar-n1-$node $CLI plugin list | grep -E "(clboss|revenue|hive)"
+    docker exec polar-n1-$node $CLI plugin list | grep -E "(clboss|sling|revenue|hive)"
 done
 ```
 
@@ -345,7 +348,7 @@ docker exec polar-n1-alice bash -c "cd /tmp/clboss && make clean && make -j$(npr
 ### View Plugin Logs
 
 ```bash
-docker exec polar-n1-alice tail -100 /home/clightning/.lightning/debug.log | grep -E "(clboss|revenue|hive)"
+docker exec polar-n1-alice tail -100 /home/clightning/.lightning/debug.log | grep -E "(clboss|sling|revenue|hive)"
 ```
 
 ### Permission Issues

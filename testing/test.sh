@@ -191,6 +191,7 @@ test_setup() {
     for node in $HIVE_NODES; do
         if container_exists $node; then
             run_test "$node has clboss" "hive_cli $node plugin list | grep -q clboss"
+            run_test "$node has sling" "hive_cli $node plugin list | grep -q sling"
             run_test "$node has cl-revenue-ops" "hive_cli $node plugin list | grep -q revenue-ops"
             run_test "$node has cl-hive" "hive_cli $node plugin list | grep -q cl-hive"
         fi

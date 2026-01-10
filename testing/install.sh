@@ -11,6 +11,7 @@
 #   REVENUE_OPS_PATH - Path to cl_revenue_ops repo (default: /home/sat/cl_revenue_ops)
 #   HIVE_PATH      - Path to cl-hive repo (default: /home/sat/cl-hive)
 #   SKIP_CLBOSS    - Set to 1 to skip clboss installation on hive nodes
+#   SKIP_SLING     - Set to 1 to skip sling installation on hive nodes
 #
 
 set -e
@@ -21,6 +22,7 @@ VANILLA_NODES="${VANILLA_NODES:-dave erin}"
 REVENUE_OPS_PATH="${REVENUE_OPS_PATH:-/home/sat/cl_revenue_ops}"
 HIVE_PATH="${HIVE_PATH:-/home/sat/cl-hive}"
 SKIP_CLBOSS="${SKIP_CLBOSS:-0}"
+SKIP_SLING="${SKIP_SLING:-0}"
 
 # CLI command for Polar CLN containers
 CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
@@ -34,6 +36,7 @@ echo "Vanilla Nodes: $VANILLA_NODES"
 echo "cl-revenue-ops: $REVENUE_OPS_PATH"
 echo "cl-hive: $HIVE_PATH"
 echo "Skip CLBOSS: $SKIP_CLBOSS"
+echo "Skip Sling: $SKIP_SLING"
 echo ""
 
 # Track installation results
@@ -54,7 +57,7 @@ install_cln_deps() {
         build-essential autoconf autoconf-archive automake libtool pkg-config \
         libev-dev libcurl4-gnutls-dev libsqlite3-dev libunwind-dev \
         python3 python3-pip python3-json5 python3-flask python3-gunicorn \
-        git jq > /dev/null 2>&1
+        git jq curl > /dev/null 2>&1
 
     echo "  [2/2] Installing pyln-client (pip)..."
     docker exec -u root $container pip3 install --break-system-packages -q pyln-client 2>/dev/null
@@ -97,6 +100,46 @@ install_clboss() {
 }
 
 #
+# Build and install Sling (Rust rebalancing plugin)
+#
+install_sling() {
+    local container=$1
+
+    if [ "$SKIP_SLING" == "1" ]; then
+        echo "  Skipping Sling (SKIP_SLING=1)"
+        return 0
+    fi
+
+    echo "  Building Sling (this may take several minutes)..."
+
+    # Check if sling already exists
+    if docker exec $container test -f /home/clightning/.lightning/plugins/sling 2>/dev/null; then
+        echo "    Sling already installed, skipping build"
+        return 0
+    fi
+
+    # Install Rust if not present and build sling
+    docker exec $container bash -c "
+        # Install Rust via rustup if not present
+        if ! command -v cargo &> /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source \$HOME/.cargo/env
+        fi
+        source \$HOME/.cargo/env
+
+        cd /tmp &&
+        if [ ! -d sling ]; then
+            git clone https://github.com/daywalker90/sling.git
+        fi &&
+        cd sling &&
+        cargo build --release &&
+        cp target/release/sling /home/clightning/.lightning/plugins/
+    " 2>&1 | while read line; do echo "    $line"; done
+
+    echo "    Sling build complete"
+}
+
+#
 # Install hive plugins (cl-revenue-ops, cl-hive)
 #
 install_hive_plugins() {
@@ -122,11 +165,21 @@ load_hive_plugins() {
 
     echo "  Loading plugins..."
 
+    # Load order: clboss → sling → cl-revenue-ops → cl-hive
+
     if [ "$SKIP_CLBOSS" != "1" ]; then
         if docker exec $container $CLI plugin start /home/clightning/.lightning/plugins/clboss 2>/dev/null; then
             echo "    clboss: loaded"
         else
             echo "    clboss: FAILED"
+        fi
+    fi
+
+    if [ "$SKIP_SLING" != "1" ]; then
+        if docker exec $container $CLI plugin start /home/clightning/.lightning/plugins/sling 2>/dev/null; then
+            echo "    sling: loaded"
+        else
+            echo "    sling: FAILED"
         fi
     fi
 
@@ -165,6 +218,7 @@ for node in $HIVE_NODES; do
 
     install_cln_deps $CONTAINER
     install_clboss $CONTAINER
+    install_sling $CONTAINER
     install_hive_plugins $CONTAINER
     load_hive_plugins $CONTAINER
 
@@ -256,7 +310,7 @@ echo "Verification Commands"
 echo "========================================"
 echo ""
 echo "# Verify hive plugins loaded:"
-echo "docker exec polar-n${NETWORK_ID}-alice $CLI plugin list | grep -E '(clboss|revenue|hive)'"
+echo "docker exec polar-n${NETWORK_ID}-alice $CLI plugin list | grep -E '(clboss|sling|revenue|hive)'"
 echo ""
 echo "# Check hive status:"
 echo "docker exec polar-n${NETWORK_ID}-alice $CLI hive-status"
