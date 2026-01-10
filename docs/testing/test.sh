@@ -3,7 +3,7 @@
 # Automated test suite for cl-hive and cl-revenue-ops plugins
 #
 # Usage: ./test.sh [category] [network_id]
-# Categories: all, setup, genesis, join, sync, channels, fees, clboss, contrib, cross, reset
+# Categories: all, setup, genesis, join, promotion, sync, channels, fees, clboss, contrib, cross, reset
 #
 # Example: ./test.sh all 1
 # Example: ./test.sh genesis 1
@@ -284,6 +284,60 @@ test_join() {
     run_test "Alice sees members" "hive_cli alice hive-members | jq -e '.count >= 1'"
 }
 
+# Promotion Tests - Neophyte to Member promotion
+test_promotion() {
+    echo ""
+    echo "========================================"
+    echo "PROMOTION TESTS"
+    echo "========================================"
+
+    # Get bob's pubkey
+    BOB_PUBKEY=$(hive_cli bob getinfo | jq -r '.id')
+    CAROL_PUBKEY=$(hive_cli carol getinfo | jq -r '.id')
+
+    # Check bob's current tier
+    BOB_TIER=$(hive_cli alice hive-members | jq -r --arg pk "$BOB_PUBKEY" '.members[] | select(.peer_id == $pk) | .tier')
+    log_info "Bob's current tier: $BOB_TIER"
+
+    # If bob is neophyte, test promotion flow
+    if [ "$BOB_TIER" == "neophyte" ]; then
+        # Bob requests promotion
+        run_test "Bob requests promotion" "hive_cli bob hive-request-promotion | jq -e '.status'"
+        sleep 2
+
+        # Check pending promotions on alice
+        run_test "Alice sees promotion request" "hive_cli alice hive-pending-promotions | jq -e '.count >= 1'"
+
+        # Alice vouches for bob
+        run_test "Alice vouches for Bob" "hive_cli alice hive-vouch $BOB_PUBKEY | jq -e '.status'"
+        sleep 2
+
+        # Bob should now be member (auto-promotion with quorum=1)
+        run_test "Bob promoted to member" "hive_cli alice hive-members | jq -r --arg pk \"$BOB_PUBKEY\" '.members[] | select(.peer_id == \$pk) | .tier' | grep -q member"
+    else
+        log_info "Bob is already $BOB_TIER, skipping promotion flow"
+        run_test "Bob tier is member or admin" "echo '$BOB_TIER' | grep -E '^(member|admin)$'"
+    fi
+
+    # Carol should remain neophyte (we don't promote her for testing)
+    CAROL_TIER=$(hive_cli alice hive-members | jq -r --arg pk "$CAROL_PUBKEY" '.members[] | select(.peer_id == $pk) | .tier')
+    log_info "Carol's current tier: $CAROL_TIER"
+
+    # Verify carol is in members list
+    run_test "Carol is in members list" "hive_cli alice hive-members | jq -e --arg pk \"$CAROL_PUBKEY\" '.members[] | select(.peer_id == \$pk)'"
+
+    # Test that neophyte cannot vouch
+    if [ "$CAROL_TIER" == "neophyte" ]; then
+        # Carol tries to vouch for bob (should fail or be ignored)
+        run_test_expect_fail "Neophyte cannot vouch" "hive_cli carol hive-vouch $BOB_PUBKEY 2>&1 | grep -q 'success'"
+    fi
+
+    # Test double promotion request (should fail or be idempotent)
+    if [ "$BOB_TIER" == "member" ]; then
+        run_test_expect_fail "Member cannot request promotion" "hive_cli bob hive-request-promotion 2>&1 | grep -q 'request accepted'"
+    fi
+}
+
 # Sync Tests - State synchronization
 test_sync() {
     echo ""
@@ -490,6 +544,7 @@ case $CATEGORY in
         test_setup
         test_genesis
         test_join
+        test_promotion
         test_sync
         test_channels
         test_fees
@@ -505,6 +560,9 @@ case $CATEGORY in
         ;;
     join)
         test_join
+        ;;
+    promotion)
+        test_promotion
         ;;
     sync)
         test_sync
@@ -530,7 +588,7 @@ case $CATEGORY in
         ;;
     *)
         echo "Unknown category: $CATEGORY"
-        echo "Valid categories: all, setup, genesis, join, sync, channels, fees, clboss, contrib, cross, reset"
+        echo "Valid categories: all, setup, genesis, join, promotion, sync, channels, fees, clboss, contrib, cross, reset"
         exit 1
         ;;
 esac
