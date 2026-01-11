@@ -1440,7 +1440,7 @@ def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     database.add_promotion_request(target_pubkey, request_id, status="pending")
 
     our_tier = membership_mgr.get_tier(our_pubkey) if our_pubkey else None
-    if our_tier != MembershipTier.MEMBER.value:
+    if our_tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
         return {"result": "continue"}
 
     if not config.auto_vouch_enabled:
@@ -1488,7 +1488,7 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     voucher = database.get_member(peer_id)
-    if not voucher or voucher.get("tier") != MembershipTier.MEMBER.value:
+    if not voucher or voucher.get("tier") not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
         return {"result": "continue"}
 
     target_member = database.get_member(payload["target_pubkey"])
@@ -1515,7 +1515,7 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     local_tier = membership_mgr.get_tier(our_pubkey) if our_pubkey else None
-    if local_tier not in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value):
+    if local_tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value, MembershipTier.NEOPHYTE.value):
         return {"result": "continue"}
 
     stored = database.add_promotion_vouch(
