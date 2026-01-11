@@ -3,7 +3,7 @@
 # Automated test suite for cl-hive and cl-revenue-ops plugins
 #
 # Usage: ./test.sh [category] [network_id]
-# Categories: all, setup, genesis, join, promotion, sync, intent, channels, fees, clboss, contrib, governance, planner, security, cross, recovery, reset
+# Categories: all, setup, genesis, join, promotion, sync, intent, channels, fees, clboss, contrib, governance, planner, security, threats, cross, recovery, reset
 #
 # Example: ./test.sh all 1
 # Example: ./test.sh genesis 1
@@ -717,6 +717,128 @@ test_security() {
     log_info "Skipping actual ban execution to preserve hive state"
 }
 
+# Threat Model Tests - Verify security mitigations from PHASE6_THREAT_MODEL.md
+test_threats() {
+    echo ""
+    echo "========================================"
+    echo "THREAT MODEL TESTS"
+    echo "========================================"
+    echo "Verifying mitigations from PHASE6_THREAT_MODEL.md"
+    echo ""
+
+    # ==========================================================================
+    # T2.1: Runaway Ignore (Denial of Service) - HIGH RISK
+    # ==========================================================================
+    echo "--- T2.1: Runaway Ignore Mitigations ---"
+
+    # T2.1.1 - Verify MAX_IGNORES_PER_CYCLE is capped at 5
+    # Check the constant in planner.py
+    run_test "T2.1.1: MAX_IGNORES_PER_CYCLE = 5" \
+        "grep -E '^MAX_IGNORES_PER_CYCLE = 5' /home/sat/cl-hive/modules/planner.py"
+
+    # T2.1.2 - Verify capacity clamping function exists
+    run_test "T2.1.2: Capacity clamping implemented" \
+        "grep -q 'SECURITY: Clamp to public reality' /home/sat/cl-hive/modules/planner.py"
+
+    # T2.1.3 - Verify circuit breaker for mass saturation
+    run_test "T2.1.3: Mass saturation circuit breaker" \
+        "grep -q 'Mass Saturation Detected' /home/sat/cl-hive/modules/planner.py"
+
+    # T2.1.4 - Verify planner has release mechanism for ignored peers
+    # The release is automatic when saturation drops below 15% (hysteresis)
+    run_test "T2.1.4: Release saturation mechanism exists" \
+        "grep -q '_release_saturation' /home/sat/cl-hive/modules/planner.py"
+
+    # T2.1.5 - Check planner stats show ignore limits
+    run_test "T2.1.5: Planner exposes ignore limits" \
+        "hive_cli alice hive-topology | jq -e '.config'"
+
+    # ==========================================================================
+    # T2.2: Sybil Liquidity Drain (Capital Exhaustion) - MEDIUM RISK
+    # ==========================================================================
+    echo ""
+    echo "--- T2.2: Sybil Liquidity Drain Mitigations ---"
+
+    # T2.2.1 - Verify MIN_TARGET_CAPACITY_SATS is 1 BTC (100M sats)
+    run_test "T2.2.1: MIN_TARGET_CAPACITY_SATS = 1 BTC" \
+        "grep -E '^MIN_TARGET_CAPACITY_SATS = 100_000_000' /home/sat/cl-hive/modules/planner.py"
+
+    # T2.2.2 - Verify default governance mode is advisor
+    run_test "T2.2.2: Default governance_mode = advisor" \
+        "grep -E \"governance_mode: str = 'advisor'\" /home/sat/cl-hive/modules/config.py"
+
+    # T2.2.3 - Verify expansions disabled by default
+    run_test "T2.2.3: planner_enable_expansions = False by default" \
+        "grep -E 'planner_enable_expansions: bool = False' /home/sat/cl-hive/modules/config.py"
+
+    # T2.2.4 - Verify runtime shows advisor mode
+    run_test "T2.2.4: Runtime governance is advisor" \
+        "hive_cli alice hive-status | jq -e '.governance_mode == \"advisor\"'"
+
+    # T2.2.5 - Verify expansions are disabled in topology config
+    run_test "T2.2.5: Expansions disabled in runtime" \
+        "hive_cli alice hive-topology | jq -e '.config.expansions_enabled == false'"
+
+    # T2.2.6 - Verify UNDERSERVED_THRESHOLD_PCT check exists
+    run_test "T2.2.6: Underserved threshold check exists" \
+        "grep -E '^UNDERSERVED_THRESHOLD_PCT = 0.05' /home/sat/cl-hive/modules/planner.py"
+
+    # ==========================================================================
+    # T2.3: Intent Storms (Network Spam) - MEDIUM RISK
+    # ==========================================================================
+    echo ""
+    echo "--- T2.3: Intent Storm Mitigations ---"
+
+    # T2.3.1 - Verify MAX_EXPANSIONS_PER_CYCLE = 1
+    run_test "T2.3.1: MAX_EXPANSIONS_PER_CYCLE = 1" \
+        "grep -E '^MAX_EXPANSIONS_PER_CYCLE = 1' /home/sat/cl-hive/modules/planner.py"
+
+    # T2.3.2 - Verify MAX_REMOTE_INTENTS DoS protection exists
+    run_test "T2.3.2: MAX_REMOTE_INTENTS limit = 200" \
+        "grep -E '^MAX_REMOTE_INTENTS = 200' /home/sat/cl-hive/modules/intent_manager.py"
+
+    # T2.3.3 - Verify pending intent check before proposing
+    run_test "T2.3.3: Pending intent check implemented" \
+        "grep -q '_has_pending_intent' /home/sat/cl-hive/modules/planner.py"
+
+    # T2.3.4 - Verify rate limit check in expansion code
+    run_test "T2.3.4: Expansion rate limit check" \
+        "grep -q 'Expansion rate limit reached' /home/sat/cl-hive/modules/planner.py"
+
+    # T2.3.5 - Verify planner interval is configurable
+    run_test "T2.3.5: Planner interval configurable" \
+        "hive_cli alice hive-topology | jq -e '.config.planner_interval_seconds >= 300'"
+
+    # T2.3.6 - Verify STALE_INTENT_THRESHOLD cleanup exists
+    run_test "T2.3.6: Stale intent cleanup threshold" \
+        "grep -E '^STALE_INTENT_THRESHOLD = 3600' /home/sat/cl-hive/modules/intent_manager.py"
+
+    # ==========================================================================
+    # Additional Security Checks
+    # ==========================================================================
+    echo ""
+    echo "--- Additional Security Checks ---"
+
+    # Verify market share cap is enforced (20% default)
+    run_test "Market share cap at 20%" \
+        "hive_cli alice hive-topology | jq -e '.config.market_share_cap_pct == 0.2'"
+
+    # Verify logging for all planner decisions
+    run_test "Planner decisions are logged" \
+        "grep -q 'log_planner_action' /home/sat/cl-hive/modules/planner.py"
+
+    # Verify saturation release uses hysteresis (15%)
+    run_test "Saturation release hysteresis (15%)" \
+        "grep -E '^SATURATION_RELEASE_THRESHOLD_PCT = 0.15' /home/sat/cl-hive/modules/planner.py"
+
+    # Verify funds check before expansion
+    run_test "Funds check before expansion" \
+        "grep -q 'Insufficient onchain funds' /home/sat/cl-hive/modules/planner.py"
+
+    echo ""
+    echo "Threat model mitigation tests complete."
+}
+
 # Recovery Tests - Plugin restart and state persistence (L14)
 test_recovery() {
     echo ""
@@ -836,6 +958,7 @@ case $CATEGORY in
         test_governance
         test_planner
         test_security
+        test_threats
         test_cross
         test_recovery
         ;;
@@ -878,6 +1001,9 @@ case $CATEGORY in
     security)
         test_security
         ;;
+    threats)
+        test_threats
+        ;;
     cross)
         test_cross
         ;;
@@ -890,7 +1016,7 @@ case $CATEGORY in
         ;;
     *)
         echo "Unknown category: $CATEGORY"
-        echo "Valid categories: all, setup, genesis, join, promotion, sync, intent, channels, fees, clboss, contrib, governance, planner, security, cross, recovery, reset"
+        echo "Valid categories: all, setup, genesis, join, promotion, sync, intent, channels, fees, clboss, contrib, governance, planner, security, threats, cross, recovery, reset"
         exit 1
         ;;
 esac
