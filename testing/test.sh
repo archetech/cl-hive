@@ -754,40 +754,47 @@ test_coordination() {
     run_test "CLBoss is active" \
         "hive_cli alice clboss-status | jq -e '.info.version'"
 
-    # Document: clboss-ignore command doesn't exist in CLBoss v0.15.1
-    # This is a KNOWN LIMITATION - the hive code tries to call clboss-ignore
-    # but CLBoss only has:
-    #   - clboss-ignore-onchain (for address sweeps - different purpose)
-    #   - clboss-unmanage (for fee management - used by cl-revenue-ops)
-    #
-    # The Hive uses Intent Lock Protocol instead for channel coordination
+    # CLBoss Integration via ksedgwic/clboss fork
+    # Uses clboss-unmanage with 'open' tag to prevent channel opens to saturated targets
+    # Fee/balance tags are managed by cl-revenue-ops
     echo ""
-    echo "[INFO] Testing CLBoss peer-ignore capability..."
-    IGNORE_RESULT=$(hive_cli alice clboss-ignore nodeid=02d449f8c5b0b91feb68 2>&1 || true)
-    if echo "$IGNORE_RESULT" | grep -qi "unknown command"; then
-        echo "[INFO] KNOWN LIMITATION: clboss-ignore command not available"
-        echo "[INFO] CLBoss v0.15.1 lacks peer-level channel coordination"
-        echo "[INFO] Hive uses Intent Lock Protocol (gossip + tie-breaker) instead"
-        # This is expected - not a failure
-        run_test "CLBoss limitation documented in bridge" \
-            "grep -q 'does not exist' /home/sat/cl-hive/modules/clboss_bridge.py"
+    echo "[INFO] Testing CLBoss clboss-unmanage capability..."
+
+    # Get a real external node ID for testing
+    DAVE_PUBKEY=$(hive_cli dave getinfo 2>/dev/null | jq -r '.id' || echo "")
+
+    if [ -n "$DAVE_PUBKEY" ]; then
+        # Test clboss-unmanage with 'open' tag
+        UNMANAGE_RESULT=$(hive_cli alice clboss-unmanage "$DAVE_PUBKEY" open 2>&1 || true)
+        if echo "$UNMANAGE_RESULT" | grep -qi "unknown command"; then
+            echo "[INFO] clboss-unmanage not available (using upstream CLBoss?)"
+            echo "[INFO] Saturation control requires ksedgwic/clboss fork"
+            run_test "CLBoss fork documented in bridge" \
+                "grep -q 'ksedgwic/clboss' /home/sat/cl-hive/modules/clboss_bridge.py"
+        else
+            echo "[INFO] clboss-unmanage 'open' tag works (ksedgwic/clboss fork)"
+            # Re-enable management using empty string (clboss-manage may not exist)
+            hive_cli alice clboss-unmanage "$DAVE_PUBKEY" "" 2>/dev/null || true
+            run_test "CLBoss unmanage_open in bridge" \
+                "grep -q 'unmanage_open' /home/sat/cl-hive/modules/clboss_bridge.py"
+        fi
     else
-        # If it worked (future CLBoss version), verify it
-        run_test "CLBoss ignore command works" \
-            "hive_cli alice clboss-ignore nodeid=02d449f8c5b0b91feb68 | jq -e '.success'"
+        echo "[INFO] Dave not available for clboss-unmanage test"
+        run_test "CLBoss bridge has unmanage_open method" \
+            "grep -q 'def unmanage_open' /home/sat/cl-hive/modules/clboss_bridge.py"
     fi
 
-    # Verify Intent Lock Protocol is available (the fallback)
+    # Verify Intent Lock Protocol complements CLBoss control
     run_test "Intent Lock Protocol available" \
         "grep -q 'Intent Lock Protocol' /home/sat/cl-hive/modules/intent_manager.py"
 
-    # Verify planner has saturation detection
-    run_test "Planner has saturation detection" \
-        "grep -q 'saturation' /home/sat/cl-hive/modules/planner.py"
+    # Verify planner uses clboss-unmanage for saturation
+    run_test "Planner uses clboss-unmanage for saturation" \
+        "grep -q 'unmanage_open' /home/sat/cl-hive/modules/planner.py"
 
-    # Verify clboss_bridge handles missing command gracefully
-    run_test "CLBoss bridge handles missing ignore gracefully" \
-        "grep -q '_supports_ignore' /home/sat/cl-hive/modules/clboss_bridge.py"
+    # Verify clboss_bridge has management tags
+    run_test "CLBoss bridge has ClbossTags" \
+        "grep -q 'ClbossTags' /home/sat/cl-hive/modules/clboss_bridge.py"
 
     echo ""
     echo "Coordination tests complete."

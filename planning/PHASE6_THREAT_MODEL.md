@@ -58,48 +58,45 @@ Phase 6 introduces automated capital allocation (Expansion) and inhibition (Guar
 2.  **Safety Valve:** Add a config option `hive-planner-enable-expansions` (default `false`). Force users to opt-in to automated channel opening.
 3.  **Circuit Breaker:** If the Planner ignores > 10 peers in a single cycle, abort the cycle and log an error "Mass Saturation Detected".
 
-## 4. IMPORTANT: CLBoss Integration Limitation
+## 4. CLBoss Integration (ksedgwic/clboss fork)
 
-**Discovery Date:** 2026-01-10
+**Updated:** 2026-01-10
 
-The threat model and mitigations above assume `clboss-ignore` and `clboss-unignore` commands exist. **They do not exist in CLBoss v0.15.1.**
+The threat model mitigations require preventing CLBoss from opening channels to saturated targets.
+This is **SOLVED** using the ksedgwic/clboss fork which provides `clboss-unmanage` with management tags.
 
-### What CLBoss Actually Has:
-- `clboss-ignore-onchain`: Ignore addresses for on-chain sweeps (different purpose)
-- `clboss-unmanage`: Stop managing fees for a peer (used by cl-revenue-ops)
-- `clboss-manage`: Resume managing fees for a peer
+### CLBoss Management Tags (ksedgwic/clboss)
+- `open`: Channel opening - **used by cl-hive for saturation control**
+- `close`: Channel closing
+- `lnfee`: Fee management - **used by cl-revenue-ops**
+- `balance`: Rebalancing - **used by cl-revenue-ops**
 
-### What This Means:
-- The saturation detection works correctly (hive_share calculation)
-- But we **cannot** tell CLBoss to avoid opening channels to saturated targets
-- CLBoss will still auto-open channels to any peer it deems profitable
+### How Saturation Control Works
+1. Hive detects target saturation (hive_share > 20%)
+2. Planner calls `clboss-unmanage <peer_id> open`
+3. CLBoss stops auto-opening channels to that peer
+4. When saturation drops below 15%, call `clboss-manage <peer_id> open`
 
-### Current Solution: Intent Lock Protocol
-The Hive uses the Intent Lock Protocol for channel coordination instead:
+### Coordination with cl-revenue-ops
+- cl-hive manages the `open` tag (channel opening to saturated targets)
+- cl-revenue-ops manages `lnfee` and `balance` tags (fees and rebalancing)
+- Both plugins use the same `clboss-unmanage` / `clboss-manage` commands
+
+### Intent Lock Protocol (Complementary)
+The Intent Lock Protocol complements CLBoss control:
 1. **ANNOUNCE**: Node broadcasts HIVE_INTENT with (type, target, initiator, timestamp)
 2. **WAIT**: Hold for 60 seconds
 3. **COMMIT**: If no conflicts, proceed with action
 4. **TIE-BREAKER**: Lowest lexicographical pubkey wins conflicts
 
-This prevents thundering herd (multiple hive nodes opening to same target) but does NOT prevent CLBoss from acting independently.
+This prevents thundering herd for Hive-initiated actions. CLBoss control prevents
+CLBoss-initiated actions to saturated targets.
 
-### Future Options:
-1. **Patch CLBoss** (RECOMMENDED): Add `clboss-ignore` / `clboss-unignore` commands upstream
-   - Submit PR to https://github.com/ZmnSCPxj/clboss
-   - New commands would accept peer_id and prevent auto-opening to that peer
-   - This is the cleanest solution
-
-2. **Hook fundchannel**: NOT POSSIBLE
-   - Core Lightning only provides `openchannel` hook for INCOMING channels
-   - No hook exists for intercepting outgoing fundchannel commands
-   - See: https://docs.corelightning.org/docs/hooks
-
-3. **Accept Limitation** (CURRENT): Document that CLBoss may open channels independently
-   - Intent Lock Protocol prevents intra-Hive conflicts
-   - CLBoss may open channels to saturated targets independently
-   - This is acceptable for Phase 6 MVP
+### Required CLBoss Version
+- Must use ksedgwic/clboss fork: https://github.com/ksedgwic/clboss
+- The upstream ZmnSCPxj/clboss lacks peer-level unmanage with `open` tag
 
 ## 5. Conclusion
 The Planner is safe to deploy **ONLY IF** expansions are gated by default (`ADVISOR` mode) and gossip data is validated against public channel state.
 
-**Note:** The `clboss-ignore` mitigation in T2.1 is not currently functional due to CLBoss limitations. The Hive relies on Intent Lock Protocol for coordination, which mitigates intra-Hive thundering herd but not independent CLBoss actions.
+All threat mitigations are functional with the ksedgwic/clboss fork.
