@@ -15,6 +15,7 @@ This package contains the core modules for the Hive swarm intelligence layer:
 - contribution: Contribution ratio tracking (Phase 5)
 - planner: Topology optimization (Phase 6)
 - governance: Decision engine modes (Phase 7)
+- vpn_transport: VPN-based transport policy for hive gossip
 """
 
 __version__ = "0.1.0-dev"

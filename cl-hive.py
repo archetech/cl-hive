@@ -62,6 +62,7 @@ from modules.membership import MembershipManager, MembershipTier
 from modules.planner import Planner
 from modules.clboss_bridge import CLBossBridge
 from modules.governance import DecisionEngine
+from modules.vpn_transport import VPNTransportManager
 
 # Initialize the plugin
 plugin = Plugin()
@@ -193,6 +194,7 @@ contribution_mgr: Optional[ContributionManager] = None
 planner: Optional[Planner] = None
 clboss_bridge: Optional[CLBossBridge] = None
 decision_engine: Optional[DecisionEngine] = None
+vpn_transport: Optional[VPNTransportManager] = None
 our_pubkey: Optional[str] = None
 
 
@@ -361,6 +363,37 @@ plugin.add_option(
     description='Enable expansion proposals (new channel openings) in Planner'
 )
 
+# VPN Transport Options
+plugin.add_option(
+    name='hive-transport-mode',
+    default='any',
+    description='Hive transport mode: any, vpn-only, vpn-preferred'
+)
+
+plugin.add_option(
+    name='hive-vpn-subnets',
+    default='',
+    description='VPN subnets for hive peers (CIDR, comma-separated). Example: 10.8.0.0/24'
+)
+
+plugin.add_option(
+    name='hive-vpn-bind',
+    default='',
+    description='VPN bind address for hive traffic (ip:port)'
+)
+
+plugin.add_option(
+    name='hive-vpn-peers',
+    default='',
+    description='VPN peer mappings (pubkey@ip:port, comma-separated)'
+)
+
+plugin.add_option(
+    name='hive-vpn-required-messages',
+    default='all',
+    description='Message types requiring VPN: all, gossip, intent, sync, none'
+)
+
 
 # =============================================================================
 # INITIALIZATION
@@ -379,7 +412,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     5. Verify cl-revenue-ops dependency
     6. Set up signal handlers for graceful shutdown
     """
-    global database, config, safe_plugin, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge
+    global database, config, safe_plugin, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge, vpn_transport
     
     plugin.log("cl-hive: Initializing Swarm Intelligence layer...")
     
@@ -498,6 +531,20 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     decision_engine = DecisionEngine(database=database, plugin=safe_plugin)
     plugin.log("cl-hive: DecisionEngine initialized")
 
+    # Initialize VPN Transport Manager
+    vpn_transport = VPNTransportManager(plugin=safe_plugin)
+    vpn_result = vpn_transport.configure(
+        mode=options.get('hive-transport-mode', 'any'),
+        vpn_subnets=options.get('hive-vpn-subnets', ''),
+        vpn_bind=options.get('hive-vpn-bind', ''),
+        vpn_peers=options.get('hive-vpn-peers', ''),
+        required_messages=options.get('hive-vpn-required-messages', 'all')
+    )
+    if vpn_transport.is_enabled():
+        plugin.log(f"cl-hive: VPN transport ENABLED - mode={vpn_result['mode']}, subnets={len(vpn_result['subnets'])}")
+    else:
+        plugin.log("cl-hive: VPN transport configured (mode=any, not enforcing)")
+
     # Initialize Planner (Phase 6)
     global planner, clboss_bridge
     clboss_bridge = CLBossBridge(safe_plugin.rpc, safe_plugin)
@@ -584,7 +631,20 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
         # Malformed Hive message (magic matched but parse failed)
         plugin.log(f"cl-hive: Malformed message from {peer_id[:16]}...", level='warn')
         return {"result": "continue"}
-    
+
+    # VPN Transport Policy Check
+    if vpn_transport and vpn_transport.is_enabled():
+        accept, reason = vpn_transport.should_accept_hive_message(
+            peer_id=peer_id,
+            message_type=msg_type.name if msg_type else ""
+        )
+        if not accept:
+            plugin.log(
+                f"cl-hive: VPN policy rejected {msg_type.name} from {peer_id[:16]}...: {reason}",
+                level='info'
+            )
+            return {"result": "continue"}
+
     # Dispatch based on message type
     try:
         if msg_type == HiveMessageType.HELLO:
@@ -1141,6 +1201,17 @@ def on_peer_connected(**kwargs):
     database.update_member(peer_id, last_seen=now)
     database.update_presence(peer_id, is_online=True, now_ts=now, window_seconds=30 * 86400)
 
+    # Track VPN connection status
+    peer_address = None
+    if vpn_transport and safe_plugin:
+        try:
+            peers = safe_plugin.rpc.listpeers(id=peer_id)
+            if peers and peers.get('peers') and peers['peers'][0].get('netaddr'):
+                peer_address = peers['peers'][0]['netaddr'][0]
+                vpn_transport.on_peer_connected(peer_id, peer_address)
+        except Exception:
+            pass
+
     if safe_plugin:
         safe_plugin.log(f"cl-hive: Hive member {peer_id[:16]}... connected, sending STATE_HASH")
 
@@ -1164,6 +1235,11 @@ def on_peer_disconnected(**kwargs):
     peer_id = kwargs.get('id')
     if not peer_id or not database:
         return
+
+    # Update VPN transport tracking
+    if vpn_transport:
+        vpn_transport.on_peer_disconnected(peer_id)
+
     member = database.get_member(peer_id)
     if not member:
         return
@@ -2134,6 +2210,123 @@ def hive_reinit_bridge(plugin: Plugin):
             "Bridge enabled successfully" if new_status == BridgeStatus.ENABLED
             else "Bridge still disabled - check cl-revenue-ops installation"
         )
+    }
+
+
+@plugin.method("hive-vpn-status")
+def hive_vpn_status(plugin: Plugin, peer_id: str = None):
+    """
+    Get VPN transport status and configuration.
+
+    Shows the current VPN transport mode, configured subnets, peer mappings,
+    and which hive members are connected via VPN.
+
+    Args:
+        peer_id: Optional - Get VPN info for a specific peer
+
+    Returns:
+        Dict with VPN transport configuration and status.
+
+    Permission: Member (read-only status)
+    """
+    if not vpn_transport:
+        return {"error": "VPN transport not initialized"}
+
+    if peer_id:
+        # Get info for specific peer
+        peer_info = vpn_transport.get_peer_vpn_info(peer_id)
+        if peer_info:
+            return {
+                "peer_id": peer_id,
+                **peer_info
+            }
+        return {
+            "peer_id": peer_id,
+            "message": "No VPN info for this peer"
+        }
+
+    # Return full status
+    return vpn_transport.get_status()
+
+
+@plugin.method("hive-vpn-add-peer")
+def hive_vpn_add_peer(plugin: Plugin, pubkey: str, vpn_address: str):
+    """
+    Add or update a VPN peer mapping.
+
+    Maps a node's pubkey to its VPN address for routing hive gossip.
+
+    Args:
+        pubkey: Node pubkey
+        vpn_address: VPN address in format ip:port or just ip (default port 9735)
+
+    Returns:
+        Dict with result.
+
+    Permission: Admin only
+    """
+    # Permission check: Admin only
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
+
+    if not vpn_transport:
+        return {"error": "VPN transport not initialized"}
+
+    # Parse address
+    if ':' in vpn_address:
+        ip, port = vpn_address.rsplit(':', 1)
+        port = int(port)
+    else:
+        ip = vpn_address
+        port = 9735
+
+    success = vpn_transport.add_vpn_peer(pubkey, ip, port)
+    if success:
+        return {
+            "success": True,
+            "pubkey": pubkey,
+            "vpn_address": f"{ip}:{port}",
+            "message": "VPN peer mapping added"
+        }
+    return {
+        "success": False,
+        "error": "Failed to add peer - max peers may be reached"
+    }
+
+
+@plugin.method("hive-vpn-remove-peer")
+def hive_vpn_remove_peer(plugin: Plugin, pubkey: str):
+    """
+    Remove a VPN peer mapping.
+
+    Args:
+        pubkey: Node pubkey to remove
+
+    Returns:
+        Dict with result.
+
+    Permission: Admin only
+    """
+    # Permission check: Admin only
+    perm_error = _check_permission('admin')
+    if perm_error:
+        return perm_error
+
+    if not vpn_transport:
+        return {"error": "VPN transport not initialized"}
+
+    success = vpn_transport.remove_vpn_peer(pubkey)
+    if success:
+        return {
+            "success": True,
+            "pubkey": pubkey,
+            "message": "VPN peer mapping removed"
+        }
+    return {
+        "success": False,
+        "pubkey": pubkey,
+        "message": "Peer not found in VPN mappings"
     }
 
 
