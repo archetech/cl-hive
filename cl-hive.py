@@ -1120,15 +1120,16 @@ def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
 # =============================================================================
 
 @plugin.subscribe("connect")
-def on_peer_connected(plugin: Plugin, id: str, **kwargs):
+def on_peer_connected(**kwargs):
     """
     Hook called when a peer connects.
 
     If the peer is a Hive member, send a STATE_HASH message to
     initiate anti-entropy check and detect state divergence.
     """
-    peer_id = id  # CLN v25+ uses 'id' instead of 'peer_id'
-    if not database or not gossip_mgr:
+    # CLN v25+ sends 'id' in the notification payload
+    peer_id = kwargs.get('id')
+    if not peer_id or not database or not gossip_mgr:
         return
 
     # Check if this peer is a Hive member
@@ -1139,27 +1140,29 @@ def on_peer_connected(plugin: Plugin, id: str, **kwargs):
     now = int(time.time())
     database.update_member(peer_id, last_seen=now)
     database.update_presence(peer_id, is_online=True, now_ts=now, window_seconds=30 * 86400)
-    
-    plugin.log(f"cl-hive: Hive member {peer_id[:16]}... connected, sending STATE_HASH")
-    
+
+    if safe_plugin:
+        safe_plugin.log(f"cl-hive: Hive member {peer_id[:16]}... connected, sending STATE_HASH")
+
     # Send STATE_HASH for anti-entropy check
     state_hash_payload = gossip_mgr.create_state_hash_payload()
     state_hash_msg = serialize(HiveMessageType.STATE_HASH, state_hash_payload)
-    
+
     try:
         safe_plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
             "msg": state_hash_msg.hex()
         })
     except Exception as e:
-        plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
 
 
 @plugin.subscribe("disconnect")
-def on_peer_disconnected(plugin: Plugin, id: str, **kwargs):
+def on_peer_disconnected(**kwargs):
     """Update presence for disconnected peers."""
-    peer_id = id  # CLN v25+ uses 'id' instead of 'peer_id'
-    if not database:
+    peer_id = kwargs.get('id')
+    if not peer_id or not database:
         return
     member = database.get_member(peer_id)
     if not member:
