@@ -1,0 +1,23 @@
+# Docker ignore file
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.pytest_cache
+.mypy_cache
+*.md
+!README.md
+docs/
+tests/
+*.zip
+*.tar.gz
+.env
+.env.*
+vendor/cl-revenue-ops/.git
+vendor/cl-revenue-ops/.venv
+vendor/cl-revenue-ops/__pycache__
+vendor/cl-revenue-ops/tests
+vendor/cl-revenue-ops/*.md

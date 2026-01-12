@@ -52,3 +52,6 @@ htmlcov/
 logs/
 data/
 modules/__pycache__
+
+# Vendor directory (bundled dependencies for Docker build)
+vendor/

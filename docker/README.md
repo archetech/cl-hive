@@ -300,15 +300,44 @@ docker-compose logs cln | grep -i error
 4. **Firewall** - Only expose necessary ports
 5. **Updates** - Keep image updated for security fixes
 
-## Building Custom Image
+## Building the Image
+
+### Prerequisites
+
+The Docker build requires cl-revenue-ops to be placed in the `vendor` directory:
 
 ```bash
+# From cl-hive root directory
+mkdir -p vendor
+cp -r /path/to/cl-revenue-ops vendor/cl-revenue-ops
+```
+
+### Build
+
+```bash
+# From cl-hive root directory
+docker build -t cl-hive-node:0.1.0-dev -f docker/Dockerfile .
+
 # Build with custom tag
 docker build -t my-registry/cl-hive-node:v1.0 -f docker/Dockerfile .
 
 # Push to registry
 docker push my-registry/cl-hive-node:v1.0
 ```
+
+### Image Contents
+
+| Component | Version |
+|-----------|---------|
+| Ubuntu | 24.04 |
+| Core Lightning | v25.02.1 |
+| CLBOSS | latest (ksedgwic fork) |
+| Sling | v4.1.3 |
+| cl-revenue-ops | bundled |
+| cl-hive | bundled |
+| Tor | 0.4.8.x |
+| WireGuard | 1.0.x |
+| Python | 3.12 |
 
 ## Multi-Node Deployment
 

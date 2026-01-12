@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y \
     # Core Lightning dependencies
     libgmp-dev \
     libsqlite3-dev \
+    libpq5 \
     python3 \
     python3-pip \
     python3-venv \
@@ -124,8 +125,9 @@ RUN ARCH=$(uname -m) \
 # CL-REVENUE-OPS PLUGIN
 # =============================================================================
 
-RUN git clone --depth 1 https://github.com/santyr/cl-revenue-ops.git /opt/cl-revenue-ops \
-    && chmod +x /opt/cl-revenue-ops/cl-revenue-ops.py
+# Copy from vendor directory (bundled with cl-hive)
+COPY vendor/cl-revenue-ops /opt/cl-revenue-ops
+RUN chmod +x /opt/cl-revenue-ops/cl-revenue-ops.py
 
 # =============================================================================
 # CL-HIVE PLUGIN
