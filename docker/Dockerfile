@@ -57,12 +57,15 @@ RUN apt-get update && apt-get install -y \
 # CORE LIGHTNING
 # =============================================================================
 
-# Install Core Lightning from official repository
-RUN curl -fsSL https://apt.lightning.engineering/keys/cln-signing-key.gpg | gpg --dearmor -o /usr/share/keyrings/cln-archive-keyring.gpg \
-    && echo "deb [signed-by=/usr/share/keyrings/cln-archive-keyring.gpg] https://apt.lightning.engineering/ubuntu noble main" > /etc/apt/sources.list.d/cln.list \
-    && apt-get update \
-    && apt-get install -y core-lightning \
-    && rm -rf /var/lib/apt/lists/*
+# Install Core Lightning from GitHub releases
+ARG CLN_VERSION=v25.02.1
+RUN ARCH=$(uname -m) \
+    && if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi \
+    && if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi \
+    && curl -SLO "https://github.com/ElementsProject/lightning/releases/download/${CLN_VERSION}/clightning-${CLN_VERSION}-Ubuntu-24.04-${ARCH}.tar.xz" \
+    && tar -xf clightning-${CLN_VERSION}-Ubuntu-24.04-${ARCH}.tar.xz -C /usr/local --strip-components=2 \
+    && rm clightning-${CLN_VERSION}-Ubuntu-24.04-${ARCH}.tar.xz \
+    && ldconfig
 
 # =============================================================================
 # PYTHON ENVIRONMENT
@@ -87,11 +90,15 @@ WORKDIR /tmp
 RUN apt-get update && apt-get install -y \
     libev-dev \
     libcurl4-openssl-dev \
+    autoconf-archive \
+    libunwind-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Build CLBOSS from ksedgwic fork (has clboss-unmanage support)
 RUN git clone --depth 1 https://github.com/ksedgwic/clboss.git \
     && cd clboss \
-    && autoreconf -i \
+    && mkdir -p m4 \
+    && autoreconf -fi \
     && ./configure \
     && make -j$(nproc) \
     && make install \
@@ -102,11 +109,16 @@ RUN git clone --depth 1 https://github.com/ksedgwic/clboss.git \
 # SLING PLUGIN
 # =============================================================================
 
+# Install sling from latest release (note: archives now named by target triple)
+ARG SLING_VERSION=v4.1.3
 RUN ARCH=$(uname -m) \
-    && if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi \
-    && if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi \
-    && wget -O /usr/local/bin/sling "https://github.com/daywalker90/sling/releases/latest/download/sling-${ARCH}" \
-    && chmod +x /usr/local/bin/sling
+    && if [ "$ARCH" = "x86_64" ]; then TRIPLE="x86_64-linux-gnu"; fi \
+    && if [ "$ARCH" = "aarch64" ]; then TRIPLE="aarch64-linux-gnu"; fi \
+    && wget -O /tmp/sling.tar.gz "https://github.com/daywalker90/sling/releases/download/${SLING_VERSION}/sling-${SLING_VERSION}-${TRIPLE}.tar.gz" \
+    && tar -xzf /tmp/sling.tar.gz -C /tmp \
+    && mv /tmp/sling /usr/local/bin/sling \
+    && chmod +x /usr/local/bin/sling \
+    && rm /tmp/sling.tar.gz
 
 # =============================================================================
 # CL-REVENUE-OPS PLUGIN
