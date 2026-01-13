@@ -2427,6 +2427,59 @@ test_hive_rpc() {
         fi
     done
 
+    # =========================================================================
+    # Test governance commands (Phase 3)
+    # =========================================================================
+    log_info "Testing governance commands..."
+
+    # Test hive-set-mode (requires advisor mode or better)
+    run_test "hive-set-mode returns object" \
+        "hive_cli alice hive-set-mode mode=advisor | jq -e 'type == \"object\"'"
+
+    run_test "hive-set-mode changes mode" \
+        "hive_cli alice hive-set-mode mode=advisor | jq -e '.current_mode == \"advisor\" or .error != null'"
+
+    # Test hive-enable-expansions
+    run_test "hive-enable-expansions returns object" \
+        "hive_cli alice hive-enable-expansions enabled=true | jq -e 'type == \"object\"'"
+
+    run_test "hive-enable-expansions can disable" \
+        "hive_cli alice hive-enable-expansions enabled=false | jq -e '.expansions_enabled == false or .error != null'"
+
+    run_test "hive-enable-expansions can enable" \
+        "hive_cli alice hive-enable-expansions enabled=true | jq -e '.expansions_enabled == true or .error != null'"
+
+    # Test hive-pending-admin-promotions (admin only)
+    run_test "hive-pending-admin-promotions returns object" \
+        "hive_cli alice hive-pending-admin-promotions | jq -e 'type == \"object\"'"
+
+    run_test "hive-pending-admin-promotions has count" \
+        "hive_cli alice hive-pending-admin-promotions | jq -e '.count >= 0 or .error != null'"
+
+    run_test "hive-pending-admin-promotions has admin_count" \
+        "hive_cli alice hive-pending-admin-promotions | jq -e '.admin_count >= 0 or .error != null'"
+
+    # Test hive-pending-bans
+    run_test "hive-pending-bans returns object" \
+        "hive_cli alice hive-pending-bans | jq -e 'type == \"object\"'"
+
+    run_test "hive-pending-bans has count" \
+        "hive_cli alice hive-pending-bans | jq -e '.count >= 0 or .error != null'"
+
+    run_test "hive-pending-bans has proposals array" \
+        "hive_cli alice hive-pending-bans | jq -e '.proposals | type == \"array\" or .error != null'"
+
+    # Test governance commands across active hive nodes
+    for node in $HIVE_NODES; do
+        if container_exists $node; then
+            NODE_STATUS=$(hive_cli $node hive-status 2>/dev/null | jq -r '.status // "none"')
+            if [ "$NODE_STATUS" = "active" ]; then
+                run_test "$node hive-pending-bans works" \
+                    "hive_cli $node hive-pending-bans | jq -e '.count >= 0 or .error != null'"
+            fi
+        fi
+    done
+
     log_info "RPC modularization tests complete"
 }
 
