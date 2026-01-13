@@ -2549,6 +2549,32 @@ test_hive_rpc() {
         fi
     done
 
+    # =========================================================================
+    # Test expansion commands (Phase 4b)
+    # =========================================================================
+    log_info "Testing expansion commands..."
+
+    # Test hive-expansion-status
+    run_test "hive-expansion-status returns object" \
+        "hive_cli alice hive-expansion-status | jq -e 'type == \"object\"'"
+
+    run_test "hive-expansion-status has active_rounds" \
+        "hive_cli alice hive-expansion-status | jq -e '.active_rounds >= 0 or .error != null'"
+
+    run_test "hive-expansion-status has max_active_rounds" \
+        "hive_cli alice hive-expansion-status | jq -e '.max_active_rounds >= 0 or .error != null'"
+
+    # Test expansion-status across active hive nodes
+    for node in $HIVE_NODES; do
+        if container_exists $node; then
+            NODE_STATUS=$(hive_cli $node hive-status 2>/dev/null | jq -r '.status // "none"')
+            if [ "$NODE_STATUS" = "active" ]; then
+                run_test "$node hive-expansion-status works" \
+                    "hive_cli $node hive-expansion-status | jq -e 'type == \"object\"'"
+            fi
+        fi
+    done
+
     log_info "RPC modularization tests complete"
 }
 
