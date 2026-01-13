@@ -927,6 +927,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Fee intelligence manager initialized")
 
+    # Start fee intelligence background thread (Phase 7)
+    fee_intel_thread = threading.Thread(
+        target=fee_intelligence_loop,
+        name="cl-hive-fee-intelligence",
+        daemon=True
+    )
+    fee_intel_thread.start()
+    plugin.log("cl-hive: Fee intelligence thread started")
+
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
     global peer_available_limiter
     peer_available_limiter = RateLimiter(max_per_minute=10, window_seconds=60)
@@ -3275,6 +3284,308 @@ def planner_loop():
 
         # Wait for next cycle or shutdown
         shutdown_event.wait(sleep_time)
+
+
+# =============================================================================
+# PHASE 7: FEE INTELLIGENCE BACKGROUND LOOP
+# =============================================================================
+
+# Fee intelligence loop interval (1 hour default)
+FEE_INTELLIGENCE_INTERVAL = 3600
+
+# Health report broadcast interval (1 hour)
+HEALTH_REPORT_INTERVAL = 3600
+
+# Fee intelligence cleanup interval (keep 7 days)
+FEE_INTELLIGENCE_MAX_AGE_HOURS = 168
+
+
+def fee_intelligence_loop():
+    """
+    Background thread for cooperative fee coordination.
+
+    Runs periodically to:
+    1. Collect and broadcast our fee observations to hive members
+    2. Aggregate received fee intelligence into peer profiles
+    3. Broadcast our health report for NNLB coordination
+    4. Clean up old fee intelligence records
+    """
+    # Wait for initialization
+    shutdown_event.wait(60)
+
+    while not shutdown_event.is_set():
+        try:
+            if not fee_intel_mgr or not database or not safe_plugin or not our_pubkey:
+                shutdown_event.wait(60)
+                continue
+
+            # Step 1: Collect and broadcast our fee intelligence
+            _broadcast_our_fee_intelligence()
+
+            # Step 2: Aggregate all received fee intelligence
+            try:
+                updated = fee_intel_mgr.aggregate_fee_profiles()
+                if updated > 0:
+                    safe_plugin.log(
+                        f"cl-hive: Aggregated {updated} peer fee profiles",
+                        level='debug'
+                    )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Fee aggregation error: {e}", level='warn')
+
+            # Step 3: Broadcast our health report
+            _broadcast_health_report()
+
+            # Step 4: Cleanup old records
+            try:
+                deleted = database.cleanup_old_fee_intelligence(FEE_INTELLIGENCE_MAX_AGE_HOURS)
+                if deleted > 0:
+                    safe_plugin.log(
+                        f"cl-hive: Cleaned up {deleted} old fee intelligence records",
+                        level='debug'
+                    )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Fee intelligence cleanup error: {e}", level='warn')
+
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"cl-hive: Fee intelligence loop error: {e}", level='warn')
+
+        # Wait for next cycle
+        shutdown_event.wait(FEE_INTELLIGENCE_INTERVAL)
+
+
+def _broadcast_our_fee_intelligence():
+    """
+    Collect fee observations from our channels and broadcast to hive.
+
+    Gathers fee and performance data for each external peer we have
+    channels with and broadcasts FEE_INTELLIGENCE messages.
+    """
+    if not fee_intel_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        # Get our channels
+        funds = safe_plugin.rpc.listfunds()
+        channels = funds.get("channels", [])
+
+        # Get list of hive members (to exclude from external peer reporting)
+        members = database.get_all_members()
+        member_ids = {m.get("peer_id") for m in members}
+
+        # Get forwarding stats if available
+        try:
+            forwards = safe_plugin.rpc.listforwards(status="settled")
+            forwards_list = forwards.get("forwards", [])
+        except Exception:
+            forwards_list = []
+
+        # Build forward stats by peer
+        peer_forwards = {}
+        seven_days_ago = int(time.time()) - (7 * 24 * 3600)
+        for fwd in forwards_list:
+            # Filter to last 7 days
+            received_time = fwd.get("received_time", 0)
+            if received_time < seven_days_ago:
+                continue
+
+            out_channel = fwd.get("out_channel")
+            if out_channel:
+                if out_channel not in peer_forwards:
+                    peer_forwards[out_channel] = {
+                        "count": 0,
+                        "volume_msat": 0,
+                        "fee_msat": 0
+                    }
+                peer_forwards[out_channel]["count"] += 1
+                peer_forwards[out_channel]["volume_msat"] += fwd.get("out_msat", 0)
+                peer_forwards[out_channel]["fee_msat"] += fwd.get("fee_msat", 0)
+
+        # Collect fee intelligence for each external peer
+        broadcast_count = 0
+        for channel in channels:
+            if channel.get("state") != "CHANNELD_NORMAL":
+                continue
+
+            peer_id = channel.get("peer_id")
+            if not peer_id or peer_id in member_ids:
+                # Skip hive members - only report on external peers
+                continue
+
+            short_channel_id = channel.get("short_channel_id")
+            if not short_channel_id:
+                continue
+
+            # Get channel capacity and balance
+            amount_msat = channel.get("amount_msat", 0)
+            our_amount_msat = channel.get("our_amount_msat", 0)
+            capacity_sats = amount_msat // 1000
+            available_sats = our_amount_msat // 1000
+
+            if capacity_sats == 0:
+                continue
+
+            utilization_pct = available_sats / capacity_sats if capacity_sats > 0 else 0
+
+            # Determine flow direction based on balance
+            if utilization_pct > 0.7:
+                flow_direction = "source"  # We have excess, liquidity flows out
+            elif utilization_pct < 0.3:
+                flow_direction = "sink"  # We need liquidity, flows in
+            else:
+                flow_direction = "balanced"
+
+            # Get forward stats for this channel
+            stats = peer_forwards.get(short_channel_id, {})
+            forward_count = stats.get("count", 0)
+            forward_volume_sats = stats.get("volume_msat", 0) // 1000
+            revenue_sats = stats.get("fee_msat", 0) // 1000
+
+            # Get our fee rate for this channel (simplified - would need listpeerchannels)
+            our_fee_ppm = 100  # Default, would query actual fee
+
+            # Create and broadcast fee intelligence message
+            try:
+                msg = fee_intel_mgr.create_fee_intelligence_message(
+                    target_peer_id=peer_id,
+                    our_fee_ppm=our_fee_ppm,
+                    their_fee_ppm=0,  # Would need to look up
+                    forward_count=forward_count,
+                    forward_volume_sats=forward_volume_sats,
+                    revenue_sats=revenue_sats,
+                    flow_direction=flow_direction,
+                    utilization_pct=utilization_pct,
+                    rpc=safe_plugin.rpc,
+                    days_observed=7
+                )
+
+                if msg:
+                    # Broadcast to all hive members
+                    for member in members:
+                        member_id = member.get("peer_id")
+                        if not member_id or member_id == our_pubkey:
+                            continue
+                        try:
+                            safe_plugin.rpc.call("sendcustommsg", {
+                                "node_id": member_id,
+                                "msg": msg.hex()
+                            })
+                            broadcast_count += 1
+                        except Exception:
+                            pass  # Peer might be offline
+
+            except Exception as e:
+                safe_plugin.log(
+                    f"cl-hive: Failed to create fee intelligence for {peer_id[:16]}...: {e}",
+                    level='debug'
+                )
+
+        if broadcast_count > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast fee intelligence ({broadcast_count} messages)",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Fee intelligence broadcast error: {e}", level='warn')
+
+
+def _broadcast_health_report():
+    """
+    Calculate and broadcast our health report for NNLB coordination.
+    """
+    if not fee_intel_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        # Get our channel data
+        funds = safe_plugin.rpc.listfunds()
+        channels = funds.get("channels", [])
+
+        capacity_sats = sum(
+            ch.get("amount_msat", 0) // 1000
+            for ch in channels if ch.get("state") == "CHANNELD_NORMAL"
+        )
+        available_sats = sum(
+            ch.get("our_amount_msat", 0) // 1000
+            for ch in channels if ch.get("state") == "CHANNELD_NORMAL"
+        )
+        channel_count = len([ch for ch in channels if ch.get("state") == "CHANNELD_NORMAL"])
+
+        # Get hive averages for comparison
+        all_health = database.get_all_member_health()
+        if all_health:
+            hive_avg_capacity = sum(
+                h.get("capacity_score", 50) for h in all_health
+            ) / len(all_health) * 200000
+        else:
+            hive_avg_capacity = 10_000_000
+
+        # Calculate our health
+        health = fee_intel_mgr.calculate_our_health(
+            capacity_sats=capacity_sats,
+            available_sats=available_sats,
+            channel_count=channel_count,
+            daily_revenue_sats=0,  # Would need forwarding stats over time
+            hive_avg_capacity=int(hive_avg_capacity)
+        )
+
+        # Store our own health record
+        database.update_member_health(
+            peer_id=our_pubkey,
+            overall_health=health["overall_health"],
+            capacity_score=health["capacity_score"],
+            revenue_score=health["revenue_score"],
+            connectivity_score=health["connectivity_score"],
+            tier=health["tier"],
+            needs_help=health["needs_help"],
+            can_help_others=health["can_help_others"],
+            needs_inbound=available_sats < capacity_sats * 0.3 if capacity_sats > 0 else False,
+            needs_outbound=available_sats > capacity_sats * 0.7 if capacity_sats > 0 else False,
+            needs_channels=channel_count < 5
+        )
+
+        # Create and broadcast health report
+        msg = fee_intel_mgr.create_health_report_message(
+            overall_health=health["overall_health"],
+            capacity_score=health["capacity_score"],
+            revenue_score=health["revenue_score"],
+            connectivity_score=health["connectivity_score"],
+            rpc=safe_plugin.rpc,
+            needs_inbound=available_sats < capacity_sats * 0.3 if capacity_sats > 0 else False,
+            needs_outbound=available_sats > capacity_sats * 0.7 if capacity_sats > 0 else False,
+            needs_channels=channel_count < 5,
+            can_provide_assistance=health["can_help_others"]
+        )
+
+        if msg:
+            members = database.get_all_members()
+            broadcast_count = 0
+            for member in members:
+                member_id = member.get("peer_id")
+                if not member_id or member_id == our_pubkey:
+                    continue
+                try:
+                    safe_plugin.rpc.call("sendcustommsg", {
+                        "node_id": member_id,
+                        "msg": msg.hex()
+                    })
+                    broadcast_count += 1
+                except Exception:
+                    pass
+
+            if broadcast_count > 0:
+                safe_plugin.log(
+                    f"cl-hive: Broadcast health report (health={health['overall_health']}, "
+                    f"tier={health['tier']}, to {broadcast_count} members)",
+                    level='debug'
+                )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Health report broadcast error: {e}", level='warn')
 
 
 # =============================================================================

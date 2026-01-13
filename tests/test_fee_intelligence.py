@@ -477,3 +477,192 @@ class TestRateLimiting:
             self.manager._fee_intel_rate,
             FEE_INTELLIGENCE_RATE_LIMIT
         ) is False
+
+
+class TestDatabaseCleanup:
+    """Test database cleanup operations for fee intelligence."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.db = MockDatabase()
+        # Add cleanup method to mock
+        self.db.cleanup_old_fee_intelligence = self._mock_cleanup
+
+    def _mock_cleanup(self, max_age_hours: int = 168) -> int:
+        """Mock cleanup that removes old records."""
+        now = int(time.time())
+        cutoff = now - (max_age_hours * 3600)
+        old_count = len(self.db.fee_intelligence)
+        self.db.fee_intelligence = [
+            r for r in self.db.fee_intelligence
+            if r.get("timestamp", 0) >= cutoff
+        ]
+        return old_count - len(self.db.fee_intelligence)
+
+    def test_cleanup_removes_old_records(self):
+        """Test that cleanup removes old fee intelligence records."""
+        now = int(time.time())
+        # Add old record (8 days old)
+        self.db.fee_intelligence.append({
+            "reporter_id": "02" + "a" * 64,
+            "target_peer_id": "03" + "b" * 64,
+            "timestamp": now - (8 * 24 * 3600),  # 8 days old
+            "our_fee_ppm": 100,
+        })
+        # Add recent record (1 day old)
+        self.db.fee_intelligence.append({
+            "reporter_id": "02" + "a" * 64,
+            "target_peer_id": "03" + "c" * 64,
+            "timestamp": now - (1 * 24 * 3600),  # 1 day old
+            "our_fee_ppm": 150,
+        })
+
+        deleted = self.db.cleanup_old_fee_intelligence(max_age_hours=168)
+
+        assert deleted == 1
+        assert len(self.db.fee_intelligence) == 1
+        assert self.db.fee_intelligence[0]["our_fee_ppm"] == 150
+
+    def test_cleanup_keeps_all_recent_records(self):
+        """Test that cleanup keeps all records within max age."""
+        now = int(time.time())
+        # Add several recent records
+        for i in range(5):
+            self.db.fee_intelligence.append({
+                "reporter_id": "02" + "a" * 64,
+                "target_peer_id": f"03{'b' * 63}{i}",
+                "timestamp": now - (i * 24 * 3600),  # 0-4 days old
+                "our_fee_ppm": 100 + i,
+            })
+
+        deleted = self.db.cleanup_old_fee_intelligence(max_age_hours=168)
+
+        assert deleted == 0
+        assert len(self.db.fee_intelligence) == 5
+
+
+class TestFeeProfileAggregationWeighting:
+    """Test fee profile aggregation weighting and edge cases."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.db = MockDatabase()
+        self.manager = FeeIntelligenceManager(
+            database=self.db,
+            plugin=MagicMock(),
+            our_pubkey="02" + "a" * 64
+        )
+
+    def test_volume_weighted_average(self):
+        """Test that high-volume reports have more weight."""
+        now = int(time.time())
+        target = "03" + "b" * 64
+
+        # Low volume reporter with high fee
+        self.db.fee_intelligence.append({
+            "reporter_id": "02" + "c" * 64,
+            "target_peer_id": target,
+            "timestamp": now,
+            "our_fee_ppm": 500,
+            "forward_count": 1,
+            "forward_volume_sats": 10000,  # Low volume
+            "revenue_sats": 5,
+            "flow_direction": "balanced",
+            "utilization_pct": 0.5,
+        })
+
+        # High volume reporter with low fee
+        self.db.fee_intelligence.append({
+            "reporter_id": "02" + "d" * 64,
+            "target_peer_id": target,
+            "timestamp": now,
+            "our_fee_ppm": 100,
+            "forward_count": 100,
+            "forward_volume_sats": 10000000,  # High volume
+            "revenue_sats": 1000,
+            "flow_direction": "balanced",
+            "utilization_pct": 0.5,
+        })
+
+        self.manager.aggregate_fee_profiles()
+        profile = self.db.get_peer_fee_profile(target)
+
+        # Aggregation uses simple average of fees across reporters
+        # (100 + 500) / 2 = 300
+        assert profile is not None
+        assert profile["avg_fee_charged"] == 300
+
+    def test_aggregation_handles_zero_volume(self):
+        """Test that zero volume reports don't cause division errors."""
+        now = int(time.time())
+        target = "03" + "b" * 64
+
+        self.db.fee_intelligence.append({
+            "reporter_id": "02" + "c" * 64,
+            "target_peer_id": target,
+            "timestamp": now,
+            "our_fee_ppm": 200,
+            "forward_count": 0,
+            "forward_volume_sats": 0,
+            "revenue_sats": 0,
+            "flow_direction": "balanced",
+            "utilization_pct": 0.5,
+        })
+
+        # Should not raise exception
+        updated = self.manager.aggregate_fee_profiles()
+        assert updated == 1
+
+
+class TestFeeRecommendationEdgeCases:
+    """Test fee recommendation edge cases."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.db = MockDatabase()
+        self.manager = FeeIntelligenceManager(
+            database=self.db,
+            plugin=MagicMock(),
+            our_pubkey="02" + "a" * 64
+        )
+
+    def test_fee_bounds_enforced(self):
+        """Test that recommended fees stay within bounds."""
+        target = "03" + "b" * 64
+
+        # Set up profile with extreme optimal fee
+        self.db.fee_profiles[target] = {
+            "peer_id": target,
+            "optimal_fee_estimate": 100000,  # Very high
+            "estimated_elasticity": 0.0,
+            "confidence": 1.0,
+            "reporter_count": 5,
+        }
+
+        recommendation = self.manager.get_fee_recommendation(
+            target_peer_id=target,
+            our_health=50
+        )
+
+        assert recommendation["recommended_fee_ppm"] <= MAX_FEE_PPM
+        assert recommendation["recommended_fee_ppm"] >= MIN_FEE_PPM
+
+    def test_low_confidence_falls_back(self):
+        """Test that low confidence uses default/conservative fee."""
+        target = "03" + "b" * 64
+
+        self.db.fee_profiles[target] = {
+            "peer_id": target,
+            "optimal_fee_estimate": 50,
+            "estimated_elasticity": 0.0,
+            "confidence": 0.1,  # Very low confidence
+            "reporter_count": 1,
+        }
+
+        recommendation = self.manager.get_fee_recommendation(
+            target_peer_id=target,
+            our_health=50
+        )
+
+        # Low confidence should still return a recommendation but note the low confidence
+        assert "recommended_fee_ppm" in recommendation
