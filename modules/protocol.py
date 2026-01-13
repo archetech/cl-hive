@@ -415,7 +415,11 @@ def validate_ban_vote(payload: Dict[str, Any]) -> bool:
 
 
 def validate_peer_available(payload: Dict[str, Any]) -> bool:
-    """Validate PEER_AVAILABLE payload schema."""
+    """
+    Validate PEER_AVAILABLE payload schema.
+
+    SECURITY: Requires cryptographic signature from the reporter.
+    """
     if not isinstance(payload, dict):
         return False
 
@@ -423,6 +427,7 @@ def validate_peer_available(payload: Dict[str, Any]) -> bool:
     reporter_peer_id = payload.get("reporter_peer_id")
     event_type = payload.get("event_type")
     timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
 
     # target_peer_id must be valid pubkey (the external peer)
     if not _valid_pubkey(target_peer_id):
@@ -449,6 +454,10 @@ def validate_peer_available(payload: Dict[str, Any]) -> bool:
     if not isinstance(timestamp, int) or timestamp < 0:
         return False
 
+    # SECURITY: Signature must be present (zbase encoded)
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
     # Optional numeric fields - validate if present
     optional_int_fields = [
         'capacity_sats', 'channel_id', 'duration_days',
@@ -468,6 +477,241 @@ def validate_peer_available(payload: Dict[str, Any]) -> bool:
             return False
 
     return True
+
+
+def get_peer_available_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing PEER_AVAILABLE messages.
+
+    The signature covers core fields that identify the event, in sorted order.
+    """
+    signing_fields = {
+        "target_peer_id": payload.get("target_peer_id", ""),
+        "reporter_peer_id": payload.get("reporter_peer_id", ""),
+        "event_type": payload.get("event_type", ""),
+        "timestamp": payload.get("timestamp", 0),
+        "capacity_sats": payload.get("capacity_sats", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+# =============================================================================
+# PHASE 2: STATE MANAGEMENT MESSAGE VALIDATION
+# =============================================================================
+
+def validate_gossip(payload: Dict[str, Any]) -> bool:
+    """
+    Validate GOSSIP payload schema.
+
+    SECURITY: Requires cryptographic signature from the sender.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+
+    # sender_id must be valid pubkey
+    if not _valid_pubkey(sender_id):
+        return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # SECURITY: Signature must be present
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    # version must be a positive integer if present
+    version = payload.get("version")
+    if version is not None and (not isinstance(version, int) or version < 0):
+        return False
+
+    return True
+
+
+def get_gossip_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing GOSSIP messages.
+
+    The signature covers core fields in sorted order.
+    """
+    signing_fields = {
+        "sender_id": payload.get("sender_id", ""),
+        "timestamp": payload.get("timestamp", 0),
+        "version": payload.get("version", 0),
+        "fleet_hash": payload.get("fleet_hash", ""),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+def validate_state_hash(payload: Dict[str, Any]) -> bool:
+    """
+    Validate STATE_HASH payload schema.
+
+    SECURITY: Requires cryptographic signature from the sender.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    fleet_hash = payload.get("fleet_hash")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+
+    # sender_id must be valid pubkey
+    if not _valid_pubkey(sender_id):
+        return False
+
+    # fleet_hash must be a string
+    if not isinstance(fleet_hash, str) or not fleet_hash:
+        return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # SECURITY: Signature must be present
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    return True
+
+
+def get_state_hash_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing STATE_HASH messages.
+
+    The signature covers core fields in sorted order.
+    """
+    signing_fields = {
+        "sender_id": payload.get("sender_id", ""),
+        "fleet_hash": payload.get("fleet_hash", ""),
+        "timestamp": payload.get("timestamp", 0),
+        "peer_count": payload.get("peer_count", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+def validate_full_sync(payload: Dict[str, Any]) -> bool:
+    """
+    Validate FULL_SYNC payload schema.
+
+    SECURITY: Requires cryptographic signature from the sender.
+    This is critical as FULL_SYNC contains membership lists.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    fleet_hash = payload.get("fleet_hash")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+    states = payload.get("states")
+
+    # sender_id must be valid pubkey
+    if not _valid_pubkey(sender_id):
+        return False
+
+    # fleet_hash must be a string
+    if not isinstance(fleet_hash, str):
+        return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # SECURITY: Signature must be present
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    # states must be a list (can be empty)
+    if not isinstance(states, list):
+        return False
+
+    # Limit states to prevent DoS
+    if len(states) > 500:
+        return False
+
+    return True
+
+
+def get_full_sync_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing FULL_SYNC messages.
+
+    The signature covers the fleet_hash which is a digest of all states,
+    plus sender identification. This prevents state tampering.
+    """
+    signing_fields = {
+        "sender_id": payload.get("sender_id", ""),
+        "fleet_hash": payload.get("fleet_hash", ""),
+        "timestamp": payload.get("timestamp", 0),
+        "state_count": len(payload.get("states", [])),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+# =============================================================================
+# PHASE 3: INTENT MESSAGE VALIDATION
+# =============================================================================
+
+def validate_intent_abort(payload: Dict[str, Any]) -> bool:
+    """
+    Validate INTENT_ABORT payload schema.
+
+    SECURITY: Requires cryptographic signature from the initiator.
+    Only the intent owner can abort their own intent.
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    intent_type = payload.get("intent_type")
+    target = payload.get("target")
+    initiator = payload.get("initiator")
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+
+    # intent_type must be a valid string
+    valid_intent_types = ('channel_open', 'channel_close', 'rebalance')
+    if intent_type not in valid_intent_types:
+        return False
+
+    # target must be valid pubkey
+    if not _valid_pubkey(target):
+        return False
+
+    # initiator must be valid pubkey (the one aborting their intent)
+    if not _valid_pubkey(initiator):
+        return False
+
+    # timestamp must be positive integer
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+
+    # SECURITY: Signature must be present
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    return True
+
+
+def get_intent_abort_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing INTENT_ABORT messages.
+
+    The signature proves the initiator is voluntarily aborting their intent.
+    """
+    signing_fields = {
+        "intent_type": payload.get("intent_type", ""),
+        "target": payload.get("target", ""),
+        "initiator": payload.get("initiator", ""),
+        "timestamp": payload.get("timestamp", 0),
+        "reason": payload.get("reason", ""),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
 
 
 # =============================================================================
@@ -517,6 +761,7 @@ def create_welcome(hive_id: str, tier: str, member_count: int,
 
 def create_peer_available(target_peer_id: str, reporter_peer_id: str,
                           event_type: str, timestamp: int,
+                          signature: str = "",
                           channel_id: str = "",
                           capacity_sats: int = 0,
                           routing_score: float = 0.0,
@@ -617,6 +862,10 @@ def create_peer_available(target_peer_id: str, reporter_peer_id: str,
         payload["their_funding_sats"] = their_funding_sats
     if opener:
         payload["opener"] = opener
+
+    # SECURITY: Signature is required
+    if signature:
+        payload["signature"] = signature
 
     return serialize(HiveMessageType.PEER_AVAILABLE, payload)
 
