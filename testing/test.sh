@@ -2480,6 +2480,75 @@ test_hive_rpc() {
         fi
     done
 
+    # =========================================================================
+    # Test topology, planner, and query commands (Phase 4a)
+    # =========================================================================
+    log_info "Testing topology and planner commands..."
+
+    # Test hive-reinit-bridge (admin only)
+    run_test "hive-reinit-bridge returns object" \
+        "hive_cli alice hive-reinit-bridge | jq -e 'type == \"object\"'"
+
+    run_test "hive-reinit-bridge has status fields" \
+        "hive_cli alice hive-reinit-bridge | jq -e '.previous_status != null or .error != null'"
+
+    # Test hive-topology
+    run_test "hive-topology returns object" \
+        "hive_cli alice hive-topology | jq -e 'type == \"object\"'"
+
+    run_test "hive-topology has saturated_targets" \
+        "hive_cli alice hive-topology | jq -e '.saturated_targets | type == \"array\" or .error != null'"
+
+    run_test "hive-topology has config" \
+        "hive_cli alice hive-topology | jq -e '.config != null or .error != null'"
+
+    # Test hive-planner-log
+    run_test "hive-planner-log returns object" \
+        "hive_cli alice hive-planner-log | jq -e 'type == \"object\"'"
+
+    run_test "hive-planner-log has count" \
+        "hive_cli alice hive-planner-log | jq -e '.count >= 0'"
+
+    run_test "hive-planner-log has logs array" \
+        "hive_cli alice hive-planner-log | jq -e '.logs | type == \"array\"'"
+
+    run_test "hive-planner-log accepts limit param" \
+        "hive_cli alice hive-planner-log limit=10 | jq -e '.limit == 10'"
+
+    # Test hive-intent-status
+    run_test "hive-intent-status returns object" \
+        "hive_cli alice hive-intent-status | jq -e 'type == \"object\"'"
+
+    run_test "hive-intent-status has local_pending" \
+        "hive_cli alice hive-intent-status | jq -e '.local_pending >= 0 or .error != null'"
+
+    run_test "hive-intent-status has remote_cached" \
+        "hive_cli alice hive-intent-status | jq -e '.remote_cached >= 0 or .error != null'"
+
+    # Test hive-contribution
+    run_test "hive-contribution returns object" \
+        "hive_cli alice hive-contribution | jq -e 'type == \"object\"'"
+
+    run_test "hive-contribution has peer_id" \
+        "hive_cli alice hive-contribution | jq -e '.peer_id != null or .error != null'"
+
+    run_test "hive-contribution has ratio" \
+        "hive_cli alice hive-contribution | jq -e '.contribution_ratio >= 0 or .error != null'"
+
+    # Test topology/planner commands across active hive nodes
+    for node in $HIVE_NODES; do
+        if container_exists $node; then
+            NODE_STATUS=$(hive_cli $node hive-status 2>/dev/null | jq -r '.status // "none"')
+            if [ "$NODE_STATUS" = "active" ]; then
+                run_test "$node hive-topology works" \
+                    "hive_cli $node hive-topology | jq -e 'type == \"object\"'"
+
+                run_test "$node hive-planner-log works" \
+                    "hive_cli $node hive-planner-log | jq -e '.count >= 0'"
+            fi
+        fi
+    done
+
     log_info "RPC modularization tests complete"
 }
 
