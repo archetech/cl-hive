@@ -672,7 +672,7 @@ class CooperativeExpansionManager:
         Handle an incoming EXPANSION_ELECT message.
 
         If we're the elected member, this signals we should proceed
-        with opening the channel.
+        with opening the channel. Either way, update our local round state.
 
         Args:
             peer_id: Sender's pubkey
@@ -685,6 +685,19 @@ class CooperativeExpansionManager:
         elected_id = payload.get("elected_id")
         target_peer_id = payload.get("target_peer_id")
         channel_size_sats = payload.get("channel_size_sats", 0)
+
+        # Update local round state if we have this round
+        with self._lock:
+            round_obj = self._rounds.get(round_id)
+            if round_obj:
+                round_obj.state = ExpansionRoundState.COMPLETED
+                round_obj.elected_id = elected_id
+                round_obj.recommended_size_sats = channel_size_sats
+                round_obj.completed_at = int(time.time())
+                round_obj.result = f"elected:{elected_id[:16]}..."
+                self._log(
+                    f"Round {round_id[:8]}... completed - elected {elected_id[:16]}..."
+                )
 
         our_id = self._get_our_id()
 
@@ -798,8 +811,9 @@ class CooperativeExpansionManager:
         with self._lock:
             active = [r for r in self._rounds.values()
                      if r.state in (ExpansionRoundState.NOMINATING, ExpansionRoundState.ELECTING)]
+            # ELECTED and COMPLETED are both "finished" rounds
             completed = [r for r in self._rounds.values()
-                        if r.state == ExpansionRoundState.COMPLETED]
+                        if r.state in (ExpansionRoundState.ELECTED, ExpansionRoundState.COMPLETED)]
             cancelled = [r for r in self._rounds.values()
                         if r.state in (ExpansionRoundState.CANCELLED, ExpansionRoundState.EXPIRED)]
 
