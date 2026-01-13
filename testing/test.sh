@@ -10,7 +10,7 @@
 #   routing, performance, metrics, simulation, reset
 #
 # Hive Categories:
-#   hive, hive_genesis, hive_join, hive_sync, hive_expansion, hive_reset
+#   hive, hive_genesis, hive_join, hive_sync, hive_expansion, hive_rpc, hive_reset
 #
 # Example: ./test.sh all 1
 # Example: ./test.sh flow 1
@@ -2237,6 +2237,158 @@ test_hive_expansion() {
     log_info "Planner log entries: $(echo "$PLANNER_LOG" | jq '.entries | length // 0')"
 }
 
+# Hive RPC Modularization Tests - Verify refactored RPC commands work correctly
+test_hive_rpc() {
+    echo ""
+    echo "========================================"
+    echo "HIVE RPC MODULARIZATION TESTS"
+    echo "========================================"
+    echo "Testing that modularized RPC commands in modules/rpc_commands.py work correctly"
+
+    # =========================================================================
+    # Test hive-status (extracted to rpc_commands.status)
+    # =========================================================================
+    log_info "Testing hive-status command..."
+
+    run_test "hive-status returns object" \
+        "hive_cli alice hive-status | jq -e 'type == \"object\"'"
+
+    run_test "hive-status has status field" \
+        "hive_cli alice hive-status | jq -e '.status != null'"
+
+    run_test "hive-status has governance_mode" \
+        "hive_cli alice hive-status | jq -e '.governance_mode != null'"
+
+    run_test "hive-status has members object" \
+        "hive_cli alice hive-status | jq -e '.members.total >= 0'"
+
+    run_test "hive-status has limits object" \
+        "hive_cli alice hive-status | jq -e '.limits.max_members >= 1'"
+
+    run_test "hive-status has version" \
+        "hive_cli alice hive-status | jq -e '.version != null'"
+
+    # =========================================================================
+    # Test hive-config (extracted to rpc_commands.get_config)
+    # =========================================================================
+    log_info "Testing hive-config command..."
+
+    run_test "hive-config returns object" \
+        "hive_cli alice hive-config | jq -e 'type == \"object\"'"
+
+    run_test "hive-config has config_version" \
+        "hive_cli alice hive-config | jq -e '.config_version != null'"
+
+    run_test "hive-config has governance section" \
+        "hive_cli alice hive-config | jq -e '.governance.governance_mode != null'"
+
+    run_test "hive-config has membership section" \
+        "hive_cli alice hive-config | jq -e '.membership.membership_enabled != null'"
+
+    run_test "hive-config has protocol section" \
+        "hive_cli alice hive-config | jq -e '.protocol.market_share_cap_pct != null'"
+
+    run_test "hive-config has planner section" \
+        "hive_cli alice hive-config | jq -e '.planner.planner_interval != null'"
+
+    run_test "hive-config has vpn section" \
+        "hive_cli alice hive-config | jq -e '.vpn != null'"
+
+    # =========================================================================
+    # Test hive-members (extracted to rpc_commands.members)
+    # =========================================================================
+    log_info "Testing hive-members command..."
+
+    run_test "hive-members returns object" \
+        "hive_cli alice hive-members | jq -e 'type == \"object\"'"
+
+    run_test "hive-members has count" \
+        "hive_cli alice hive-members | jq -e '.count >= 0'"
+
+    run_test "hive-members has members array" \
+        "hive_cli alice hive-members | jq -e '.members | type == \"array\"'"
+
+    # If there are members, verify their structure
+    MEMBER_COUNT=$(hive_cli alice hive-members | jq '.count')
+    if [ "$MEMBER_COUNT" -gt 0 ]; then
+        run_test "hive-members entries have peer_id" \
+            "hive_cli alice hive-members | jq -e '.members[0].peer_id != null'"
+
+        run_test "hive-members entries have tier" \
+            "hive_cli alice hive-members | jq -e '.members[0].tier != null'"
+    else
+        log_info "[SKIP] No members to verify structure"
+    fi
+
+    # =========================================================================
+    # Test hive-vpn-status (extracted to rpc_commands.vpn_status)
+    # =========================================================================
+    log_info "Testing hive-vpn-status command..."
+
+    run_test "hive-vpn-status returns object" \
+        "hive_cli alice hive-vpn-status | jq -e 'type == \"object\"'"
+
+    # VPN status should have enabled field or error
+    VPN_STATUS=$(hive_cli alice hive-vpn-status 2>&1)
+    if echo "$VPN_STATUS" | jq -e '.enabled' >/dev/null 2>&1; then
+        run_test "hive-vpn-status has enabled field" \
+            "hive_cli alice hive-vpn-status | jq -e '.enabled != null'"
+    elif echo "$VPN_STATUS" | jq -e '.error' >/dev/null 2>&1; then
+        log_info "[INFO] VPN transport not initialized (expected if VPN disabled)"
+    fi
+
+    # Test peer-specific VPN status query
+    ALICE_PUBKEY=$(hive_cli alice getinfo | jq -r '.id')
+    run_test "hive-vpn-status with peer_id returns object" \
+        "hive_cli alice hive-vpn-status peer_id=$ALICE_PUBKEY | jq -e 'type == \"object\"'"
+
+    # =========================================================================
+    # Test consistent behavior across all hive nodes
+    # =========================================================================
+    log_info "Testing RPC consistency across hive nodes..."
+
+    for node in $HIVE_NODES; do
+        if container_exists $node; then
+            # Check node has hive active
+            NODE_STATUS=$(hive_cli $node hive-status 2>/dev/null | jq -r '.status // "none"')
+            if [ "$NODE_STATUS" = "active" ]; then
+                run_test "$node hive-status works" \
+                    "hive_cli $node hive-status | jq -e '.status == \"active\"'"
+
+                run_test "$node hive-config works" \
+                    "hive_cli $node hive-config | jq -e '.governance != null'"
+
+                run_test "$node hive-members works" \
+                    "hive_cli $node hive-members | jq -e '.count >= 0'"
+
+                run_test "$node hive-vpn-status works" \
+                    "hive_cli $node hive-vpn-status | jq -e 'type == \"object\"'"
+            else
+                log_info "[SKIP] $node not in active hive state"
+            fi
+        fi
+    done
+
+    # =========================================================================
+    # Test error handling for uninitialized state
+    # =========================================================================
+    log_info "Testing error handling..."
+
+    # If we have a vanilla node, test that hive commands fail gracefully
+    for node in $VANILLA_NODES; do
+        if container_exists $node; then
+            # Vanilla nodes shouldn't have hive plugin, so this should fail or return error
+            VANILLA_RESULT=$(hive_cli $node hive-status 2>&1 || echo '{"error":"expected"}')
+            if echo "$VANILLA_RESULT" | jq -e '.error' >/dev/null 2>&1; then
+                log_info "[INFO] $node correctly reports hive not available"
+            fi
+            break  # Only test one vanilla node
+        fi
+    done
+
+    log_info "RPC modularization tests complete"
+}
+
 # Hive Full Reset - Clean slate for testing
 test_hive_reset() {
     echo ""
@@ -2284,6 +2436,7 @@ test_hive() {
     test_hive_join
     test_hive_sync
     test_hive_expansion
+    test_hive_rpc
 }
 
 run_category() {
@@ -2360,6 +2513,9 @@ run_category() {
         hive_reset)
             test_hive_reset
             ;;
+        hive_rpc)
+            test_hive_rpc
+            ;;
         hive)
             test_hive
             ;;
@@ -2415,6 +2571,7 @@ run_category() {
             echo "  hive_join      - Member invitation and join"
             echo "  hive_sync      - State synchronization"
             echo "  hive_expansion - Cooperative expansion"
+            echo "  hive_rpc       - RPC modularization tests"
             echo "  hive_reset     - Reset hive state"
             exit 1
             ;;
