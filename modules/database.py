@@ -462,6 +462,34 @@ class HiveDatabase:
             )
         """)
 
+        # =====================================================================
+        # LIQUIDITY NEEDS TABLE (Phase 7.3 - Cooperative Rebalancing)
+        # =====================================================================
+        # Stores liquidity needs broadcast by hive members
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS liquidity_needs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_id TEXT NOT NULL,
+                need_type TEXT NOT NULL,
+                target_peer_id TEXT,
+                amount_sats INTEGER NOT NULL,
+                urgency TEXT DEFAULT 'medium',
+                max_fee_ppm INTEGER DEFAULT 0,
+                reason TEXT,
+                current_balance_pct REAL DEFAULT 0.5,
+                timestamp INTEGER NOT NULL,
+                UNIQUE(reporter_id, target_peer_id)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_liquidity_needs_reporter "
+            "ON liquidity_needs(reporter_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_liquidity_needs_urgency "
+            "ON liquidity_needs(urgency)"
+        )
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -2264,3 +2292,166 @@ class HiveDatabase:
             result['needs_channels'] = bool(result.get('needs_channels', 0))
             results.append(result)
         return results
+
+    # =========================================================================
+    # LIQUIDITY NEEDS OPERATIONS (Phase 7.3 - Cooperative Rebalancing)
+    # =========================================================================
+
+    def store_liquidity_need(
+        self,
+        reporter_id: str,
+        need_type: str,
+        target_peer_id: str,
+        amount_sats: int,
+        urgency: str = "medium",
+        max_fee_ppm: int = 0,
+        reason: str = "",
+        current_balance_pct: float = 0.5,
+        timestamp: Optional[int] = None
+    ):
+        """
+        Store or update a liquidity need.
+
+        Args:
+            reporter_id: Hive member reporting the need
+            need_type: Type of need (inbound/outbound/rebalance)
+            target_peer_id: External peer involved
+            amount_sats: Amount needed
+            urgency: Urgency level
+            max_fee_ppm: Maximum fee willing to pay
+            reason: Reason for the need
+            current_balance_pct: Current local balance percentage
+            timestamp: When the need was reported
+        """
+        conn = self._get_connection()
+        now = timestamp or int(time.time())
+        conn.execute("""
+            INSERT OR REPLACE INTO liquidity_needs
+            (reporter_id, need_type, target_peer_id, amount_sats, urgency,
+             max_fee_ppm, reason, current_balance_pct, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            reporter_id, need_type, target_peer_id, amount_sats, urgency,
+            max_fee_ppm, reason, current_balance_pct, now
+        ))
+
+    def get_liquidity_need(
+        self,
+        reporter_id: str,
+        target_peer_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get a specific liquidity need.
+
+        Args:
+            reporter_id: Hive member who reported
+            target_peer_id: Target peer
+
+        Returns:
+            Liquidity need dict or None
+        """
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM liquidity_needs
+            WHERE reporter_id = ? AND target_peer_id = ?
+        """, (reporter_id, target_peer_id)).fetchone()
+        return dict(row) if row else None
+
+    def get_all_liquidity_needs(
+        self,
+        max_age_hours: int = 24
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all recent liquidity needs.
+
+        Args:
+            max_age_hours: Maximum age to include
+
+        Returns:
+            List of liquidity need dicts
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+        rows = conn.execute("""
+            SELECT * FROM liquidity_needs
+            WHERE timestamp >= ?
+            ORDER BY
+                CASE urgency
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    WHEN 'medium' THEN 3
+                    ELSE 4
+                END,
+                timestamp DESC
+        """, (cutoff,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_liquidity_needs_for_reporter(
+        self,
+        reporter_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all liquidity needs from a specific reporter.
+
+        Args:
+            reporter_id: Hive member peer ID
+
+        Returns:
+            List of liquidity need dicts
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM liquidity_needs
+            WHERE reporter_id = ?
+            ORDER BY timestamp DESC
+        """, (reporter_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_urgent_liquidity_needs(
+        self,
+        urgency_levels: List[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get liquidity needs by urgency level.
+
+        Args:
+            urgency_levels: List of urgency levels to include
+                           (default: critical, high)
+
+        Returns:
+            List of liquidity need dicts
+        """
+        if urgency_levels is None:
+            urgency_levels = ["critical", "high"]
+
+        conn = self._get_connection()
+        placeholders = ",".join("?" * len(urgency_levels))
+        rows = conn.execute(f"""
+            SELECT * FROM liquidity_needs
+            WHERE urgency IN ({placeholders})
+            ORDER BY
+                CASE urgency
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    ELSE 3
+                END,
+                timestamp DESC
+        """, urgency_levels).fetchall()
+        return [dict(row) for row in rows]
+
+    def cleanup_old_liquidity_needs(self, max_age_hours: int = 24) -> int:
+        """
+        Remove old liquidity need records.
+
+        Args:
+            max_age_hours: Maximum age to keep
+
+        Returns:
+            Number of records deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+        cursor = conn.execute("""
+            DELETE FROM liquidity_needs WHERE timestamp < ?
+        """, (cutoff,))
+        return cursor.rowcount

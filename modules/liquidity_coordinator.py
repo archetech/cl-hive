@@ -1,0 +1,614 @@
+"""
+Liquidity Coordinator Module (Phase 3 - Cooperative Rebalancing)
+
+Implements cooperative rebalancing between hive members:
+- Internal hive rebalancing (zero cost via 0-fee channels)
+- Coordinated external rebalancing
+- NNLB-prioritized liquidity assistance
+
+Security: All operations use cryptographic signatures.
+"""
+
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
+
+from .protocol import (
+    HiveMessageType,
+    serialize,
+    create_liquidity_need,
+    validate_liquidity_need_payload,
+    get_liquidity_need_signing_payload,
+    LIQUIDITY_NEED_RATE_LIMIT,
+)
+
+
+# Urgency levels for liquidity needs
+URGENCY_CRITICAL = "critical"
+URGENCY_HIGH = "high"
+URGENCY_MEDIUM = "medium"
+URGENCY_LOW = "low"
+
+# Need types
+NEED_INBOUND = "inbound"
+NEED_OUTBOUND = "outbound"
+NEED_REBALANCE = "rebalance"
+
+# Reasons for liquidity need
+REASON_CHANNEL_DEPLETED = "channel_depleted"
+REASON_OPPORTUNITY = "opportunity"
+REASON_NNLB_ASSIST = "nnlb_assist"
+
+# Rebalance proposal types
+PROPOSAL_INTERNAL_PUSH = "internal_push"
+PROPOSAL_EXTERNAL_REBALANCE = "external_rebalance"
+PROPOSAL_FEE_YIELD = "fee_yield"
+
+# Limits
+MAX_PENDING_NEEDS = 100  # Max liquidity needs to track
+MAX_PROPOSAL_AGE = 3600  # 1 hour proposal validity
+MIN_REBALANCE_AMOUNT = 100000  # 100k sats minimum
+
+
+@dataclass
+class RebalanceProposal:
+    """A proposed rebalance operation."""
+    proposal_id: str
+    proposal_type: str
+    from_member: str
+    to_member: str
+    target_peer: Optional[str]
+    amount_sats: int
+    estimated_cost_sats: int
+    nnlb_priority: float
+    created_at: int
+    expires_at: int
+
+
+@dataclass
+class LiquidityNeed:
+    """Tracked liquidity need from a hive member."""
+    reporter_id: str
+    need_type: str
+    target_peer_id: str
+    amount_sats: int
+    urgency: str
+    max_fee_ppm: int
+    reason: str
+    current_balance_pct: float
+    can_provide_inbound: int
+    can_provide_outbound: int
+    timestamp: int
+    signature: str
+
+
+class LiquidityCoordinator:
+    """
+    Coordinates liquidity operations between hive members.
+
+    Implements NNLB-prioritized rebalancing where struggling
+    nodes get help from thriving members.
+    """
+
+    def __init__(
+        self,
+        database: Any,
+        plugin: Any,
+        our_pubkey: str,
+        fee_intel_mgr: Any = None
+    ):
+        """
+        Initialize the liquidity coordinator.
+
+        Args:
+            database: HiveDatabase instance
+            plugin: Plugin instance for RPC/logging
+            our_pubkey: Our node's pubkey
+            fee_intel_mgr: FeeIntelligenceManager for health data
+        """
+        self.database = database
+        self.plugin = plugin
+        self.our_pubkey = our_pubkey
+        self.fee_intel_mgr = fee_intel_mgr
+
+        # In-memory tracking
+        self._liquidity_needs: Dict[str, LiquidityNeed] = {}  # reporter_id -> need
+        self._pending_proposals: Dict[str, RebalanceProposal] = {}
+
+        # Rate limiting
+        self._need_rate: Dict[str, List[float]] = defaultdict(list)
+
+    def _check_rate_limit(
+        self,
+        sender: str,
+        rate_tracker: Dict[str, List[float]],
+        limit: Tuple[int, int]
+    ) -> bool:
+        """Check if sender is within rate limit."""
+        max_count, period = limit
+        now = time.time()
+
+        # Clean old entries
+        rate_tracker[sender] = [
+            ts for ts in rate_tracker[sender]
+            if now - ts < period
+        ]
+
+        return len(rate_tracker[sender]) < max_count
+
+    def _record_message(
+        self,
+        sender: str,
+        rate_tracker: Dict[str, List[float]]
+    ):
+        """Record a message for rate limiting."""
+        rate_tracker[sender].append(time.time())
+
+    def create_liquidity_need_message(
+        self,
+        need_type: str,
+        target_peer_id: str,
+        amount_sats: int,
+        urgency: str,
+        max_fee_ppm: int,
+        reason: str,
+        current_balance_pct: float,
+        can_provide_inbound: int,
+        can_provide_outbound: int,
+        rpc: Any
+    ) -> Optional[bytes]:
+        """
+        Create a signed LIQUIDITY_NEED message.
+
+        Args:
+            need_type: Type of need (inbound/outbound/rebalance)
+            target_peer_id: External peer involved
+            amount_sats: Amount needed
+            urgency: Urgency level
+            max_fee_ppm: Maximum fee willing to pay
+            reason: Why we need this
+            current_balance_pct: Current local balance percentage
+            can_provide_inbound: Sats of inbound we can provide
+            can_provide_outbound: Sats of outbound we can provide
+            rpc: RPC interface for signing
+
+        Returns:
+            Serialized and signed message bytes, or None on error
+        """
+        try:
+            return create_liquidity_need(
+                reporter_id=self.our_pubkey,
+                need_type=need_type,
+                target_peer_id=target_peer_id,
+                amount_sats=amount_sats,
+                urgency=urgency,
+                max_fee_ppm=max_fee_ppm,
+                reason=reason,
+                current_balance_pct=current_balance_pct,
+                can_provide_inbound=can_provide_inbound,
+                can_provide_outbound=can_provide_outbound,
+                rpc=rpc
+            )
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"cl-hive: Failed to create liquidity need message: {e}",
+                    level='warn'
+                )
+            return None
+
+    def handle_liquidity_need(
+        self,
+        peer_id: str,
+        payload: Dict[str, Any],
+        rpc: Any
+    ) -> Dict[str, Any]:
+        """
+        Handle incoming LIQUIDITY_NEED message.
+
+        Args:
+            peer_id: Sender peer ID
+            payload: Message payload
+            rpc: RPC interface for signature verification
+
+        Returns:
+            Result dict with success/error
+        """
+        # Validate payload structure
+        if not validate_liquidity_need_payload(payload):
+            return {"error": "invalid payload"}
+
+        reporter_id = payload.get("reporter_id")
+
+        # Verify sender is a hive member
+        member = self.database.get_member(reporter_id)
+        if not member:
+            return {"error": "reporter not a member"}
+
+        # Rate limit check
+        if not self._check_rate_limit(
+            reporter_id,
+            self._need_rate,
+            LIQUIDITY_NEED_RATE_LIMIT
+        ):
+            return {"error": "rate limited"}
+
+        # Verify signature
+        signature = payload.get("signature")
+        if not signature:
+            return {"error": "missing signature"}
+
+        signing_message = get_liquidity_need_signing_payload(payload)
+
+        try:
+            verify_result = rpc.checkmessage(signing_message, signature)
+            if not verify_result.get("verified"):
+                return {"error": "signature verification failed"}
+
+            if verify_result.get("pubkey") != reporter_id:
+                return {"error": "signature pubkey mismatch"}
+        except Exception as e:
+            return {"error": f"signature check failed: {e}"}
+
+        # Record rate limit
+        self._record_message(reporter_id, self._need_rate)
+
+        # Store the liquidity need
+        need = LiquidityNeed(
+            reporter_id=reporter_id,
+            need_type=payload.get("need_type", NEED_REBALANCE),
+            target_peer_id=payload.get("target_peer_id", ""),
+            amount_sats=payload.get("amount_sats", 0),
+            urgency=payload.get("urgency", URGENCY_LOW),
+            max_fee_ppm=payload.get("max_fee_ppm", 0),
+            reason=payload.get("reason", ""),
+            current_balance_pct=payload.get("current_balance_pct", 0.5),
+            can_provide_inbound=payload.get("can_provide_inbound", 0),
+            can_provide_outbound=payload.get("can_provide_outbound", 0),
+            timestamp=payload.get("timestamp", int(time.time())),
+            signature=signature
+        )
+
+        # Store in memory (replace older need from same reporter)
+        self._liquidity_needs[reporter_id] = need
+
+        # Prune old needs if over limit
+        self._prune_old_needs()
+
+        # Store in database
+        self.database.store_liquidity_need(
+            reporter_id=need.reporter_id,
+            need_type=need.need_type,
+            target_peer_id=need.target_peer_id,
+            amount_sats=need.amount_sats,
+            urgency=need.urgency,
+            max_fee_ppm=need.max_fee_ppm,
+            reason=need.reason,
+            current_balance_pct=need.current_balance_pct,
+            timestamp=need.timestamp
+        )
+
+        if self.plugin:
+            self.plugin.log(
+                f"cl-hive: Received liquidity need from {reporter_id[:16]}...: "
+                f"{need.need_type} {need.amount_sats} sats ({need.urgency})",
+                level='debug'
+            )
+
+        return {"success": True, "stored": True}
+
+    def _prune_old_needs(self):
+        """Remove old liquidity needs to stay under limit."""
+        if len(self._liquidity_needs) <= MAX_PENDING_NEEDS:
+            return
+
+        # Sort by timestamp, remove oldest
+        sorted_needs = sorted(
+            self._liquidity_needs.items(),
+            key=lambda x: x[1].timestamp
+        )
+
+        to_remove = len(sorted_needs) - MAX_PENDING_NEEDS
+        for reporter_id, _ in sorted_needs[:to_remove]:
+            del self._liquidity_needs[reporter_id]
+
+    def get_prioritized_needs(self) -> List[LiquidityNeed]:
+        """
+        Get liquidity needs sorted by NNLB priority.
+
+        Struggling nodes get higher priority.
+
+        Returns:
+            List of needs sorted by priority (highest first)
+        """
+        needs = list(self._liquidity_needs.values())
+
+        def nnlb_priority(need: LiquidityNeed) -> float:
+            """Calculate NNLB priority score."""
+            # Get member health
+            member_health = self.database.get_member_health(need.reporter_id)
+            if member_health:
+                health_score = member_health.get("overall_health", 50)
+            else:
+                health_score = 50
+
+            # Lower health = higher priority (inverted)
+            health_priority = 1.0 - (health_score / 100.0)
+
+            # Urgency multiplier
+            urgency_mult = {
+                URGENCY_CRITICAL: 2.0,
+                URGENCY_HIGH: 1.5,
+                URGENCY_MEDIUM: 1.0,
+                URGENCY_LOW: 0.5
+            }.get(need.urgency, 1.0)
+
+            return health_priority * urgency_mult
+
+        return sorted(needs, key=nnlb_priority, reverse=True)
+
+    def find_internal_rebalance_opportunity(
+        self,
+        funds: Dict[str, Any]
+    ) -> Optional[RebalanceProposal]:
+        """
+        Find an opportunity to help another member via internal rebalance.
+
+        Since hive members have 0-fee channels to each other,
+        internal rebalancing is essentially free.
+
+        Args:
+            funds: Result of listfunds() call
+
+        Returns:
+            RebalanceProposal if opportunity found, None otherwise
+        """
+        needs = self.get_prioritized_needs()
+        channels = funds.get("channels", [])
+
+        # Build map of our channels
+        our_channels: Dict[str, Dict[str, Any]] = {}
+        for ch in channels:
+            if ch.get("state") != "CHANNELD_NORMAL":
+                continue
+            peer_id = ch.get("peer_id")
+            if peer_id:
+                our_channels[peer_id] = ch
+
+        for need in needs:
+            if need.reporter_id == self.our_pubkey:
+                continue
+
+            target = need.target_peer_id
+
+            if need.need_type == NEED_OUTBOUND:
+                # They need outbound to target
+                # Do we have excess outbound to that target?
+                if target in our_channels:
+                    ch = our_channels[target]
+                    capacity = ch.get("amount_msat", 0) // 1000
+                    local = ch.get("our_amount_msat", 0) // 1000
+                    local_pct = local / capacity if capacity > 0 else 0
+
+                    if local_pct > 0.7:
+                        # We have excess, propose internal rebalance
+                        excess = local - (capacity * 0.5)  # Target 50% balance
+                        amount = min(int(excess), need.amount_sats, 10_000_000)
+
+                        if amount >= MIN_REBALANCE_AMOUNT:
+                            # Get NNLB priority
+                            member_health = self.database.get_member_health(
+                                need.reporter_id
+                            )
+                            priority = 1.0 - (
+                                member_health.get("overall_health", 50) / 100.0
+                            ) if member_health else 0.5
+
+                            proposal_id = f"internal_{int(time.time())}_{need.reporter_id[:8]}"
+
+                            return RebalanceProposal(
+                                proposal_id=proposal_id,
+                                proposal_type=PROPOSAL_INTERNAL_PUSH,
+                                from_member=self.our_pubkey,
+                                to_member=need.reporter_id,
+                                target_peer=target,
+                                amount_sats=amount,
+                                estimated_cost_sats=0,  # Internal is free
+                                nnlb_priority=priority,
+                                created_at=int(time.time()),
+                                expires_at=int(time.time()) + MAX_PROPOSAL_AGE
+                            )
+
+            elif need.need_type == NEED_INBOUND:
+                # They need inbound from target
+                # Check if we have a channel to them and excess local
+                if need.reporter_id in our_channels:
+                    ch = our_channels[need.reporter_id]
+                    capacity = ch.get("amount_msat", 0) // 1000
+                    local = ch.get("our_amount_msat", 0) // 1000
+                    local_pct = local / capacity if capacity > 0 else 0
+
+                    if local_pct > 0.6:
+                        # We can push to them directly
+                        excess = local - (capacity * 0.5)
+                        amount = min(int(excess), need.amount_sats, 10_000_000)
+
+                        if amount >= MIN_REBALANCE_AMOUNT:
+                            member_health = self.database.get_member_health(
+                                need.reporter_id
+                            )
+                            priority = 1.0 - (
+                                member_health.get("overall_health", 50) / 100.0
+                            ) if member_health else 0.5
+
+                            proposal_id = f"direct_{int(time.time())}_{need.reporter_id[:8]}"
+
+                            return RebalanceProposal(
+                                proposal_id=proposal_id,
+                                proposal_type=PROPOSAL_INTERNAL_PUSH,
+                                from_member=self.our_pubkey,
+                                to_member=need.reporter_id,
+                                target_peer=None,  # Direct push
+                                amount_sats=amount,
+                                estimated_cost_sats=0,
+                                nnlb_priority=priority,
+                                created_at=int(time.time()),
+                                expires_at=int(time.time()) + MAX_PROPOSAL_AGE
+                            )
+
+        return None
+
+    def can_help_with_liquidity(
+        self,
+        funds: Dict[str, Any]
+    ) -> Dict[str, int]:
+        """
+        Calculate how much liquidity we can provide to help others.
+
+        Args:
+            funds: Result of listfunds() call
+
+        Returns:
+            Dict with inbound/outbound we can provide
+        """
+        channels = funds.get("channels", [])
+
+        total_inbound = 0
+        total_outbound = 0
+
+        # Get hive members
+        members = self.database.get_all_members()
+        member_ids = {m.get("peer_id") for m in members}
+
+        for ch in channels:
+            if ch.get("state") != "CHANNELD_NORMAL":
+                continue
+
+            peer_id = ch.get("peer_id")
+            if peer_id not in member_ids:
+                continue  # Only count hive channels
+
+            capacity = ch.get("amount_msat", 0) // 1000
+            local = ch.get("our_amount_msat", 0) // 1000
+
+            # Excess local = outbound we can push to member
+            if local > capacity * 0.6:
+                total_outbound += int(local - capacity * 0.5)
+
+            # Excess remote = inbound we can receive from member
+            remote = capacity - local
+            if remote > capacity * 0.6:
+                total_inbound += int(remote - capacity * 0.5)
+
+        return {
+            "can_provide_inbound": total_inbound,
+            "can_provide_outbound": total_outbound
+        }
+
+    def assess_our_liquidity_needs(
+        self,
+        funds: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        Assess what liquidity we currently need.
+
+        Args:
+            funds: Result of listfunds() call
+
+        Returns:
+            List of liquidity needs
+        """
+        channels = funds.get("channels", [])
+        needs = []
+
+        # Get hive members
+        members = self.database.get_all_members()
+        member_ids = {m.get("peer_id") for m in members}
+
+        for ch in channels:
+            if ch.get("state") != "CHANNELD_NORMAL":
+                continue
+
+            peer_id = ch.get("peer_id")
+            if peer_id in member_ids:
+                continue  # Skip hive channels, focus on external
+
+            capacity = ch.get("amount_msat", 0) // 1000
+            local = ch.get("our_amount_msat", 0) // 1000
+            local_pct = local / capacity if capacity > 0 else 0.5
+
+            # Determine if we need liquidity
+            if local_pct < 0.2:
+                # Depleted outbound - need outbound to this peer
+                amount_needed = int(capacity * 0.5 - local)
+                needs.append({
+                    "need_type": NEED_OUTBOUND,
+                    "target_peer_id": peer_id,
+                    "amount_sats": amount_needed,
+                    "urgency": URGENCY_HIGH if local_pct < 0.1 else URGENCY_MEDIUM,
+                    "reason": REASON_CHANNEL_DEPLETED,
+                    "current_balance_pct": local_pct
+                })
+            elif local_pct > 0.8:
+                # Depleted inbound - need inbound from this peer
+                amount_needed = int(local - capacity * 0.5)
+                needs.append({
+                    "need_type": NEED_INBOUND,
+                    "target_peer_id": peer_id,
+                    "amount_sats": amount_needed,
+                    "urgency": URGENCY_HIGH if local_pct > 0.9 else URGENCY_MEDIUM,
+                    "reason": REASON_CHANNEL_DEPLETED,
+                    "current_balance_pct": local_pct
+                })
+
+        return needs
+
+    def get_nnlb_assistance_status(self) -> Dict[str, Any]:
+        """
+        Get status of NNLB liquidity assistance.
+
+        Returns:
+            Dict with assistance statistics
+        """
+        needs = self.get_prioritized_needs()
+
+        # Count by urgency
+        urgency_counts = defaultdict(int)
+        for need in needs:
+            urgency_counts[need.urgency] += 1
+
+        # Get struggling members
+        struggling = self.database.get_struggling_members(threshold=40)
+        helpers = self.database.get_helping_members()
+
+        return {
+            "pending_needs": len(needs),
+            "critical_needs": urgency_counts.get(URGENCY_CRITICAL, 0),
+            "high_needs": urgency_counts.get(URGENCY_HIGH, 0),
+            "medium_needs": urgency_counts.get(URGENCY_MEDIUM, 0),
+            "low_needs": urgency_counts.get(URGENCY_LOW, 0),
+            "struggling_members": len(struggling),
+            "available_helpers": len(helpers),
+            "pending_proposals": len(self._pending_proposals)
+        }
+
+    def cleanup_expired_data(self):
+        """Clean up expired proposals and old needs."""
+        now = time.time()
+
+        # Remove expired proposals
+        expired_proposals = [
+            pid for pid, prop in self._pending_proposals.items()
+            if prop.expires_at < now
+        ]
+        for pid in expired_proposals:
+            del self._pending_proposals[pid]
+
+        # Remove old needs (older than 1 hour)
+        old_needs = [
+            rid for rid, need in self._liquidity_needs.items()
+            if now - need.timestamp > 3600
+        ]
+        for rid in old_needs:
+            del self._liquidity_needs[rid]

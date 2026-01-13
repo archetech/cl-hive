@@ -70,6 +70,7 @@ from modules.clboss_bridge import CLBossBridge
 from modules.governance import DecisionEngine
 from modules.vpn_transport import VPNTransportManager
 from modules.fee_intelligence import FeeIntelligenceManager
+from modules.liquidity_coordinator import LiquidityCoordinator
 
 # Initialize the plugin
 plugin = Plugin()
@@ -204,6 +205,7 @@ decision_engine: Optional[DecisionEngine] = None
 vpn_transport: Optional[VPNTransportManager] = None
 coop_expansion: Optional[CooperativeExpansionManager] = None
 fee_intel_mgr: Optional[FeeIntelligenceManager] = None
+liquidity_coord: Optional[LiquidityCoordinator] = None
 our_pubkey: Optional[str] = None
 
 
@@ -936,6 +938,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     fee_intel_thread.start()
     plugin.log("cl-hive: Fee intelligence thread started")
 
+    # Initialize Liquidity Coordinator (Phase 7.3 - Cooperative Rebalancing)
+    global liquidity_coord
+    liquidity_coord = LiquidityCoordinator(
+        database=database,
+        plugin=safe_plugin,
+        our_pubkey=our_pubkey,
+        fee_intel_mgr=fee_intel_mgr
+    )
+    plugin.log("cl-hive: Liquidity coordinator initialized")
+
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
     global peer_available_limiter
     peer_available_limiter = RateLimiter(max_per_minute=10, window_seconds=60)
@@ -1066,6 +1078,8 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_fee_intelligence(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.HEALTH_REPORT:
             return handle_health_report(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.LIQUIDITY_NEED:
+            return handle_liquidity_need(peer_id, msg_payload, plugin)
         else:
             # Known but unimplemented message type (Phase 4+)
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
@@ -3104,6 +3118,38 @@ def handle_health_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     return {"result": "continue"}
 
 
+def handle_liquidity_need(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle LIQUIDITY_NEED message from a hive member.
+
+    Used for cooperative rebalancing coordination.
+    """
+    if not liquidity_coord or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: LIQUIDITY_NEED from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to liquidity coordinator
+    result = liquidity_coord.handle_liquidity_need(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        plugin.log(
+            f"cl-hive: Stored liquidity need from {peer_id[:16]}...",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: LIQUIDITY_NEED rejected from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
 # =============================================================================
 # PHASE 3: INTENT MONITOR BACKGROUND THREAD
 # =============================================================================
@@ -3347,6 +3393,23 @@ def fee_intelligence_loop():
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Fee intelligence cleanup error: {e}", level='warn')
 
+            # Step 5: Broadcast liquidity needs (Phase 7.3)
+            _broadcast_liquidity_needs()
+
+            # Step 6: Look for internal rebalance opportunities
+            _check_rebalance_opportunities()
+
+            # Step 7: Cleanup old liquidity needs
+            try:
+                deleted_needs = database.cleanup_old_liquidity_needs(max_age_hours=24)
+                if deleted_needs > 0:
+                    safe_plugin.log(
+                        f"cl-hive: Cleaned up {deleted_needs} old liquidity needs",
+                        level='debug'
+                    )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Liquidity needs cleanup error: {e}", level='warn')
+
         except Exception as e:
             if safe_plugin:
                 safe_plugin.log(f"cl-hive: Fee intelligence loop error: {e}", level='warn')
@@ -3586,6 +3649,107 @@ def _broadcast_health_report():
     except Exception as e:
         if safe_plugin:
             safe_plugin.log(f"cl-hive: Health report broadcast error: {e}", level='warn')
+
+
+def _broadcast_liquidity_needs():
+    """
+    Assess and broadcast our liquidity needs to hive members.
+
+    Identifies channels that need rebalancing and broadcasts
+    LIQUIDITY_NEED messages for cooperative assistance.
+    """
+    if not liquidity_coord or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        # Get our channel data
+        funds = safe_plugin.rpc.listfunds()
+
+        # Assess our liquidity needs
+        needs = liquidity_coord.assess_our_liquidity_needs(funds)
+
+        if not needs:
+            return
+
+        # Get hive members
+        members = database.get_all_members()
+
+        # Get our capacity to help others
+        can_help = liquidity_coord.can_help_with_liquidity(funds)
+
+        broadcast_count = 0
+        for need in needs[:3]:  # Broadcast top 3 needs
+            msg = liquidity_coord.create_liquidity_need_message(
+                need_type=need["need_type"],
+                target_peer_id=need["target_peer_id"],
+                amount_sats=need["amount_sats"],
+                urgency=need["urgency"],
+                max_fee_ppm=100,  # Willing to pay 100ppm
+                reason=need["reason"],
+                current_balance_pct=need["current_balance_pct"],
+                can_provide_inbound=can_help["can_provide_inbound"],
+                can_provide_outbound=can_help["can_provide_outbound"],
+                rpc=safe_plugin.rpc
+            )
+
+            if msg:
+                for member in members:
+                    member_id = member.get("peer_id")
+                    if not member_id or member_id == our_pubkey:
+                        continue
+                    try:
+                        safe_plugin.rpc.call("sendcustommsg", {
+                            "node_id": member_id,
+                            "msg": msg.hex()
+                        })
+                        broadcast_count += 1
+                    except Exception:
+                        pass
+
+        if broadcast_count > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast {len(needs[:3])} liquidity needs to hive",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Liquidity needs broadcast error: {e}", level='warn')
+
+
+def _check_rebalance_opportunities():
+    """
+    Check for internal rebalance opportunities to help other members.
+
+    Looks for opportunities to push liquidity to struggling members
+    via zero-cost internal hive channels.
+    """
+    if not liquidity_coord or not safe_plugin or not database:
+        return
+
+    try:
+        # Get our channel data
+        funds = safe_plugin.rpc.listfunds()
+
+        # Look for opportunity to help
+        proposal = liquidity_coord.find_internal_rebalance_opportunity(funds)
+
+        if proposal:
+            safe_plugin.log(
+                f"cl-hive: Found rebalance opportunity: "
+                f"{proposal.amount_sats} sats to {proposal.to_member[:16]}... "
+                f"(cost={proposal.estimated_cost_sats}, priority={proposal.nnlb_priority:.2f})",
+                level='info'
+            )
+            # Note: Actual execution would be implemented in Phase 4
+            # For now, just log the opportunity
+
+        # Cleanup expired data
+        liquidity_coord.cleanup_expired_data()
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Rebalance opportunity check error: {e}", level='warn')
 
 
 # =============================================================================
