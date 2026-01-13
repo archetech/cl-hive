@@ -10,7 +10,7 @@
 #   routing, performance, metrics, simulation, reset
 #
 # Hive Categories:
-#   hive, hive_genesis, hive_join, hive_sync, hive_expansion, hive_reset
+#   hive, hive_genesis, hive_join, hive_sync, hive_expansion, hive_fees, hive_reset
 #
 # Example: ./test.sh all 1
 # Example: ./test.sh flow 1
@@ -2278,12 +2278,53 @@ test_hive_reset() {
     log_info "Hive reset complete"
 }
 
+# Hive Fee Coordination Tests - Cooperative fee intelligence
+test_hive_fees() {
+    echo ""
+    echo "========================================"
+    echo "HIVE COOPERATIVE FEE COORDINATION TESTS"
+    echo "========================================"
+    echo ""
+
+    log_info "Running cooperative fee coordination test suite..."
+
+    # Run the dedicated fee coordination test script
+    local SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "$SCRIPT_DIR/test-coop-fee-coordination.sh" ]; then
+        "$SCRIPT_DIR/test-coop-fee-coordination.sh" "$NETWORK_ID"
+    else
+        log_info "Running inline fee coordination tests..."
+
+        # Test Phase 1: Fee Intelligence RPCs
+        run_test "hive-fee-profiles exists" "hive_cli alice hive-fee-profiles | jq -e '.'"
+        run_test "hive-fee-intelligence exists" "hive_cli alice hive-fee-intelligence | jq -e '.report_count >= 0'"
+        run_test "hive-aggregate-fees exists" "hive_cli alice hive-aggregate-fees | jq -e '.status == \"ok\"'"
+
+        # Test Phase 2: Health Reports
+        run_test "hive-member-health exists" "hive_cli alice hive-member-health | jq -e '.'"
+        run_test "hive-calculate-health exists" "hive_cli alice hive-calculate-health | jq -e '.our_pubkey'"
+        run_test "hive-nnlb-status exists" "hive_cli alice hive-nnlb-status | jq -e '.'"
+
+        # Test Phase 3: Liquidity Coordination
+        run_test "hive-liquidity-needs exists" "hive_cli alice hive-liquidity-needs | jq -e '.need_count >= 0'"
+        run_test "hive-liquidity-status exists" "hive_cli alice hive-liquidity-status | jq -e '.status == \"active\"'"
+
+        # Test Phase 4: Routing Intelligence
+        run_test "hive-routing-stats exists" "hive_cli alice hive-routing-stats | jq -e '.paths_tracked >= 0'"
+
+        # Test Phase 5: Peer Reputation
+        run_test "hive-peer-reputations exists" "hive_cli alice hive-peer-reputations | jq -e '.'"
+        run_test "hive-reputation-stats exists" "hive_cli alice hive-reputation-stats | jq -e '.total_peers_tracked >= 0'"
+    fi
+}
+
 # Combined hive test suite
 test_hive() {
     test_hive_genesis
     test_hive_join
     test_hive_sync
     test_hive_expansion
+    test_hive_fees
 }
 
 run_category() {
@@ -2357,6 +2398,9 @@ run_category() {
         hive_expansion)
             test_hive_expansion
             ;;
+        hive_fees)
+            test_hive_fees
+            ;;
         hive_reset)
             test_hive_reset
             ;;
@@ -2415,6 +2459,7 @@ run_category() {
             echo "  hive_join      - Member invitation and join"
             echo "  hive_sync      - State synchronization"
             echo "  hive_expansion - Cooperative expansion"
+            echo "  hive_fees      - Cooperative fee coordination (Phases 1-5)"
             echo "  hive_reset     - Reset hive state"
             exit 1
             ;;
