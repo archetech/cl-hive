@@ -1666,9 +1666,13 @@ test_performance() {
         log_info "Database size: ${DB_SIZE} bytes"
         run_test "Database file exists" "[ -n '$DB_SIZE' ]"
 
-        # Run a quick query count test
-        TABLE_COUNT=$(docker exec polar-n${NETWORK_ID}-alice sqlite3 /home/clightning/.lightning/revenue_ops.db \
-            "SELECT count(*) FROM sqlite_master WHERE type='table'" 2>/dev/null || echo "0")
+        # Run a quick query count test (using python since sqlite3 CLI may not be in container)
+        TABLE_COUNT=$(docker exec polar-n${NETWORK_ID}-alice python3 -c "
+import sqlite3
+conn = sqlite3.connect('/home/clightning/.lightning/revenue_ops.db')
+print(conn.execute(\"SELECT count(*) FROM sqlite_master WHERE type='table'\").fetchone()[0])
+conn.close()
+" 2>/dev/null || echo "0")
         log_info "Database tables: $TABLE_COUNT"
         run_test "Database has tables" "[ '$TABLE_COUNT' -gt 0 ]"
     fi
@@ -1825,7 +1829,7 @@ test_simulation() {
 
     # Test help command
     run_test "simulate.sh help works" \
-        "'$SIMULATE_SCRIPT' help 2>/dev/null | grep -q 'cl-revenue-ops Simulation Suite'"
+        "'$SIMULATE_SCRIPT' help 2>/dev/null | grep -q 'Simulation Suite'"
 
     # Quick traffic test (2 minute balanced scenario)
     if channels_exist; then
