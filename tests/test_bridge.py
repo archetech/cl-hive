@@ -16,7 +16,20 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pyln.client import RpcError
+# Create a mock RpcError class (must be done before importing modules)
+class MockRpcError(Exception):
+    """Mock RpcError to match pyln.client.RpcError behavior."""
+    pass
+
+# Mock pyln.client before importing modules
+mock_pyln = MagicMock()
+mock_pyln.Plugin = MagicMock
+mock_pyln.RpcError = MockRpcError
+sys.modules['pyln'] = mock_pyln
+sys.modules['pyln.client'] = mock_pyln
+
+# Alias for use in tests
+RpcError = MockRpcError
 
 from modules.bridge import (
     Bridge,
@@ -355,27 +368,27 @@ class TestRevenueOpsIntegration:
         """set_hive_policy sets HIVE strategy for members."""
         bridge._status = BridgeStatus.ENABLED
         mock_rpc.call.return_value = {"status": "success"}
-        
+
         result = bridge.set_hive_policy("peer123" * 5, True)
-        
+
         assert result is True
         mock_rpc.call.assert_called_with("revenue-policy", {
-            "subcommand": "set",
+            "action": "set",
             "peer_id": "peer123" * 5,
             "strategy": "hive",
             "rebalance": "enabled"
         })
-    
+
     def test_set_hive_policy_non_member(self, bridge, mock_rpc):
         """set_hive_policy sets DYNAMIC strategy for non-members."""
         bridge._status = BridgeStatus.ENABLED
         mock_rpc.call.return_value = {"status": "success"}
-        
+
         result = bridge.set_hive_policy("peer123" * 5, False)
-        
+
         assert result is True
         mock_rpc.call.assert_called_with("revenue-policy", {
-            "subcommand": "set",
+            "action": "set",
             "peer_id": "peer123" * 5,
             "strategy": "dynamic"
         })
@@ -396,19 +409,23 @@ class TestRevenueOpsIntegration:
         """trigger_rebalance initiates rebalance successfully."""
         bridge._status = BridgeStatus.ENABLED
         mock_rpc.call.return_value = {"status": "initiated"}
-        
-        result = bridge.trigger_rebalance("target_peer" * 5, 100000)
-        
+
+        # Mock _get_channel_scid to return valid SCIDs
+        with patch.object(bridge, '_get_channel_scid') as mock_get_scid:
+            mock_get_scid.side_effect = lambda peer: f"{peer[:8]}_scid"
+
+            result = bridge.trigger_rebalance("target_peer" * 5, 100000, "source_peer" * 5)
+
         assert result is True
         mock_rpc.call.assert_called_with("revenue-rebalance", {
-            "from": "auto",
-            "to": "target_peer" * 5,
-            "amount": 100000
+            "from_channel": "source_p_scid",
+            "to_channel": "target_p_scid",
+            "amount_sats": 100000
         })
-    
+
     def test_trigger_rebalance_disabled(self, bridge):
         """trigger_rebalance returns False when disabled."""
-        result = bridge.trigger_rebalance("target", 100000)
+        result = bridge.trigger_rebalance("target", 100000, "source")
         assert result is False
     
     def test_get_peer_policy_success(self, bridge, mock_rpc):
