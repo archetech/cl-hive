@@ -74,6 +74,10 @@ from modules.cooperative_expansion import CooperativeExpansionManager
 from modules.clboss_bridge import CLBossBridge
 from modules.governance import DecisionEngine
 from modules.vpn_transport import VPNTransportManager
+from modules.fee_intelligence import FeeIntelligenceManager
+from modules.liquidity_coordinator import LiquidityCoordinator
+from modules.routing_intelligence import HiveRoutingMap
+from modules.peer_reputation import PeerReputationManager
 from modules.rpc_commands import (
     HiveContext,
     status as rpc_status,
@@ -231,6 +235,10 @@ clboss_bridge: Optional[CLBossBridge] = None
 decision_engine: Optional[DecisionEngine] = None
 vpn_transport: Optional[VPNTransportManager] = None
 coop_expansion: Optional[CooperativeExpansionManager] = None
+fee_intel_mgr: Optional[FeeIntelligenceManager] = None
+liquidity_coord: Optional[LiquidityCoordinator] = None
+routing_map: Optional[HiveRoutingMap] = None
+peer_reputation_mgr: Optional[PeerReputationManager] = None
 our_pubkey: Optional[str] = None
 
 
@@ -987,6 +995,56 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Cooperative expansion manager initialized")
 
+    # Initialize Fee Intelligence Manager (Phase 7 - Cooperative Fee Coordination)
+    global fee_intel_mgr
+    fee_intel_mgr = FeeIntelligenceManager(
+        database=database,
+        plugin=safe_plugin,
+        our_pubkey=our_pubkey
+    )
+    plugin.log("cl-hive: Fee intelligence manager initialized")
+
+    # Start fee intelligence background thread (Phase 7)
+    fee_intel_thread = threading.Thread(
+        target=fee_intelligence_loop,
+        name="cl-hive-fee-intelligence",
+        daemon=True
+    )
+    fee_intel_thread.start()
+    plugin.log("cl-hive: Fee intelligence thread started")
+
+    # Initialize Liquidity Coordinator (Phase 7.3 - Cooperative Rebalancing)
+    global liquidity_coord
+    liquidity_coord = LiquidityCoordinator(
+        database=database,
+        plugin=safe_plugin,
+        our_pubkey=our_pubkey,
+        fee_intel_mgr=fee_intel_mgr
+    )
+    plugin.log("cl-hive: Liquidity coordinator initialized")
+
+    # Initialize Routing Map (Phase 7.4 - Routing Intelligence)
+    global routing_map
+    routing_map = HiveRoutingMap(
+        database=database,
+        plugin=safe_plugin,
+        our_pubkey=our_pubkey
+    )
+    # Load existing probes from database
+    routing_map.aggregate_from_database()
+    plugin.log("cl-hive: Routing map initialized")
+
+    # Initialize Peer Reputation Manager (Phase 5 - Advanced Cooperation)
+    global peer_reputation_mgr
+    peer_reputation_mgr = PeerReputationManager(
+        database=database,
+        plugin=safe_plugin,
+        our_pubkey=our_pubkey
+    )
+    # Load existing reputation data from database
+    peer_reputation_mgr.aggregate_from_database()
+    plugin.log("cl-hive: Peer reputation manager initialized")
+
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
     global peer_available_limiter
     peer_available_limiter = RateLimiter(max_per_minute=10, window_seconds=60)
@@ -1112,8 +1170,19 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_expansion_nominate(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.EXPANSION_ELECT:
             return handle_expansion_elect(peer_id, msg_payload, plugin)
+        # Phase 7: Cooperative Fee Coordination
+        elif msg_type == HiveMessageType.FEE_INTELLIGENCE:
+            return handle_fee_intelligence(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.HEALTH_REPORT:
+            return handle_health_report(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.LIQUIDITY_NEED:
+            return handle_liquidity_need(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.ROUTE_PROBE:
+            return handle_route_probe(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.PEER_REPUTATION:
+            return handle_peer_reputation(peer_id, msg_payload, plugin)
         else:
-            # Known but unimplemented message type (Phase 4+)
+            # Known but unimplemented message type
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
             
@@ -3399,6 +3468,172 @@ def handle_expansion_elect(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
 
 # =============================================================================
+# PHASE 7: FEE INTELLIGENCE MESSAGE HANDLERS
+# =============================================================================
+
+def handle_fee_intelligence(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle FEE_INTELLIGENCE message from a hive member.
+
+    Validates signature and stores the fee observation for aggregation.
+    """
+    if not fee_intel_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: FEE_INTELLIGENCE from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to fee intelligence manager
+    result = fee_intel_mgr.handle_fee_intelligence(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        plugin.log(
+            f"cl-hive: Stored fee intelligence from {peer_id[:16]}... "
+            f"for {payload.get('target_peer_id', '')[:16]}...",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: FEE_INTELLIGENCE rejected from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_health_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle HEALTH_REPORT message from a hive member.
+
+    Used for NNLB (No Node Left Behind) coordination.
+    """
+    if not fee_intel_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: HEALTH_REPORT from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to fee intelligence manager
+    result = fee_intel_mgr.handle_health_report(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        tier = result.get("tier", "unknown")
+        plugin.log(
+            f"cl-hive: Stored health report from {peer_id[:16]}... (tier={tier})",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: HEALTH_REPORT rejected from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_liquidity_need(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle LIQUIDITY_NEED message from a hive member.
+
+    Used for cooperative rebalancing coordination.
+    """
+    if not liquidity_coord or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: LIQUIDITY_NEED from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to liquidity coordinator
+    result = liquidity_coord.handle_liquidity_need(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        plugin.log(
+            f"cl-hive: Stored liquidity need from {peer_id[:16]}...",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: LIQUIDITY_NEED rejected from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle ROUTE_PROBE message from a hive member.
+
+    Used for collective routing intelligence.
+    """
+    if not routing_map or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: ROUTE_PROBE from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to routing map
+    result = routing_map.handle_route_probe(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        plugin.log(
+            f"cl-hive: Stored route probe from {peer_id[:16]}...",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: ROUTE_PROBE rejected from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_peer_reputation(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle PEER_REPUTATION message from a hive member.
+
+    Used for collective peer reputation tracking.
+    """
+    if not peer_reputation_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: PEER_REPUTATION from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to peer reputation manager
+    result = peer_reputation_mgr.handle_peer_reputation(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        plugin.log(
+            f"cl-hive: Stored peer reputation from {peer_id[:16]}...",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: PEER_REPUTATION rejected from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+# =============================================================================
 # PHASE 3: INTENT MONITOR BACKGROUND THREAD
 # =============================================================================
 
@@ -3578,6 +3813,466 @@ def planner_loop():
 
         # Wait for next cycle or shutdown
         shutdown_event.wait(sleep_time)
+
+
+# =============================================================================
+# PHASE 7: FEE INTELLIGENCE BACKGROUND LOOP
+# =============================================================================
+
+# Fee intelligence loop interval (1 hour default)
+FEE_INTELLIGENCE_INTERVAL = 3600
+
+# Health report broadcast interval (1 hour)
+HEALTH_REPORT_INTERVAL = 3600
+
+# Fee intelligence cleanup interval (keep 7 days)
+FEE_INTELLIGENCE_MAX_AGE_HOURS = 168
+
+
+def fee_intelligence_loop():
+    """
+    Background thread for cooperative fee coordination.
+
+    Runs periodically to:
+    1. Collect and broadcast our fee observations to hive members
+    2. Aggregate received fee intelligence into peer profiles
+    3. Broadcast our health report for NNLB coordination
+    4. Clean up old fee intelligence records
+    """
+    # Wait for initialization
+    shutdown_event.wait(60)
+
+    while not shutdown_event.is_set():
+        try:
+            if not fee_intel_mgr or not database or not safe_plugin or not our_pubkey:
+                shutdown_event.wait(60)
+                continue
+
+            # Step 1: Collect and broadcast our fee intelligence
+            _broadcast_our_fee_intelligence()
+
+            # Step 2: Aggregate all received fee intelligence
+            try:
+                updated = fee_intel_mgr.aggregate_fee_profiles()
+                if updated > 0:
+                    safe_plugin.log(
+                        f"cl-hive: Aggregated {updated} peer fee profiles",
+                        level='debug'
+                    )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Fee aggregation error: {e}", level='warn')
+
+            # Step 3: Broadcast our health report
+            _broadcast_health_report()
+
+            # Step 4: Cleanup old records
+            try:
+                deleted = database.cleanup_old_fee_intelligence(FEE_INTELLIGENCE_MAX_AGE_HOURS)
+                if deleted > 0:
+                    safe_plugin.log(
+                        f"cl-hive: Cleaned up {deleted} old fee intelligence records",
+                        level='debug'
+                    )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Fee intelligence cleanup error: {e}", level='warn')
+
+            # Step 5: Broadcast liquidity needs (Phase 7.3)
+            _broadcast_liquidity_needs()
+
+            # Step 6: Look for internal rebalance opportunities
+            _check_rebalance_opportunities()
+
+            # Step 7: Cleanup old liquidity needs
+            try:
+                deleted_needs = database.cleanup_old_liquidity_needs(max_age_hours=24)
+                if deleted_needs > 0:
+                    safe_plugin.log(
+                        f"cl-hive: Cleaned up {deleted_needs} old liquidity needs",
+                        level='debug'
+                    )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Liquidity needs cleanup error: {e}", level='warn')
+
+            # Step 8: Cleanup old route probes (Phase 7.4 - Routing Intelligence)
+            try:
+                if routing_map:
+                    # Clean database
+                    deleted_probes = database.cleanup_old_route_probes(max_age_hours=24)
+                    if deleted_probes > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {deleted_probes} old route probes from database",
+                            level='debug'
+                        )
+                    # Clean in-memory stats
+                    cleaned_paths = routing_map.cleanup_stale_data()
+                    if cleaned_paths > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {cleaned_paths} stale paths from routing map",
+                            level='debug'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Route probe cleanup error: {e}", level='warn')
+
+            # Step 9: Cleanup old peer reputation (Phase 5 - Advanced Cooperation)
+            try:
+                if peer_reputation_mgr:
+                    # Clean database
+                    deleted_reps = database.cleanup_old_peer_reputation(max_age_hours=168)
+                    if deleted_reps > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {deleted_reps} old peer reputation records",
+                            level='debug'
+                        )
+                    # Clean in-memory aggregations
+                    cleaned_reps = peer_reputation_mgr.cleanup_stale_data()
+                    if cleaned_reps > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {cleaned_reps} stale peer reputations",
+                            level='debug'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Peer reputation cleanup error: {e}", level='warn')
+
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"cl-hive: Fee intelligence loop error: {e}", level='warn')
+
+        # Wait for next cycle
+        shutdown_event.wait(FEE_INTELLIGENCE_INTERVAL)
+
+
+def _broadcast_our_fee_intelligence():
+    """
+    Collect fee observations from our channels and broadcast to hive.
+
+    Gathers fee and performance data for each external peer we have
+    channels with and broadcasts FEE_INTELLIGENCE messages.
+    """
+    if not fee_intel_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        # Get our channels
+        funds = safe_plugin.rpc.listfunds()
+        channels = funds.get("channels", [])
+
+        # Get list of hive members (to exclude from external peer reporting)
+        members = database.get_all_members()
+        member_ids = {m.get("peer_id") for m in members}
+
+        # Get forwarding stats if available
+        try:
+            forwards = safe_plugin.rpc.listforwards(status="settled")
+            forwards_list = forwards.get("forwards", [])
+        except Exception:
+            forwards_list = []
+
+        # Build forward stats by peer
+        peer_forwards = {}
+        seven_days_ago = int(time.time()) - (7 * 24 * 3600)
+        for fwd in forwards_list:
+            # Filter to last 7 days
+            received_time = fwd.get("received_time", 0)
+            if received_time < seven_days_ago:
+                continue
+
+            out_channel = fwd.get("out_channel")
+            if out_channel:
+                if out_channel not in peer_forwards:
+                    peer_forwards[out_channel] = {
+                        "count": 0,
+                        "volume_msat": 0,
+                        "fee_msat": 0
+                    }
+                peer_forwards[out_channel]["count"] += 1
+                peer_forwards[out_channel]["volume_msat"] += fwd.get("out_msat", 0)
+                peer_forwards[out_channel]["fee_msat"] += fwd.get("fee_msat", 0)
+
+        # Collect fee intelligence for each external peer
+        broadcast_count = 0
+        for channel in channels:
+            if channel.get("state") != "CHANNELD_NORMAL":
+                continue
+
+            peer_id = channel.get("peer_id")
+            if not peer_id or peer_id in member_ids:
+                # Skip hive members - only report on external peers
+                continue
+
+            short_channel_id = channel.get("short_channel_id")
+            if not short_channel_id:
+                continue
+
+            # Get channel capacity and balance
+            amount_msat = channel.get("amount_msat", 0)
+            our_amount_msat = channel.get("our_amount_msat", 0)
+            capacity_sats = amount_msat // 1000
+            available_sats = our_amount_msat // 1000
+
+            if capacity_sats == 0:
+                continue
+
+            utilization_pct = available_sats / capacity_sats if capacity_sats > 0 else 0
+
+            # Determine flow direction based on balance
+            if utilization_pct > 0.7:
+                flow_direction = "source"  # We have excess, liquidity flows out
+            elif utilization_pct < 0.3:
+                flow_direction = "sink"  # We need liquidity, flows in
+            else:
+                flow_direction = "balanced"
+
+            # Get forward stats for this channel
+            stats = peer_forwards.get(short_channel_id, {})
+            forward_count = stats.get("count", 0)
+            forward_volume_sats = stats.get("volume_msat", 0) // 1000
+            revenue_sats = stats.get("fee_msat", 0) // 1000
+
+            # Get our fee rate for this channel (simplified - would need listpeerchannels)
+            our_fee_ppm = 100  # Default, would query actual fee
+
+            # Create and broadcast fee intelligence message
+            try:
+                msg = fee_intel_mgr.create_fee_intelligence_message(
+                    target_peer_id=peer_id,
+                    our_fee_ppm=our_fee_ppm,
+                    their_fee_ppm=0,  # Would need to look up
+                    forward_count=forward_count,
+                    forward_volume_sats=forward_volume_sats,
+                    revenue_sats=revenue_sats,
+                    flow_direction=flow_direction,
+                    utilization_pct=utilization_pct,
+                    rpc=safe_plugin.rpc,
+                    days_observed=7
+                )
+
+                if msg:
+                    # Broadcast to all hive members
+                    for member in members:
+                        member_id = member.get("peer_id")
+                        if not member_id or member_id == our_pubkey:
+                            continue
+                        try:
+                            safe_plugin.rpc.call("sendcustommsg", {
+                                "node_id": member_id,
+                                "msg": msg.hex()
+                            })
+                            broadcast_count += 1
+                        except Exception:
+                            pass  # Peer might be offline
+
+            except Exception as e:
+                safe_plugin.log(
+                    f"cl-hive: Failed to create fee intelligence for {peer_id[:16]}...: {e}",
+                    level='debug'
+                )
+
+        if broadcast_count > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast fee intelligence ({broadcast_count} messages)",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Fee intelligence broadcast error: {e}", level='warn')
+
+
+def _broadcast_health_report():
+    """
+    Calculate and broadcast our health report for NNLB coordination.
+    """
+    if not fee_intel_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        # Get our channel data
+        funds = safe_plugin.rpc.listfunds()
+        channels = funds.get("channels", [])
+
+        capacity_sats = sum(
+            ch.get("amount_msat", 0) // 1000
+            for ch in channels if ch.get("state") == "CHANNELD_NORMAL"
+        )
+        available_sats = sum(
+            ch.get("our_amount_msat", 0) // 1000
+            for ch in channels if ch.get("state") == "CHANNELD_NORMAL"
+        )
+        channel_count = len([ch for ch in channels if ch.get("state") == "CHANNELD_NORMAL"])
+
+        # Get hive averages for comparison
+        all_health = database.get_all_member_health()
+        if all_health:
+            hive_avg_capacity = sum(
+                h.get("capacity_score", 50) for h in all_health
+            ) / len(all_health) * 200000
+        else:
+            hive_avg_capacity = 10_000_000
+
+        # Calculate our health
+        health = fee_intel_mgr.calculate_our_health(
+            capacity_sats=capacity_sats,
+            available_sats=available_sats,
+            channel_count=channel_count,
+            daily_revenue_sats=0,  # Would need forwarding stats over time
+            hive_avg_capacity=int(hive_avg_capacity)
+        )
+
+        # Store our own health record
+        database.update_member_health(
+            peer_id=our_pubkey,
+            overall_health=health["overall_health"],
+            capacity_score=health["capacity_score"],
+            revenue_score=health["revenue_score"],
+            connectivity_score=health["connectivity_score"],
+            tier=health["tier"],
+            needs_help=health["needs_help"],
+            can_help_others=health["can_help_others"],
+            needs_inbound=available_sats < capacity_sats * 0.3 if capacity_sats > 0 else False,
+            needs_outbound=available_sats > capacity_sats * 0.7 if capacity_sats > 0 else False,
+            needs_channels=channel_count < 5
+        )
+
+        # Create and broadcast health report
+        msg = fee_intel_mgr.create_health_report_message(
+            overall_health=health["overall_health"],
+            capacity_score=health["capacity_score"],
+            revenue_score=health["revenue_score"],
+            connectivity_score=health["connectivity_score"],
+            rpc=safe_plugin.rpc,
+            needs_inbound=available_sats < capacity_sats * 0.3 if capacity_sats > 0 else False,
+            needs_outbound=available_sats > capacity_sats * 0.7 if capacity_sats > 0 else False,
+            needs_channels=channel_count < 5,
+            can_provide_assistance=health["can_help_others"]
+        )
+
+        if msg:
+            members = database.get_all_members()
+            broadcast_count = 0
+            for member in members:
+                member_id = member.get("peer_id")
+                if not member_id or member_id == our_pubkey:
+                    continue
+                try:
+                    safe_plugin.rpc.call("sendcustommsg", {
+                        "node_id": member_id,
+                        "msg": msg.hex()
+                    })
+                    broadcast_count += 1
+                except Exception:
+                    pass
+
+            if broadcast_count > 0:
+                safe_plugin.log(
+                    f"cl-hive: Broadcast health report (health={health['overall_health']}, "
+                    f"tier={health['tier']}, to {broadcast_count} members)",
+                    level='debug'
+                )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Health report broadcast error: {e}", level='warn')
+
+
+def _broadcast_liquidity_needs():
+    """
+    Assess and broadcast our liquidity needs to hive members.
+
+    Identifies channels that need rebalancing and broadcasts
+    LIQUIDITY_NEED messages for cooperative assistance.
+    """
+    if not liquidity_coord or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        # Get our channel data
+        funds = safe_plugin.rpc.listfunds()
+
+        # Assess our liquidity needs
+        needs = liquidity_coord.assess_our_liquidity_needs(funds)
+
+        if not needs:
+            return
+
+        # Get hive members
+        members = database.get_all_members()
+
+        # Get our capacity to help others
+        can_help = liquidity_coord.can_help_with_liquidity(funds)
+
+        broadcast_count = 0
+        for need in needs[:3]:  # Broadcast top 3 needs
+            msg = liquidity_coord.create_liquidity_need_message(
+                need_type=need["need_type"],
+                target_peer_id=need["target_peer_id"],
+                amount_sats=need["amount_sats"],
+                urgency=need["urgency"],
+                max_fee_ppm=100,  # Willing to pay 100ppm
+                reason=need["reason"],
+                current_balance_pct=need["current_balance_pct"],
+                can_provide_inbound=can_help["can_provide_inbound"],
+                can_provide_outbound=can_help["can_provide_outbound"],
+                rpc=safe_plugin.rpc
+            )
+
+            if msg:
+                for member in members:
+                    member_id = member.get("peer_id")
+                    if not member_id or member_id == our_pubkey:
+                        continue
+                    try:
+                        safe_plugin.rpc.call("sendcustommsg", {
+                            "node_id": member_id,
+                            "msg": msg.hex()
+                        })
+                        broadcast_count += 1
+                    except Exception:
+                        pass
+
+        if broadcast_count > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast {len(needs[:3])} liquidity needs to hive",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Liquidity needs broadcast error: {e}", level='warn')
+
+
+def _check_rebalance_opportunities():
+    """
+    Check for internal rebalance opportunities to help other members.
+
+    Looks for opportunities to push liquidity to struggling members
+    via zero-cost internal hive channels.
+    """
+    if not liquidity_coord or not safe_plugin or not database:
+        return
+
+    try:
+        # Get our channel data
+        funds = safe_plugin.rpc.listfunds()
+
+        # Look for opportunity to help
+        proposal = liquidity_coord.find_internal_rebalance_opportunity(funds)
+
+        if proposal:
+            safe_plugin.log(
+                f"cl-hive: Found rebalance opportunity: "
+                f"{proposal.amount_sats} sats to {proposal.to_member[:16]}... "
+                f"(cost={proposal.estimated_cost_sats}, priority={proposal.nnlb_priority:.2f})",
+                level='info'
+            )
+            # Note: Actual execution would be implemented in Phase 4
+            # For now, just log the opportunity
+
+        # Cleanup expired data
+        liquidity_coord.cleanup_expired_data()
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Rebalance opportunity check error: {e}", level='warn')
 
 
 # =============================================================================
@@ -4629,6 +5324,505 @@ def hive_budget_summary(plugin: Plugin, days: int = 7):
     Permission: Member or Admin only
     """
     return rpc_budget_summary(_get_hive_context(), days)
+
+
+# =============================================================================
+# PHASE 7: FEE INTELLIGENCE RPC COMMANDS
+# =============================================================================
+
+@plugin.method("hive-fee-profiles")
+def hive_fee_profiles(plugin: Plugin, peer_id: str = None):
+    """
+    Get aggregated fee profiles for external peers.
+
+    Fee profiles are built from collective intelligence shared by hive members.
+    Includes optimal fee recommendations based on elasticity and NNLB.
+
+    Args:
+        peer_id: Optional specific peer to query (otherwise returns all)
+
+    Returns:
+        Dict with fee profile(s) and aggregation stats.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database or not fee_intel_mgr:
+        return {"error": "Fee intelligence not initialized"}
+
+    if peer_id:
+        # Query specific peer
+        profile = database.get_peer_fee_profile(peer_id)
+        if not profile:
+            return {
+                "peer_id": peer_id,
+                "error": "No fee profile found",
+                "hint": "No hive members have reported on this peer yet"
+            }
+        return {
+            "profile": profile
+        }
+    else:
+        # Return all profiles
+        profiles = database.get_all_peer_fee_profiles()
+        return {
+            "profile_count": len(profiles),
+            "profiles": profiles
+        }
+
+
+@plugin.method("hive-fee-recommendation")
+def hive_fee_recommendation(plugin: Plugin, peer_id: str, channel_size: int = 0):
+    """
+    Get fee recommendation for an external peer.
+
+    Uses collective fee intelligence and NNLB health adjustments
+    to recommend optimal fee for maximum revenue while supporting
+    struggling hive members.
+
+    Args:
+        peer_id: External peer to get recommendation for
+        channel_size: Our channel size to this peer (for context)
+
+    Returns:
+        Dict with recommended fee and reasoning.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database or not fee_intel_mgr:
+        return {"error": "Fee intelligence not initialized"}
+
+    # Get our health for NNLB adjustment
+    our_health = 50  # Default to healthy
+    if our_pubkey:
+        health_record = database.get_member_health(our_pubkey)
+        if health_record:
+            our_health = health_record.get("overall_health", 50)
+
+    recommendation = fee_intel_mgr.get_fee_recommendation(
+        target_peer_id=peer_id,
+        our_channel_size=channel_size,
+        our_health=our_health
+    )
+
+    return recommendation
+
+
+@plugin.method("hive-fee-intelligence")
+def hive_fee_intelligence(plugin: Plugin, max_age_hours: int = 24, peer_id: str = None):
+    """
+    Get raw fee intelligence reports.
+
+    Returns individual fee observations from hive members before aggregation.
+
+    Args:
+        max_age_hours: Maximum age of reports to return (default 24)
+        peer_id: Optional filter by target peer
+
+    Returns:
+        Dict with fee intelligence reports.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database:
+        return {"error": "Database not initialized"}
+
+    if peer_id:
+        reports = database.get_fee_intelligence_for_peer(peer_id, max_age_hours)
+    else:
+        reports = database.get_all_fee_intelligence(max_age_hours)
+
+    return {
+        "report_count": len(reports),
+        "max_age_hours": max_age_hours,
+        "reports": reports
+    }
+
+
+@plugin.method("hive-aggregate-fees")
+def hive_aggregate_fees(plugin: Plugin):
+    """
+    Trigger fee profile aggregation.
+
+    Aggregates all recent fee intelligence into peer fee profiles.
+    Normally runs automatically, but can be triggered manually.
+
+    Returns:
+        Dict with aggregation results.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not fee_intel_mgr:
+        return {"error": "Fee intelligence manager not initialized"}
+
+    updated_count = fee_intel_mgr.aggregate_fee_profiles()
+
+    return {
+        "status": "ok",
+        "profiles_updated": updated_count
+    }
+
+
+@plugin.method("hive-nnlb-status")
+def hive_nnlb_status(plugin: Plugin):
+    """
+    Get NNLB (No Node Left Behind) status.
+
+    Shows health distribution across hive members and identifies
+    struggling members who may need assistance.
+
+    Returns:
+        Dict with NNLB statistics and member health tiers.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not fee_intel_mgr:
+        return {"error": "Fee intelligence manager not initialized"}
+
+    return fee_intel_mgr.get_nnlb_status()
+
+
+@plugin.method("hive-member-health")
+def hive_member_health(plugin: Plugin, peer_id: str = None):
+    """
+    Get health records for hive members.
+
+    Health records include capacity, revenue, and connectivity scores
+    used for NNLB assistance decisions.
+
+    Args:
+        peer_id: Optional specific member to query
+
+    Returns:
+        Dict with health record(s).
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database:
+        return {"error": "Database not initialized"}
+
+    if peer_id:
+        health = database.get_member_health(peer_id)
+        if not health:
+            return {
+                "peer_id": peer_id,
+                "error": "No health record found"
+            }
+        return {"health": health}
+    else:
+        all_health = database.get_all_member_health()
+        return {
+            "member_count": len(all_health),
+            "health_records": all_health
+        }
+
+
+@plugin.method("hive-calculate-health")
+def hive_calculate_health(plugin: Plugin):
+    """
+    Calculate and return our node's health score.
+
+    Uses local channel and revenue data to calculate health scores
+    for NNLB purposes.
+
+    Returns:
+        Dict with our health assessment.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not fee_intel_mgr or not safe_plugin:
+        return {"error": "Not initialized"}
+
+    # Get our channel data
+    try:
+        funds = safe_plugin.rpc.listfunds()
+        channels = funds.get("channels", [])
+
+        capacity_sats = sum(
+            ch.get("our_amount_msat", 0) // 1000 + ch.get("amount_msat", 0) // 1000 - ch.get("our_amount_msat", 0) // 1000
+            for ch in channels if ch.get("state") == "CHANNELD_NORMAL"
+        )
+        available_sats = sum(
+            ch.get("our_amount_msat", 0) // 1000
+            for ch in channels if ch.get("state") == "CHANNELD_NORMAL"
+        )
+        channel_count = len([ch for ch in channels if ch.get("state") == "CHANNELD_NORMAL"])
+
+    except Exception as e:
+        return {"error": f"Failed to get channel data: {e}"}
+
+    # Get hive averages for comparison
+    all_health = database.get_all_member_health() if database else []
+    if all_health:
+        hive_avg_capacity = sum(h.get("capacity_score", 50) for h in all_health) / len(all_health) * 200000
+    else:
+        hive_avg_capacity = 10_000_000  # 10M default
+
+    # Calculate health (revenue estimation simplified)
+    health = fee_intel_mgr.calculate_our_health(
+        capacity_sats=capacity_sats,
+        available_sats=available_sats,
+        channel_count=channel_count,
+        daily_revenue_sats=0,  # Would need forwarding stats
+        hive_avg_capacity=int(hive_avg_capacity)
+    )
+
+    return {
+        "our_pubkey": our_pubkey,
+        "channel_count": channel_count,
+        "capacity_sats": capacity_sats,
+        "available_sats": available_sats,
+        **health
+    }
+
+
+@plugin.method("hive-routing-stats")
+def hive_routing_stats(plugin: Plugin):
+    """
+    Get routing intelligence statistics.
+
+    Shows collective routing intelligence from all hive members including
+    path success rates, probe counts, and route suggestions.
+
+    Returns:
+        Dict with routing intelligence statistics.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not routing_map:
+        return {"error": "Routing intelligence not initialized"}
+
+    stats = routing_map.get_routing_stats()
+    return {
+        "paths_tracked": stats.get("total_paths", 0),
+        "total_probes": stats.get("total_probes", 0),
+        "total_successes": stats.get("total_successes", 0),
+        "unique_destinations": stats.get("unique_destinations", 0),
+        "high_quality_paths": stats.get("high_quality_paths", 0),
+        "overall_success_rate": round(stats.get("overall_success_rate", 0.0), 3),
+    }
+
+
+@plugin.method("hive-route-suggest")
+def hive_route_suggest(plugin: Plugin, destination: str, amount_sats: int = 100000):
+    """
+    Get route suggestions for a destination using hive intelligence.
+
+    Uses collective routing data to suggest optimal paths.
+
+    Args:
+        destination: Target node pubkey
+        amount_sats: Amount to route (default 100000)
+
+    Returns:
+        Dict with route suggestions.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not routing_map:
+        return {"error": "Routing intelligence not initialized"}
+
+    routes = routing_map.get_routes_to(destination, amount_sats)
+
+    return {
+        "destination": destination,
+        "amount_sats": amount_sats,
+        "route_count": len(routes),
+        "routes": [
+            {
+                "path": list(r.path),
+                "success_rate": r.success_rate,
+                "expected_latency_ms": r.expected_latency_ms,
+                "confidence": r.confidence,
+            }
+            for r in routes[:5]  # Top 5 suggestions
+        ]
+    }
+
+
+@plugin.method("hive-peer-reputations")
+def hive_peer_reputations(plugin: Plugin, peer_id: str = None):
+    """
+    Get aggregated peer reputations from hive intelligence.
+
+    Peer reputations are aggregated from reports by all hive members
+    with outlier detection to prevent manipulation.
+
+    Args:
+        peer_id: Optional specific peer to query
+
+    Returns:
+        Dict with peer reputation data.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not peer_reputation_mgr:
+        return {"error": "Peer reputation manager not initialized"}
+
+    if peer_id:
+        rep = peer_reputation_mgr.get_reputation(peer_id)
+        if not rep:
+            return {
+                "peer_id": peer_id,
+                "error": "No reputation data found"
+            }
+        return {
+            "peer_id": rep.peer_id,
+            "reputation_score": rep.reputation_score,
+            "confidence": rep.confidence,
+            "avg_uptime": rep.avg_uptime,
+            "avg_htlc_success": rep.avg_htlc_success,
+            "avg_fee_stability": rep.avg_fee_stability,
+            "total_force_closes": rep.total_force_closes,
+            "report_count": rep.report_count,
+            "reporter_count": len(rep.reporters),
+            "warnings": rep.warnings,
+        }
+    else:
+        stats = peer_reputation_mgr.get_reputation_stats()
+        all_reps = peer_reputation_mgr.get_all_reputations()
+        return {
+            **stats,
+            "reputations": [
+                {
+                    "peer_id": rep.peer_id,
+                    "reputation_score": rep.reputation_score,
+                    "confidence": rep.confidence,
+                    "warnings": list(rep.warnings.keys()),
+                }
+                for rep in all_reps.values()
+            ]
+        }
+
+
+@plugin.method("hive-reputation-stats")
+def hive_reputation_stats(plugin: Plugin):
+    """
+    Get overall reputation tracking statistics.
+
+    Returns summary statistics about tracked peer reputations.
+
+    Returns:
+        Dict with reputation statistics.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not peer_reputation_mgr:
+        return {"error": "Peer reputation manager not initialized"}
+
+    return peer_reputation_mgr.get_reputation_stats()
+
+
+@plugin.method("hive-liquidity-needs")
+def hive_liquidity_needs(plugin: Plugin, peer_id: str = None):
+    """
+    Get current liquidity needs from hive members.
+
+    Shows liquidity requests from members that may need assistance
+    with rebalancing or capacity.
+
+    Args:
+        peer_id: Optional filter by specific member
+
+    Returns:
+        Dict with liquidity needs.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not database:
+        return {"error": "Database not initialized"}
+
+    if peer_id:
+        needs = database.get_liquidity_needs_for_reporter(peer_id)
+    else:
+        needs = database.get_all_liquidity_needs(max_age_hours=24)
+
+    return {
+        "need_count": len(needs),
+        "needs": needs
+    }
+
+
+@plugin.method("hive-liquidity-status")
+def hive_liquidity_status(plugin: Plugin):
+    """
+    Get liquidity coordination status.
+
+    Shows rebalance proposals, pending needs, and assistance statistics.
+
+    Returns:
+        Dict with liquidity coordination status.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not liquidity_coord:
+        return {"error": "Liquidity coordinator not initialized"}
+
+    return liquidity_coord.get_status()
 
 
 @plugin.method("hive-set-mode")

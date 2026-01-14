@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 ACTIVE_MEMBER_WINDOW_SECONDS = 24 * 3600
 UPTIME_PASS_THRESHOLD = 99.5
+BAN_QUORUM_THRESHOLD = 0.51  # 51% quorum for ban proposals
 
 
 class MembershipTier(str, Enum):

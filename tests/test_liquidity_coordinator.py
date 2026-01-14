@@ -1,0 +1,540 @@
+"""
+Tests for Liquidity Coordinator functionality (Phase 7.3).
+
+Tests cover:
+- LiquidityCoordinator class
+- LIQUIDITY_NEED payload validation
+- Internal rebalance opportunity detection
+- NNLB prioritization
+- Rate limiting
+"""
+
+import pytest
+import time
+from unittest.mock import MagicMock, patch
+
+from modules.liquidity_coordinator import (
+    LiquidityCoordinator,
+    RebalanceProposal,
+    LiquidityNeed,
+    URGENCY_CRITICAL,
+    URGENCY_HIGH,
+    URGENCY_MEDIUM,
+    URGENCY_LOW,
+    NEED_INBOUND,
+    NEED_OUTBOUND,
+    NEED_REBALANCE,
+    MIN_REBALANCE_AMOUNT,
+)
+from modules.protocol import (
+    validate_liquidity_need_payload,
+    get_liquidity_need_signing_payload,
+    create_liquidity_need,
+    LIQUIDITY_NEED_RATE_LIMIT,
+)
+
+
+class MockDatabase:
+    """Mock database for testing."""
+
+    def __init__(self):
+        self.liquidity_needs = []
+        self.members = {}
+        self.member_health = {}
+
+    def get_member(self, peer_id):
+        return self.members.get(peer_id, {"peer_id": peer_id, "tier": "member"})
+
+    def get_all_members(self):
+        return list(self.members.values()) if self.members else []
+
+    def store_liquidity_need(self, **kwargs):
+        self.liquidity_needs.append(kwargs)
+
+    def get_all_liquidity_needs(self, max_age_hours=24):
+        return self.liquidity_needs
+
+    def get_member_health(self, peer_id):
+        return self.member_health.get(peer_id)
+
+    def get_struggling_members(self, threshold=40):
+        return [h for h in self.member_health.values() if h.get("overall_health", 100) < threshold]
+
+    def get_helping_members(self):
+        return [h for h in self.member_health.values() if h.get("can_help_others")]
+
+    def cleanup_old_liquidity_needs(self, max_age_hours=24):
+        return 0
+
+
+class TestLiquidityNeedPayload:
+    """Test LIQUIDITY_NEED payload validation."""
+
+    def test_valid_payload(self):
+        """Test that valid payload passes validation."""
+        payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": int(time.time()),
+            "signature": "a" * 100,
+            "need_type": "outbound",
+            "target_peer_id": "03" + "b" * 64,
+            "amount_sats": 1000000,
+            "urgency": "high",
+            "max_fee_ppm": 100,
+            "reason": "channel_depleted",
+            "current_balance_pct": 0.1,
+        }
+        assert validate_liquidity_need_payload(payload) is True
+
+    def test_missing_reporter(self):
+        """Test that missing reporter fails validation."""
+        payload = {
+            "timestamp": int(time.time()),
+            "signature": "a" * 100,
+            "need_type": "outbound",
+            "amount_sats": 1000000,
+        }
+        assert validate_liquidity_need_payload(payload) is False
+
+    def test_invalid_need_type(self):
+        """Test that invalid need type fails validation."""
+        payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": int(time.time()),
+            "signature": "a" * 100,
+            "need_type": "invalid_type",
+            "amount_sats": 1000000,
+        }
+        assert validate_liquidity_need_payload(payload) is False
+
+    def test_invalid_amount_bounds(self):
+        """Test that out-of-bounds amount fails validation."""
+        payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": int(time.time()),
+            "signature": "a" * 100,
+            "need_type": "outbound",
+            "amount_sats": -100,  # Negative
+        }
+        assert validate_liquidity_need_payload(payload) is False
+
+
+class TestSigningPayload:
+    """Test signing payload generation."""
+
+    def test_signing_payload_deterministic(self):
+        """Test that signing payload is deterministic."""
+        payload = {
+            "reporter_id": "02aaa",
+            "timestamp": 1700000000,
+            "need_type": "outbound",
+            "target_peer_id": "03bbb",
+            "amount_sats": 1000000,
+            "urgency": "high",
+            "max_fee_ppm": 100,
+        }
+
+        msg1 = get_liquidity_need_signing_payload(payload)
+        msg2 = get_liquidity_need_signing_payload(payload)
+
+        assert msg1 == msg2
+        assert "LIQUIDITY_NEED:" in msg1
+        assert "02aaa" in msg1
+
+
+class TestLiquidityCoordinator:
+    """Test LiquidityCoordinator class."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.db = MockDatabase()
+        self.plugin = MagicMock()
+        self.coordinator = LiquidityCoordinator(
+            database=self.db,
+            plugin=self.plugin,
+            our_pubkey="02" + "a" * 64
+        )
+
+    def test_handle_liquidity_need_valid(self):
+        """Test handling valid liquidity need."""
+        # Add reporter as member
+        reporter_id = "02" + "b" * 64
+        self.db.members[reporter_id] = {"peer_id": reporter_id, "tier": "member"}
+
+        payload = {
+            "reporter_id": reporter_id,
+            "timestamp": int(time.time()),
+            "signature": "a" * 100,
+            "need_type": "outbound",
+            "target_peer_id": "03" + "c" * 64,
+            "amount_sats": 1000000,
+            "urgency": "high",
+            "max_fee_ppm": 100,
+            "reason": "channel_depleted",
+            "current_balance_pct": 0.1,
+        }
+
+        # Mock RPC for signature verification
+        mock_rpc = MagicMock()
+        mock_rpc.checkmessage.return_value = {
+            "verified": True,
+            "pubkey": reporter_id
+        }
+
+        result = self.coordinator.handle_liquidity_need(
+            peer_id=reporter_id,
+            payload=payload,
+            rpc=mock_rpc
+        )
+
+        assert result.get("success") is True
+        assert reporter_id in self.coordinator._liquidity_needs
+
+    def test_handle_liquidity_need_non_member(self):
+        """Test that non-members are rejected."""
+        reporter_id = "02" + "x" * 64
+        # Don't add to members - remove from default mock
+        self.db.get_member = lambda pid: None
+
+        payload = {
+            "reporter_id": reporter_id,
+            "timestamp": int(time.time()),
+            "signature": "a" * 100,
+            "need_type": "outbound",
+            "target_peer_id": "03" + "y" * 64,
+            "amount_sats": 1000000,
+            "urgency": "high",
+            "max_fee_ppm": 100,
+            "current_balance_pct": 0.1,
+        }
+
+        result = self.coordinator.handle_liquidity_need(
+            peer_id=reporter_id,
+            payload=payload,
+            rpc=MagicMock()
+        )
+
+        assert result.get("error") == "reporter not a member"
+
+    def test_nnlb_prioritization(self):
+        """Test that struggling members get higher priority."""
+        now = int(time.time())
+        our_pubkey = "02" + "a" * 64
+
+        # Add needs from different members
+        struggling_member = "02" + "b" * 64
+        healthy_member = "02" + "c" * 64
+
+        self.coordinator._liquidity_needs[struggling_member] = LiquidityNeed(
+            reporter_id=struggling_member,
+            need_type=NEED_OUTBOUND,
+            target_peer_id="03" + "d" * 64,
+            amount_sats=1000000,
+            urgency=URGENCY_MEDIUM,
+            max_fee_ppm=100,
+            reason="channel_depleted",
+            current_balance_pct=0.1,
+            can_provide_inbound=0,
+            can_provide_outbound=0,
+            timestamp=now,
+            signature="sig1"
+        )
+
+        self.coordinator._liquidity_needs[healthy_member] = LiquidityNeed(
+            reporter_id=healthy_member,
+            need_type=NEED_OUTBOUND,
+            target_peer_id="03" + "e" * 64,
+            amount_sats=1000000,
+            urgency=URGENCY_MEDIUM,
+            max_fee_ppm=100,
+            reason="channel_depleted",
+            current_balance_pct=0.1,
+            can_provide_inbound=0,
+            can_provide_outbound=0,
+            timestamp=now,
+            signature="sig2"
+        )
+
+        # Set health scores
+        self.db.member_health[struggling_member] = {
+            "peer_id": struggling_member,
+            "overall_health": 20,  # Struggling
+        }
+        self.db.member_health[healthy_member] = {
+            "peer_id": healthy_member,
+            "overall_health": 80,  # Healthy
+        }
+
+        prioritized = self.coordinator.get_prioritized_needs()
+
+        # Struggling member should come first
+        assert prioritized[0].reporter_id == struggling_member
+
+    def test_assess_liquidity_needs_depleted_outbound(self):
+        """Test assessment identifies depleted outbound channels."""
+        funds = {
+            "channels": [
+                {
+                    "peer_id": "03" + "x" * 64,
+                    "state": "CHANNELD_NORMAL",
+                    "amount_msat": 10_000_000_000,  # 10M sats
+                    "our_amount_msat": 500_000_000,  # 0.5M sats (5% - critical)
+                }
+            ]
+        }
+
+        needs = self.coordinator.assess_our_liquidity_needs(funds)
+
+        assert len(needs) == 1
+        assert needs[0]["need_type"] == NEED_OUTBOUND
+        assert needs[0]["urgency"] == URGENCY_HIGH
+
+    def test_assess_liquidity_needs_depleted_inbound(self):
+        """Test assessment identifies depleted inbound channels."""
+        funds = {
+            "channels": [
+                {
+                    "peer_id": "03" + "x" * 64,
+                    "state": "CHANNELD_NORMAL",
+                    "amount_msat": 10_000_000_000,  # 10M sats
+                    "our_amount_msat": 9_500_000_000,  # 9.5M sats (95% - critical)
+                }
+            ]
+        }
+
+        needs = self.coordinator.assess_our_liquidity_needs(funds)
+
+        assert len(needs) == 1
+        assert needs[0]["need_type"] == NEED_INBOUND
+        assert needs[0]["urgency"] == URGENCY_HIGH
+
+    def test_can_help_with_liquidity(self):
+        """Test calculation of help capacity."""
+        # Add hive member
+        member_id = "02" + "m" * 64
+        self.db.members[member_id] = {"peer_id": member_id, "tier": "member"}
+
+        funds = {
+            "channels": [
+                {
+                    # Hive member channel with excess local
+                    "peer_id": member_id,
+                    "state": "CHANNELD_NORMAL",
+                    "amount_msat": 10_000_000_000,  # 10M sats
+                    "our_amount_msat": 8_000_000_000,  # 8M sats (80%)
+                },
+                {
+                    # External channel (not counted)
+                    "peer_id": "03" + "x" * 64,
+                    "state": "CHANNELD_NORMAL",
+                    "amount_msat": 10_000_000_000,
+                    "our_amount_msat": 8_000_000_000,
+                }
+            ]
+        }
+
+        capacity = self.coordinator.can_help_with_liquidity(funds)
+
+        assert capacity["can_provide_outbound"] > 0
+        assert capacity["can_provide_inbound"] == 0  # No excess remote
+
+
+class TestRateLimiting:
+    """Test rate limiting functionality."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.db = MockDatabase()
+        self.coordinator = LiquidityCoordinator(
+            database=self.db,
+            plugin=MagicMock(),
+            our_pubkey="02" + "a" * 64
+        )
+
+    def test_rate_limit_allows_initial(self):
+        """Test that initial messages are allowed."""
+        sender = "02" + "b" * 64
+        assert self.coordinator._check_rate_limit(
+            sender,
+            self.coordinator._need_rate,
+            LIQUIDITY_NEED_RATE_LIMIT
+        ) is True
+
+    def test_rate_limit_blocks_excess(self):
+        """Test that excess messages are blocked."""
+        sender = "02" + "b" * 64
+        max_count, period = LIQUIDITY_NEED_RATE_LIMIT
+
+        # Fill up to limit
+        for _ in range(max_count):
+            self.coordinator._record_message(
+                sender,
+                self.coordinator._need_rate
+            )
+
+        # Next should be blocked
+        assert self.coordinator._check_rate_limit(
+            sender,
+            self.coordinator._need_rate,
+            LIQUIDITY_NEED_RATE_LIMIT
+        ) is False
+
+
+class TestNNLBAssistanceStatus:
+    """Test NNLB assistance status reporting."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.db = MockDatabase()
+        self.coordinator = LiquidityCoordinator(
+            database=self.db,
+            plugin=MagicMock(),
+            our_pubkey="02" + "a" * 64
+        )
+
+    def test_status_empty(self):
+        """Test status with no needs."""
+        status = self.coordinator.get_nnlb_assistance_status()
+
+        assert status["pending_needs"] == 0
+        assert status["critical_needs"] == 0
+
+    def test_status_with_needs(self):
+        """Test status with various needs."""
+        now = int(time.time())
+
+        # Add needs with different urgencies
+        self.coordinator._liquidity_needs["m1"] = LiquidityNeed(
+            reporter_id="m1",
+            need_type=NEED_OUTBOUND,
+            target_peer_id="t1",
+            amount_sats=1000000,
+            urgency=URGENCY_CRITICAL,
+            max_fee_ppm=100,
+            reason="depleted",
+            current_balance_pct=0.05,
+            can_provide_inbound=0,
+            can_provide_outbound=0,
+            timestamp=now,
+            signature="sig"
+        )
+
+        self.coordinator._liquidity_needs["m2"] = LiquidityNeed(
+            reporter_id="m2",
+            need_type=NEED_INBOUND,
+            target_peer_id="t2",
+            amount_sats=500000,
+            urgency=URGENCY_HIGH,
+            max_fee_ppm=50,
+            reason="depleted",
+            current_balance_pct=0.9,
+            can_provide_inbound=0,
+            can_provide_outbound=0,
+            timestamp=now,
+            signature="sig2"
+        )
+
+        status = self.coordinator.get_nnlb_assistance_status()
+
+        assert status["pending_needs"] == 2
+        assert status["critical_needs"] == 1
+        assert status["high_needs"] == 1
+
+
+class TestInternalRebalanceOpportunity:
+    """Test internal rebalance opportunity detection."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.db = MockDatabase()
+        self.coordinator = LiquidityCoordinator(
+            database=self.db,
+            plugin=MagicMock(),
+            our_pubkey="02" + "a" * 64
+        )
+
+    def test_find_opportunity_for_outbound_need(self):
+        """Test finding opportunity when member needs outbound."""
+        now = int(time.time())
+        target_peer = "03" + "t" * 64
+        needy_member = "02" + "n" * 64
+
+        # Member needs outbound to target
+        self.coordinator._liquidity_needs[needy_member] = LiquidityNeed(
+            reporter_id=needy_member,
+            need_type=NEED_OUTBOUND,
+            target_peer_id=target_peer,
+            amount_sats=500000,
+            urgency=URGENCY_HIGH,
+            max_fee_ppm=100,
+            reason="depleted",
+            current_balance_pct=0.1,
+            can_provide_inbound=0,
+            can_provide_outbound=0,
+            timestamp=now,
+            signature="sig"
+        )
+
+        self.db.member_health[needy_member] = {
+            "peer_id": needy_member,
+            "overall_health": 30,  # Struggling
+        }
+
+        # We have excess outbound to that target
+        funds = {
+            "channels": [
+                {
+                    "peer_id": target_peer,
+                    "state": "CHANNELD_NORMAL",
+                    "amount_msat": 10_000_000_000,  # 10M sats
+                    "our_amount_msat": 8_000_000_000,  # 8M sats (80%)
+                }
+            ]
+        }
+
+        proposal = self.coordinator.find_internal_rebalance_opportunity(funds)
+
+        assert proposal is not None
+        assert proposal.to_member == needy_member
+        assert proposal.target_peer == target_peer
+        assert proposal.estimated_cost_sats == 0  # Internal is free
+        assert proposal.amount_sats >= MIN_REBALANCE_AMOUNT
+
+    def test_no_opportunity_when_balanced(self):
+        """Test no opportunity when our channels are balanced."""
+        now = int(time.time())
+        target_peer = "03" + "t" * 64
+        needy_member = "02" + "n" * 64
+
+        # Member needs outbound
+        self.coordinator._liquidity_needs[needy_member] = LiquidityNeed(
+            reporter_id=needy_member,
+            need_type=NEED_OUTBOUND,
+            target_peer_id=target_peer,
+            amount_sats=500000,
+            urgency=URGENCY_HIGH,
+            max_fee_ppm=100,
+            reason="depleted",
+            current_balance_pct=0.1,
+            can_provide_inbound=0,
+            can_provide_outbound=0,
+            timestamp=now,
+            signature="sig"
+        )
+
+        # Our channel to target is balanced (50%)
+        funds = {
+            "channels": [
+                {
+                    "peer_id": target_peer,
+                    "state": "CHANNELD_NORMAL",
+                    "amount_msat": 10_000_000_000,  # 10M sats
+                    "our_amount_msat": 5_000_000_000,  # 5M sats (50%)
+                }
+            ]
+        }
+
+        proposal = self.coordinator.find_internal_rebalance_opportunity(funds)
+
+        # No opportunity because we don't have excess
+        assert proposal is None
