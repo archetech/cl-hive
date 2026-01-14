@@ -513,12 +513,12 @@ test_error_handling() {
     run_test "Handles invalid peer_id gracefully" "echo '$RESULT' | grep -qi 'error\|no reputation\|plugin terminated'"
 
     # Nonexistent peer
-    # Note: There's a known issue where passing peer_id to some RPCs can cause
-    # a JSON decode error due to race conditions in stdin/stdout handling.
-    # This is tracked as a bug to investigate.
-    FAKE_ID="020000000000000000000000000000000000000000000000000000000000000001"
-    RESULT=$(hive_cli alice hive-peer-reputations peer_id=$FAKE_ID 2>&1)
-    run_test "Handles unknown peer gracefully" "echo '$RESULT' | grep -qi 'error\|no reputation\|plugin terminated'"
+    # Note: All-numeric peer_ids must be quoted to prevent lightning-cli from
+    # interpreting them as numbers (which causes JSON corruption for large values).
+    # Use a hex string with letters to avoid the issue, or always quote.
+    FAKE_ID="02abcdef00000000000000000000000000000000000000000000000000000001"
+    RESULT=$(hive_cli alice hive-peer-reputations 'peer_id="'"$FAKE_ID"'"' 2>&1)
+    run_test "Handles unknown peer gracefully" "echo '$RESULT' | grep -qi 'error\|no reputation'"
 
     # Test permission checks (if carol is neophyte)
     log_info "Testing permission handling..."
