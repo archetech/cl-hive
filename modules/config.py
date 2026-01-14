@@ -50,6 +50,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'oracle_timeout_seconds': int,
     'budget_reserve_pct': float,
     'budget_max_per_channel_pct': float,
+    # Feerate gate
+    'max_expansion_feerate_perkb': int,
 }
 
 # Range constraints for numeric fields
@@ -75,6 +77,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'oracle_timeout_seconds': (1, 30),  # 1 to 30 seconds
     'budget_reserve_pct': (0.05, 0.50),  # 5% to 50% reserve
     'budget_max_per_channel_pct': (0.10, 1.0),  # 10% to 100% of daily budget per channel
+    # Feerate gate for expansions
+    'max_expansion_feerate_perkb': (1000, 100000),  # 1-100 sat/vB (perkb = 4x perkw)
 }
 
 # Valid governance modes
@@ -136,6 +140,10 @@ class HiveConfig:
     oracle_timeout_seconds: int = 5              # Oracle API timeout
     budget_reserve_pct: float = 0.20             # Reserve 20% of onchain for future expansion
     budget_max_per_channel_pct: float = 0.50     # Max 50% of daily budget per single channel
+
+    # Feerate gate for expansions (sat/kB, where 1 sat/vB = 4 sat/kB approx)
+    # Default 5000 sat/kB = ~1.25 sat/vB - conservative low-fee threshold
+    max_expansion_feerate_perkb: int = 5000
 
     # Internal version tracking
     _version: int = field(default=0, repr=False, compare=False)
@@ -207,6 +215,7 @@ class HiveConfigSnapshot:
     oracle_timeout_seconds: int
     budget_reserve_pct: float
     budget_max_per_channel_pct: float
+    max_expansion_feerate_perkb: int
     version: int
 
     @classmethod
@@ -241,5 +250,6 @@ class HiveConfigSnapshot:
             oracle_timeout_seconds=config.oracle_timeout_seconds,
             budget_reserve_pct=config.budget_reserve_pct,
             budget_max_per_channel_pct=config.budget_max_per_channel_pct,
+            max_expansion_feerate_perkb=config.max_expansion_feerate_perkb,
             version=config._version,
         )

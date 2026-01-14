@@ -618,6 +618,13 @@ plugin.add_option(
     dynamic=True
 )
 
+plugin.add_option(
+    name='hive-max-expansion-feerate',
+    default='5000',
+    description='Max on-chain feerate (sat/kB) to allow expansion proposals (default: 5000 = ~1.25 sat/vB). Set to 0 to disable check.',
+    dynamic=True
+)
+
 # VPN Transport Options (all dynamic)
 plugin.add_option(
     name='hive-transport-mode',
@@ -685,6 +692,8 @@ OPTION_TO_CONFIG_MAP: Dict[str, tuple] = {
     'hive-autonomous-budget-per-day': ('autonomous_budget_per_day', int),
     'hive-budget-reserve-pct': ('budget_reserve_pct', float),
     'hive-budget-max-per-channel-pct': ('budget_max_per_channel_pct', float),
+    # Feerate gate
+    'hive-max-expansion-feerate': ('max_expansion_feerate_perkb', int),
 }
 
 # VPN options require special handling (reconfigure VPN transport)
@@ -854,6 +863,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         autonomous_budget_per_day=int(options.get('hive-autonomous-budget-per-day', '10000000')),
         budget_reserve_pct=float(options.get('hive-budget-reserve-pct', '0.20')),
         budget_max_per_channel_pct=float(options.get('hive-budget-max-per-channel-pct', '0.50')),
+        max_expansion_feerate_perkb=int(options.get('hive-max-expansion-feerate', '5000')),
     )
     
     # Initialize database
@@ -3001,6 +3011,21 @@ def handle_peer_available(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
                                      capacity_sats, routing_score, reason)
         return {"result": "continue"}
 
+    # Check if on-chain feerates are low enough for channel opening
+    feerate_allowed, current_feerate, feerate_reason = _check_feerate_for_expansion(
+        cfg.max_expansion_feerate_perkb
+    )
+    if not feerate_allowed:
+        plugin.log(
+            f"cl-hive: On-chain fees too high for expansion ({feerate_reason}), "
+            f"storing PEER_AVAILABLE for later when fees drop",
+            level='info'
+        )
+        _store_peer_available_action(target_peer_id, reporter_peer_id, event_type,
+                                     capacity_sats, routing_score,
+                                     f"Deferred: {feerate_reason}")
+        return {"result": "continue"}
+
     # =========================================================================
     # Phase 6.4: Trigger cooperative expansion round
     # =========================================================================
@@ -3039,6 +3064,43 @@ def handle_peer_available(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             )
 
     return {"result": "continue"}
+
+
+def _check_feerate_for_expansion(max_feerate_perkb: int) -> tuple:
+    """
+    Check if current on-chain feerates allow channel expansion.
+
+    Args:
+        max_feerate_perkb: Maximum feerate threshold in sat/kB (0 = disabled)
+
+    Returns:
+        Tuple of (allowed: bool, current_feerate: int, reason: str)
+    """
+    if max_feerate_perkb == 0:
+        return (True, 0, "feerate check disabled")
+
+    if not safe_plugin:
+        return (False, 0, "plugin not initialized")
+
+    try:
+        feerates = safe_plugin.rpc.feerates("perkb")
+        # Use 'opening' feerate which is what fundchannel uses
+        opening_feerate = feerates.get("perkb", {}).get("opening")
+
+        if opening_feerate is None:
+            # Fallback to min_acceptable if opening not available
+            opening_feerate = feerates.get("perkb", {}).get("min_acceptable", 0)
+
+        if opening_feerate == 0:
+            return (True, 0, "feerate unavailable, allowing")
+
+        if opening_feerate <= max_feerate_perkb:
+            return (True, opening_feerate, "feerate acceptable")
+        else:
+            return (False, opening_feerate, f"feerate {opening_feerate} > max {max_feerate_perkb}")
+    except Exception as e:
+        # On error, be conservative and allow (don't block on RPC issues)
+        return (True, 0, f"feerate check error: {e}")
 
 
 def _store_peer_available_action(target_peer_id: str, reporter_peer_id: str,
@@ -4986,7 +5048,19 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
             "min_channel_sats": cfg.planner_min_channel_sats,
             "max_channel_sats": cfg.planner_max_channel_sats,
             "default_channel_sats": cfg.planner_default_channel_sats,
-        }
+        },
+        "feerate": _get_feerate_info(cfg.max_expansion_feerate_perkb),
+    }
+
+
+def _get_feerate_info(max_feerate_perkb: int) -> dict:
+    """Get current feerate information for expansion decisions."""
+    allowed, current, reason = _check_feerate_for_expansion(max_feerate_perkb)
+    return {
+        "current_perkb": current,
+        "max_allowed_perkb": max_feerate_perkb,
+        "expansion_allowed": allowed,
+        "reason": reason,
     }
 
 
@@ -5036,6 +5110,14 @@ def hive_expansion_nominate(plugin: Plugin, target_peer_id: str, round_id: str =
     if not target_peer_id:
         return {"error": "target_peer_id is required"}
 
+    # Check feerate and warn if high (but don't block manual operation)
+    cfg = config.snapshot() if config else None
+    max_feerate = cfg.max_expansion_feerate_perkb if cfg else 5000
+    feerate_allowed, current_feerate, feerate_reason = _check_feerate_for_expansion(max_feerate)
+    feerate_warning = None
+    if not feerate_allowed:
+        feerate_warning = f"Warning: on-chain fees are high ({feerate_reason}). Consider waiting for lower fees."
+
     if round_id:
         # Join existing round - create it locally if we don't have it
         round_obj = coop_expansion.get_round(round_id)
@@ -5051,11 +5133,15 @@ def hive_expansion_nominate(plugin: Plugin, target_peer_id: str, round_id: str =
         # Broadcast our nomination
         _broadcast_expansion_nomination(round_id, target_peer_id)
 
-        return {
+        result = {
             "action": "joined",
             "round_id": round_id,
             "target_peer_id": target_peer_id,
         }
+        if feerate_warning:
+            result["warning"] = feerate_warning
+            result["current_feerate_perkb"] = current_feerate
+        return result
 
     # Start new round
     new_round_id = coop_expansion.start_round(
@@ -5068,11 +5154,15 @@ def hive_expansion_nominate(plugin: Plugin, target_peer_id: str, round_id: str =
     # Broadcast our nomination
     _broadcast_expansion_nomination(new_round_id, target_peer_id)
 
-    return {
+    result = {
         "action": "started",
         "round_id": new_round_id,
         "target_peer_id": target_peer_id,
     }
+    if feerate_warning:
+        result["warning"] = feerate_warning
+        result["current_feerate_perkb"] = current_feerate
+    return result
 
 
 @plugin.method("hive-expansion-elect")
