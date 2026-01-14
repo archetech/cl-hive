@@ -384,6 +384,30 @@ class HiveDatabase:
         """)
 
         # =====================================================================
+        # DELEGATION ATTEMPTS TABLE (Phase 8 - Cooperative Failure Handling)
+        # =====================================================================
+        # Tracks channel open delegation attempts when local opens fail
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS delegation_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                original_action_id INTEGER NOT NULL,
+                target TEXT NOT NULL,
+                delegation_count INTEGER NOT NULL,
+                failure_type TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                completed_by TEXT,
+                completed_at INTEGER
+            )
+        """)
+
+        # Index for querying by target
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_delegation_target
+            ON delegation_attempts(target)
+        """)
+
+        # =====================================================================
         # FEE INTELLIGENCE TABLE (Phase 7 - Cooperative Fee Coordination)
         # =====================================================================
         # Stores fee intelligence reports from hive members
@@ -1974,6 +1998,40 @@ class HiveDatabase:
             return True
         except Exception as e:
             self.plugin.log(f"Failed to record budget spend: {e}", level='error')
+            return False
+
+    def record_delegation_attempt(
+        self,
+        original_action_id: int,
+        target: str,
+        delegation_count: int,
+        failure_type: str
+    ) -> bool:
+        """
+        Record a channel open delegation attempt.
+
+        Args:
+            original_action_id: ID of the failed action being delegated
+            target: Target peer ID for the channel
+            delegation_count: Number of delegation requests sent
+            failure_type: Type of failure that triggered delegation
+
+        Returns:
+            True if recorded successfully
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        try:
+            conn.execute("""
+                INSERT INTO delegation_attempts
+                (original_action_id, target, delegation_count, failure_type, timestamp, status)
+                VALUES (?, ?, ?, ?, ?, 'pending')
+            """, (original_action_id, target, delegation_count, failure_type, now))
+            return True
+        except Exception as e:
+            # Table might not exist yet - that's OK for new feature
+            self.plugin.log(f"Failed to record delegation attempt: {e}", level='debug')
             return False
 
     def get_daily_spend(self, date_key: str = None) -> int:

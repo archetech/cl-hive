@@ -857,7 +857,10 @@ def _execute_channel_open(
         # Update action status to failed
         ctx.database.update_action_status(action_id, 'failed')
 
-        return {
+        # Classify the error to determine if delegation is appropriate
+        failure_info = _classify_channel_open_failure(error_msg)
+
+        result = {
             "status": "failed",
             "action_id": action_id,
             "action_type": action_type,
@@ -865,7 +868,214 @@ def _execute_channel_open(
             "channel_size_sats": channel_size_sats,
             "error": error_msg,
             "broadcast_count": broadcast_count,
+            "failure_type": failure_info["type"],
+            "delegation_recommended": failure_info["delegation_recommended"],
         }
+
+        # If delegation is recommended, try to find a hive member to delegate
+        if failure_info["delegation_recommended"] and ctx.database:
+            delegation_result = _attempt_channel_open_delegation(
+                ctx, target, channel_size_sats, action_id, failure_info
+            )
+            if delegation_result:
+                result["delegation"] = delegation_result
+
+        return result
+
+
+def _classify_channel_open_failure(error_msg: str) -> Dict[str, Any]:
+    """
+    Classify channel open failure to determine appropriate response.
+
+    Failure types:
+    - peer_offline: Peer not reachable (temporary, retry later)
+    - peer_rejected: Peer actively refused connection (may need different opener)
+    - openingd_crash: Protocol error or stale state (peer issue)
+    - insufficient_funds: We don't have enough funds
+    - channel_exists: Already have a channel
+    - unknown: Unclassified error
+
+    Returns:
+        Dict with failure type and whether delegation is recommended
+    """
+    error_lower = error_msg.lower()
+
+    # Peer actively closed connection - might reject us specifically
+    if "peer closed connection" in error_lower or "connection refused" in error_lower:
+        return {
+            "type": "peer_rejected",
+            "delegation_recommended": True,
+            "reason": "Peer may be rejecting connections from this node (reputation/policy)",
+            "retry_delay_seconds": 0,  # Don't retry ourselves
+        }
+
+    # Openingd died - often indicates stale channel state or peer protocol issue
+    if "openingd died" in error_lower or "subdaemon" in error_lower:
+        return {
+            "type": "openingd_crash",
+            "delegation_recommended": True,
+            "reason": "Protocol error or stale channel state with peer",
+            "retry_delay_seconds": 0,
+        }
+
+    # Peer unreachable - might be temporarily offline
+    if "no addresses" in error_lower or "connection timed out" in error_lower:
+        return {
+            "type": "peer_offline",
+            "delegation_recommended": False,  # Peer is down for everyone
+            "reason": "Peer appears to be offline",
+            "retry_delay_seconds": 3600,  # Retry in 1 hour
+        }
+
+    # Insufficient funds
+    if "insufficient" in error_lower or "not enough" in error_lower:
+        return {
+            "type": "insufficient_funds",
+            "delegation_recommended": True,  # Another node might have funds
+            "reason": "Insufficient on-chain funds",
+            "retry_delay_seconds": 0,
+        }
+
+    # Channel already exists
+    if "already have" in error_lower or "channel exists" in error_lower:
+        return {
+            "type": "channel_exists",
+            "delegation_recommended": False,
+            "reason": "Channel already exists with this peer",
+            "retry_delay_seconds": 0,
+        }
+
+    # Unknown error
+    return {
+        "type": "unknown",
+        "delegation_recommended": False,
+        "reason": "Unknown error - manual investigation needed",
+        "retry_delay_seconds": 3600,
+    }
+
+
+def _attempt_channel_open_delegation(
+    ctx: HiveContext,
+    target: str,
+    channel_size_sats: int,
+    original_action_id: int,
+    failure_info: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """
+    Attempt to delegate a failed channel open to another hive member.
+
+    Uses AI Oracle task delegation if available, otherwise broadcasts
+    a TASK_REQUEST message to capable members.
+
+    Returns:
+        Dict with delegation status, or None if delegation not possible
+    """
+    if not ctx.database or not ctx.safe_plugin:
+        return None
+
+    # Find hive members who might be able to help
+    members = ctx.database.get_all_members()
+    capable_members = []
+
+    for member in members:
+        member_id = member.get('peer_id')
+        if not member_id or member_id == ctx.our_pubkey:
+            continue
+
+        # Check member health - only delegate to healthy members
+        health = ctx.database.get_member_health(member_id)
+        if health:
+            overall_health = health.get('overall_health', 0)
+            can_help = health.get('can_help_others', False)
+            if overall_health >= 50 and can_help:
+                capable_members.append({
+                    "peer_id": member_id,
+                    "health": overall_health,
+                    "tier": health.get('tier', 'unknown')
+                })
+
+    if not capable_members:
+        if ctx.log:
+            ctx.log(
+                f"cl-hive: No capable members available for delegation",
+                'debug'
+            )
+        return {"status": "no_capable_members"}
+
+    # Sort by health (highest first)
+    capable_members.sort(key=lambda m: m['health'], reverse=True)
+
+    # Try to send delegation request to top candidates
+    from modules.protocol import HiveMessageType, serialize, create_ai_task_request
+    import time as time_module
+
+    delegation_sent = 0
+    max_delegation_attempts = 3
+    now = int(time_module.time())
+
+    for member in capable_members[:max_delegation_attempts]:
+        member_id = member['peer_id']
+        try:
+            # Create AI task request for channel open delegation
+            request_id = f"delegate_{original_action_id}_{now}"
+            deadline = now + 3600  # 1 hour to complete
+
+            msg = create_ai_task_request(
+                node_id=ctx.our_pubkey,
+                target_node=member_id,
+                timestamp=now,
+                request_id=request_id,
+                task_type="expand_to",
+                task_target=target,
+                rpc=ctx.safe_plugin.rpc,
+                task_priority="normal",
+                task_deadline_timestamp=deadline,
+                amount_sats=channel_size_sats,
+                selection_factors=["delegation", "peer_rejected_opener"],
+                compensation_offer_type="reciprocal",
+                fallback_if_rejected="will_handle_self",
+                fallback_if_timeout="will_handle_self"
+            )
+
+            if msg:
+                ctx.safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": member_id,
+                    "msg": msg.hex()
+                })
+                delegation_sent += 1
+
+                if ctx.log:
+                    ctx.log(
+                        f"cl-hive: Sent channel open delegation request to "
+                        f"{member_id[:16]}... (health={member['health']})",
+                        'info'
+                    )
+
+        except Exception as e:
+            if ctx.log:
+                ctx.log(
+                    f"cl-hive: Failed to send delegation to {member_id[:16]}...: {e}",
+                    'debug'
+                )
+
+    if delegation_sent > 0:
+        # Record the delegation attempt
+        ctx.database.record_delegation_attempt(
+            original_action_id=original_action_id,
+            target=target,
+            delegation_count=delegation_sent,
+            failure_type=failure_info["type"]
+        )
+
+        return {
+            "status": "delegation_requested",
+            "requests_sent": delegation_sent,
+            "candidates": [m['peer_id'][:16] + "..." for m in capable_members[:max_delegation_attempts]],
+            "failure_type": failure_info["type"],
+            "message": f"Requested {delegation_sent} hive member(s) to attempt channel open"
+        }
+
+    return {"status": "delegation_failed", "message": "Could not send delegation requests"}
 
 
 # =============================================================================
