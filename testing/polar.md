@@ -1,6 +1,8 @@
 # Polar Testing Guide for cl-revenue-ops and cl-hive
 
-This guide covers installing and testing cl-revenue-ops, cl-hive, and their dependencies (clboss, sling) on a Polar regtest environment.
+This guide covers installing and testing cl-revenue-ops and cl-hive on a Polar regtest environment.
+
+**Note:** CLBoss and Sling are optional integrations. cl-hive functions fully without them using native cooperative expansion.
 
 ## Prerequisites
 
@@ -18,9 +20,9 @@ Create the following 9 nodes in Polar before running the install script:
 
 | Node Name | Implementation | Version | Purpose | Plugins |
 |-----------|---------------|---------|---------|---------|
-| alice | Core Lightning | v25.12 | Hive Admin | clboss, sling, cl-revenue-ops, cl-hive |
-| bob | Core Lightning | v25.12 | Hive Member | clboss, sling, cl-revenue-ops, cl-hive |
-| carol | Core Lightning | v25.12 | Hive Member | clboss, sling, cl-revenue-ops, cl-hive |
+| alice | Core Lightning | v25.12 | Hive Admin | cl-revenue-ops, cl-hive (clboss, sling optional) |
+| bob | Core Lightning | v25.12 | Hive Member | cl-revenue-ops, cl-hive (clboss, sling optional) |
+| carol | Core Lightning | v25.12 | Hive Member | cl-revenue-ops, cl-hive (clboss, sling optional) |
 | dave | Core Lightning | v25.12 | External CLN | none (vanilla) |
 | erin | Core Lightning | v25.12 | External CLN | none (vanilla) |
 | lnd1 | LND | latest | External LND | none |
@@ -66,26 +68,26 @@ Create channels in Polar to match this topology:
 HIVE FLEET (with plugins)              EXTERNAL NODES (no hive plugins)
 ┌─────────────────────────────┐       ┌─────────────────────────────┐
 │  alice (CLN v25.12)         │       │  lnd1 (LND)                 │
-│  ├── clboss                 │       │  lnd2 (LND)                 │
-│  ├── sling                  │◄─────►│  eclair1 (Eclair)           │
-│  ├── cl-revenue-ops         │       │  eclair2 (Eclair)           │
-│  └── cl-hive                │       │  dave (CLN - vanilla)       │
+│  ├── cl-revenue-ops         │       │  lnd2 (LND)                 │
+│  ├── cl-hive                │◄─────►│  eclair1 (Eclair)           │
+│  ├── clboss (optional)      │       │  eclair2 (Eclair)           │
+│  └── sling (optional)       │       │  dave (CLN - vanilla)       │
 │                             │       │  erin (CLN - vanilla)       │
 │  bob (CLN v25.12)           │       └─────────────────────────────┘
-│  ├── clboss                 │
-│  ├── sling                  │
 │  ├── cl-revenue-ops         │
-│  └── cl-hive                │
+│  ├── cl-hive                │
+│  ├── clboss (optional)      │
+│  └── sling (optional)       │
 │                             │
 │  carol (CLN v25.12)         │
-│  ├── clboss                 │
-│  ├── sling                  │
 │  ├── cl-revenue-ops         │
-│  └── cl-hive                │
+│  ├── cl-hive                │
+│  ├── clboss (optional)      │
+│  └── sling (optional)       │
 └─────────────────────────────┘
 ```
 
-**Plugin Load Order:** clboss → sling → cl-revenue-ops → cl-hive
+**Plugin Load Order:** cl-revenue-ops → cl-hive (then optionally: clboss → sling)
 
 ---
 
@@ -103,7 +105,7 @@ ls ~/.polar/networks/
 ./install.sh 1
 ```
 
-**Note:** First run takes 5-10 minutes per node to build clboss from source.
+**Note:** If CLBoss is enabled (optional), first run takes 5-10 minutes per node to build from source. Use `SKIP_CLBOSS=1` to skip.
 
 ### Option B: Manual Installation
 
@@ -306,7 +308,9 @@ docker exec polar-n1-alice $CLI hive-members
 # Should show 3 members
 ```
 
-### Test 9: CLBOSS Integration
+### Test 9: CLBOSS Integration (Optional)
+
+**Note:** This test only applies if CLBoss is installed. Skip if using `SKIP_CLBOSS=1`.
 
 ```bash
 CLI="lightning-cli --lightning-dir=/home/clightning/.lightning --network=regtest"
@@ -418,7 +422,7 @@ Use the `test.sh` script for comprehensive automated testing:
 | sync | State synchronization between members |
 | channels | Channel opening with intent protocol |
 | fees | Fee policy and HIVE strategy |
-| clboss | CLBOSS integration (unmanage/ignore) |
+| clboss | CLBOSS integration (optional, skip if not installed) |
 | contrib | Contribution tracking and ratios |
 | cross | Cross-implementation (LND/Eclair) tests |
 

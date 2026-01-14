@@ -1,6 +1,7 @@
 #!/bin/bash
 #
-# Install clboss, cl-revenue-ops, and cl-hive plugins on Polar CLN nodes
+# Install cl-hive and cl-revenue-ops plugins on Polar CLN nodes
+# Optionally installs clboss and sling (not required for hive operation)
 #
 # Usage: ./install.sh <network-id>
 # Example: ./install.sh 1
@@ -10,8 +11,8 @@
 #   VANILLA_NODES  - CLN nodes without hive plugins (default: "dave erin")
 #   REVENUE_OPS_PATH - Path to cl_revenue_ops repo (default: /home/sat/cl_revenue_ops)
 #   HIVE_PATH      - Path to cl-hive repo (default: /home/sat/cl-hive)
-#   SKIP_CLBOSS    - Set to 1 to skip clboss installation on hive nodes
-#   SKIP_SLING     - Set to 1 to skip sling installation on hive nodes
+#   SKIP_CLBOSS    - Set to 1 to skip clboss installation (clboss is optional)
+#   SKIP_SLING     - Set to 1 to skip sling installation (sling is optional)
 #
 
 set -e
