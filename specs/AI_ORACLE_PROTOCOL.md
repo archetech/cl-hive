@@ -1323,20 +1323,118 @@ def can_accept_task(requester_id, task):
 
 The security model relies on:
 1. **Node Identity**: Lightning key (HSM-bound) authenticates the node
-2. **Operator Attestation**: Operator chooses and configures their AI
+2. **Operator Attestation**: Operator signs attestation of AI responses
 3. **Behavioral Observation**: Track task completion, strategy accuracy over time
 
-**What We Don't Verify**:
-- AI model identity (can be faked, doesn't affect security)
-- AI provider attestation (no infrastructure exists)
-- AI decision quality (subjective, varies by context)
+**What We Don't Verify** (pending provider support):
+- AI provider attestation (Anthropic doesn't yet sign responses)
+- AI model identity (can be faked without provider signatures)
 
 **What We Do Verify**:
 - Message signatures (node's Lightning key)
+- Operator attestations (signed claim of AI response)
 - Reciprocity balance (track actual task completion)
 - Strategy outcomes (measurable results)
 
-The `ai_meta` fields are informational only - useful for debugging and interoperability, not for security decisions.
+#### 6.7.1 Operator Attestation
+
+Until AI providers offer cryptographic response signing, operators MUST create signed attestations for AI decisions.
+
+**Attestation Object**:
+```json
+{
+  "response_id": "msg_01XFDUDYJgAACzvnptvVoYEL",
+  "model_claimed": "claude-sonnet-4-20250514",
+  "timestamp": 1705234567,
+  "operator_pubkey": "03abc123...",
+  "api_endpoint": "api.anthropic.com",
+  "response_hash": "sha256:def456...",
+  "operator_signature": "sig_xyz..."
+}
+```
+
+**Implementation**:
+```python
+def create_attestation(api_response, node_key):
+    """Create operator-signed attestation of AI response."""
+    attestation = {
+        "response_id": api_response.get("id", "unknown"),
+        "model_claimed": api_response.get("model", "unknown"),
+        "timestamp": int(time.time()),
+        "operator_pubkey": get_node_pubkey(),
+        "api_endpoint": "api.anthropic.com",
+        "response_hash": hashlib.sha256(
+            json.dumps(api_response, sort_keys=True).encode()
+        ).hexdigest()
+    }
+    # Sign with node's Lightning key via HSM
+    attestation["operator_signature"] = sign_message(
+        json.dumps(attestation, sort_keys=True)
+    )
+    return attestation
+
+def verify_attestation(attestation, message):
+    """Verify operator attestation matches message."""
+    # Verify signature
+    if not check_signature(
+        attestation["operator_pubkey"],
+        attestation["operator_signature"],
+        json.dumps({k: v for k, v in attestation.items()
+                   if k != "operator_signature"}, sort_keys=True)
+    ):
+        return False, "invalid_signature"
+
+    # Verify timestamp freshness (5 minute window)
+    if abs(time.time() - attestation["timestamp"]) > 300:
+        return False, "stale_attestation"
+
+    # Verify operator matches message sender
+    if attestation["operator_pubkey"] != message["node_id"]:
+        return False, "operator_mismatch"
+
+    return True, None
+```
+
+**Attestation in Messages**:
+
+All AI-generated messages MUST include an `attestation` field:
+```json
+{
+  "type": "ai_state_summary",
+  "node_id": "03abc123...",
+  "timestamp": 1705234567,
+  ...
+  "attestation": {
+    "response_id": "msg_01XFDUDYJgAACzvnptvVoYEL",
+    "model_claimed": "claude-sonnet-4-20250514",
+    "timestamp": 1705234567,
+    "operator_pubkey": "03abc123...",
+    "api_endpoint": "api.anthropic.com",
+    "response_hash": "sha256:def456...",
+    "operator_signature": "sig_xyz..."
+  },
+  "signature": "dhbc4mqjz..."
+}
+```
+
+**Trust Implications**:
+
+| Attestation Status | Trust Level | Action |
+|--------------------|-------------|--------|
+| Valid signature, matching operator | High | Process normally |
+| Valid signature, fresh timestamp | High | Process normally |
+| Missing attestation | Low | Log warning, process with caution |
+| Invalid signature | None | Reject message |
+| Stale timestamp (> 5 min) | Low | Log warning, may reject |
+
+**Future: Provider Attestation**
+
+When AI providers (Anthropic, OpenAI, etc.) implement response signing:
+- `attestation.provider_signature` field will be added
+- Provider certificates will be validated against known roots
+- Trust level will increase from "operator claim" to "provider verified"
+
+Feature request submitted to Anthropic for cryptographic response attestation.
 
 ### 6.8 Sybil Resistance
 
