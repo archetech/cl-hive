@@ -45,6 +45,10 @@ def mock_database():
     db = MagicMock()
     db.get_all_members.return_value = []
     db.log_planner_action = MagicMock()
+    # Mock pending action tracking methods (rejection tracking)
+    db.has_pending_action_for_target.return_value = False
+    db.was_recently_rejected.return_value = False
+    db.get_rejection_count.return_value = 0
     # Mock peer event summary for quality scorer (neutral values)
     db.get_peer_event_summary.return_value = {
         "peer_id": "",
@@ -719,6 +723,83 @@ class TestExpansionLogic:
 
             decisions = planner._propose_expansion(mock_config, 'test-pending')
 
+        assert decisions == []
+        mock_intent_mgr.create_intent.assert_not_called()
+
+    def test_expansion_skips_recently_rejected_target(self, planner, mock_config, mock_plugin, mock_database):
+        """Should skip targets that were recently rejected."""
+        mock_config.planner_enable_expansions = True
+        target = '02' + 'r' * 64
+
+        # Setup mock intent manager
+        mock_intent_mgr = MagicMock()
+        planner.intent_manager = mock_intent_mgr
+
+        # Mock sufficient funds
+        mock_plugin.rpc.listfunds.return_value = {
+            'outputs': [{'status': 'confirmed', 'amount_msat': 10000000000}]
+        }
+
+        # Mock underserved targets
+        from modules.planner import UnderservedResult
+        with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:
+            mock_get_underserved.return_value = [
+                UnderservedResult(
+                    target=target,
+                    public_capacity_sats=200_000_000,
+                    hive_share_pct=0.02,
+                    score=2.0
+                )
+            ]
+
+            # Mock no pending intents
+            mock_database.get_pending_intents.return_value = []
+
+            # But the target was recently rejected
+            mock_database.was_recently_rejected.return_value = True
+
+            decisions = planner._propose_expansion(mock_config, 'test-rejected')
+
+        # Should skip due to recent rejection
+        assert decisions == []
+        mock_intent_mgr.create_intent.assert_not_called()
+
+    def test_expansion_skips_target_with_pending_action(self, planner, mock_config, mock_plugin, mock_database):
+        """Should skip targets that have a pending action awaiting approval."""
+        mock_config.planner_enable_expansions = True
+        target = '02' + 'p' * 64
+
+        # Setup mock intent manager
+        mock_intent_mgr = MagicMock()
+        planner.intent_manager = mock_intent_mgr
+
+        # Mock sufficient funds
+        mock_plugin.rpc.listfunds.return_value = {
+            'outputs': [{'status': 'confirmed', 'amount_msat': 10000000000}]
+        }
+
+        # Mock underserved targets
+        from modules.planner import UnderservedResult
+        with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:
+            mock_get_underserved.return_value = [
+                UnderservedResult(
+                    target=target,
+                    public_capacity_sats=200_000_000,
+                    hive_share_pct=0.02,
+                    score=2.0
+                )
+            ]
+
+            # Mock no pending intents
+            mock_database.get_pending_intents.return_value = []
+            mock_database.was_recently_rejected.return_value = False
+
+            # But target has a pending action awaiting approval
+            mock_database.has_pending_action_for_target.return_value = True
+
+            decisions = planner._propose_expansion(mock_config, 'test-pending-action')
+
+        # Should skip due to pending action
         assert decisions == []
         mock_intent_mgr.create_intent.assert_not_called()
 

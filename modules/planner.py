@@ -1222,6 +1222,37 @@ class Planner:
                 return True
         return False
 
+    def _should_skip_target(self, target: str, cooldown_seconds: int = 86400) -> tuple[bool, str]:
+        """
+        Check if a target should be skipped due to existing proposals or rejections.
+
+        This consolidates all the checks for whether we should skip proposing
+        a channel to this target.
+
+        Args:
+            target: Target pubkey to check
+            cooldown_seconds: Cooldown period after rejection (default: 24 hours)
+
+        Returns:
+            Tuple of (should_skip, reason)
+        """
+        if not self.db:
+            return False, ""
+
+        # Check for pending intent
+        if self._has_pending_intent(target):
+            return True, "pending_intent"
+
+        # Check for pending action in pending_actions table
+        if self.db.has_pending_action_for_target(target):
+            return True, "pending_action"
+
+        # Check for recent rejection
+        if self.db.was_recently_rejected(target, cooldown_seconds):
+            return True, "recently_rejected"
+
+        return False, ""
+
     def _propose_expansion(self, cfg, run_id: str) -> List[Dict[str, Any]]:
         """
         Propose channel expansions to underserved targets.
@@ -1286,15 +1317,28 @@ class Planner:
             self._log("No underserved targets found", level='debug')
             return decisions
 
-        # Find a target without pending intent
+        # Get rejection cooldown from config (default 24 hours)
+        rejection_cooldown = getattr(cfg, 'rejection_cooldown_seconds', 86400)
+
+        # Find a target without pending intent, pending action, or recent rejection
         selected_target = None
+        skipped_reasons = {}
         for candidate in underserved:
-            if not self._has_pending_intent(candidate.target):
+            should_skip, reason = self._should_skip_target(candidate.target, rejection_cooldown)
+            if not should_skip:
                 selected_target = candidate
                 break
+            else:
+                skipped_reasons[candidate.target[:16]] = reason
 
         if not selected_target:
-            self._log("All underserved targets have pending intents", level='debug')
+            if skipped_reasons:
+                self._log(
+                    f"All underserved targets skipped: {skipped_reasons}",
+                    level='debug'
+                )
+            else:
+                self._log("All underserved targets have pending intents", level='debug')
             return decisions
 
         # Create intent and potentially broadcast

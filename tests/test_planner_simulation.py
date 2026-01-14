@@ -60,6 +60,10 @@ def mock_database():
     db.get_all_members.return_value = []
     db.get_pending_intents.return_value = []
     db.create_intent.return_value = 1
+    # Mock pending action tracking methods (rejection tracking)
+    db.has_pending_action_for_target.return_value = False
+    db.was_recently_rejected.return_value = False
+    db.get_rejection_count.return_value = 0
     # Mock peer event summary for quality scorer (neutral values)
     db.get_peer_event_summary.return_value = {
         "peer_id": "",

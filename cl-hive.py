@@ -5276,15 +5276,17 @@ def hive_pending_actions(plugin: Plugin):
 
 
 @plugin.method("hive-approve-action")
-def hive_approve_action(plugin: Plugin, action_id: int, amount_sats: int = None):
+def hive_approve_action(plugin: Plugin, action_id="all", amount_sats: int = None):
     """
-    Approve and execute a pending action.
+    Approve and execute pending action(s).
 
     Args:
-        action_id: ID of the action to approve
+        action_id: ID of the action to approve, or "all" to approve all pending actions.
+            Defaults to "all" if not specified.
         amount_sats: Optional override for channel size (member budget control).
             If provided, uses this amount instead of the proposed amount.
             Must be >= min_channel_sats and will still be subject to budget limits.
+            Only applies when approving a single action.
 
     Returns:
         Dict with approval result including budget details.
@@ -5295,12 +5297,13 @@ def hive_approve_action(plugin: Plugin, action_id: int, amount_sats: int = None)
 
 
 @plugin.method("hive-reject-action")
-def hive_reject_action(plugin: Plugin, action_id: int):
+def hive_reject_action(plugin: Plugin, action_id="all"):
     """
-    Reject a pending action.
+    Reject pending action(s).
 
     Args:
-        action_id: ID of the action to reject
+        action_id: ID of the action to reject, or "all" to reject all pending actions.
+            Defaults to "all" if not specified.
 
     Returns:
         Dict with rejection result.

@@ -1430,6 +1430,100 @@ class HiveDatabase:
         )
         return result.rowcount
 
+    def has_pending_action_for_target(self, target: str) -> bool:
+        """
+        Check if there's a pending action for the given target.
+
+        Args:
+            target: Target pubkey to check
+
+        Returns:
+            True if a pending action exists for this target
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        # Get all pending actions and check payload for target
+        rows = conn.execute("""
+            SELECT payload FROM pending_actions
+            WHERE status = 'pending' AND expires_at > ?
+        """, (now,)).fetchall()
+
+        for row in rows:
+            try:
+                payload = json.loads(row['payload'])
+                if payload.get('target') == target:
+                    return True
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        return False
+
+    def was_recently_rejected(self, target: str, cooldown_seconds: int = 86400) -> bool:
+        """
+        Check if a target was recently rejected (within cooldown period).
+
+        This prevents the planner from repeatedly proposing the same peer
+        that keeps getting rejected.
+
+        Args:
+            target: Target pubkey to check
+            cooldown_seconds: How long to wait before re-proposing (default: 24 hours)
+
+        Returns:
+            True if the target was rejected within the cooldown period
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        cutoff = now - cooldown_seconds
+
+        # Get rejected actions since cutoff and check payload for target
+        rows = conn.execute("""
+            SELECT payload FROM pending_actions
+            WHERE status = 'rejected' AND proposed_at > ?
+        """, (cutoff,)).fetchall()
+
+        for row in rows:
+            try:
+                payload = json.loads(row['payload'])
+                if payload.get('target') == target:
+                    return True
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        return False
+
+    def get_rejection_count(self, target: str, days: int = 30) -> int:
+        """
+        Get the number of times a target was rejected in the given period.
+
+        Args:
+            target: Target pubkey to check
+            days: Look-back period in days
+
+        Returns:
+            Number of rejections for this target
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        cutoff = now - (days * 86400)
+
+        rows = conn.execute("""
+            SELECT payload FROM pending_actions
+            WHERE status = 'rejected' AND proposed_at > ?
+        """, (cutoff,)).fetchall()
+
+        count = 0
+        for row in rows:
+            try:
+                payload = json.loads(row['payload'])
+                if payload.get('target') == target:
+                    count += 1
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        return count
+
     # =========================================================================
     # PLANNER LOGGING (Phase 6)
     # =========================================================================
