@@ -1974,14 +1974,73 @@ def on_peer_disconnected(**kwargs):
 
 @plugin.subscribe("forward_event")
 def on_forward_event(plugin: Plugin, **payload):
-    """Track forwarding events for contribution and leech detection."""
-    if not contribution_mgr:
+    """Track forwarding events for contribution, leech detection, and route probing."""
+    # Handle contribution tracking
+    if contribution_mgr:
+        try:
+            contribution_mgr.handle_forward_event(payload)
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"Forward event handling error: {e}", level="warn")
+
+    # Generate route probe data from successful forwards (Phase 7.4)
+    if routing_map and database and our_pubkey:
+        try:
+            forward_event = payload.get("forward_event", payload)
+            status = forward_event.get("status")
+            if status == "settled":
+                _record_forward_as_route_probe(forward_event)
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"Route probe from forward error: {e}", level="debug")
+
+
+def _record_forward_as_route_probe(forward_event: Dict):
+    """
+    Record a settled forward as route probe data.
+
+    While we don't know the full path, we can record that this hop
+    (through our node) succeeded, which contributes to path success rates.
+    """
+    if not routing_map or not database or not safe_plugin:
         return
+
     try:
-        contribution_mgr.handle_forward_event(payload)
-    except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"Forward event handling error: {e}", level="warn")
+        in_channel = forward_event.get("in_channel", "")
+        out_channel = forward_event.get("out_channel", "")
+        fee_msat = forward_event.get("fee_msat", 0)
+        out_msat = forward_event.get("out_msat", 0)
+
+        if not in_channel or not out_channel:
+            return
+
+        # Get peer IDs for the channels
+        funds = safe_plugin.rpc.listfunds()
+        channels = {ch.get("short_channel_id"): ch for ch in funds.get("channels", [])}
+
+        in_peer = channels.get(in_channel, {}).get("peer_id", "")
+        out_peer = channels.get(out_channel, {}).get("peer_id", "")
+
+        if not in_peer or not out_peer:
+            return
+
+        # Record this as a successful path segment: in_peer -> us -> out_peer
+        # This is stored locally (no need to broadcast - each node sees their own forwards)
+        database.store_route_probe(
+            reporter_id=our_pubkey,
+            destination=out_peer,  # The next hop in the path
+            path=[in_peer, our_pubkey],  # Partial path we observed
+            success=True,
+            latency_ms=0,  # We don't have timing for forwards
+            failure_reason="",
+            failure_hop=-1,
+            estimated_capacity_sats=out_msat // 1000 if out_msat else 0,
+            total_fee_ppm=int((fee_msat * 1_000_000) / out_msat) if out_msat else 0,
+            amount_probed_sats=out_msat // 1000 if out_msat else 0,
+            timestamp=int(time.time())
+        )
+    except Exception:
+        pass  # Silently ignore errors in route probe recording
 
 
 # =============================================================================
@@ -4100,22 +4159,42 @@ def _broadcast_health_report():
         )
         channel_count = len([ch for ch in channels if ch.get("state") == "CHANNELD_NORMAL"])
 
+        # Calculate actual daily revenue from forwarding stats
+        daily_revenue_sats = 0
+        try:
+            forwards = safe_plugin.rpc.listforwards(status="settled")
+            forwards_list = forwards.get("forwards", [])
+            one_day_ago = time.time() - (24 * 3600)
+            daily_revenue_sats = sum(
+                fwd.get("fee_msat", 0) // 1000
+                for fwd in forwards_list
+                if fwd.get("received_time", 0) > one_day_ago
+            )
+        except Exception:
+            pass
+
         # Get hive averages for comparison
         all_health = database.get_all_member_health()
         if all_health:
             hive_avg_capacity = sum(
                 h.get("capacity_score", 50) for h in all_health
             ) / len(all_health) * 200000
+            # Estimate hive average revenue from revenue scores
+            hive_avg_revenue = sum(
+                h.get("revenue_score", 50) for h in all_health
+            ) / len(all_health) * 20  # Scale factor for reasonable default
         else:
             hive_avg_capacity = 10_000_000
+            hive_avg_revenue = 1000  # Default 1000 sats/day
 
         # Calculate our health
         health = fee_intel_mgr.calculate_our_health(
             capacity_sats=capacity_sats,
             available_sats=available_sats,
             channel_count=channel_count,
-            daily_revenue_sats=0,  # Would need forwarding stats over time
-            hive_avg_capacity=int(hive_avg_capacity)
+            daily_revenue_sats=daily_revenue_sats,
+            hive_avg_capacity=int(hive_avg_capacity),
+            hive_avg_revenue=int(max(1, hive_avg_revenue))  # Avoid division by zero
         )
 
         # Store our own health record
@@ -5483,6 +5562,127 @@ def hive_aggregate_fees(plugin: Plugin):
         "status": "ok",
         "profiles_updated": updated_count
     }
+
+
+@plugin.method("hive-trigger-fee-broadcast")
+def hive_trigger_fee_broadcast(plugin: Plugin):
+    """
+    Manually trigger fee intelligence broadcast.
+
+    Immediately collects fee observations from our channels and broadcasts
+    to all hive members. Useful for testing or forcing an immediate update.
+
+    Returns:
+        Dict with broadcast results.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not fee_intel_mgr or not safe_plugin:
+        return {"error": "Fee intelligence manager not initialized"}
+
+    try:
+        _broadcast_our_fee_intelligence()
+        return {"status": "ok", "message": "Fee intelligence broadcast triggered"}
+    except Exception as e:
+        return {"error": f"Broadcast failed: {e}"}
+
+
+@plugin.method("hive-trigger-health-report")
+def hive_trigger_health_report(plugin: Plugin):
+    """
+    Manually trigger health report broadcast.
+
+    Immediately calculates our health score and broadcasts to all hive members.
+    Useful for testing NNLB or forcing an immediate health update.
+
+    Returns:
+        Dict with health report results.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not fee_intel_mgr or not safe_plugin:
+        return {"error": "Fee intelligence manager not initialized"}
+
+    try:
+        _broadcast_health_report()
+        # Return current health after broadcast
+        if database and our_pubkey:
+            health = database.get_member_health(our_pubkey)
+            if health:
+                return {
+                    "status": "ok",
+                    "message": "Health report broadcast triggered",
+                    "our_health": health
+                }
+        return {"status": "ok", "message": "Health report broadcast triggered"}
+    except Exception as e:
+        return {"error": f"Health report broadcast failed: {e}"}
+
+
+@plugin.method("hive-trigger-all")
+def hive_trigger_all(plugin: Plugin):
+    """
+    Manually trigger all fee intelligence operations.
+
+    Runs the complete fee intelligence cycle:
+    1. Broadcast fee intelligence
+    2. Aggregate fee profiles
+    3. Broadcast health report
+
+    Useful for testing or forcing immediate updates.
+
+    Returns:
+        Dict with all operation results.
+
+    Permission: Member or Admin
+    """
+    # Permission check: Member or Admin
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    if not fee_intel_mgr or not safe_plugin:
+        return {"error": "Fee intelligence manager not initialized"}
+
+    results = {}
+
+    try:
+        _broadcast_our_fee_intelligence()
+        results["fee_broadcast"] = "ok"
+    except Exception as e:
+        results["fee_broadcast"] = f"error: {e}"
+
+    try:
+        updated = fee_intel_mgr.aggregate_fee_profiles()
+        results["profiles_aggregated"] = updated
+    except Exception as e:
+        results["profiles_aggregated"] = f"error: {e}"
+
+    try:
+        _broadcast_health_report()
+        results["health_broadcast"] = "ok"
+    except Exception as e:
+        results["health_broadcast"] = f"error: {e}"
+
+    # Get current state after operations
+    if database and our_pubkey:
+        health = database.get_member_health(our_pubkey)
+        if health:
+            results["our_health"] = health.get("overall_health")
+            results["our_tier"] = health.get("tier")
+
+    results["status"] = "ok"
+    return results
 
 
 @plugin.method("hive-nnlb-status")
