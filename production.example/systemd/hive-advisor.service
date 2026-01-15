@@ -7,11 +7,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 
-# Run as the installing user (use %u for username, %h for home)
-User=%u
-
-# Environment setup
-Environment=HOME=%h
+# Environment setup (user services already run as your user)
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 # Working directory - adjust path as needed for your deployment
