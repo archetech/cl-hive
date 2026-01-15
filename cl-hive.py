@@ -3105,6 +3105,76 @@ def _check_feerate_for_expansion(max_feerate_perkb: int) -> tuple:
         return (True, 0, f"feerate check error: {e}")
 
 
+def _get_spendable_balance(cfg) -> int:
+    """
+    Get onchain balance minus reserve, or 0 if unavailable.
+
+    This is the amount available for channel opens after accounting for
+    the configured reserve percentage.
+
+    Args:
+        cfg: Config snapshot with budget_reserve_pct
+
+    Returns:
+        Spendable balance in sats, or 0 if unavailable
+    """
+    if not safe_plugin:
+        return 0
+    try:
+        funds = safe_plugin.rpc.listfunds()
+        outputs = funds.get('outputs', [])
+        onchain_balance = sum(
+            (o.get('amount_msat', 0) // 1000 if isinstance(o.get('amount_msat'), int)
+             else int(o.get('amount_msat', '0msat')[:-4]) // 1000
+             if isinstance(o.get('amount_msat'), str) else o.get('value', 0))
+            for o in outputs if o.get('status') == 'confirmed'
+        )
+        return int(onchain_balance * (1.0 - cfg.budget_reserve_pct))
+    except Exception:
+        return 0
+
+
+def _cap_channel_size_to_budget(size_sats: int, cfg, context: str = "") -> tuple:
+    """
+    Cap channel size to available budget.
+
+    Ensures proposed channel sizes don't exceed what we can actually afford.
+
+    Args:
+        size_sats: Proposed channel size
+        cfg: Config snapshot
+        context: Optional context string for logging
+
+    Returns:
+        Tuple of (capped_size, was_insufficient, was_capped)
+        - capped_size: Final size (0 if insufficient funds)
+        - was_insufficient: True if we can't afford minimum channel
+        - was_capped: True if size was reduced to fit budget
+    """
+    spendable = _get_spendable_balance(cfg)
+
+    # Check if we can afford minimum channel size
+    if spendable < cfg.planner_min_channel_sats:
+        if context and plugin:
+            plugin.log(
+                f"cl-hive: {context}: insufficient funds "
+                f"({spendable:,} < {cfg.planner_min_channel_sats:,} min)",
+                level='debug'
+            )
+        return (0, True, False)
+
+    # Cap to what we can afford
+    if size_sats > spendable:
+        if context and plugin:
+            plugin.log(
+                f"cl-hive: {context}: capping channel size from {size_sats:,} to {spendable:,}",
+                level='info'
+            )
+        return (spendable, False, True)
+
+    return (size_sats, False, False)
+
+
 def _store_peer_available_action(target_peer_id: str, reporter_peer_id: str,
                                   event_type: str, capacity_sats: int,
                                   routing_score: float, reason: str) -> None:
@@ -3112,22 +3182,42 @@ def _store_peer_available_action(target_peer_id: str, reporter_peer_id: str,
     if not database:
         return
 
-    # Use planner's channel sizer if available
+    cfg = config.snapshot() if config else None
+    if not cfg:
+        return
+
+    # Determine suggested channel size
     suggested_sats = capacity_sats
-    if planner and config and capacity_sats == 0:
-        cfg = config.snapshot()
+    if capacity_sats == 0:
         suggested_sats = cfg.planner_default_channel_sats
+
+    # Check affordability and cap to available budget
+    capped_size, insufficient, was_capped = _cap_channel_size_to_budget(
+        suggested_sats, cfg, context=f"PEER_AVAILABLE to {target_peer_id[:16]}..."
+    )
+
+    # Skip if we can't afford minimum channel
+    if insufficient:
+        if plugin:
+            plugin.log(
+                f"cl-hive: Skipping PEER_AVAILABLE action for {target_peer_id[:16]}...: "
+                f"insufficient funds for minimum channel",
+                level='info'
+            )
+        return
 
     database.add_pending_action(
         action_type="channel_open",
         payload={
             "target": target_peer_id,
-            "amount_sats": suggested_sats,
+            "amount_sats": capped_size,
+            "original_amount_sats": suggested_sats if was_capped else None,
             "source": "peer_available",
             "reporter": reporter_peer_id,
             "event_type": event_type,
             "routing_score": routing_score,
-            "reason": reason or f"Peer available via {event_type}"
+            "reason": reason or f"Peer available via {event_type}",
+            "budget_capped": was_capped,
         },
         expires_hours=24
     )
@@ -3568,11 +3658,30 @@ def handle_expansion_elect(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         # Queue the channel open via pending actions
         if database and config:
             cfg = config.snapshot()
+            proposed_size = channel_size or cfg.planner_default_channel_sats
+
+            # Check affordability before queuing
+            capped_size, insufficient, was_capped = _cap_channel_size_to_budget(
+                proposed_size, cfg, f"EXPANSION_ELECT for {target_peer_id[:16]}..."
+            )
+            if insufficient:
+                plugin.log(
+                    f"cl-hive: [ELECT] Declining election: insufficient funds to open channel "
+                    f"(proposed={proposed_size}, min={cfg.planner_min_channel_sats})",
+                    level='info'
+                )
+                return {"result": "declined", "reason": "insufficient_funds"}
+            if was_capped:
+                plugin.log(
+                    f"cl-hive: [ELECT] Capping channel size from {proposed_size} to {capped_size}",
+                    level='info'
+                )
+
             action_id = database.add_pending_action(
                 action_type="channel_open",
                 payload={
                     "target": target_peer_id,
-                    "amount_sats": channel_size or cfg.planner_default_channel_sats,
+                    "amount_sats": capped_size,
                     "source": "cooperative_expansion",
                     "round_id": payload.get("round_id", ""),
                     "reason": "Elected by hive for cooperative expansion"
@@ -5220,12 +5329,36 @@ def hive_expansion_elect(plugin: Plugin, round_id: str):
     # (we won't receive our own broadcast message)
     if elected_id == our_pubkey and database and config:
         cfg = config.snapshot()
-        channel_size = round_obj.recommended_size_sats or cfg.planner_default_channel_sats
+        proposed_size = round_obj.recommended_size_sats or cfg.planner_default_channel_sats
+
+        # Check affordability before queuing
+        capped_size, insufficient, was_capped = _cap_channel_size_to_budget(
+            proposed_size, cfg, f"Local election for {round_obj.target_peer_id[:16]}..."
+        )
+        if insufficient:
+            plugin.log(
+                f"cl-hive: [ELECT] Cannot queue channel: insufficient funds "
+                f"(proposed={proposed_size}, min={cfg.planner_min_channel_sats})",
+                level='warn'
+            )
+            return {
+                "round_id": round_id,
+                "elected": True,
+                "elected_id": elected_id,
+                "error": "insufficient_funds",
+                "reason": f"Cannot afford minimum channel size ({cfg.planner_min_channel_sats} sats)"
+            }
+        if was_capped:
+            plugin.log(
+                f"cl-hive: [ELECT] Capping local election channel size from {proposed_size} to {capped_size}",
+                level='info'
+            )
+
         action_id = database.add_pending_action(
             action_type="channel_open",
             payload={
                 "target": round_obj.target_peer_id,
-                "amount_sats": channel_size,
+                "amount_sats": capped_size,
                 "source": "cooperative_expansion",
                 "round_id": round_id,
                 "reason": "Elected by hive for cooperative expansion"
@@ -5234,7 +5367,7 @@ def hive_expansion_elect(plugin: Plugin, round_id: str):
         )
         plugin.log(
             f"cl-hive: Queued channel open to {round_obj.target_peer_id[:16]}... "
-            f"(action_id={action_id}, size={channel_size})",
+            f"(action_id={action_id}, size={capped_size})",
             level='info'
         )
 
