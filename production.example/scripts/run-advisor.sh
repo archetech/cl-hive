@@ -17,8 +17,13 @@ mkdir -p "$LOG_DIR"
 
 LOG_FILE="${LOG_DIR}/advisor_${TIMESTAMP}.log"
 
-# Change to hive directory (MCP server expects relative paths)
+# Change to hive directory
 cd "$HIVE_DIR"
+
+# Activate virtual environment if it exists
+if [[ -f "${HIVE_DIR}/.venv/bin/activate" ]]; then
+    source "${HIVE_DIR}/.venv/bin/activate"
+fi
 
 echo "=== Hive AI Advisor Run: $(date) ===" | tee "$LOG_FILE"
 
@@ -30,10 +35,28 @@ else
     SYSTEM_PROMPT="You are an AI advisor for a Lightning node. Review pending actions and make decisions."
 fi
 
+# Generate MCP config with absolute paths
+MCP_CONFIG_TMP="${PROD_DIR}/.mcp-config-runtime.json"
+cat > "$MCP_CONFIG_TMP" << MCPEOF
+{
+  "mcpServers": {
+    "hive": {
+      "command": "${HIVE_DIR}/.venv/bin/python",
+      "args": ["${HIVE_DIR}/tools/mcp-hive-server.py"],
+      "env": {
+        "HIVE_NODES_CONFIG": "${PROD_DIR}/nodes.production.json",
+        "HIVE_STRATEGY_DIR": "${PROD_DIR}/strategy-prompts",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
+MCPEOF
+
 # Run Claude with MCP server
 # --allowedTools restricts to only hive/revenue tools for safety
 claude -p \
-    --mcp-config "${PROD_DIR}/mcp-config.json" \
+    --mcp-config "$MCP_CONFIG_TMP" \
     --system-prompt "$SYSTEM_PROMPT" \
     --model sonnet \
     --max-budget-usd 0.50 \

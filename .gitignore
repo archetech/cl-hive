@@ -63,3 +63,6 @@ reports/
 
 # Production deployment folder (contains secrets - use production.example/ as template)
 production/
+
+# Runtime-generated MCP config (created by run-advisor.sh)
+.mcp-config-runtime.json
