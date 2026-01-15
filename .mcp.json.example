@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "hive": {
+      "command": "/path/to/cl-hive/.venv/bin/python",
+      "args": ["/path/to/cl-hive/mcp-hive-server.py"],
+      "env": {
+        "HIVE_NODES_CONFIG": "/path/to/cl-hive/mcp-nodes.json"
+      }
+    }
+  }
+}

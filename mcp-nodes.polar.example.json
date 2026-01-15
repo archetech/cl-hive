@@ -1,0 +1,19 @@
+{
+  "mode": "docker",
+  "network": "regtest",
+  "lightning_dir": "/home/clightning/.lightning",
+  "nodes": [
+    {
+      "name": "alice",
+      "docker_container": "polar-n1-alice"
+    },
+    {
+      "name": "bob",
+      "docker_container": "polar-n1-bob"
+    },
+    {
+      "name": "carol",
+      "docker_container": "polar-n1-carol"
+    }
+  ]
+}

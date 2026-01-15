@@ -271,10 +271,23 @@ All options can be set in your CLN config file or passed as CLI arguments. Most 
 | `hive-vpn-peers` | `` | VPN peer mappings (pubkey@ip:port) |
 | `hive-vpn-required-messages` | `all` | Messages requiring VPN: all, gossip, intent, sync, none |
 
+## Claude Code Integration (MCP Server)
+
+The `mcp-hive-server.py` allows Claude Code to act as an AI oracle for your Hive fleet. This enables natural language fleet management:
+
+```
+"Show me the status of all hive nodes"
+"What pending actions need approval?"
+"Approve action 5 on alice - good expansion target"
+```
+
+See [MCP Server Documentation](docs/MCP_SERVER.md) for setup instructions.
+
 ## Documentation
 
 | Document | Description |
 |----------|-------------|
+| [MCP Server](docs/MCP_SERVER.md) | Claude Code integration guide |
 | [CLAUDE.md](CLAUDE.md) | Developer guidance for Claude Code |
 | [Phase 6 Plan](docs/planning/PHASE6_PLAN.md) | Topology optimization specification |
 | [Threat Model](docs/security/THREAT_MODEL.md) | Security threat analysis |

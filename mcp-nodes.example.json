@@ -1,0 +1,23 @@
+{
+  "mode": "rest",
+  "nodes": [
+    {
+      "name": "node1",
+      "rest_url": "https://node1.example.com:3001",
+      "rune": "your-rune-from-createrune-command",
+      "ca_cert": "/path/to/node1/ca.pem"
+    },
+    {
+      "name": "node2",
+      "rest_url": "https://node2.example.com:3001",
+      "rune": "your-rune-from-createrune-command",
+      "ca_cert": "/path/to/node2/ca.pem"
+    },
+    {
+      "name": "node3",
+      "rest_url": "https://node3.example.com:3001",
+      "rune": "your-rune-from-createrune-command",
+      "ca_cert": "/path/to/node3/ca.pem"
+    }
+  ]
+}

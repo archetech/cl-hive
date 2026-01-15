@@ -55,3 +55,8 @@ modules/__pycache__
 
 # Vendor directory (bundled dependencies for Docker build)
 vendor/
+
+# MCP Server config files (user-specific, use examples as templates)
+.mcp.json
+mcp-nodes.json
+polar-nodes.json
