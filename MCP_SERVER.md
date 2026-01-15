@@ -1,6 +1,6 @@
 # MCP Server for Claude Code Integration
 
-The `mcp-hive-server.py` provides a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that allows Claude Code to manage your Hive fleet directly. This turns Claude Code into an AI oracle that can monitor, analyze, and execute decisions across your Lightning node fleet.
+The `tools/mcp-hive-server.py` provides a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that allows Claude Code to manage your Hive fleet directly. This turns Claude Code into an AI advisor that can monitor, analyze, and execute decisions across your Lightning node fleet.
 
 ## Overview
 
@@ -42,7 +42,7 @@ python3 -m venv .venv
 
 ### 2. Create Node Configuration
 
-Create a `nodes.json` file with your fleet configuration. Two modes are supported:
+Copy an example config from `config/` and customize it. Two modes are supported:
 
 #### Production Mode (REST API)
 
@@ -112,7 +112,7 @@ Create `.mcp.json` in your cl-hive directory:
   "mcpServers": {
     "hive": {
       "command": "/path/to/cl-hive/.venv/bin/python",
-      "args": ["/path/to/cl-hive/mcp-hive-server.py"],
+      "args": ["/path/to/cl-hive/tools/mcp-hive-server.py"],
       "env": {
         "HIVE_NODES_CONFIG": "/path/to/cl-hive/nodes.json"
       }
@@ -127,6 +127,8 @@ Restart Claude Code in the cl-hive directory. It will detect the `.mcp.json` and
 
 ## Available Tools
 
+### cl-hive Tools
+
 | Tool | Description |
 |------|-------------|
 | `hive_status` | Get hive status from all nodes (membership, health, governance mode) |
@@ -138,8 +140,35 @@ Restart Claude Code in the cl-hive directory. It will detect the `.mcp.json` and
 | `hive_channels` | List channels with balance and fee information |
 | `hive_set_fees` | Set channel fees for a specific channel |
 | `hive_topology_analysis` | Get planner log and topology view |
-| `hive_broadcast_message` | Broadcast AI oracle messages to fleet |
-| `hive_governance_mode` | Get or set governance mode (advisor/autonomous/oracle) |
+| `hive_governance_mode` | Get or set governance mode (advisor/autonomous) |
+
+### cl-revenue-ops Tools
+
+| Tool | Description |
+|------|-------------|
+| `revenue_status` | Plugin status, fee controller state, recent changes |
+| `revenue_profitability` | Channel ROI, costs, revenue, classification |
+| `revenue_dashboard` | Financial health: TLV, operating margin, ROC |
+| `revenue_policy` | Manage peer-level fee/rebalance policies |
+| `revenue_set_fee` | Set channel fee with clboss coordination |
+| `revenue_rebalance` | Trigger manual rebalance with EV constraints |
+| `revenue_report` | Generate summary, peer, hive, or cost reports |
+| `revenue_config` | Get/set runtime configuration |
+| `revenue_debug` | Diagnostic info for fee or rebalance issues |
+| `revenue_history` | Lifetime financial history including closed channels |
+
+## Available Resources
+
+MCP Resources allow Claude to automatically see fleet status:
+
+| Resource URI | Description |
+|-------------|-------------|
+| `hive://fleet/status` | Status of all nodes |
+| `hive://fleet/pending-actions` | Pending actions needing approval |
+| `hive://fleet/summary` | Aggregated fleet metrics |
+| `hive://node/{name}/status` | Per-node detailed status |
+| `hive://node/{name}/channels` | Channel list and balances |
+| `hive://node/{name}/profitability` | Revenue analysis |
 
 ## Usage Examples
 
@@ -233,8 +262,22 @@ To add a new tool:
 2. Add a handler function `handle_your_tool(args)`
 3. Add the dispatch in `call_tool()`
 
+## Monitoring Daemon
+
+The `tools/hive-monitor.py` daemon provides real-time monitoring and daily reports:
+
+```bash
+# Quick status check
+./tools/hive-monitor.py --config nodes.json check
+
+# Generate daily report
+./tools/hive-monitor.py --config nodes.json report --output report.json
+
+# Run continuous monitoring (alerts for new pending actions, health issues)
+./tools/hive-monitor.py --config nodes.json monitor --interval 60
+```
+
 ## Related Documentation
 
-- [AI Oracle Protocol](specs/ai-oracle-protocol.md) - Message types for AI communication
-- [Governance Modes](../README.md#governance-modes) - Understanding advisor/autonomous/oracle modes
+- [Governance Modes](../README.md#governance-modes) - Understanding advisor/autonomous modes
 - [Polar Testing](testing/polar.md) - Testing with Polar network
