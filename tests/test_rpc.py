@@ -304,17 +304,6 @@ class TestSetModeRPC:
         config.governance_mode = 'autonomous'
         assert config.governance_mode == 'autonomous'
 
-    def test_set_mode_oracle_requires_url(self, config):
-        """Setting mode to oracle without URL should fail."""
-        # This test validates the logic that should exist in hive-set-mode
-        config.oracle_url = None
-        config.governance_mode = 'oracle'
-
-        # The RPC should check this condition
-        if config.governance_mode == 'oracle' and not config.oracle_url:
-            error = "Cannot switch to oracle mode: oracle_url not configured"
-            assert "oracle_url" in error
-
 
 # =============================================================================
 # CONTRIBUTION TESTS

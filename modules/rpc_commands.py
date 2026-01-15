@@ -257,8 +257,6 @@ def get_config(ctx: HiveContext) -> Dict[str, Any]:
             "governance_mode": ctx.config.governance_mode,
             "autonomous_budget_per_day": ctx.config.autonomous_budget_per_day,
             "autonomous_actions_per_hour": ctx.config.autonomous_actions_per_hour,
-            "oracle_url": ctx.config.oracle_url,
-            "oracle_timeout_seconds": ctx.config.oracle_timeout_seconds,
         },
         "membership": {
             "membership_enabled": ctx.config.membership_enabled,
@@ -1088,7 +1086,7 @@ def set_mode(ctx: HiveContext, mode: str) -> Dict[str, Any]:
 
     Args:
         ctx: HiveContext
-        mode: New governance mode ('advisor', 'autonomous', or 'oracle')
+        mode: New governance mode ('advisor' or 'autonomous')
 
     Returns:
         Dict with new mode and previous mode.
@@ -1111,13 +1109,6 @@ def set_mode(ctx: HiveContext, mode: str) -> Dict[str, Any]:
         return {
             "error": f"Invalid mode: {mode}",
             "valid_modes": list(VALID_GOVERNANCE_MODES)
-        }
-
-    # Check for oracle URL if switching to oracle mode
-    if mode_lower == 'oracle' and not ctx.config.oracle_url:
-        return {
-            "error": "Cannot switch to oracle mode: oracle_url not configured",
-            "hint": "Set hive-oracle-url option or configure oracle_url"
         }
 
     # Store previous mode

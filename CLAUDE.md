@@ -55,7 +55,6 @@ Core Lightning
 | `planner.py` | Topology optimization - saturation analysis, expansion election, feerate gate |
 | `config.py` | Hot-reloadable configuration with snapshot pattern |
 | `database.py` | SQLite with WAL mode, thread-local connections |
-| `ai_oracle_store.py` | AI Oracle message storage, validation, and rate limiting |
 
 ### Key Patterns
 
@@ -87,7 +86,6 @@ Core Lightning
 |------|----------|
 | `advisor` | Log decisions, queue to pending_actions, no auto-execution |
 | `autonomous` | Execute within safety limits (budget cap, rate limit) |
-| `oracle` | Delegate decisions to external API |
 
 ### Database Tables
 
@@ -180,14 +178,23 @@ cl-hive/
 │   ├── membership.py       # Member management
 │   ├── contribution.py     # Contribution tracking
 │   ├── planner.py          # Topology planner
+│   ├── governance.py       # Decision engine (advisor/autonomous)
 │   ├── config.py           # Configuration
 │   └── database.py         # Database layer
+├── tools/
+│   ├── mcp-hive-server.py  # MCP server for Claude Code integration
+│   ├── hive-monitor.py     # Real-time monitoring daemon
+│   └── ai_advisor.py       # AI advisor utility
+├── config/
+│   ├── nodes.rest.example.json    # REST API config example
+│   └── nodes.docker.example.json  # Docker/Polar config example
 ├── tests/                  # Test suite
 ├── docs/                   # Documentation
 │   ├── design/             # Design documents
 │   ├── planning/           # Implementation plans
 │   ├── security/           # Security docs
 │   ├── specs/              # Specifications
-│   └── testing/            # Testing guides
+│   └── testing/            # Testing guides & scripts
+├── audits/                 # Security audits
 └── docker/                 # Docker deployment
 ```

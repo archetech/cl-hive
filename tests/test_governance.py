@@ -4,7 +4,6 @@ Tests for the Governance module (Phase 7).
 Tests cover:
 - ADVISOR mode: Queuing actions for manual approval
 - AUTONOMOUS mode: Budget caps and rate limits
-- ORACLE mode: External API with fallback
 - Fail-closed behavior on errors
 """
 
@@ -24,8 +23,6 @@ from modules.governance import (
     DecisionResult,
     DecisionPacket,
     DecisionResponse,
-    ORACLE_RETRY_COUNT,
-    ORACLE_RETRY_DELAY_SECONDS,
 )
 
 
@@ -39,8 +36,6 @@ class MockConfig:
     governance_mode: str = 'advisor'
     autonomous_budget_per_day: int = 10_000_000
     autonomous_actions_per_hour: int = 2
-    oracle_url: str = None
-    oracle_timeout_seconds: int = 5
 
 
 @pytest.fixture
@@ -226,108 +221,6 @@ class TestAutonomousMode:
             action_type='rebalance',
             target='02' + 'h' * 64,
             context={'amount_sats': 100_000},
-            cfg=mock_config
-        )
-
-        assert response.result == DecisionResult.QUEUED
-
-
-# =============================================================================
-# ORACLE MODE TESTS
-# =============================================================================
-
-class TestOracleMode:
-    """Tests for ORACLE mode (external API delegation)."""
-
-    def test_oracle_approve_executes(self, engine, mock_config):
-        """ORACLE mode should execute when oracle approves."""
-        mock_config.governance_mode = 'oracle'
-        mock_config.oracle_url = 'http://oracle.example.com/decide'
-
-        executor = MagicMock()
-        engine.register_executor('channel_open', executor)
-
-        # Mock successful oracle response
-        with patch.object(engine, '_query_oracle') as mock_query:
-            mock_query.return_value = {'decision': 'APPROVE', 'reason': 'Good target'}
-
-            response = engine.propose_action(
-                action_type='channel_open',
-                target='02' + 'i' * 64,
-                context={'amount_sats': 1_000_000},
-                cfg=mock_config
-            )
-
-        assert response.result == DecisionResult.APPROVED
-        assert 'oracle' in response.reason.lower()
-        executor.assert_called_once()
-
-    def test_oracle_deny_rejects(self, engine, mock_config):
-        """ORACLE mode should reject when oracle denies."""
-        mock_config.governance_mode = 'oracle'
-        mock_config.oracle_url = 'http://oracle.example.com/decide'
-
-        executor = MagicMock()
-        engine.register_executor('channel_open', executor)
-
-        with patch.object(engine, '_query_oracle') as mock_query:
-            mock_query.return_value = {'decision': 'DENY', 'reason': 'Target saturated'}
-
-            response = engine.propose_action(
-                action_type='channel_open',
-                target='02' + 'j' * 64,
-                context={'amount_sats': 1_000_000},
-                cfg=mock_config
-            )
-
-        assert response.result == DecisionResult.DENIED
-        assert 'saturated' in response.reason.lower()
-        executor.assert_not_called()
-
-    def test_oracle_timeout_falls_back_to_advisor(self, engine, mock_database, mock_config):
-        """ORACLE mode should fall back to ADVISOR on timeout."""
-        mock_config.governance_mode = 'oracle'
-        mock_config.oracle_url = 'http://oracle.example.com/decide'
-
-        with patch.object(engine, '_query_oracle') as mock_query:
-            mock_query.return_value = None  # Timeout/failure
-
-            response = engine.propose_action(
-                action_type='channel_open',
-                target='02' + 'k' * 64,
-                context={'amount_sats': 1_000_000},
-                cfg=mock_config
-            )
-
-        assert response.result == DecisionResult.QUEUED
-        mock_database.add_pending_action.assert_called()
-
-    def test_oracle_malformed_response_falls_back(self, engine, mock_database, mock_config):
-        """ORACLE mode should fall back on malformed response."""
-        mock_config.governance_mode = 'oracle'
-        mock_config.oracle_url = 'http://oracle.example.com/decide'
-
-        with patch.object(engine, '_query_oracle') as mock_query:
-            mock_query.return_value = {'invalid': 'response'}  # Missing 'decision'
-
-            response = engine.propose_action(
-                action_type='channel_open',
-                target='02' + 'l' * 64,
-                context={'amount_sats': 1_000_000},
-                cfg=mock_config
-            )
-
-        assert response.result == DecisionResult.QUEUED
-
-    def test_oracle_no_url_falls_back(self, engine, mock_database, mock_config):
-        """ORACLE mode should fall back if no URL configured."""
-        mock_config.governance_mode = 'oracle'
-        mock_config.oracle_url = None
-
-        response = engine.propose_action(
-            action_type='channel_open',
-            target='02' + 'm' * 64,
-            context={'amount_sats': 1_000_000},
             cfg=mock_config
         )
 

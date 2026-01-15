@@ -4,7 +4,6 @@ Governance Module for cl-hive (Phase 7)
 Implements the Decision Engine that controls how Hive actions are executed:
 - ADVISOR mode: Queue actions for manual approval (human in the loop)
 - AUTONOMOUS mode: Execute within safety limits (budget cap, rate limits)
-- ORACLE mode: Delegate decisions to external API with fallback
 
 Security Constraints (GEMINI.md):
 - Rule #3: Fail-Closed Bias - On any error, fall back to ADVISOR mode
@@ -15,8 +14,6 @@ Author: Lightning Goats Team
 
 import json
 import time
-import urllib.request
-import urllib.error
 from dataclasses import dataclass, asdict
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -25,10 +22,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-
-# Oracle retry configuration
-ORACLE_RETRY_COUNT = 1
-ORACLE_RETRY_DELAY_SECONDS = 2
 
 # Default action expiry
 DEFAULT_ACTION_EXPIRY_HOURS = 24
@@ -42,7 +35,6 @@ class GovernanceMode(Enum):
     """Decision-making modes for the Hive."""
     ADVISOR = 'advisor'       # Queue for manual approval
     AUTONOMOUS = 'autonomous' # Execute within safety limits
-    ORACLE = 'oracle'         # Delegate to external API
 
 
 class DecisionResult(Enum):
@@ -94,7 +86,6 @@ class DecisionEngine:
     Handles action proposals based on the configured governance mode:
     - ADVISOR: Queue to pending_actions, require manual approval
     - AUTONOMOUS: Execute if within budget/rate limits
-    - ORACLE: Query external API, fallback to ADVISOR on failure
 
     Thread Safety:
     - Uses config snapshot pattern for consistency
@@ -153,7 +144,6 @@ class DecisionEngine:
         Based on the governance mode, the action will be:
         - ADVISOR: Queued for manual approval
         - AUTONOMOUS: Executed if within limits, else queued
-        - ORACLE: Decided by external API, with fallback
 
         Args:
             action_type: Type of action ('channel_open', 'rebalance', 'ban')
@@ -180,8 +170,6 @@ class DecisionEngine:
                 return self._handle_advisor_mode(packet, cfg)
             elif mode == GovernanceMode.AUTONOMOUS:
                 return self._handle_autonomous_mode(packet, cfg)
-            elif mode == GovernanceMode.ORACLE:
-                return self._handle_oracle_mode(packet, cfg)
             else:
                 # Unknown mode - fail closed to ADVISOR
                 self._log(f"Unknown mode {mode}, falling back to ADVISOR", level='warn')
@@ -330,149 +318,6 @@ class DecisionEngine:
         self._hourly_actions = [ts for ts in self._hourly_actions if ts > cutoff]
 
         return len(self._hourly_actions) < cfg.autonomous_actions_per_hour
-
-    # =========================================================================
-    # ORACLE MODE
-    # =========================================================================
-
-    def _handle_oracle_mode(self, packet: DecisionPacket, cfg) -> DecisionResponse:
-        """
-        Handle action in ORACLE mode - delegate to external API.
-
-        Implements fail-closed behavior:
-        - Timeout -> fallback to ADVISOR
-        - 5xx error -> fallback to ADVISOR
-        - Malformed response -> fallback to ADVISOR
-        - DENY response -> action rejected
-        - APPROVE response -> execute action
-
-        Args:
-            packet: Decision packet
-            cfg: Config snapshot
-
-        Returns:
-            DecisionResponse based on oracle decision
-        """
-        oracle_url = cfg.oracle_url
-
-        if not oracle_url:
-            self._log("Oracle URL not configured, falling back to ADVISOR", level='warn')
-            return self._handle_advisor_mode(packet, cfg)
-
-        # Query oracle with retry
-        oracle_response = self._query_oracle(
-            url=oracle_url,
-            packet=packet,
-            timeout=cfg.oracle_timeout_seconds
-        )
-
-        if oracle_response is None:
-            # GEMINI.md Rule #3: Fail-Closed - fallback to ADVISOR
-            self._log("Oracle query failed, falling back to ADVISOR", level='warn')
-            return self._handle_advisor_mode(packet, cfg)
-
-        # Parse oracle decision
-        decision = oracle_response.get('decision', '').upper()
-        reason = oracle_response.get('reason', '')
-
-        if decision == 'APPROVE':
-            # Execute the action
-            executor = self._executors.get(packet.action_type)
-            if executor:
-                try:
-                    executor(packet.target, packet.context)
-                    self._log(f"Action approved and executed by oracle")
-
-                    return DecisionResponse(
-                        result=DecisionResult.APPROVED,
-                        reason=f"Approved by oracle: {reason}",
-                        oracle_response=oracle_response
-                    )
-                except Exception as e:
-                    self._log(f"Execution failed after oracle approval: {e}", level='warn')
-                    return self._handle_advisor_mode(packet, cfg)
-            else:
-                self._log(f"No executor for {packet.action_type}, queueing")
-                return self._handle_advisor_mode(packet, cfg)
-
-        elif decision == 'DENY':
-            self._log(f"Action denied by oracle: {reason}")
-            return DecisionResponse(
-                result=DecisionResult.DENIED,
-                reason=f"Denied by oracle: {reason}",
-                oracle_response=oracle_response
-            )
-        else:
-            # Malformed response - fail closed
-            self._log(f"Invalid oracle response: {oracle_response}, falling back to ADVISOR", level='warn')
-            return self._handle_advisor_mode(packet, cfg)
-
-    def _query_oracle(
-        self,
-        url: str,
-        packet: DecisionPacket,
-        timeout: int
-    ) -> Optional[Dict]:
-        """
-        Query the external oracle API.
-
-        Implements:
-        - POST request with JSON body
-        - Configurable timeout
-        - 1 retry after 2s delay
-
-        Args:
-            url: Oracle API URL
-            packet: Decision packet to send
-            timeout: Request timeout in seconds
-
-        Returns:
-            Dict response or None on failure
-        """
-        payload = packet.to_json().encode('utf-8')
-
-        for attempt in range(ORACLE_RETRY_COUNT + 1):
-            try:
-                req = urllib.request.Request(
-                    url,
-                    data=payload,
-                    headers={
-                        'Content-Type': 'application/json',
-                        'User-Agent': 'cl-hive/1.0'
-                    },
-                    method='POST'
-                )
-
-                with urllib.request.urlopen(req, timeout=timeout) as response:
-                    if response.status == 200:
-                        body = response.read().decode('utf-8')
-                        return json.loads(body)
-                    elif response.status >= 500:
-                        self._log(f"Oracle returned {response.status}, retrying...", level='warn')
-                    else:
-                        # 4xx error - don't retry
-                        self._log(f"Oracle returned {response.status}", level='warn')
-                        return None
-
-            except urllib.error.URLError as e:
-                self._log(f"Oracle connection error: {e}", level='warn')
-            except urllib.error.HTTPError as e:
-                if e.code >= 500:
-                    self._log(f"Oracle server error {e.code}, retrying...", level='warn')
-                else:
-                    self._log(f"Oracle HTTP error {e.code}", level='warn')
-                    return None
-            except json.JSONDecodeError as e:
-                self._log(f"Oracle returned invalid JSON: {e}", level='warn')
-                return None
-            except Exception as e:
-                self._log(f"Oracle query error: {e}", level='warn')
-
-            # Wait before retry
-            if attempt < ORACLE_RETRY_COUNT:
-                time.sleep(ORACLE_RETRY_DELAY_SECONDS)
-
-        return None
 
     # =========================================================================
     # STATISTICS
