@@ -50,11 +50,17 @@ import json
 import logging
 import os
 import ssl
+import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+# Add tools directory to path for advisor_db import
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from advisor_db import AdvisorDB
 
 # MCP SDK imports
 try:
@@ -273,6 +279,10 @@ class HiveFleet:
 
 # Global fleet instance
 fleet = HiveFleet()
+
+# Global advisor database instance
+ADVISOR_DB_PATH = os.environ.get('ADVISOR_DB_PATH', str(Path.home() / ".lightning" / "advisor.db"))
+advisor_db: Optional[AdvisorDB] = None
 
 
 # =============================================================================
@@ -688,6 +698,136 @@ async def list_tools() -> List[Tool]:
                 },
                 "required": ["node"]
             }
+        ),
+        # =====================================================================
+        # Advisor Database Tools - Historical tracking and trend analysis
+        # =====================================================================
+        Tool(
+            name="advisor_record_snapshot",
+            description="Record the current fleet state to the advisor database for historical tracking. Call this at the START of each advisor run to track state over time. This enables trend analysis and velocity calculations.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to record snapshot for"
+                    },
+                    "snapshot_type": {
+                        "type": "string",
+                        "enum": ["manual", "hourly", "daily"],
+                        "description": "Type of snapshot (default: manual)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="advisor_get_trends",
+            description="Get fleet-wide trend analysis over specified period. Shows revenue change, capacity change, health trends, and channels depleting/filling. Use this to understand how the node is performing over time.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "Number of days to analyze (default: 7)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="advisor_get_velocities",
+            description="Get channels with critical velocity - those depleting or filling rapidly. Returns channels predicted to deplete or fill within the threshold hours. Use this to identify channels that need urgent attention (rebalancing, fee changes).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hours_threshold": {
+                        "type": "number",
+                        "description": "Alert threshold in hours (default: 24). Channels predicted to deplete/fill within this time are returned."
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="advisor_get_channel_history",
+            description="Get historical data for a specific channel including balance, fees, and flow over time. Use this to understand a channel's behavior patterns.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel ID (SCID format)"
+                    },
+                    "hours": {
+                        "type": "integer",
+                        "description": "Hours of history to retrieve (default: 24)"
+                    }
+                },
+                "required": ["node", "channel_id"]
+            }
+        ),
+        Tool(
+            name="advisor_record_decision",
+            description="Record an AI decision to the audit trail. Call this after making any significant decision (approval, rejection, flagging channels). This builds a history of decisions for learning and accountability.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "decision_type": {
+                        "type": "string",
+                        "enum": ["approve", "reject", "flag_channel", "fee_change", "rebalance"],
+                        "description": "Type of decision made"
+                    },
+                    "node": {
+                        "type": "string",
+                        "description": "Node name where decision applies"
+                    },
+                    "recommendation": {
+                        "type": "string",
+                        "description": "What was decided/recommended"
+                    },
+                    "reasoning": {
+                        "type": "string",
+                        "description": "Why this decision was made"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Related channel ID (optional)"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Related peer ID (optional)"
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "Confidence score 0-1 (optional)"
+                    }
+                },
+                "required": ["decision_type", "node", "recommendation"]
+            }
+        ),
+        Tool(
+            name="advisor_get_recent_decisions",
+            description="Get recent AI decisions from the audit trail. Use this to review past decisions and avoid repeating the same recommendations.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of decisions to return (default: 20)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="advisor_db_stats",
+            description="Get advisor database statistics including record counts and oldest data timestamp. Use this to verify the database is collecting data properly.",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
         )
     ]
 
@@ -738,6 +878,21 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_revenue_debug(arguments)
         elif name == "revenue_history":
             result = await handle_revenue_history(arguments)
+        # Advisor database tools
+        elif name == "advisor_record_snapshot":
+            result = await handle_advisor_record_snapshot(arguments)
+        elif name == "advisor_get_trends":
+            result = await handle_advisor_get_trends(arguments)
+        elif name == "advisor_get_velocities":
+            result = await handle_advisor_get_velocities(arguments)
+        elif name == "advisor_get_channel_history":
+            result = await handle_advisor_get_channel_history(arguments)
+        elif name == "advisor_record_decision":
+            result = await handle_advisor_record_decision(arguments)
+        elif name == "advisor_get_recent_decisions":
+            result = await handle_advisor_get_recent_decisions(arguments)
+        elif name == "advisor_db_stats":
+            result = await handle_advisor_db_stats(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -1303,6 +1458,325 @@ async def handle_revenue_history(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("revenue-history")
+
+
+# =============================================================================
+# Advisor Database Tool Handlers
+# =============================================================================
+
+def ensure_advisor_db() -> AdvisorDB:
+    """Ensure advisor database is initialized."""
+    global advisor_db
+    if advisor_db is None:
+        advisor_db = AdvisorDB(ADVISOR_DB_PATH)
+        logger.info(f"Initialized advisor database at {ADVISOR_DB_PATH}")
+    return advisor_db
+
+
+async def handle_advisor_record_snapshot(args: Dict) -> Dict:
+    """Record current fleet state to the advisor database."""
+    node_name = args.get("node")
+    snapshot_type = args.get("snapshot_type", "manual")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    db = ensure_advisor_db()
+
+    # Gather data from the node
+    try:
+        hive_status = await node.call("hive-status")
+        funds = await node.call("listfunds")
+        pending = await node.call("hive-pending-actions")
+
+        # Try to get revenue data if plugin is installed
+        try:
+            dashboard = await node.call("revenue-dashboard", {"window_days": 30})
+            profitability = await node.call("revenue-profitability")
+            history = await node.call("revenue-history")
+        except Exception:
+            dashboard = {}
+            profitability = {}
+            history = {}
+
+        channels = funds.get("channels", [])
+        outputs = funds.get("outputs", [])
+
+        # Build report structure for database
+        report = {
+            "fleet_summary": {
+                "total_nodes": 1,
+                "nodes_healthy": 1 if "error" not in hive_status else 0,
+                "nodes_unhealthy": 0 if "error" not in hive_status else 1,
+                "total_channels": len(channels),
+                "total_capacity_sats": sum(c.get("amount_msat", 0) // 1000 for c in channels),
+                "total_onchain_sats": sum(o.get("amount_msat", 0) // 1000
+                                          for o in outputs if o.get("status") == "confirmed"),
+                "total_pending_actions": len(pending.get("actions", [])),
+                "channel_health": {
+                    "balanced": 0,
+                    "needs_inbound": 0,
+                    "needs_outbound": 0
+                }
+            },
+            "hive_topology": {
+                "member_count": len(hive_status.get("members", []))
+            },
+            "nodes": {
+                node_name: {
+                    "healthy": "error" not in hive_status,
+                    "channels_detail": [],
+                    "lifetime_history": history
+                }
+            }
+        }
+
+        # Process channel details for history
+        channels_data = await node.call("listpeerchannels")
+        prof_data = profitability.get("channels", [])
+        prof_by_id = {c.get("channel_id"): c for c in prof_data}
+
+        for ch in channels_data.get("channels", []):
+            scid = ch.get("short_channel_id", "")
+            prof_ch = prof_by_id.get(scid, {})
+
+            local_msat = ch.get("to_us_msat", 0)
+            if isinstance(local_msat, str):
+                local_msat = int(local_msat.replace("msat", ""))
+            capacity_msat = ch.get("total_msat", 0)
+            if isinstance(capacity_msat, str):
+                capacity_msat = int(capacity_msat.replace("msat", ""))
+
+            local_sats = local_msat // 1000
+            capacity_sats = capacity_msat // 1000
+            remote_sats = capacity_sats - local_sats
+            balance_ratio = local_sats / capacity_sats if capacity_sats > 0 else 0
+
+            # Extract fee info
+            updates = ch.get("updates", {})
+            local_updates = updates.get("local", {})
+            fee_ppm = local_updates.get("fee_proportional_millionths", 0)
+            fee_base = local_updates.get("fee_base_msat", 0)
+
+            ch_detail = {
+                "channel_id": scid,
+                "peer_id": ch.get("peer_id", ""),
+                "capacity_sats": capacity_sats,
+                "local_sats": local_sats,
+                "remote_sats": remote_sats,
+                "balance_ratio": round(balance_ratio, 4),
+                "flow_state": prof_ch.get("profitability_class", "unknown"),
+                "flow_ratio": prof_ch.get("roi_annual_pct", 0),
+                "confidence": 1.0,
+                "forward_count": 0,
+                "fee_ppm": fee_ppm,
+                "fee_base_msat": fee_base,
+                "needs_inbound": balance_ratio > 0.8,
+                "needs_outbound": balance_ratio < 0.2,
+                "is_balanced": 0.2 <= balance_ratio <= 0.8
+            }
+            report["nodes"][node_name]["channels_detail"].append(ch_detail)
+
+            # Update health counters
+            if ch_detail["is_balanced"]:
+                report["fleet_summary"]["channel_health"]["balanced"] += 1
+            elif ch_detail["needs_inbound"]:
+                report["fleet_summary"]["channel_health"]["needs_inbound"] += 1
+            elif ch_detail["needs_outbound"]:
+                report["fleet_summary"]["channel_health"]["needs_outbound"] += 1
+
+        # Record to database
+        snapshot_id = db.record_fleet_snapshot(report, snapshot_type)
+        channels_recorded = db.record_channel_states(report)
+
+        return {
+            "success": True,
+            "snapshot_id": snapshot_id,
+            "channels_recorded": channels_recorded,
+            "snapshot_type": snapshot_type,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        logger.exception("Error recording snapshot")
+        return {"error": f"Failed to record snapshot: {str(e)}"}
+
+
+async def handle_advisor_get_trends(args: Dict) -> Dict:
+    """Get fleet-wide trend analysis."""
+    days = args.get("days", 7)
+
+    db = ensure_advisor_db()
+
+    trends = db.get_fleet_trends(days)
+    if not trends:
+        return {
+            "message": "Not enough historical data for trend analysis. Record more snapshots over time.",
+            "snapshots_available": len(db.get_recent_snapshots(100))
+        }
+
+    return {
+        "period_days": days,
+        "revenue_change_pct": trends.revenue_change_pct,
+        "capacity_change_pct": trends.capacity_change_pct,
+        "channel_count_change": trends.channel_count_change,
+        "health_trend": trends.health_trend,
+        "channels_depleting": trends.channels_depleting,
+        "channels_filling": trends.channels_filling
+    }
+
+
+async def handle_advisor_get_velocities(args: Dict) -> Dict:
+    """Get channels with critical velocity."""
+    hours_threshold = args.get("hours_threshold", 24)
+
+    db = ensure_advisor_db()
+
+    critical_channels = db.get_critical_channels(hours_threshold)
+
+    if not critical_channels:
+        return {
+            "message": f"No channels predicted to deplete or fill within {hours_threshold} hours",
+            "critical_count": 0
+        }
+
+    channels = []
+    for ch in critical_channels:
+        channels.append({
+            "node": ch.node_name,
+            "channel_id": ch.channel_id,
+            "current_balance_ratio": round(ch.current_balance_ratio, 4),
+            "velocity_pct_per_hour": round(ch.velocity_pct_per_hour, 4),
+            "trend": ch.trend,
+            "hours_until_depleted": round(ch.hours_until_depleted, 1) if ch.hours_until_depleted else None,
+            "hours_until_full": round(ch.hours_until_full, 1) if ch.hours_until_full else None,
+            "urgency": ch.urgency,
+            "confidence": round(ch.confidence, 2)
+        })
+
+    return {
+        "critical_count": len(channels),
+        "hours_threshold": hours_threshold,
+        "channels": channels
+    }
+
+
+async def handle_advisor_get_channel_history(args: Dict) -> Dict:
+    """Get historical data for a specific channel."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    hours = args.get("hours", 24)
+
+    db = ensure_advisor_db()
+
+    history = db.get_channel_history(node_name, channel_id, hours)
+    velocity = db.get_channel_velocity(node_name, channel_id)
+
+    result = {
+        "node": node_name,
+        "channel_id": channel_id,
+        "hours_requested": hours,
+        "data_points": len(history),
+        "history": []
+    }
+
+    for h in history:
+        result["history"].append({
+            "timestamp": datetime.fromtimestamp(h["timestamp"]).isoformat(),
+            "local_sats": h["local_sats"],
+            "balance_ratio": round(h["balance_ratio"], 4),
+            "fee_ppm": h["fee_ppm"],
+            "flow_state": h["flow_state"]
+        })
+
+    if velocity:
+        result["velocity"] = {
+            "trend": velocity.trend,
+            "velocity_pct_per_hour": round(velocity.velocity_pct_per_hour, 4),
+            "hours_until_depleted": round(velocity.hours_until_depleted, 1) if velocity.hours_until_depleted else None,
+            "hours_until_full": round(velocity.hours_until_full, 1) if velocity.hours_until_full else None,
+            "confidence": round(velocity.confidence, 2)
+        }
+
+    return result
+
+
+async def handle_advisor_record_decision(args: Dict) -> Dict:
+    """Record an AI decision to the audit trail."""
+    decision_type = args.get("decision_type")
+    node_name = args.get("node")
+    recommendation = args.get("recommendation")
+    reasoning = args.get("reasoning")
+    channel_id = args.get("channel_id")
+    peer_id = args.get("peer_id")
+    confidence = args.get("confidence")
+
+    db = ensure_advisor_db()
+
+    decision_id = db.record_decision(
+        decision_type=decision_type,
+        node_name=node_name,
+        recommendation=recommendation,
+        reasoning=reasoning,
+        channel_id=channel_id,
+        peer_id=peer_id,
+        confidence=confidence
+    )
+
+    return {
+        "success": True,
+        "decision_id": decision_id,
+        "decision_type": decision_type,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+async def handle_advisor_get_recent_decisions(args: Dict) -> Dict:
+    """Get recent AI decisions from the audit trail."""
+    limit = args.get("limit", 20)
+
+    db = ensure_advisor_db()
+
+    # Get recent decisions
+    with db._get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, timestamp, decision_type, node_name, channel_id, peer_id,
+                   recommendation, reasoning, confidence, status
+            FROM ai_decisions
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+    decisions = []
+    for row in rows:
+        decisions.append({
+            "id": row["id"],
+            "timestamp": datetime.fromtimestamp(row["timestamp"]).isoformat(),
+            "decision_type": row["decision_type"],
+            "node": row["node_name"],
+            "channel_id": row["channel_id"],
+            "peer_id": row["peer_id"],
+            "recommendation": row["recommendation"],
+            "reasoning": row["reasoning"],
+            "confidence": row["confidence"],
+            "status": row["status"]
+        })
+
+    return {
+        "count": len(decisions),
+        "decisions": decisions
+    }
+
+
+async def handle_advisor_db_stats(args: Dict) -> Dict:
+    """Get advisor database statistics."""
+    db = ensure_advisor_db()
+
+    stats = db.get_stats()
+    stats["database_path"] = ADVISOR_DB_PATH
+
+    return stats
 
 
 # =============================================================================
