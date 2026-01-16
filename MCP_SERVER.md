@@ -157,6 +157,30 @@ Restart Claude Code in the cl-hive directory. It will detect the `.mcp.json` and
 | `revenue_debug` | Diagnostic info for fee or rebalance issues |
 | `revenue_history` | Lifetime financial history including closed channels |
 
+### Advisor Database Tools
+
+These tools maintain a local SQLite database for historical tracking and trend analysis:
+
+| Tool | Description |
+|------|-------------|
+| `advisor_record_snapshot` | Record current fleet state for trend tracking (call at START of each run) |
+| `advisor_get_trends` | Get fleet-wide trends over 7/30 days (revenue, capacity, health) |
+| `advisor_get_velocities` | Find channels depleting/filling within threshold hours |
+| `advisor_get_channel_history` | Get historical data for a specific channel |
+| `advisor_record_decision` | Record AI decision to audit trail (call after each approval/rejection) |
+| `advisor_get_recent_decisions` | Get recent decisions to avoid repeating recommendations |
+| `advisor_db_stats` | Database statistics (record counts, oldest data) |
+
+**Configuration:**
+- Set `ADVISOR_DB_PATH` environment variable to customize database location
+- Default: `~/.lightning/advisor.db`
+
+**Capabilities enabled:**
+- **Velocity tracking**: Predict when channels will deplete/fill
+- **Trend analysis**: Compare metrics over time
+- **Decision audit**: Track all AI decisions with reasoning
+- **Learning**: Avoid repeating ineffective recommendations
+
 ## Available Resources
 
 MCP Resources allow Claude to automatically see fleet status:

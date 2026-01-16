@@ -39,6 +39,19 @@ The AI advisor provides intelligent oversight for your Lightning node:
 - Close channels (only flags for review)
 - Make changes outside defined safety limits
 
+### Historical Tracking (Advisor Database)
+
+The advisor maintains a local SQLite database for intelligent decision-making:
+
+| Capability | Description |
+|------------|-------------|
+| **Trend Analysis** | Compare metrics over 7/30 days to spot changes |
+| **Velocity Tracking** | Predict when channels will deplete or fill |
+| **Decision Audit** | Full history of AI decisions with reasoning |
+| **Pattern Learning** | Avoid repeating ineffective recommendations |
+
+Database location: `production/data/advisor.db`
+
 ## Prerequisites
 
 ### On Your Lightning Node
