@@ -1153,14 +1153,74 @@ async def handle_node_info(args: Dict) -> Dict:
 
 
 async def handle_channels(args: Dict) -> Dict:
-    """Get channel list."""
+    """Get channel list with flow profiles and profitability data."""
     node_name = args.get("node")
 
     node = fleet.get_node(node_name)
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    return await node.call("listpeerchannels")
+    # Get raw channel data
+    channels_result = await node.call("listpeerchannels")
+
+    # Try to get profitability data from revenue-ops
+    try:
+        profitability = await node.call("revenue-profitability")
+    except Exception:
+        profitability = None
+
+    # Enhance channels with flow data from listpeerchannels fields
+    if "channels" in channels_result:
+        for channel in channels_result["channels"]:
+            scid = channel.get("short_channel_id")
+            if not scid:
+                continue
+
+            # Extract in/out payment counts from CLN
+            in_fulfilled = channel.get("in_payments_fulfilled", 0)
+            out_fulfilled = channel.get("out_payments_fulfilled", 0)
+            in_msat = channel.get("in_fulfilled_msat", 0)
+            out_msat = channel.get("out_fulfilled_msat", 0)
+
+            # Calculate flow profile
+            total_payments = in_fulfilled + out_fulfilled
+            if total_payments == 0:
+                flow_profile = "inactive"
+                inbound_outbound_ratio = 0.0
+            elif out_fulfilled == 0:
+                flow_profile = "inbound_only"
+                inbound_outbound_ratio = float('inf')
+            elif in_fulfilled == 0:
+                flow_profile = "outbound_only"
+                inbound_outbound_ratio = 0.0
+            else:
+                inbound_outbound_ratio = round(in_fulfilled / out_fulfilled, 2)
+                if inbound_outbound_ratio > 3.0:
+                    flow_profile = "inbound_dominant"
+                elif inbound_outbound_ratio < 0.33:
+                    flow_profile = "outbound_dominant"
+                else:
+                    flow_profile = "balanced"
+
+            # Add flow metrics to channel
+            channel["flow_profile"] = flow_profile
+            channel["inbound_outbound_ratio"] = inbound_outbound_ratio if inbound_outbound_ratio != float('inf') else "infinite"
+            channel["inbound_payments"] = in_fulfilled
+            channel["outbound_payments"] = out_fulfilled
+            channel["inbound_volume_sats"] = in_msat // 1000 if isinstance(in_msat, int) else 0
+            channel["outbound_volume_sats"] = out_msat // 1000 if isinstance(out_msat, int) else 0
+
+            # Add profitability data if available
+            if profitability and "channels_by_class" in profitability:
+                for class_name, class_channels in profitability["channels_by_class"].items():
+                    for ch in class_channels:
+                        if ch.get("channel_id") == scid:
+                            channel["profitability_class"] = class_name
+                            channel["net_profit_sats"] = ch.get("net_profit_sats", 0)
+                            channel["roi_percentage"] = ch.get("roi_percentage", 0)
+                            break
+
+    return channels_result
 
 
 async def handle_set_fees(args: Dict) -> Dict:
