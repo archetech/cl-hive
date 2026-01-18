@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Database Schema
 # =============================================================================
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 -- Schema version tracking
@@ -213,6 +213,30 @@ CREATE TABLE IF NOT EXISTS peer_intelligence (
     recommendation TEXT DEFAULT 'unknown'  -- 'excellent', 'good', 'neutral', 'caution', 'avoid'
 );
 CREATE INDEX IF NOT EXISTS idx_peer_intelligence_recommendation ON peer_intelligence(recommendation);
+
+-- Goat Feeder P&L snapshots
+-- Tracks Lightning Goats revenue and CyberHerd Treats expenses over time
+CREATE TABLE IF NOT EXISTS goat_feeder_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    node_name TEXT NOT NULL,
+    window_days INTEGER NOT NULL,          -- Time window for this snapshot
+
+    -- Revenue (Lightning Goats incoming)
+    revenue_sats INTEGER NOT NULL,
+    revenue_count INTEGER NOT NULL,
+
+    -- Expenses (CyberHerd Treats outgoing)
+    expense_sats INTEGER NOT NULL,
+    expense_count INTEGER NOT NULL,
+    expense_routing_fee_sats INTEGER DEFAULT 0,
+
+    -- Calculated
+    net_profit_sats INTEGER NOT NULL,
+    profitable INTEGER NOT NULL            -- 1 if net >= 0, 0 otherwise
+);
+CREATE INDEX IF NOT EXISTS idx_goat_feeder_time ON goat_feeder_snapshots(timestamp);
+CREATE INDEX IF NOT EXISTS idx_goat_feeder_node ON goat_feeder_snapshots(node_name, timestamp);
 """
 
 
@@ -327,6 +351,24 @@ class ContextBrief:
     decisions_by_type: Dict[str, int]
     # Summary text
     summary_text: str
+
+
+@dataclass
+class GoatFeederSnapshot:
+    """Goat Feeder P&L snapshot."""
+    timestamp: datetime
+    node_name: str
+    window_days: int
+    # Revenue (Lightning Goats)
+    revenue_sats: int
+    revenue_count: int
+    # Expenses (CyberHerd Treats)
+    expense_sats: int
+    expense_count: int
+    expense_routing_fee_sats: int
+    # Calculated
+    net_profit_sats: int
+    profitable: bool
 
 
 # =============================================================================
@@ -822,6 +864,16 @@ class AdvisorDB:
             stats['peers_tracked'] = conn.execute(
                 "SELECT COUNT(*) as count FROM peer_intelligence"
             ).fetchone()['count']
+
+            # Goat feeder stats
+            stats['goat_feeder_snapshots'] = conn.execute(
+                "SELECT COUNT(*) as count FROM goat_feeder_snapshots"
+            ).fetchone()['count']
+
+            goat_oldest = conn.execute(
+                "SELECT MIN(timestamp) as ts FROM goat_feeder_snapshots"
+            ).fetchone()['ts']
+            stats['goat_feeder_oldest_snapshot'] = datetime.fromtimestamp(goat_oldest).isoformat() if goat_oldest else None
 
             return stats
 
@@ -1360,3 +1412,249 @@ class AdvisorDB:
             "outcome_success": outcome_success,
             "outcome_metrics": outcome_metrics
         }
+
+    # =========================================================================
+    # Goat Feeder Tracking
+    # =========================================================================
+
+    def record_goat_feeder_snapshot(self, node_name: str, window_days: int,
+                                     revenue_sats: int, revenue_count: int,
+                                     expense_sats: int, expense_count: int,
+                                     expense_routing_fee_sats: int = 0) -> int:
+        """
+        Record a goat feeder P&L snapshot.
+
+        Args:
+            node_name: Node this snapshot is for
+            window_days: Time window for the data (e.g., 30 for 30-day P&L)
+            revenue_sats: Lightning Goats revenue in sats
+            revenue_count: Number of Lightning Goats payments
+            expense_sats: CyberHerd Treats expense in sats
+            expense_count: Number of CyberHerd Treats payments
+            expense_routing_fee_sats: Routing fees paid for treats
+
+        Returns:
+            ID of the inserted snapshot record
+        """
+        net_profit = revenue_sats - expense_sats
+        profitable = 1 if net_profit >= 0 else 0
+
+        with self._get_conn() as conn:
+            cursor = conn.execute("""
+                INSERT INTO goat_feeder_snapshots (
+                    timestamp, node_name, window_days,
+                    revenue_sats, revenue_count,
+                    expense_sats, expense_count, expense_routing_fee_sats,
+                    net_profit_sats, profitable
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                int(datetime.now().timestamp()),
+                node_name,
+                window_days,
+                revenue_sats,
+                revenue_count,
+                expense_sats,
+                expense_count,
+                expense_routing_fee_sats,
+                net_profit,
+                profitable
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_goat_feeder_history(self, node_name: str = None,
+                                 days: int = 30) -> List[GoatFeederSnapshot]:
+        """
+        Get goat feeder P&L history.
+
+        Args:
+            node_name: Filter by node (None for all nodes)
+            days: Number of days of history to retrieve
+
+        Returns:
+            List of GoatFeederSnapshot records
+        """
+        cutoff = int((datetime.now() - timedelta(days=days)).timestamp())
+
+        with self._get_conn() as conn:
+            if node_name:
+                rows = conn.execute("""
+                    SELECT * FROM goat_feeder_snapshots
+                    WHERE node_name = ? AND timestamp > ?
+                    ORDER BY timestamp DESC
+                """, (node_name, cutoff)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM goat_feeder_snapshots
+                    WHERE timestamp > ?
+                    ORDER BY timestamp DESC
+                """, (cutoff,)).fetchall()
+
+            return [GoatFeederSnapshot(
+                timestamp=datetime.fromtimestamp(row['timestamp']),
+                node_name=row['node_name'],
+                window_days=row['window_days'],
+                revenue_sats=row['revenue_sats'],
+                revenue_count=row['revenue_count'],
+                expense_sats=row['expense_sats'],
+                expense_count=row['expense_count'],
+                expense_routing_fee_sats=row['expense_routing_fee_sats'] or 0,
+                net_profit_sats=row['net_profit_sats'],
+                profitable=bool(row['profitable'])
+            ) for row in rows]
+
+    def get_goat_feeder_trends(self, node_name: str = None,
+                                days: int = 7) -> Optional[Dict[str, Any]]:
+        """
+        Get goat feeder trend analysis.
+
+        Args:
+            node_name: Filter by node (None for all nodes)
+            days: Analysis period in days
+
+        Returns:
+            Dict with trend metrics or None if insufficient data
+        """
+        now = datetime.now()
+        cutoff = int((now - timedelta(days=days)).timestamp())
+        prev_cutoff = int((now - timedelta(days=days * 2)).timestamp())
+
+        with self._get_conn() as conn:
+            # Build query based on node filter
+            if node_name:
+                current = conn.execute("""
+                    SELECT
+                        SUM(revenue_sats) as revenue,
+                        SUM(revenue_count) as revenue_count,
+                        SUM(expense_sats) as expense,
+                        SUM(expense_count) as expense_count,
+                        SUM(net_profit_sats) as net_profit
+                    FROM goat_feeder_snapshots
+                    WHERE node_name = ? AND timestamp > ?
+                """, (node_name, cutoff)).fetchone()
+
+                previous = conn.execute("""
+                    SELECT
+                        SUM(revenue_sats) as revenue,
+                        SUM(expense_sats) as expense,
+                        SUM(net_profit_sats) as net_profit
+                    FROM goat_feeder_snapshots
+                    WHERE node_name = ? AND timestamp > ? AND timestamp <= ?
+                """, (node_name, prev_cutoff, cutoff)).fetchone()
+            else:
+                current = conn.execute("""
+                    SELECT
+                        SUM(revenue_sats) as revenue,
+                        SUM(revenue_count) as revenue_count,
+                        SUM(expense_sats) as expense,
+                        SUM(expense_count) as expense_count,
+                        SUM(net_profit_sats) as net_profit
+                    FROM goat_feeder_snapshots
+                    WHERE timestamp > ?
+                """, (cutoff,)).fetchone()
+
+                previous = conn.execute("""
+                    SELECT
+                        SUM(revenue_sats) as revenue,
+                        SUM(expense_sats) as expense,
+                        SUM(net_profit_sats) as net_profit
+                    FROM goat_feeder_snapshots
+                    WHERE timestamp > ? AND timestamp <= ?
+                """, (prev_cutoff, cutoff)).fetchone()
+
+            if not current or current['revenue'] is None:
+                return None
+
+            # Calculate changes
+            curr_revenue = current['revenue'] or 0
+            prev_revenue = previous['revenue'] or 0 if previous else 0
+            revenue_change = ((curr_revenue - prev_revenue) / prev_revenue * 100) if prev_revenue > 0 else 0
+
+            curr_expense = current['expense'] or 0
+            prev_expense = previous['expense'] or 0 if previous else 0
+            expense_change = ((curr_expense - prev_expense) / prev_expense * 100) if prev_expense > 0 else 0
+
+            curr_net = current['net_profit'] or 0
+            prev_net = previous['net_profit'] or 0 if previous else 0
+
+            # Determine trend
+            if curr_net > prev_net + 100:  # > 100 sats improvement
+                trend = "improving"
+            elif curr_net < prev_net - 100:
+                trend = "declining"
+            else:
+                trend = "stable"
+
+            return {
+                "period_days": days,
+                "current_period": {
+                    "revenue_sats": curr_revenue,
+                    "revenue_count": current['revenue_count'] or 0,
+                    "expense_sats": curr_expense,
+                    "expense_count": current['expense_count'] or 0,
+                    "net_profit_sats": curr_net
+                },
+                "previous_period": {
+                    "revenue_sats": prev_revenue,
+                    "expense_sats": prev_expense,
+                    "net_profit_sats": prev_net
+                },
+                "changes": {
+                    "revenue_change_pct": round(revenue_change, 2),
+                    "expense_change_pct": round(expense_change, 2),
+                    "net_profit_change_sats": curr_net - prev_net
+                },
+                "trend": trend,
+                "profitable": curr_net >= 0
+            }
+
+    def get_goat_feeder_summary(self, node_name: str = None) -> Dict[str, Any]:
+        """
+        Get lifetime goat feeder summary.
+
+        Args:
+            node_name: Filter by node (None for all nodes)
+
+        Returns:
+            Dict with lifetime totals
+        """
+        with self._get_conn() as conn:
+            if node_name:
+                row = conn.execute("""
+                    SELECT
+                        COUNT(*) as snapshot_count,
+                        MIN(timestamp) as first_snapshot,
+                        MAX(timestamp) as last_snapshot,
+                        SUM(revenue_sats) as total_revenue,
+                        SUM(revenue_count) as total_revenue_count,
+                        SUM(expense_sats) as total_expense,
+                        SUM(expense_count) as total_expense_count,
+                        SUM(net_profit_sats) as total_net_profit
+                    FROM goat_feeder_snapshots
+                    WHERE node_name = ?
+                """, (node_name,)).fetchone()
+            else:
+                row = conn.execute("""
+                    SELECT
+                        COUNT(*) as snapshot_count,
+                        MIN(timestamp) as first_snapshot,
+                        MAX(timestamp) as last_snapshot,
+                        SUM(revenue_sats) as total_revenue,
+                        SUM(revenue_count) as total_revenue_count,
+                        SUM(expense_sats) as total_expense,
+                        SUM(expense_count) as total_expense_count,
+                        SUM(net_profit_sats) as total_net_profit
+                    FROM goat_feeder_snapshots
+                """).fetchone()
+
+            return {
+                "snapshot_count": row['snapshot_count'] or 0,
+                "first_snapshot": datetime.fromtimestamp(row['first_snapshot']).isoformat() if row['first_snapshot'] else None,
+                "last_snapshot": datetime.fromtimestamp(row['last_snapshot']).isoformat() if row['last_snapshot'] else None,
+                "lifetime_revenue_sats": row['total_revenue'] or 0,
+                "lifetime_revenue_count": row['total_revenue_count'] or 0,
+                "lifetime_expense_sats": row['total_expense'] or 0,
+                "lifetime_expense_count": row['total_expense_count'] or 0,
+                "lifetime_net_profit_sats": row['total_net_profit'] or 0,
+                "profitable": (row['total_net_profit'] or 0) >= 0
+            }
