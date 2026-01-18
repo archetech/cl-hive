@@ -812,9 +812,37 @@ class Bridge:
             return False
     
     # =========================================================================
+    # FEE CONFIGURATION
+    # =========================================================================
+
+    def get_fee_config(self) -> Optional[Dict[str, Any]]:
+        """
+        Get fee configuration from cl-revenue-ops.
+
+        Returns:
+            Dict with fee_range_ppm [min, max] and midpoint, or None if unavailable
+        """
+        if self._status == BridgeStatus.DISABLED:
+            return None
+
+        try:
+            result = self.safe_call("revenue-status")
+            config = result.get("config", {})
+            fee_range = config.get("fee_range_ppm", [50, 2500])
+            if isinstance(fee_range, list) and len(fee_range) == 2:
+                return {
+                    "min_fee_ppm": fee_range[0],
+                    "max_fee_ppm": fee_range[1],
+                    "midpoint_ppm": (fee_range[0] + fee_range[1]) // 2
+                }
+            return None
+        except Exception:
+            return None
+
+    # =========================================================================
     # STATUS & STATISTICS
     # =========================================================================
-    
+
     @property
     def status(self) -> BridgeStatus:
         """Get current bridge status."""

@@ -1972,6 +1972,18 @@ class HiveDatabase:
 
         reporters = list(set(e['reporter_id'] for e in events))
 
+        # Calculate per-reporter scores for disagreement detection
+        reporter_scores = {}
+        for reporter_id in reporters:
+            reporter_events = [e for e in events if e['reporter_id'] == reporter_id]
+            r_routing = [e.get('routing_score', 0.5) for e in reporter_events if e.get('routing_score')]
+            r_profit = [e.get('profitability_score', 0.5) for e in reporter_events if e.get('profitability_score')]
+            reporter_scores[reporter_id] = {
+                "event_count": len(reporter_events),
+                "avg_routing_score": sum(r_routing) / len(r_routing) if r_routing else 0.5,
+                "avg_profitability_score": sum(r_profit) / len(r_profit) if r_profit else 0.5,
+            }
+
         return {
             "peer_id": peer_id,
             "event_count": len(events),
@@ -1987,7 +1999,8 @@ class HiveDatabase:
             "avg_routing_score": sum(routing_scores) / len(routing_scores) if routing_scores else 0.5,
             "avg_profitability_score": sum(profit_scores) / len(profit_scores) if profit_scores else 0.5,
             "avg_duration_days": sum(durations) / len(durations) if durations else 0,
-            "reporters": reporters
+            "reporters": reporters,
+            "reporter_scores": reporter_scores
         }
 
     def get_recent_channel_events(self, event_types: List[str] = None,

@@ -406,8 +406,35 @@ class PeerQualityScorer:
             score = min(0.85, 0.6 + (reporter_count - 2) * 0.05)
             consistency_factors["note"] = f"{reporter_count} reporters - good sample"
 
-        # TODO: In future, could compare individual reporter scores
-        # to detect disagreement and reduce consistency score
+        # Detect disagreement between reporters and reduce consistency score
+        reporter_scores = summary.get("reporter_scores", {})
+        if len(reporter_scores) >= 2:
+            # Calculate variance of profitability scores across reporters
+            profit_scores = [rs.get("avg_profitability_score", 0.5)
+                           for rs in reporter_scores.values()]
+            routing_scores = [rs.get("avg_routing_score", 0.5)
+                            for rs in reporter_scores.values()]
+
+            # Calculate standard deviation (measure of disagreement)
+            if len(profit_scores) >= 2:
+                profit_mean = sum(profit_scores) / len(profit_scores)
+                profit_variance = sum((x - profit_mean) ** 2 for x in profit_scores) / len(profit_scores)
+                profit_std = math.sqrt(profit_variance)
+
+                routing_mean = sum(routing_scores) / len(routing_scores)
+                routing_variance = sum((x - routing_mean) ** 2 for x in routing_scores) / len(routing_scores)
+                routing_std = math.sqrt(routing_variance)
+
+                # Average disagreement (0 = perfect agreement, 0.5 = max disagreement)
+                avg_std = (profit_std + routing_std) / 2
+                consistency_factors["score_std_dev"] = round(avg_std, 3)
+
+                # Penalize high disagreement: std > 0.2 starts reducing score
+                if avg_std > 0.2:
+                    disagreement_penalty = min(0.3, (avg_std - 0.2) * 1.5)
+                    score = max(0.3, score - disagreement_penalty)
+                    consistency_factors["disagreement_penalty"] = round(disagreement_penalty, 3)
+                    consistency_factors["note"] += " (score reduced due to reporter disagreement)"
 
         factors["consistency"] = consistency_factors
         return score
