@@ -75,6 +75,12 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-hive")
 
+# Goat Feeder configuration
+# Revenue is tracked via LNbits API - payments with "⚡CyberHerd Treats⚡" in memo
+GOAT_FEEDER_PATTERN = "⚡CyberHerd Treats⚡"
+LNBITS_URL = "http://127.0.0.1:3002"
+LNBITS_INVOICE_KEY = "ac0dcb0cdab94f72b757d0f3aa85d08a"
+
 # =============================================================================
 # Strategy Prompt Loading
 # =============================================================================
@@ -699,6 +705,60 @@ async def list_tools() -> List[Tool]:
                 "required": ["node"]
             }
         ),
+        Tool(
+            name="revenue_outgoing",
+            description="Get goat feeder P&L: Lightning Goats revenue (incoming donations) vs CyberHerd Treats expenses (outgoing rewards). Shows goat feeder profitability separate from routing.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "window_days": {
+                        "type": "integer",
+                        "description": "Time window in days (default: 30)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="goat_feeder_history",
+            description="Get historical goat feeder P&L from the advisor database. Shows snapshots over time for trend analysis.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (optional, omit for all nodes)"
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Days of history to retrieve (default: 30)"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="goat_feeder_trends",
+            description="Get goat feeder trend analysis comparing current vs previous period. Shows if goat feeder profitability is improving, stable, or declining.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (optional, omit for all nodes)"
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Analysis period in days (default: 7)"
+                    }
+                },
+                "required": []
+            }
+        ),
         # =====================================================================
         # Advisor Database Tools - Historical tracking and trend analysis
         # =====================================================================
@@ -1007,6 +1067,12 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_revenue_debug(arguments)
         elif name == "revenue_history":
             result = await handle_revenue_history(arguments)
+        elif name == "revenue_outgoing":
+            result = await handle_revenue_outgoing(arguments)
+        elif name == "goat_feeder_history":
+            result = await handle_goat_feeder_history(arguments)
+        elif name == "goat_feeder_trends":
+            result = await handle_goat_feeder_trends(arguments)
         # Advisor database tools
         elif name == "advisor_record_snapshot":
             result = await handle_advisor_record_snapshot(arguments)
@@ -1500,7 +1566,7 @@ async def handle_revenue_profitability(args: Dict) -> Dict:
 
 
 async def handle_revenue_dashboard(args: Dict) -> Dict:
-    """Get financial health dashboard."""
+    """Get financial health dashboard with routing and goat feeder revenue."""
     node_name = args.get("node")
     window_days = args.get("window_days", 30)
 
@@ -1508,7 +1574,92 @@ async def handle_revenue_dashboard(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    return await node.call("revenue-dashboard", {"window_days": window_days})
+    # Get base dashboard from cl-revenue-ops (routing P&L)
+    dashboard = await node.call("revenue-dashboard", {"window_days": window_days})
+
+    if "error" in dashboard:
+        return dashboard
+
+    import time
+    since_timestamp = int(time.time()) - (window_days * 86400)
+
+    # Fetch goat feeder revenue from LNbits
+    goat_feeder = await get_goat_feeder_revenue(since_timestamp)
+
+    # Extract routing P&L data from cl-revenue-ops dashboard structure
+    # Data is in "period" and "financial_health", not "pnl_summary"
+    period = dashboard.get("period", {})
+    financial_health = dashboard.get("financial_health", {})
+    routing_revenue = period.get("gross_revenue_sats", 0)
+    routing_opex = period.get("opex_sats", 0)
+    routing_net = financial_health.get("net_profit_sats", 0)
+
+    # Initialize pnl structure for building enhanced response
+    pnl = {}
+
+    # Goat feeder revenue (no expenses tracked)
+    goat_revenue = goat_feeder.get("total_sats", 0)
+    goat_count = goat_feeder.get("payment_count", 0)
+
+    # Combined totals
+    total_revenue = routing_revenue + goat_revenue
+    total_net = routing_net + goat_revenue  # Goat revenue adds directly to profit
+
+    # Calculate combined operating margin
+    if total_revenue > 0:
+        combined_margin_pct = round((total_net / total_revenue) * 100, 2)
+    else:
+        combined_margin_pct = financial_health.get("operating_margin_pct", 0.0)
+
+    # Build enhanced P&L structure
+    # Note: opex_breakdown not exposed in dashboard API, set to 0
+    pnl["routing"] = {
+        "revenue_sats": routing_revenue,
+        "opex_sats": routing_opex,
+        "net_profit_sats": routing_net,
+        "opex_breakdown": {
+            "rebalance_cost_sats": 0,
+            "closure_cost_sats": 0,
+            "splice_cost_sats": 0
+        }
+    }
+
+    pnl["goat_feeder"] = {
+        "revenue_sats": goat_revenue,
+        "payment_count": goat_count,
+        "source": "LNbits"
+    }
+
+    # Record goat feeder snapshot to advisor database for historical tracking
+    try:
+        db = ensure_advisor_db()
+        db.record_goat_feeder_snapshot(
+            node_name=node_name,
+            window_days=window_days,
+            revenue_sats=goat_revenue,
+            revenue_count=goat_count,
+            expense_sats=0,
+            expense_count=0,
+            expense_routing_fee_sats=0
+        )
+    except Exception as e:
+        logger.warning(f"Failed to record goat feeder snapshot: {e}")
+
+    pnl["combined"] = {
+        "total_revenue_sats": total_revenue,
+        "total_opex_sats": routing_opex,
+        "net_profit_sats": total_net,
+        "operating_margin_pct": combined_margin_pct
+    }
+
+    # Update top-level fields for backwards compatibility
+    pnl["gross_revenue_sats"] = total_revenue
+    pnl["net_profit_sats"] = total_net
+    pnl["operating_margin_pct"] = combined_margin_pct
+
+    dashboard["pnl_summary"] = pnl
+
+    return dashboard
 
 
 async def handle_revenue_policy(args: Dict) -> Dict:
@@ -1660,6 +1811,155 @@ async def handle_revenue_history(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("revenue-history")
+
+
+async def get_goat_feeder_revenue(since_timestamp: int) -> Dict[str, Any]:
+    """
+    Fetch goat feeder revenue from LNbits.
+
+    Queries the LNbits wallet for payments with "⚡CyberHerd Treats⚡" in the memo.
+    These are incoming payments to the sat wallet from the goat feeder.
+
+    Args:
+        since_timestamp: Only count payments after this timestamp
+
+    Returns:
+        Dict with total_sats and payment_count
+    """
+    import urllib.request
+    import json
+
+    try:
+        # Query LNbits payments API using urllib (no external dependencies)
+        req = urllib.request.Request(
+            f"{LNBITS_URL}/api/v1/payments",
+            headers={"X-Api-Key": LNBITS_INVOICE_KEY}
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            if response.status != 200:
+                return {"total_sats": 0, "payment_count": 0, "error": f"API error: {response.status}"}
+            payments = json.loads(response.read())
+
+        total_sats = 0
+        payment_count = 0
+
+        for payment in payments:
+            # Only count incoming payments (positive amount)
+            amount = payment.get("amount", 0)
+            if amount <= 0:
+                continue
+
+            # Check if memo matches goat feeder pattern
+            memo = payment.get("memo", "") or ""
+            if GOAT_FEEDER_PATTERN not in memo:
+                continue
+
+            # Parse timestamp (LNbits uses ISO date string in 'time' field)
+            payment_time_str = payment.get("time", "")
+            try:
+                from datetime import datetime
+                # Handle ISO format with or without timezone
+                if "." in payment_time_str:
+                    payment_time = datetime.fromisoformat(payment_time_str.replace("Z", "+00:00"))
+                else:
+                    payment_time = datetime.fromisoformat(payment_time_str)
+                payment_timestamp = int(payment_time.timestamp())
+            except (ValueError, TypeError):
+                payment_timestamp = 0
+
+            if payment_timestamp < since_timestamp:
+                continue
+
+            # LNbits amounts are in millisats
+            total_sats += amount // 1000
+            payment_count += 1
+
+        return {
+            "total_sats": total_sats,
+            "payment_count": payment_count
+        }
+
+    except Exception as e:
+        logger.warning(f"Error fetching goat feeder revenue from LNbits: {e}")
+        return {
+            "total_sats": 0,
+            "payment_count": 0,
+            "error": str(e)
+        }
+
+
+async def handle_revenue_outgoing(args: Dict) -> Dict:
+    """Get goat feeder revenue from LNbits."""
+    window_days = args.get("window_days", 30)
+
+    import time
+    since_timestamp = int(time.time()) - (window_days * 86400)
+
+    # Get goat feeder revenue from LNbits
+    revenue = await get_goat_feeder_revenue(since_timestamp)
+
+    return {
+        "window_days": window_days,
+        "goat_feeder": {
+            "revenue_sats": revenue.get("total_sats", 0),
+            "payment_count": revenue.get("payment_count", 0),
+            "pattern": GOAT_FEEDER_PATTERN,
+            "source": f"LNbits ({LNBITS_URL})"
+        },
+        "error": revenue.get("error")
+    }
+
+
+async def handle_goat_feeder_history(args: Dict) -> Dict:
+    """Get historical goat feeder P&L from the advisor database."""
+    node_name = args.get("node")
+    days = args.get("days", 30)
+
+    db = ensure_advisor_db()
+    history = db.get_goat_feeder_history(node_name=node_name, days=days)
+
+    if not history:
+        return {
+            "snapshots": [],
+            "count": 0,
+            "note": "No goat feeder history found. Run revenue_dashboard to start recording snapshots."
+        }
+
+    return {
+        "snapshots": [
+            {
+                "timestamp": s.timestamp.isoformat(),
+                "node_name": s.node_name,
+                "window_days": s.window_days,
+                "revenue_sats": s.revenue_sats,
+                "revenue_count": s.revenue_count,
+                "expense_sats": s.expense_sats,
+                "expense_count": s.expense_count,
+                "net_profit_sats": s.net_profit_sats,
+                "profitable": s.profitable
+            }
+            for s in history
+        ],
+        "count": len(history),
+        "summary": db.get_goat_feeder_summary(node_name=node_name)
+    }
+
+
+async def handle_goat_feeder_trends(args: Dict) -> Dict:
+    """Get goat feeder trend analysis."""
+    node_name = args.get("node")
+    days = args.get("days", 7)
+
+    db = ensure_advisor_db()
+    trends = db.get_goat_feeder_trends(node_name=node_name, days=days)
+
+    if not trends:
+        return {
+            "error": "Insufficient data for trend analysis",
+            "note": "Run revenue_dashboard multiple times over several days to collect enough data for trends."
+        }
+
+    return trends
 
 
 # =============================================================================
