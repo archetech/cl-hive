@@ -42,7 +42,8 @@ Given the node's state, your priorities are:
 10. **Channel Health Review**: Use `revenue_profitability` to identify problematic channels
 11. **Check Velocities**: Use `advisor_get_velocities` to find channels depleting/filling rapidly
 12. **Apply Fee Management Protocol**: For problematic channels, set fees and policies per the Fee Management Protocol section
-13. **Report Issues**: Note any warnings or recommendations
+13. **Splice Analysis** (weekly): If on-chain feerates <20 sat/vB, analyze channels for splice opportunities
+14. **Report Issues**: Note any warnings or recommendations
 
 ### Pattern Recognition
 
@@ -247,32 +248,74 @@ Identify rebalance opportunities by pairing:
 
 ## Splice Opportunity Analysis
 
-Identify channels that would benefit from capacity changes:
+Analyze channels for capacity optimization. Splices move capital more efficiently than closing/reopening channels.
+
+### When to Analyze Splices
+
+Run splice analysis when:
+- Channel has been active 30+ days (enough data)
+- On-chain feerates are reasonable (<20 sat/vB for non-urgent, <10 sat/vB ideal)
+- Node has sufficient on-chain funds (500k+ reserve after splice)
 
 ### Candidates for Splice-In (add capacity)
 
-- High utilization (forward_count > 50/month) AND frequently imbalanced
-- Consistently profitable (ROI > 1%) but capacity-limited
-- Strategic peers (high connectivity, good reliability)
+| Criteria | Threshold | Weight |
+|----------|-----------|--------|
+| High forward count | >50/month | Required |
+| Profitable | ROI >1% annualized | Required |
+| Frequently depleted | Balance <20% or >80% often | Strong signal |
+| Strategic peer | >20 channels, good uptime | Bonus |
+| Current capacity | <5M sats | More benefit from increase |
+
+**Recommendation**: Splice-in 2-5M sats to high-performing channels that frequently run out of liquidity in one direction.
 
 ### Candidates for Splice-Out (reduce capacity)
 
-- Low utilization (forward_count < 5/month) for 60+ days
-- Consistently unprofitable (ROI < 0%)
-- Zombie channels that can't be closed cleanly
+| Criteria | Threshold | Weight |
+|----------|-----------|--------|
+| Low forward count | <5/month for 60+ days | Required |
+| Unprofitable | ROI <0% | Strong signal |
+| Oversized | Capacity >10M but <10 fwds/mo | Capital inefficient |
+| Zombie-like | Peer often offline | Consider full close instead |
+
+**Recommendation**: Splice-out 50-80% of capacity from underperforming channels to redeploy capital.
+
+### Splice vs Close Decision
+
+| Situation | Action |
+|-----------|--------|
+| Peer responsive, some value | Splice-out (keep relationship) |
+| Peer unresponsive, no value | Close entirely |
+| Peer excellent but wrong size | Splice in/out to optimize |
+
+### Data Sources for Splice Decisions
+
+| Tool | Key Fields |
+|------|------------|
+| `hive_channels` | `capacity_sats`, `forward_count`, `flow_profile` |
+| `revenue_profitability` | `roi_percentage`, `net_profit_sats`, `days_active` |
+| `advisor_get_channel_history` | Balance trends over time |
 
 ### Splice Recommendation Output
 
 ```
 ### Splice Opportunities
 
-| Channel | Peer | Current Capacity | Recommended | Reason |
-|---------|------|-----------------|-------------|--------|
-| 932263x1883x0 | HighVolumePeer | 2M sats | +3M splice-in | High volume (89 fwds/mo), frequently depleted |
-| 931199x1231x0 | LowVolumePeer | 5M sats | -3M splice-out | Low volume (2 fwds/mo), capital inefficient |
+| Channel | Peer | Current | Action | Reason | Est. ROI Impact |
+|---------|------|---------|--------|--------|-----------------|
+| 932263x1883x0 | HighVolume | 2M | +3M splice-in | 89 fwds/mo, often depleted | +50% capacity utilization |
+| 931199x1231x0 | LowVolume | 5M | -3M splice-out | 2 fwds/mo, capital waste | Redeploy to better peer |
 ```
 
-**Note:** Splicing requires on-chain fees. Only recommend when benefit clearly outweighs cost. Consider current feerate before recommending splice operations.
+### Splice Constraints
+
+- **Minimum splice**: 500k sats (not worth on-chain cost below this)
+- **Maximum splice-in**: Don't exceed 15M total to single peer (concentration risk)
+- **Feerate gate**: Skip splice recommendations if on-chain >30 sat/vB
+- **Reserve**: Maintain 500k on-chain after any splice operation
+- **Frequency**: Don't recommend splicing same channel within 30 days
+
+**Note:** Always consider current feerate before recommending splice operations. Splices are on-chain transactions and should wait for favorable fee conditions.
 
 ## Safety Constraints (NEVER EXCEED)
 
@@ -368,12 +411,24 @@ For changes that need operator review or fall outside auto-execute criteria:
 - Overall status: [healthy/warning/critical]
 - Key metrics: [TLV, operating margin, ROC]
 
-### Goat Feeder P&L
-Include this section showing revenue from `pnl_summary.goat_feeder` in the dashboard.
-Note: Routing revenue and goat feeder revenue are SEPARATE sources - report them individually:
-- Routing revenue: [X sats] (from `pnl_summary.routing.revenue_sats`)
-- Goat feeder revenue: [X sats] from [N payments] (from `pnl_summary.goat_feeder`)
-- Combined total: [sum of both]
+### Financial Summary
+
+Report routing and goat feeder P&L as SEPARATE categories, then provide a combined total:
+
+**Routing P&L** (from `pnl_summary.routing`):
+- Revenue: [X sats] (forward fees earned)
+- Costs: [Y sats] (rebalancing costs)
+- Net: [X-Y sats]
+
+**Goat Feeder P&L** (from `pnl_summary.goat_feeder`):
+- Revenue: [X sats] from [N] Lightning Goats donations
+- Expenses: [Y sats] from [M] CyberHerd Treats payouts
+- Net: [X-Y sats]
+
+**Combined Total**:
+- Total Revenue: [routing + goat feeder revenue]
+- Total Costs: [routing costs + goat feeder expenses]
+- Net Profit: [combined net]
 
 ### Warnings
 - [NEW issues only - use advisor_check_alert to deduplicate]
