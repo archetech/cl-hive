@@ -66,6 +66,7 @@ def setup_file_logging(log_file: str = None, level: int = logging.INFO) -> None:
 
     # Configure logger
     logger.setLevel(level)
+    logger.propagate = False  # Don't propagate to root logger (prevents duplicates)
 
     # Remove existing handlers to avoid duplicates
     logger.handlers = []
