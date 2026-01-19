@@ -8559,6 +8559,48 @@ def hive_positioning_status(plugin: Plugin):
     return rpc_positioning_status(_get_hive_context())
 
 
+# =============================================================================
+# PHYSARUM AUTO-TRIGGER RPC METHODS (Phase 7.2)
+# =============================================================================
+
+@plugin.method("hive-physarum-cycle")
+def hive_physarum_cycle(plugin: Plugin):
+    """
+    Execute one Physarum optimization cycle.
+
+    Evaluates all channels and creates pending_actions for:
+    - High-flow channels that should be strengthened (splice-in)
+    - Old low-flow channels that should atrophy (close recommendation)
+    - Young low-flow channels that need stimulation (fee reduction)
+
+    All actions go through governance approval - nothing executes directly.
+
+    Returns:
+        Dict with cycle results including proposals created.
+    """
+    if not strategic_positioning_mgr:
+        return {"error": "Strategic positioning manager not initialized"}
+
+    result = strategic_positioning_mgr.physarum_mgr.execute_physarum_cycle()
+    return result
+
+
+@plugin.method("hive-physarum-status")
+def hive_physarum_status(plugin: Plugin):
+    """
+    Get Physarum auto-trigger status.
+
+    Shows configuration, thresholds, rate limits, and current usage.
+
+    Returns:
+        Dict with auto-trigger status.
+    """
+    if not strategic_positioning_mgr:
+        return {"error": "Strategic positioning manager not initialized"}
+
+    return strategic_positioning_mgr.physarum_mgr.get_auto_trigger_status()
+
+
 @plugin.method("hive-request-promotion")
 def hive_request_promotion(plugin: Plugin):
     """

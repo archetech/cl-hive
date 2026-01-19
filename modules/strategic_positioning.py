@@ -36,6 +36,26 @@ ATROPHY_FLOW_THRESHOLD = 0.001              # 0.1% daily turn rate → close
 STIMULATE_GRACE_DAYS = 90                   # Young channels get fee reduction
 MIN_CHANNEL_AGE_FOR_ATROPHY_DAYS = 180      # Must be >6 months to recommend close
 
+# Physarum auto-trigger configuration (Phase 7.2)
+AUTO_STRENGTHEN_ENABLED = True              # Enable auto splice-in for high-flow channels
+AUTO_ATROPHY_ENABLED = False                # Atrophy always requires human approval
+AUTO_STIMULATE_ENABLED = True               # Enable auto fee reduction for young channels
+
+# Auto-trigger thresholds
+MIN_AUTO_STRENGTHEN_FLOW = 0.025            # 2.5% flow for auto-strengthen (above base)
+MIN_SUSTAIN_PERIODS = 3                     # Flow must be sustained for 3 periods
+AUTO_STRENGTHEN_MIN_SATS = 1_000_000        # Minimum 1M sats for auto splice-in
+AUTO_STRENGTHEN_MAX_SATS = 5_000_000        # Maximum 5M sats for auto splice-in
+
+# Rate limits for auto-triggers
+MAX_AUTO_STRENGTHEN_PER_DAY = 2             # Max 2 splice-in recommendations per day
+MAX_AUTO_ATROPHY_PER_WEEK = 1               # Max 1 atrophy recommendation per week
+MIN_STRENGTHEN_INTERVAL_HOURS = 24          # Minimum 24h between strengthen for same channel
+
+# Safety constraints
+AUTO_TRIGGER_MIN_ON_CHAIN_SATS = 500_000    # Minimum 500k sats on-chain reserve
+AUTO_TRIGGER_MAX_PCT_OF_CAPACITY = 0.10     # Max 10% of total capacity per action
+
 # Positioning priorities
 EXCHANGE_PRIORITY_BONUS = 1.5               # 50% bonus for exchange channels
 BRIDGE_PRIORITY_BONUS = 1.3                 # 30% bonus for bridge positions
@@ -1090,6 +1110,398 @@ class PhysarumChannelManager:
 
         return recommendations
 
+    # =========================================================================
+    # AUTO-TRIGGER METHODS (Phase 7.2)
+    # =========================================================================
+
+    def set_database(self, database) -> None:
+        """Set database reference for pending_actions."""
+        self._database = database
+
+    def set_decision_engine(self, decision_engine) -> None:
+        """Set decision engine reference for governance checks."""
+        self._decision_engine = decision_engine
+
+    def execute_physarum_cycle(self) -> Dict[str, Any]:
+        """
+        Execute one Physarum optimization cycle.
+
+        Evaluates all channels and creates pending_actions for:
+        - High-flow channels that should be strengthened (splice-in)
+        - Old low-flow channels that should atrophy (close recommendation)
+        - Young low-flow channels that need stimulation (fee reduction)
+
+        All actions go through governance approval (pending_actions) - nothing
+        is executed directly.
+
+        Returns:
+            Dict with cycle results:
+            {
+                "evaluated_channels": 25,
+                "strengthen_proposals": 1,
+                "atrophy_proposals": 0,
+                "stimulate_proposals": 2,
+                "skipped_rate_limit": 0,
+                "actions_created": [...]
+            }
+        """
+        result = {
+            "evaluated_channels": 0,
+            "strengthen_proposals": 0,
+            "atrophy_proposals": 0,
+            "stimulate_proposals": 0,
+            "skipped_rate_limit": 0,
+            "actions_created": []
+        }
+
+        # Check if we have required dependencies
+        if not hasattr(self, '_database') or not self._database:
+            self._log("Physarum cycle skipped: no database", level="debug")
+            return result
+
+        # Get all recommendations
+        recommendations = self.get_all_recommendations()
+        result["evaluated_channels"] = len(self._get_channel_data())
+
+        now = int(time.time())
+
+        for rec in recommendations:
+            action_created = None
+
+            if rec.action == "strengthen" and AUTO_STRENGTHEN_ENABLED:
+                # Check if meets auto-strengthen criteria
+                if rec.flow_intensity >= MIN_AUTO_STRENGTHEN_FLOW:
+                    action_created = self._create_strengthen_action(rec, now)
+                    if action_created:
+                        result["strengthen_proposals"] += 1
+                    else:
+                        result["skipped_rate_limit"] += 1
+
+            elif rec.action == "atrophy":
+                # Atrophy always creates action for human review (never auto)
+                action_created = self._create_atrophy_action(rec, now)
+                if action_created:
+                    result["atrophy_proposals"] += 1
+
+            elif rec.action == "stimulate" and AUTO_STIMULATE_ENABLED:
+                action_created = self._create_stimulate_action(rec, now)
+                if action_created:
+                    result["stimulate_proposals"] += 1
+
+            if action_created:
+                result["actions_created"].append(action_created)
+
+        self._log(
+            f"Physarum cycle: {result['evaluated_channels']} channels, "
+            f"{result['strengthen_proposals']} strengthen, "
+            f"{result['atrophy_proposals']} atrophy, "
+            f"{result['stimulate_proposals']} stimulate",
+            level="info"
+        )
+
+        return result
+
+    def _create_strengthen_action(
+        self,
+        rec: 'FlowRecommendation',
+        now: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create pending_action for splice-in (strengthen).
+
+        Safety checks:
+        - Rate limit not exceeded
+        - On-chain balance sufficient
+        - Channel hasn't been strengthened recently
+        - Splice amount within bounds
+
+        Returns:
+            Action dict if created, None if skipped
+        """
+        if not self._check_strengthen_rate_limit(now):
+            self._log(f"Strengthen rate limit reached", level="debug")
+            return None
+
+        if not self._check_on_chain_reserve():
+            self._log(f"Insufficient on-chain reserve for strengthen", level="debug")
+            return None
+
+        # Check channel cooldown
+        if self._check_recent_strengthen(rec.channel_id, now):
+            self._log(f"Channel {rec.channel_id[:12]}... strengthened recently", level="debug")
+            return None
+
+        # Clamp splice amount to safe range
+        splice_amount = max(AUTO_STRENGTHEN_MIN_SATS, min(
+            rec.splice_amount_sats or AUTO_STRENGTHEN_MIN_SATS,
+            AUTO_STRENGTHEN_MAX_SATS
+        ))
+
+        action = {
+            "action_type": "physarum_strengthen",
+            "channel_id": rec.channel_id,
+            "peer_id": rec.peer_id,
+            "splice_amount_sats": splice_amount,
+            "flow_intensity": rec.flow_intensity,
+            "turn_rate": rec.turn_rate,
+            "reason": rec.reason,
+            "method": "splice_in",
+            "timestamp": now
+        }
+
+        # Create pending action via database
+        action_id = self._create_pending_action(
+            action_type="physarum_strengthen",
+            payload=action,
+            expires_hours=72  # 3 days to approve
+        )
+
+        if action_id:
+            action["action_id"] = action_id
+            self._log(
+                f"Created strengthen action for {rec.channel_id[:12]}... "
+                f"({splice_amount:,} sats, flow={rec.flow_intensity:.3f})",
+                level="info"
+            )
+            return action
+
+        return None
+
+    def _create_atrophy_action(
+        self,
+        rec: 'FlowRecommendation',
+        now: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create pending_action for close recommendation (atrophy).
+
+        Always creates action (never auto-executes closes).
+        Rate limit checked to avoid spam.
+
+        Returns:
+            Action dict if created, None if skipped
+        """
+        if not self._check_atrophy_rate_limit(now):
+            self._log(f"Atrophy rate limit reached", level="debug")
+            return None
+
+        action = {
+            "action_type": "physarum_atrophy",
+            "channel_id": rec.channel_id,
+            "peer_id": rec.peer_id,
+            "capacity_sats": rec.capacity_sats,
+            "capital_to_redeploy_sats": rec.capital_to_redeploy_sats,
+            "flow_intensity": rec.flow_intensity,
+            "age_days": rec.age_days,
+            "revenue_sats": rec.revenue_sats,
+            "reason": rec.reason,
+            "method": "cooperative_close",
+            "timestamp": now,
+            "requires_human_approval": True  # Always
+        }
+
+        # Create pending action
+        action_id = self._create_pending_action(
+            action_type="physarum_atrophy",
+            payload=action,
+            expires_hours=168  # 7 days to review
+        )
+
+        if action_id:
+            action["action_id"] = action_id
+            self._log(
+                f"Created atrophy action for {rec.channel_id[:12]}... "
+                f"({rec.capacity_sats:,} sats, age={rec.age_days}d, flow={rec.flow_intensity:.4f})",
+                level="info"
+            )
+            return action
+
+        return None
+
+    def _create_stimulate_action(
+        self,
+        rec: 'FlowRecommendation',
+        now: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create pending_action for fee reduction (stimulate young channel).
+
+        Returns:
+            Action dict if created, None if skipped
+        """
+        action = {
+            "action_type": "physarum_stimulate",
+            "channel_id": rec.channel_id,
+            "peer_id": rec.peer_id,
+            "capacity_sats": rec.capacity_sats,
+            "flow_intensity": rec.flow_intensity,
+            "age_days": rec.age_days,
+            "reason": rec.reason,
+            "method": "fee_reduction",
+            "recommended_fee_ppm": 50,  # Stimulate with low fee
+            "timestamp": now
+        }
+
+        # Create pending action
+        action_id = self._create_pending_action(
+            action_type="physarum_stimulate",
+            payload=action,
+            expires_hours=48  # 2 days to approve
+        )
+
+        if action_id:
+            action["action_id"] = action_id
+            self._log(
+                f"Created stimulate action for {rec.channel_id[:12]}... "
+                f"(young channel, age={rec.age_days}d)",
+                level="info"
+            )
+            return action
+
+        return None
+
+    def _create_pending_action(
+        self,
+        action_type: str,
+        payload: Dict,
+        expires_hours: int = 72
+    ) -> Optional[int]:
+        """Create a pending action in the database."""
+        import json
+
+        if not hasattr(self, '_database') or not self._database:
+            return None
+
+        try:
+            now = int(time.time())
+            expires_at = now + (expires_hours * 3600)
+
+            return self._database.create_pending_action(
+                action_type=action_type,
+                payload=json.dumps(payload),
+                proposed_at=now,
+                expires_at=expires_at
+            )
+        except Exception as e:
+            self._log(f"Failed to create pending action: {e}", level="debug")
+            return None
+
+    def _check_strengthen_rate_limit(self, now: int) -> bool:
+        """Check if we can create another strengthen action today."""
+        if not hasattr(self, '_database') or not self._database:
+            return True
+
+        try:
+            # Count today's strengthen actions
+            day_start = now - (now % 86400)
+            count = self._database.count_pending_actions_since(
+                action_type="physarum_strengthen",
+                since_timestamp=day_start
+            )
+            return count < MAX_AUTO_STRENGTHEN_PER_DAY
+        except Exception:
+            return True  # Allow on error
+
+    def _check_atrophy_rate_limit(self, now: int) -> bool:
+        """Check if we can create another atrophy action this week."""
+        if not hasattr(self, '_database') or not self._database:
+            return True
+
+        try:
+            week_start = now - (7 * 86400)
+            count = self._database.count_pending_actions_since(
+                action_type="physarum_atrophy",
+                since_timestamp=week_start
+            )
+            return count < MAX_AUTO_ATROPHY_PER_WEEK
+        except Exception:
+            return True
+
+    def _check_recent_strengthen(self, channel_id: str, now: int) -> bool:
+        """Check if channel was strengthened recently."""
+        if not hasattr(self, '_database') or not self._database:
+            return False
+
+        try:
+            cutoff = now - (MIN_STRENGTHEN_INTERVAL_HOURS * 3600)
+            return self._database.has_recent_action_for_channel(
+                channel_id=channel_id,
+                action_type="physarum_strengthen",
+                since_timestamp=cutoff
+            )
+        except Exception:
+            return False
+
+    def _check_on_chain_reserve(self) -> bool:
+        """Check if on-chain balance is sufficient for splice-in."""
+        if not self.plugin:
+            return False
+
+        try:
+            funds = self.plugin.rpc.listfunds()
+            confirmed = sum(
+                o.get("amount_msat", 0)
+                for o in funds.get("outputs", [])
+                if o.get("status") == "confirmed"
+            )
+            if isinstance(confirmed, str):
+                confirmed = int(confirmed.replace("msat", ""))
+            confirmed_sats = confirmed // 1000
+
+            return confirmed_sats >= (AUTO_TRIGGER_MIN_ON_CHAIN_SATS + AUTO_STRENGTHEN_MIN_SATS)
+        except Exception:
+            return False
+
+    def get_auto_trigger_status(self) -> Dict[str, Any]:
+        """
+        Get status of auto-trigger configuration and limits.
+
+        Returns:
+            Dict with auto-trigger status
+        """
+        now = int(time.time())
+
+        status = {
+            "auto_strengthen_enabled": AUTO_STRENGTHEN_ENABLED,
+            "auto_atrophy_enabled": AUTO_ATROPHY_ENABLED,
+            "auto_stimulate_enabled": AUTO_STIMULATE_ENABLED,
+            "thresholds": {
+                "strengthen_flow": STRENGTHEN_FLOW_THRESHOLD,
+                "auto_strengthen_flow": MIN_AUTO_STRENGTHEN_FLOW,
+                "atrophy_flow": ATROPHY_FLOW_THRESHOLD,
+                "min_channel_age_days": MIN_CHANNEL_AGE_FOR_ATROPHY_DAYS
+            },
+            "limits": {
+                "max_strengthen_per_day": MAX_AUTO_STRENGTHEN_PER_DAY,
+                "max_atrophy_per_week": MAX_AUTO_ATROPHY_PER_WEEK,
+                "min_strengthen_interval_hours": MIN_STRENGTHEN_INTERVAL_HOURS
+            },
+            "safety": {
+                "min_on_chain_reserve_sats": AUTO_TRIGGER_MIN_ON_CHAIN_SATS,
+                "splice_min_sats": AUTO_STRENGTHEN_MIN_SATS,
+                "splice_max_sats": AUTO_STRENGTHEN_MAX_SATS
+            }
+        }
+
+        # Add current usage if database available
+        if hasattr(self, '_database') and self._database:
+            try:
+                day_start = now - (now % 86400)
+                week_start = now - (7 * 86400)
+
+                status["current_usage"] = {
+                    "strengthen_today": self._database.count_pending_actions_since(
+                        "physarum_strengthen", day_start
+                    ),
+                    "atrophy_this_week": self._database.count_pending_actions_since(
+                        "physarum_atrophy", week_start
+                    )
+                }
+            except Exception:
+                pass
+
+        return status
+
 
 # =============================================================================
 # STRATEGIC POSITIONING MANAGER
@@ -1146,6 +1558,8 @@ class StrategicPositioningManager:
             plugin=plugin,
             yield_metrics_mgr=yield_metrics_mgr
         )
+        # Pass database reference for pending_actions
+        self.physarum_mgr.set_database(database)
 
         self._our_pubkey: Optional[str] = None
 

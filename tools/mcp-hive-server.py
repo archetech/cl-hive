@@ -1777,6 +1777,37 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                 },
                 "required": ["node"]
             }
+        ),
+        # =====================================================================
+        # Physarum Auto-Trigger Tools (Phase 7.2)
+        # =====================================================================
+        Tool(
+            name="physarum_cycle",
+            description="Execute one Physarum optimization cycle. Evaluates all channels and creates pending_actions for: high-flow channels (strengthen/splice-in), old low-flow channels (atrophy/close), young low-flow channels (stimulate/fee reduction). All actions go through governance approval.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="physarum_status",
+            description="Get Physarum auto-trigger status. Shows configuration (auto_strengthen/atrophy/stimulate enabled), thresholds (flow intensity triggers), rate limits (max actions per day/week), and current usage.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
         )
     ]
 
@@ -1947,6 +1978,11 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_positioning_summary(arguments)
         elif name == "positioning_status":
             result = await handle_positioning_status(arguments)
+        # Physarum Auto-Trigger tools (Phase 7.2)
+        elif name == "physarum_cycle":
+            result = await handle_physarum_cycle(arguments)
+        elif name == "physarum_status":
+            result = await handle_physarum_status(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -4278,6 +4314,74 @@ async def handle_positioning_status(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("hive-positioning-status", {})
+
+
+# =============================================================================
+# Physarum Auto-Trigger Handlers (Phase 7.2)
+# =============================================================================
+
+async def handle_physarum_cycle(args: Dict) -> Dict:
+    """
+    Execute one Physarum optimization cycle.
+
+    Evaluates channels and creates pending_actions for lifecycle changes.
+    """
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-physarum-cycle", {})
+
+    # Add helpful summary
+    if result.get("actions_created"):
+        actions = result["actions_created"]
+        strengthen = [a for a in actions if a.get("action_type") == "physarum_strengthen"]
+        atrophy = [a for a in actions if a.get("action_type") == "physarum_atrophy"]
+        stimulate = [a for a in actions if a.get("action_type") == "physarum_stimulate"]
+
+        summary_parts = []
+        if strengthen:
+            summary_parts.append(f"{len(strengthen)} splice-in proposals")
+        if atrophy:
+            summary_parts.append(f"{len(atrophy)} close recommendations")
+        if stimulate:
+            summary_parts.append(f"{len(stimulate)} fee reduction proposals")
+
+        if summary_parts:
+            result["ai_summary"] = (
+                f"Physarum cycle created: {', '.join(summary_parts)}. "
+                "Review in pending_actions and approve/reject."
+            )
+    else:
+        result["ai_summary"] = "Physarum cycle completed. No actions needed - all channels within optimal range."
+
+    return result
+
+
+async def handle_physarum_status(args: Dict) -> Dict:
+    """
+    Get Physarum auto-trigger status.
+
+    Shows configuration, thresholds, rate limits, and current usage.
+    """
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-physarum-status", {})
+
+    # Add configuration guidance
+    if result.get("auto_strengthen_enabled") and result.get("auto_atrophy_enabled") is False:
+        result["ai_note"] = (
+            "Auto-atrophy is disabled (safe default). "
+            "Close recommendations always require human approval."
+        )
+
+    return result
 
 
 # =============================================================================

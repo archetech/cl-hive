@@ -1752,6 +1752,102 @@ class HiveDatabase:
 
         return count
 
+    def create_pending_action(
+        self,
+        action_type: str,
+        payload: str,
+        proposed_at: int,
+        expires_at: int
+    ) -> int:
+        """
+        Create a pending action with explicit timestamps.
+
+        Similar to add_pending_action but accepts pre-computed timestamps
+        and string payload (already JSON-encoded).
+
+        Args:
+            action_type: Type of action (e.g., 'physarum_strengthen')
+            payload: JSON-encoded action details
+            proposed_at: Unix timestamp when proposed
+            expires_at: Unix timestamp when expires
+
+        Returns:
+            Action ID
+        """
+        conn = self._get_connection()
+
+        cursor = conn.execute("""
+            INSERT INTO pending_actions (action_type, payload, proposed_at, expires_at, status)
+            VALUES (?, ?, ?, ?, 'pending')
+        """, (action_type, payload, proposed_at, expires_at))
+
+        return cursor.lastrowid
+
+    def count_pending_actions_since(
+        self,
+        action_type: str,
+        since_timestamp: int
+    ) -> int:
+        """
+        Count pending actions of a type since a timestamp.
+
+        Used for rate limiting auto-trigger actions.
+
+        Args:
+            action_type: Type of action to count
+            since_timestamp: Count actions created after this time
+
+        Returns:
+            Number of actions (any status) of this type since timestamp
+        """
+        conn = self._get_connection()
+
+        row = conn.execute("""
+            SELECT COUNT(*) as cnt FROM pending_actions
+            WHERE action_type = ? AND proposed_at >= ?
+        """, (action_type, since_timestamp)).fetchone()
+
+        return row['cnt'] if row else 0
+
+    def has_recent_action_for_channel(
+        self,
+        channel_id: str,
+        action_type: str,
+        since_timestamp: int
+    ) -> bool:
+        """
+        Check if a channel had a recent action of the specified type.
+
+        Used to prevent duplicate actions on the same channel.
+
+        Args:
+            channel_id: Channel SCID to check
+            action_type: Type of action to check
+            since_timestamp: Check for actions after this time
+
+        Returns:
+            True if channel has a recent action of this type
+        """
+        conn = self._get_connection()
+
+        # Use LIKE for initial filtering, then parse to confirm
+        rows = conn.execute("""
+            SELECT payload FROM pending_actions
+            WHERE action_type = ? AND proposed_at >= ?
+            AND payload LIKE ?
+            LIMIT 10
+        """, (action_type, since_timestamp, f'%{channel_id}%')).fetchall()
+
+        for row in rows:
+            try:
+                payload = json.loads(row['payload'])
+                if payload.get('channel_id') == channel_id:
+                    return True
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        return False
+
     def get_recent_expansion_rejections(self, hours: int = 24) -> List[Dict[str, Any]]:
         """
         Get all expansion-related rejections in the given time period.
