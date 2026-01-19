@@ -122,7 +122,185 @@ LQWD reports 24% annualized. Likely includes:
 
 ## Implementation Plan
 
-### Phase 1: Foundation (Weeks 1-4)
+### Phase 0: Routing Pool Foundation (Weeks 1-2)
+
+**Goal**: Establish collective economics as the foundation for all other optimizations
+
+The routing pool is not an add-on—it's the foundation that makes everything else work. Without shared economics, members will always have incentive to defect from coordination.
+
+#### 0.1 Pool Data Schema
+
+```python
+# Add to modules/database.py
+
+POOL_TABLES = """
+-- Member contributions (snapshot each period)
+CREATE TABLE IF NOT EXISTS pool_contributions (
+    id INTEGER PRIMARY KEY,
+    member_id TEXT NOT NULL,
+    period TEXT NOT NULL,  -- e.g., "2025-W03"
+
+    -- Capital metrics
+    total_capacity_sats INTEGER,
+    weighted_capacity_sats INTEGER,
+    uptime_pct REAL,
+
+    -- Position metrics
+    betweenness_centrality REAL,
+    unique_peers INTEGER,
+    bridge_score REAL,
+
+    -- Operations metrics
+    routing_success_rate REAL,
+    avg_response_time_ms REAL,
+
+    -- Computed
+    pool_share REAL,
+
+    recorded_at INTEGER,
+    UNIQUE(member_id, period)
+);
+
+-- Revenue earned (individual transactions)
+CREATE TABLE IF NOT EXISTS pool_revenue (
+    id INTEGER PRIMARY KEY,
+    member_id TEXT NOT NULL,
+    amount_sats INTEGER NOT NULL,
+    channel_id TEXT,
+    recorded_at INTEGER
+);
+
+-- Distributions (settlements)
+CREATE TABLE IF NOT EXISTS pool_distributions (
+    id INTEGER PRIMARY KEY,
+    period TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    contribution_share REAL,
+    amount_sats INTEGER,
+    settled_at INTEGER,
+    UNIQUE(member_id, period)
+);
+"""
+```
+
+#### 0.2 Contribution Tracking
+
+```python
+# New module: modules/routing_pool.py
+
+class RoutingPool:
+    """
+    Collective profit sharing for the hive.
+
+    All routing revenue goes to pool, distributed proportionally
+    based on capital, position, and operational contributions.
+    """
+
+    CAPITAL_WEIGHT = 0.70
+    POSITION_WEIGHT = 0.20
+    OPERATIONS_WEIGHT = 0.10
+
+    SETTLEMENT_PERIOD_DAYS = 7
+
+    def __init__(self, database, plugin, state_manager, health_aggregator):
+        self.db = database
+        self.plugin = plugin
+        self.state_manager = state_manager
+        self.health_aggregator = health_aggregator
+
+    def record_revenue(self, member_id: str, amount_sats: int, channel_id: str = None):
+        """Record routing revenue (goes to pool, not individual)."""
+        self.db.execute(
+            "INSERT INTO pool_revenue (member_id, amount_sats, channel_id, recorded_at) "
+            "VALUES (?, ?, ?, ?)",
+            (member_id, amount_sats, channel_id, int(time.time()))
+        )
+
+    def snapshot_contributions(self, period: str):
+        """Snapshot all member contributions for a period."""
+        members = self.state_manager.get_all_peer_states()
+
+        for member in members:
+            contrib = self._calculate_contribution(member)
+            self.db.execute(
+                "INSERT OR REPLACE INTO pool_contributions "
+                "(member_id, period, total_capacity_sats, weighted_capacity_sats, "
+                "uptime_pct, betweenness_centrality, unique_peers, bridge_score, "
+                "routing_success_rate, avg_response_time_ms, pool_share, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (member.peer_id, period, contrib.total_capacity,
+                 contrib.weighted_capacity, contrib.uptime,
+                 contrib.centrality, contrib.unique_peers, contrib.bridge_score,
+                 contrib.success_rate, contrib.response_time,
+                 contrib.pool_share, int(time.time()))
+            )
+
+    def calculate_distribution(self, period: str) -> Dict[str, int]:
+        """Calculate fair distribution for a settlement period."""
+        # Get total revenue for period
+        total_revenue = self.db.execute(
+            "SELECT SUM(amount_sats) FROM pool_revenue "
+            "WHERE recorded_at >= ? AND recorded_at < ?",
+            self._period_bounds(period)
+        ).fetchone()[0] or 0
+
+        # Get contributions
+        contributions = self.db.execute(
+            "SELECT member_id, pool_share FROM pool_contributions "
+            "WHERE period = ?", (period,)
+        ).fetchall()
+
+        total_shares = sum(c[1] for c in contributions)
+
+        distributions = {}
+        for member_id, share in contributions:
+            pct = share / total_shares if total_shares > 0 else 0
+            distributions[member_id] = int(total_revenue * pct)
+
+        return distributions
+
+    def get_pool_status(self) -> Dict:
+        """Get current pool status for MCP/display."""
+        current_period = self._current_period()
+
+        return {
+            "period": current_period,
+            "total_revenue_sats": self._get_period_revenue(current_period),
+            "member_count": self._get_member_count(),
+            "contributions": self._get_contribution_summary(current_period),
+            "projected_distribution": self.calculate_distribution(current_period)
+        }
+```
+
+#### 0.3 MCP Integration
+
+```python
+# Add to tools/mcp-hive-server.py
+
+@server.tool("pool_status")
+async def handle_pool_status(args: Dict) -> Dict:
+    """Get routing pool status - revenue, contributions, projections."""
+    node = fleet.get_node(args.get("node"))
+    return await node.call("hive-pool-status")
+
+@server.tool("pool_distribution")
+async def handle_pool_distribution(args: Dict) -> Dict:
+    """Get distribution calculation for a period."""
+    node = fleet.get_node(args.get("node"))
+    period = args.get("period", "current")
+    return await node.call("hive-pool-distribution", {"period": period})
+```
+
+**Deliverables**:
+- [ ] Pool database schema
+- [ ] RoutingPool class with contribution tracking
+- [ ] Revenue recording hooks in forwarding events
+- [ ] MCP tools for pool visibility
+- [ ] Weekly contribution snapshots
+
+---
+
+### Phase 1: Metrics & Measurement (Weeks 3-4)
 
 **Goal**: Measure current state, establish baselines
 
@@ -550,14 +728,17 @@ def prioritize_exchange_channels(self):
 | Phase | Timeline | Expected Yield | Cumulative |
 |-------|----------|----------------|------------|
 | Baseline (current) | Now | 2-4% | 2-4% |
-| Phase 1: Metrics | Week 4 | +1% (awareness) | 3-5% |
-| Phase 2: Fee Coordination | Week 8 | +2% (no competition) | 5-7% |
-| Phase 3: Cost Reduction | Week 12 | +2% (lower costs) | 7-9% |
+| **Phase 0: Routing Pool** | Week 2 | +1% (alignment) | 3-5% |
+| Phase 1: Metrics | Week 4 | +1% (awareness) | 4-6% |
+| Phase 2: Fee Coordination | Week 8 | +2% (no competition) | 6-8% |
+| Phase 3: Cost Reduction | Week 12 | +2% (lower costs) | 8-10% |
 | Phase 4: LSP Services | DEFERRED | -- | -- |
-| Phase 5: Positioning | Week 16 | +3% (strategic) | 10-12% |
+| Phase 5: Positioning | Week 16 | +3% (strategic) | 11-13% |
+| Swarm Intelligence | Ongoing | +2-4% (optimization) | 13-17% |
 
-**Target without LSP**: 10-12% (match/slightly exceed Block)
-**Note**: LSP services deferred - focus on coordination and positioning first
+**Target**: 13-17% annual yield (significantly exceeds Block's 9.7%)
+
+**Key Insight**: Phase 0 (Routing Pool) is foundational. Without shared economics, coordination phases (2, 3, 5) face defection incentives. Pool-first approach ensures all subsequent optimizations benefit the collective.
 
 ---
 
@@ -565,42 +746,63 @@ def prioritize_exchange_channels(self):
 
 ### Primary KPIs
 
-1. **Fleet Yield** (target: 10%+)
+1. **Pool Yield** (target: 13%+)
    ```
-   Fleet Yield = (Total Routing Revenue - Total Costs) / Total Capacity
+   Pool Yield = Total Pool Revenue / Total Pool Capacity
    ```
 
-2. **Internal Competition Index** (target: <0.1)
+2. **Distribution Fairness** (target: Gini < 0.3)
+   ```
+   Gini Coefficient of distributions vs contributions
+   ```
+
+3. **Internal Competition Index** (target: 0)
    ```
    ICI = Revenue Lost to Undercutting / Total Revenue
+   With pool: should be zero (no incentive to undercut)
    ```
 
-3. **Rebalancing Efficiency** (target: >3x)
+4. **Rebalancing Efficiency** (target: >3x)
    ```
    RE = Fees Earned from Rebalanced Liquidity / Rebalancing Cost
    ```
 
-4. **Captive Flow Ratio** (target: >30%)
+### Pool-Specific KPIs
+
+5. **Contribution Variance** (target: stable)
    ```
-   CFR = LSP Customer Volume / Total Routed Volume
+   CV = StdDev(member_shares) / Mean(member_shares)
+   Lower = more equal participation
+   ```
+
+6. **Revenue per Capacity** (target: increasing)
+   ```
+   RPC = Pool Revenue / Pool Capacity (weekly)
+   Primary efficiency metric
+   ```
+
+7. **Member Retention** (target: 100%)
+   ```
+   MR = Members at end of period / Members at start
+   Pool should incentivize staying
    ```
 
 ### Secondary KPIs
 
-5. **Prediction Accuracy** (target: >80%)
+8. **Prediction Accuracy** (target: >80%)
    ```
    PA = Correct Predictions / Total Predictions
    ```
 
-6. **Position Value** (target: increasing)
+9. **Position Value** (target: increasing)
    ```
    PV = Betweenness Centrality of Fleet
    ```
 
-7. **Cost per Sat Routed** (target: decreasing)
-   ```
-   CPR = Total Costs / Total Volume Routed
-   ```
+10. **Cost per Sat Routed** (target: decreasing)
+    ```
+    CPR = Total Costs / Total Volume Routed
+    ```
 
 ---
 
@@ -1121,13 +1323,24 @@ This potentially pushes the achievable yield from 10-12% to **13-18%**.
 
 ## Immediate Next Steps
 
-1. **Implement Phase 1.1**: Add `ChannelYieldMetrics` to revenue tracking
-2. **Implement Phase 1.2**: Enhance velocity prediction
-3. **Design Phase 2.1**: Route ownership model specification
-4. **Implement Phase 2.2**: Adaptive fee decay (pheromone evaporation)
-5. **Plan Phase 5**: Exchange connectivity strategy
-6. **Prototype**: Pheromone-based fee controller (highest immediate impact)
-7. **Prototype**: Salience detector for noise filtering
+### Priority 1: Routing Pool (Foundation)
+1. **Implement Phase 0.1**: Pool database schema in `database.py`
+2. **Implement Phase 0.2**: `RoutingPool` class in new `modules/routing_pool.py`
+3. **Implement Phase 0.3**: Revenue recording hooks in forward event handling
+4. **Add MCP tools**: `pool_status`, `pool_distribution`
+
+### Priority 2: Metrics
+5. **Implement Phase 1.1**: Add `ChannelYieldMetrics` to revenue tracking
+6. **Implement Phase 1.2**: Enhance velocity prediction
+
+### Priority 3: Swarm Intelligence
+7. **Prototype**: Pheromone-based fee controller (adaptive evaporation)
+8. **Prototype**: Salience detector for noise filtering
+9. **Design**: Stigmergic route markers (indirect coordination)
+
+### Priority 4: Positioning
+10. **Plan Phase 5**: Exchange connectivity strategy
+11. **Implement**: Physarum-inspired channel lifecycle
 
 ---
 
