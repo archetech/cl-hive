@@ -1182,7 +1182,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         database=database,
         state_manager=state_manager,
         fee_coordination_mgr=fee_coordination_mgr,
-        governance=governance
+        governance=decision_engine
     )
     rationalization_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Rationalization manager initialized")
