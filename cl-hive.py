@@ -77,6 +77,7 @@ from modules.governance import DecisionEngine
 from modules.vpn_transport import VPNTransportManager
 from modules.fee_intelligence import FeeIntelligenceManager
 from modules.liquidity_coordinator import LiquidityCoordinator
+from modules.health_aggregator import HealthScoreAggregator, HealthTier
 from modules.routing_intelligence import HiveRoutingMap
 from modules.peer_reputation import PeerReputationManager
 from modules.rpc_commands import (
@@ -237,6 +238,7 @@ decision_engine: Optional[DecisionEngine] = None
 vpn_transport: Optional[VPNTransportManager] = None
 coop_expansion: Optional[CooperativeExpansionManager] = None
 fee_intel_mgr: Optional[FeeIntelligenceManager] = None
+health_aggregator: Optional[HealthScoreAggregator] = None
 liquidity_coord: Optional[LiquidityCoordinator] = None
 routing_map: Optional[HiveRoutingMap] = None
 peer_reputation_mgr: Optional[PeerReputationManager] = None
@@ -989,6 +991,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         our_pubkey=our_pubkey
     )
     plugin.log("cl-hive: Fee intelligence manager initialized")
+
+    # Initialize Health Score Aggregator (Phase 7 - NNLB)
+    global health_aggregator
+    health_aggregator = HealthScoreAggregator(
+        database=database,
+        plugin=safe_plugin
+    )
+    plugin.log("cl-hive: Health aggregator initialized")
 
     # Start fee intelligence background thread (Phase 7)
     fee_intel_thread = threading.Thread(
@@ -6290,43 +6300,146 @@ def hive_nnlb_status(plugin: Plugin):
 
 
 @plugin.method("hive-member-health")
-def hive_member_health(plugin: Plugin, peer_id: str = None):
+def hive_member_health(plugin: Plugin, member_id: str = None, action: str = "query"):
     """
-    Get health records for hive members.
+    Query NNLB health scores for fleet members.
 
-    Health records include capacity, revenue, and connectivity scores
-    used for NNLB assistance decisions.
+    This is INFORMATION SHARING only - no fund movement.
+    Used by cl-revenue-ops to adjust its own rebalancing priorities.
 
     Args:
-        peer_id: Optional specific member to query
+        member_id: Specific member (None for self, "all" for fleet summary)
+        action: "query" (default) or "aggregate" (fleet summary)
+
+    Returns for single member:
+    {
+        "member_id": "02abc...",
+        "health_score": 65,
+        "health_tier": "stable",
+        "budget_multiplier": 1.0,
+        "capacity_score": 70,
+        "revenue_score": 60,
+        "connectivity_score": 72,
+        ...
+    }
+
+    Returns for "aggregate" or member_id="all":
+    {
+        "fleet_health": 58,
+        "member_count": 5,
+        "struggling_count": 1,
+        "vulnerable_count": 2,
+        "stable_count": 2,
+        "thriving_count": 0,
+        "members": [...]
+    }
+
+    Permission: None (local cl-revenue-ops integration)
+    """
+    # No permission check - this is for local cl-revenue-ops integration
+
+    if not database or not health_aggregator:
+        return {"error": "Health tracking not initialized"}
+
+    # Handle "all" member_id or "aggregate" action
+    if member_id == "all" or action == "aggregate":
+        summary = health_aggregator.get_fleet_health_summary()
+        return summary
+
+    # Query specific member or self
+    target_id = member_id if member_id else our_pubkey
+    if not target_id:
+        return {"error": "No member specified and our_pubkey not set"}
+
+    health = health_aggregator.get_our_health(target_id)
+    if not health:
+        return {
+            "member_id": target_id,
+            "error": "No health record found",
+            # Return defaults for graceful degradation
+            "health_score": 50,
+            "health_tier": "stable",
+            "budget_multiplier": 1.0
+        }
+
+    # Rename overall_health to health_score for API consistency
+    health["health_score"] = health.pop("overall_health", 50)
+    health["member_id"] = target_id
+
+    return health
+
+
+@plugin.method("hive-report-health")
+def hive_report_health(
+    plugin: Plugin,
+    profitable_channels: int,
+    underwater_channels: int,
+    stagnant_channels: int,
+    total_channels: int = None,
+    revenue_trend: str = "stable",
+    liquidity_score: int = 50
+):
+    """
+    Report health status from cl-revenue-ops.
+
+    Called periodically by cl-revenue-ops profitability analyzer.
+    This shares INFORMATION - no sats move between nodes.
+
+    The health score is calculated from profitability metrics and used
+    to determine the node's NNLB budget multiplier for its own operations.
+
+    Args:
+        profitable_channels: Number of channels classified as profitable
+        underwater_channels: Number of channels classified as underwater
+        stagnant_channels: Number of stagnant/zombie channels
+        total_channels: Total channel count (defaults to sum of above)
+        revenue_trend: "improving", "stable", or "declining"
+        liquidity_score: Liquidity balance score 0-100 (default 50)
 
     Returns:
-        Dict with health record(s).
+        {"status": "reported", "health_score": 65, "health_tier": "stable",
+         "budget_multiplier": 1.0}
 
-    Permission: Member or Admin
+    Permission: None (local cl-revenue-ops integration)
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
-    if perm_error:
-        return perm_error
+    # No permission check - this is for local cl-revenue-ops integration
 
-    if not database:
-        return {"error": "Database not initialized"}
+    if not database or not health_aggregator or not our_pubkey:
+        return {"error": "Health tracking not initialized"}
 
-    if peer_id:
-        health = database.get_member_health(peer_id)
-        if not health:
-            return {
-                "peer_id": peer_id,
-                "error": "No health record found"
-            }
-        return {"health": health}
-    else:
-        all_health = database.get_all_member_health()
+    # Calculate total if not provided
+    if total_channels is None:
+        total_channels = profitable_channels + underwater_channels + stagnant_channels
+
+    # Validate inputs
+    if total_channels < 0:
+        return {"error": "total_channels must be non-negative"}
+    if revenue_trend not in ["improving", "stable", "declining"]:
+        revenue_trend = "stable"
+    liquidity_score = max(0, min(100, liquidity_score))
+
+    try:
+        # Update our health using the aggregator
+        result = health_aggregator.update_our_health(
+            profitable_channels=profitable_channels,
+            underwater_channels=underwater_channels,
+            stagnant_channels=stagnant_channels,
+            total_channels=total_channels,
+            revenue_trend=revenue_trend,
+            liquidity_score=liquidity_score,
+            our_pubkey=our_pubkey
+        )
+
         return {
-            "member_count": len(all_health),
-            "health_records": all_health
+            "status": "reported",
+            "health_score": result.get("health_score", 50),
+            "health_tier": result.get("health_tier", "stable"),
+            "budget_multiplier": result.get("budget_multiplier", 1.0)
         }
+
+    except Exception as e:
+        plugin.log(f"Error updating health: {e}", level='warn')
+        return {"error": f"Failed to update health: {e}"}
 
 
 @plugin.method("hive-calculate-health")
