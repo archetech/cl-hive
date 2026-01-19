@@ -1187,6 +1187,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     rationalization_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Rationalization manager initialized")
 
+    # Wire rationalization manager to cooperative expansion (slime mold coordination)
+    if coop_expansion:
+        coop_expansion.set_rationalization_manager(rationalization_mgr)
+        plugin.log("cl-hive: Cooperative expansion linked to rationalization (redundancy checks enabled)")
+
     # Initialize Strategic Positioning Manager (Phase 5 - Strategic Positioning)
     global strategic_positioning_mgr
     strategic_positioning_mgr = StrategicPositioningManager(
@@ -1199,6 +1204,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     strategic_positioning_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Strategic positioning manager initialized (Phase 5)")
+
+    # Link yield optimization modules to Planner (Slime mold coordination)
+    # These enable the planner to avoid redundant opens and prioritize high-value corridors
+    planner.set_cooperation_modules(
+        rationalization_mgr=rationalization_mgr,
+        strategic_positioning_mgr=strategic_positioning_mgr
+    )
+    plugin.log("cl-hive: Planner linked to yield optimization modules (slime mold mode)")
 
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
     global peer_available_limiter

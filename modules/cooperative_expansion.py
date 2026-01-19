@@ -145,7 +145,8 @@ class CooperativeExpansionManager:
         plugin=None,
         our_id: str = None,
         config_getter=None,
-        state_manager=None
+        state_manager=None,
+        rationalization_mgr=None
     ):
         """
         Initialize the CooperativeExpansionManager.
@@ -157,6 +158,7 @@ class CooperativeExpansionManager:
             our_id: Our node's pubkey
             config_getter: Callable that returns current HiveConfig
             state_manager: StateManager for fleet budget queries (Phase 8)
+            rationalization_mgr: RationalizationManager for redundancy detection
         """
         self.database = database
         self.quality_scorer = quality_scorer
@@ -164,6 +166,7 @@ class CooperativeExpansionManager:
         self.our_id = our_id
         self._config_getter = config_getter
         self.state_manager = state_manager
+        self.rationalization_mgr = rationalization_mgr
 
         # Active rounds (keyed by round_id)
         self._rounds: Dict[str, ExpansionRound] = {}
@@ -174,6 +177,18 @@ class CooperativeExpansionManager:
 
         # Track cooldowns per target
         self._target_cooldowns: Dict[str, int] = {}  # target_id -> cooldown_until
+
+    def set_rationalization_manager(self, rationalization_mgr) -> None:
+        """
+        Set rationalization manager after initialization.
+
+        This allows wiring the rationalization manager after it's created,
+        avoiding circular dependency issues.
+
+        Args:
+            rationalization_mgr: RationalizationManager for redundancy detection
+        """
+        self.rationalization_mgr = rationalization_mgr
 
     def _log(self, msg: str, level: str = "info") -> None:
         """Log a message if plugin is available."""
@@ -194,6 +209,51 @@ class CooperativeExpansionManager:
             except Exception:
                 pass
         return ""
+
+    def _check_redundancy(self, target_peer_id: str) -> tuple:
+        """
+        Check if opening a channel to this target would create unhealthy redundancy.
+
+        Uses rationalization manager to detect if the fleet already has
+        sufficient coverage to this peer based on stigmergic markers.
+
+        Slime mold principle: Don't extend tendrils to territory that
+        another part of the organism is already exploiting successfully.
+
+        Args:
+            target_peer_id: The target peer to check
+
+        Returns:
+            Tuple of (is_redundant: bool, reason: str)
+        """
+        if not self.rationalization_mgr:
+            return False, ""
+
+        try:
+            coverage = self.rationalization_mgr.analyze_coverage(peer_id=target_peer_id)
+            if "error" in coverage:
+                return False, ""
+
+            coverages = coverage.get("coverages", [])
+            for cov in coverages:
+                if cov.get("peer_id") == target_peer_id:
+                    redundancy_count = cov.get("redundancy_count", 0)
+                    owner = cov.get("owner_pubkey")
+                    owner_strength = cov.get("owner_marker_strength", 0)
+
+                    # MAX_HEALTHY_REDUNDANCY = 2
+                    if redundancy_count >= 2:
+                        return True, (
+                            f"Already has {redundancy_count} fleet channels "
+                            f"(owner: {owner[:16] if owner else 'none'}..., "
+                            f"strength: {owner_strength:.1f})"
+                        )
+
+            return False, ""
+
+        except Exception as e:
+            self._log(f"Error checking redundancy: {e}", level='debug')
+            return False, ""
 
     def _get_onchain_balance(self) -> int:
         """Get our available onchain balance."""
@@ -436,6 +496,15 @@ class CooperativeExpansionManager:
             self._log(
                 f"Target {target_peer_id[:16]}... quality too low: {quality_score:.2f}",
                 level='debug'
+            )
+            return None
+
+        # Slime mold: Check if this would create unhealthy redundancy
+        is_redundant, redundancy_reason = self._check_redundancy(target_peer_id)
+        if is_redundant:
+            self._log(
+                f"Skipping {target_peer_id[:16]}...: redundant coverage - {redundancy_reason}",
+                level='info'
             )
             return None
 

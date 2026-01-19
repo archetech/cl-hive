@@ -110,6 +110,13 @@ COMPETITION_DISCOUNT_HIGH = 0.65      # 35% discount for high competition
 # Bottleneck bonus (for peers identified by liquidity_coordinator)
 BOTTLENECK_BONUS_MULTIPLIER = 1.5     # 50% bonus for bottleneck peers
 
+# Physarum positioning bonuses (integrate with strategic_positioning)
+CORRIDOR_VALUE_BONUS_HIGH = 1.4       # 40% bonus for high-value corridors
+CORRIDOR_VALUE_BONUS_MEDIUM = 1.15    # 15% bonus for medium-value corridors
+
+# Redundancy penalty from rationalization (stigmergic marker-based)
+REDUNDANCY_PENALTY_OVERSERVED = 0.3   # 70% penalty if already well-owned by another member
+
 
 # =============================================================================
 # DATA CLASSES
@@ -567,7 +574,8 @@ class Planner:
     def __init__(self, state_manager, database, bridge, clboss_bridge, plugin=None,
                  intent_manager=None, decision_engine=None,
                  liquidity_coordinator=None, splice_coordinator=None,
-                 health_aggregator=None):
+                 health_aggregator=None, rationalization_mgr=None,
+                 strategic_positioning_mgr=None):
         """
         Initialize the Planner.
 
@@ -582,6 +590,8 @@ class Planner:
             liquidity_coordinator: LiquidityCoordinator for bottleneck detection (Phase 7)
             splice_coordinator: SpliceCoordinator for splice recommendations (Phase 7)
             health_aggregator: HealthScoreAggregator for fleet health (Phase 7)
+            rationalization_mgr: RationalizationManager for redundancy detection
+            strategic_positioning_mgr: StrategicPositioningManager for corridor value
         """
         self.state_manager = state_manager
         self.db = database
@@ -595,6 +605,10 @@ class Planner:
         self.liquidity_coordinator = liquidity_coordinator
         self.splice_coordinator = splice_coordinator
         self.health_aggregator = health_aggregator
+
+        # Yield optimization modules - slime mold coordination
+        self.rationalization_mgr = rationalization_mgr
+        self.strategic_positioning_mgr = strategic_positioning_mgr
 
         # Quality scorer for peer evaluation (Phase 6.2)
         if PeerQualityScorer and database:
@@ -621,7 +635,9 @@ class Planner:
         self,
         liquidity_coordinator=None,
         splice_coordinator=None,
-        health_aggregator=None
+        health_aggregator=None,
+        rationalization_mgr=None,
+        strategic_positioning_mgr=None
     ) -> None:
         """
         Set cooperation modules after initialization.
@@ -633,6 +649,8 @@ class Planner:
             liquidity_coordinator: LiquidityCoordinator for bottleneck detection
             splice_coordinator: SpliceCoordinator for splice recommendations
             health_aggregator: HealthScoreAggregator for fleet health
+            rationalization_mgr: RationalizationManager for redundancy detection
+            strategic_positioning_mgr: StrategicPositioningManager for corridor value
         """
         if liquidity_coordinator is not None:
             self.liquidity_coordinator = liquidity_coordinator
@@ -640,11 +658,17 @@ class Planner:
             self.splice_coordinator = splice_coordinator
         if health_aggregator is not None:
             self.health_aggregator = health_aggregator
+        if rationalization_mgr is not None:
+            self.rationalization_mgr = rationalization_mgr
+        if strategic_positioning_mgr is not None:
+            self.strategic_positioning_mgr = strategic_positioning_mgr
 
         self._log(
             f"Cooperation modules set: liquidity={liquidity_coordinator is not None}, "
             f"splice={splice_coordinator is not None}, "
-            f"health={health_aggregator is not None}",
+            f"health={health_aggregator is not None}, "
+            f"rationalization={rationalization_mgr is not None}, "
+            f"positioning={strategic_positioning_mgr is not None}",
             level='debug'
         )
 
@@ -740,6 +764,124 @@ class Planner:
         except Exception as e:
             self._log(f"Error checking bottleneck status: {e}", level='debug')
             return False
+
+    def _check_stigmergic_redundancy(self, target: str) -> tuple:
+        """
+        Check stigmergic marker-based redundancy for a target.
+
+        Uses rationalization manager to determine if another member
+        already "owns" this route based on routing success (markers).
+
+        Slime mold principle: Don't over-cover routes that another
+        tendril (member) is already successfully exploiting.
+
+        Args:
+            target: Target node pubkey
+
+        Returns:
+            Tuple of (is_overserved: bool, owner_pubkey: str or None, owner_strength: float)
+        """
+        if not self.rationalization_mgr:
+            return False, None, 0.0
+
+        try:
+            coverage = self.rationalization_mgr.analyze_coverage(peer_id=target)
+            if "error" in coverage:
+                return False, None, 0.0
+
+            # Check if this peer is covered
+            coverages = coverage.get("coverages", [])
+            for cov in coverages:
+                if cov.get("peer_id") == target:
+                    owner = cov.get("owner_pubkey")
+                    owner_strength = cov.get("owner_marker_strength", 0)
+                    redundancy_count = cov.get("redundancy_count", 0)
+
+                    # If owner exists and we're not the owner, this is overserved territory
+                    if owner and redundancy_count >= 2:  # MAX_HEALTHY_REDUNDANCY
+                        return True, owner, owner_strength
+
+            return False, None, 0.0
+
+        except Exception as e:
+            self._log(f"Error checking stigmergic redundancy: {e}", level='debug')
+            return False, None, 0.0
+
+    def _get_corridor_value_bonus(self, target: str) -> tuple:
+        """
+        Get corridor value bonus from strategic positioning.
+
+        Uses route value analyzer to determine if this target
+        is on a high-value routing corridor.
+
+        Slime mold principle: Prioritize routes where nutrients (fees)
+        flow most abundantly.
+
+        Args:
+            target: Target node pubkey
+
+        Returns:
+            Tuple of (bonus_multiplier: float, value_tier: str)
+        """
+        if not self.strategic_positioning_mgr:
+            return 1.0, "unknown"
+
+        try:
+            corridors = self.strategic_positioning_mgr.get_valuable_corridors(min_score=0.01)
+
+            # Find corridors that include this target
+            best_tier = "low"
+            for corridor in corridors:
+                if corridor.get("destination_peer_id") == target:
+                    tier = corridor.get("value_tier", "low")
+                    if tier == "high":
+                        best_tier = "high"
+                        break
+                    elif tier == "medium" and best_tier != "high":
+                        best_tier = "medium"
+
+            if best_tier == "high":
+                return CORRIDOR_VALUE_BONUS_HIGH, "high"
+            elif best_tier == "medium":
+                return CORRIDOR_VALUE_BONUS_MEDIUM, "medium"
+            else:
+                return 1.0, "low"
+
+        except Exception as e:
+            self._log(f"Error getting corridor value: {e}", level='debug')
+            return 1.0, "unknown"
+
+    def _is_exchange_target(self, target: str) -> tuple:
+        """
+        Check if target is a priority exchange node.
+
+        Uses strategic positioning to identify high-value
+        exchange connections.
+
+        Args:
+            target: Target node pubkey
+
+        Returns:
+            Tuple of (is_exchange: bool, exchange_name: str or None)
+        """
+        if not self.strategic_positioning_mgr:
+            return False, None
+
+        try:
+            exchange_data = self.strategic_positioning_mgr.get_exchange_coverage()
+            exchanges = exchange_data.get("exchanges", [])
+
+            for ex in exchanges:
+                # Check if any connected members have this target
+                # This would require pubkey matching which we don't have directly
+                # For now, return False - exchange detection uses alias matching
+                pass
+
+            return False, None
+
+        except Exception as e:
+            self._log(f"Error checking exchange status: {e}", level='debug')
+            return False, None
 
     def get_expansion_recommendation(
         self,
@@ -1432,6 +1574,28 @@ class Planner:
                 adjusted_score *= BOTTLENECK_BONUS_MULTIPLIER
                 self._log(
                     f"Boosting {target[:16]}... - bottleneck peer (+50%)",
+                    level='debug'
+                )
+
+            # Physarum/Slime mold: Check stigmergic redundancy
+            # Avoid expanding to routes already "owned" by another member
+            is_overserved, owner, owner_strength = self._check_stigmergic_redundancy(target)
+            if is_overserved and owner:
+                adjusted_score *= REDUNDANCY_PENALTY_OVERSERVED
+                self._log(
+                    f"Penalizing {target[:16]}... - already owned by {owner[:16]}... "
+                    f"(strength={owner_strength:.1f}, -{int((1-REDUNDANCY_PENALTY_OVERSERVED)*100)}%)",
+                    level='debug'
+                )
+
+            # Physarum/Slime mold: Boost high-value corridors
+            # Prioritize routes where "nutrients" (fees) flow abundantly
+            corridor_bonus, corridor_tier = self._get_corridor_value_bonus(target)
+            if corridor_bonus > 1.0:
+                adjusted_score *= corridor_bonus
+                self._log(
+                    f"Boosting {target[:16]}... - {corridor_tier} value corridor "
+                    f"(+{int((corridor_bonus-1)*100)}%)",
                     level='debug'
                 )
 
