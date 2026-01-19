@@ -83,6 +83,7 @@ from modules.routing_intelligence import HiveRoutingMap
 from modules.peer_reputation import PeerReputationManager
 from modules.routing_pool import RoutingPool
 from modules.yield_metrics import YieldMetricsManager
+from modules.fee_coordination import FeeCoordinationManager
 from modules.rpc_commands import (
     HiveContext,
     status as rpc_status,
@@ -120,6 +121,15 @@ from modules.rpc_commands import (
     velocity_prediction as rpc_velocity_prediction,
     critical_velocity_channels as rpc_critical_velocity_channels,
     internal_competition as rpc_internal_competition,
+    # Phase 2: Fee Coordination
+    fee_recommendation as rpc_fee_recommendation,
+    corridor_assignments as rpc_corridor_assignments,
+    stigmergic_markers as rpc_stigmergic_markers,
+    deposit_marker as rpc_deposit_marker,
+    defense_status as rpc_defense_status,
+    broadcast_warning as rpc_broadcast_warning,
+    pheromone_levels as rpc_pheromone_levels,
+    fee_coordination_status as rpc_fee_coordination_status,
 )
 
 # Initialize the plugin
@@ -262,6 +272,7 @@ routing_map: Optional[HiveRoutingMap] = None
 peer_reputation_mgr: Optional[PeerReputationManager] = None
 routing_pool: Optional[RoutingPool] = None
 yield_metrics_mgr: Optional[YieldMetricsManager] = None
+fee_coordination_mgr: Optional[FeeCoordinationManager] = None
 our_pubkey: Optional[str] = None
 
 
@@ -448,6 +459,7 @@ def _get_hive_context() -> HiveContext:
     _routing_pool = routing_pool if 'routing_pool' in globals() else None
     _yield_metrics_mgr = yield_metrics_mgr if 'yield_metrics_mgr' in globals() else None
     _liquidity_coord = liquidity_coord if 'liquidity_coord' in globals() else None
+    _fee_coordination_mgr = fee_coordination_mgr if 'fee_coordination_mgr' in globals() else None
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -469,6 +481,7 @@ def _get_hive_context() -> HiveContext:
         routing_pool=_routing_pool,
         yield_metrics_mgr=_yield_metrics_mgr,
         liquidity_coordinator=_liquidity_coord,
+        fee_coordination_mgr=_fee_coordination_mgr,
         log=_log,
     )
 
@@ -1105,6 +1118,18 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     yield_metrics_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Yield metrics manager initialized (Phase 1)")
+
+    # Initialize Fee Coordination Manager (Phase 2 - Fee Coordination)
+    global fee_coordination_mgr
+    fee_coordination_mgr = FeeCoordinationManager(
+        database=database,
+        plugin=safe_plugin,
+        state_manager=state_manager,
+        liquidity_coordinator=liquidity_coord,
+        gossip_mgr=gossip_mgr
+    )
+    fee_coordination_mgr.set_our_pubkey(our_pubkey)
+    plugin.log("cl-hive: Fee coordination manager initialized (Phase 2)")
 
     # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
     global peer_available_limiter
@@ -7945,6 +7970,174 @@ def hive_internal_competition(plugin: Plugin):
         compete for the same source/destination routes.
     """
     return rpc_internal_competition(_get_hive_context())
+
+
+# =============================================================================
+# PHASE 2 FEE COORDINATION RPC METHODS
+# =============================================================================
+
+@plugin.method("hive-coord-fee-recommendation")
+def hive_coord_fee_recommendation(
+    plugin: Plugin,
+    channel_id: str,
+    current_fee: int = 500,
+    local_balance_pct: float = 0.5,
+    source: str = None,
+    destination: str = None
+):
+    """
+    Get coordinated fee recommendation for a channel (Phase 2 Fee Coordination).
+
+    Uses corridor ownership, pheromone levels, stigmergic markers, and defense
+    signals to recommend optimal fees while avoiding internal fleet competition.
+
+    Args:
+        channel_id: Channel ID to get recommendation for
+        current_fee: Current fee in ppm (default: 500)
+        local_balance_pct: Current local balance percentage (default: 0.5)
+        source: Source peer hint for corridor lookup
+        destination: Destination peer hint for corridor lookup
+
+    Returns:
+        Dict with fee recommendation, reasoning, and coordination factors.
+    """
+    return rpc_fee_recommendation(
+        _get_hive_context(),
+        channel_id=channel_id,
+        current_fee=current_fee,
+        local_balance_pct=local_balance_pct,
+        source=source,
+        destination=destination
+    )
+
+
+@plugin.method("hive-corridor-assignments")
+def hive_corridor_assignments(plugin: Plugin, force_refresh: bool = False):
+    """
+    Get flow corridor assignments for the fleet.
+
+    Shows which member is primary for each (source, destination) pair.
+
+    Args:
+        force_refresh: Force refresh of cached assignments
+
+    Returns:
+        Dict with corridor assignments and statistics.
+    """
+    return rpc_corridor_assignments(_get_hive_context(), force_refresh=force_refresh)
+
+
+@plugin.method("hive-stigmergic-markers")
+def hive_stigmergic_markers(plugin: Plugin, source: str = None, destination: str = None):
+    """
+    Get stigmergic route markers from the fleet.
+
+    Shows fee signals left by members after routing attempts.
+
+    Args:
+        source: Filter by source peer
+        destination: Filter by destination peer
+
+    Returns:
+        Dict with route markers and analysis.
+    """
+    return rpc_stigmergic_markers(_get_hive_context(), source=source, destination=destination)
+
+
+@plugin.method("hive-deposit-marker")
+def hive_deposit_marker(
+    plugin: Plugin,
+    source: str,
+    destination: str,
+    fee_ppm: int,
+    success: bool,
+    volume_sats: int
+):
+    """
+    Deposit a stigmergic route marker.
+
+    Args:
+        source: Source peer ID
+        destination: Destination peer ID
+        fee_ppm: Fee charged in ppm
+        success: Whether routing succeeded
+        volume_sats: Volume routed in sats
+
+    Returns:
+        Dict with deposited marker info.
+    """
+    return rpc_deposit_marker(
+        _get_hive_context(),
+        source=source,
+        destination=destination,
+        fee_ppm=fee_ppm,
+        success=success,
+        volume_sats=volume_sats
+    )
+
+
+@plugin.method("hive-defense-status")
+def hive_defense_status(plugin: Plugin):
+    """
+    Get mycelium defense system status.
+
+    Returns:
+        Dict with active warnings and defensive fee adjustments.
+    """
+    return rpc_defense_status(_get_hive_context())
+
+
+@plugin.method("hive-broadcast-warning")
+def hive_broadcast_warning(
+    plugin: Plugin,
+    peer_id: str,
+    threat_type: str = "drain",
+    severity: float = 0.5
+):
+    """
+    Broadcast a peer warning to the fleet.
+
+    Permission: Member only
+
+    Args:
+        peer_id: Peer to warn about
+        threat_type: Type of threat ('drain', 'unreliable', 'force_close')
+        severity: Severity from 0.0 to 1.0
+
+    Returns:
+        Dict with broadcast result.
+    """
+    return rpc_broadcast_warning(
+        _get_hive_context(),
+        peer_id=peer_id,
+        threat_type=threat_type,
+        severity=severity
+    )
+
+
+@plugin.method("hive-pheromone-levels")
+def hive_pheromone_levels(plugin: Plugin, channel_id: str = None):
+    """
+    Get pheromone levels for adaptive fee control.
+
+    Args:
+        channel_id: Optional specific channel
+
+    Returns:
+        Dict with pheromone levels.
+    """
+    return rpc_pheromone_levels(_get_hive_context(), channel_id=channel_id)
+
+
+@plugin.method("hive-fee-coordination-status")
+def hive_fee_coordination_status(plugin: Plugin):
+    """
+    Get overall fee coordination status.
+
+    Returns:
+        Dict with comprehensive fee coordination status.
+    """
+    return rpc_fee_coordination_status(_get_hive_context())
 
 
 @plugin.method("hive-request-promotion")

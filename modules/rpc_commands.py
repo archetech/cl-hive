@@ -39,6 +39,7 @@ class HiveContext:
     routing_pool: Any = None  # RoutingPool (Phase 0 - Collective Economics)
     yield_metrics_mgr: Any = None  # YieldMetricsManager (Phase 1 - Metrics)
     liquidity_coordinator: Any = None  # LiquidityCoordinator (for competition detection)
+    fee_coordination_mgr: Any = None  # FeeCoordinationManager (Phase 2 - Fee Coordination)
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
 
@@ -1982,3 +1983,358 @@ def internal_competition(ctx: HiveContext) -> Dict[str, Any]:
         return summary
     except Exception as e:
         return {"error": f"Failed to detect internal competition: {e}"}
+
+
+# =============================================================================
+# PHASE 2: FEE COORDINATION RPC COMMANDS
+# =============================================================================
+
+def fee_recommendation(
+    ctx: HiveContext,
+    channel_id: str,
+    current_fee: int = 500,
+    local_balance_pct: float = 0.5,
+    source: str = None,
+    destination: str = None
+) -> Dict[str, Any]:
+    """
+    Get coordinated fee recommendation for a channel.
+
+    Combines corridor assignment, adaptive pheromone signals,
+    stigmergic markers, and defensive adjustments.
+
+    Args:
+        ctx: HiveContext
+        channel_id: Channel ID to get recommendation for
+        current_fee: Current fee in ppm (default: 500)
+        local_balance_pct: Current local balance percentage (default: 0.5)
+        source: Source peer hint for corridor lookup
+        destination: Destination peer hint for corridor lookup
+
+    Returns:
+        Dict with fee recommendation and reasoning.
+    """
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination not initialized"}
+
+    try:
+        # Get peer_id from channel if possible
+        peer_id = ""
+        if ctx.safe_plugin:
+            try:
+                channels = ctx.safe_plugin.rpc.listpeerchannels()
+                for ch in channels.get("channels", []):
+                    if ch.get("short_channel_id") == channel_id:
+                        peer_id = ch.get("peer_id", "")
+                        break
+            except Exception:
+                pass
+
+        recommendation = ctx.fee_coordination_mgr.get_fee_recommendation(
+            channel_id=channel_id,
+            peer_id=peer_id,
+            current_fee=current_fee,
+            local_balance_pct=local_balance_pct,
+            source_hint=source,
+            destination_hint=destination
+        )
+
+        return recommendation.to_dict()
+
+    except Exception as e:
+        return {"error": f"Failed to get fee recommendation: {e}"}
+
+
+def corridor_assignments(ctx: HiveContext, force_refresh: bool = False) -> Dict[str, Any]:
+    """
+    Get flow corridor assignments for the fleet.
+
+    Shows which member is primary for each (source, destination) pair.
+
+    Args:
+        ctx: HiveContext
+        force_refresh: Force refresh of cached assignments
+
+    Returns:
+        Dict with corridor assignments and statistics.
+    """
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination not initialized"}
+
+    try:
+        assignments = ctx.fee_coordination_mgr.corridor_mgr.get_assignments(
+            force_refresh=force_refresh
+        )
+
+        # Categorize by competition level
+        by_level = {
+            "none": [], "low": [], "medium": [], "high": []
+        }
+        for a in assignments:
+            level = a.corridor.competition_level
+            if level in by_level:
+                by_level[level].append(a.to_dict())
+
+        return {
+            "total_corridors": len(assignments),
+            "by_competition_level": {
+                level: len(items) for level, items in by_level.items()
+            },
+            "assignments": [a.to_dict() for a in assignments],
+            "our_primary_corridors": [
+                a.to_dict() for a in assignments
+                if a.primary_member == ctx.our_pubkey
+            ]
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get corridor assignments: {e}"}
+
+
+def stigmergic_markers(ctx: HiveContext, source: str = None, destination: str = None) -> Dict[str, Any]:
+    """
+    Get stigmergic route markers from the fleet.
+
+    Shows fee signals left by members after routing attempts.
+
+    Args:
+        ctx: HiveContext
+        source: Filter by source peer
+        destination: Filter by destination peer
+
+    Returns:
+        Dict with route markers and analysis.
+    """
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination not initialized"}
+
+    try:
+        if source and destination:
+            markers = ctx.fee_coordination_mgr.stigmergic_coord.read_markers(
+                source, destination
+            )
+        else:
+            markers = ctx.fee_coordination_mgr.stigmergic_coord.get_all_markers()
+
+        # Analyze markers
+        successful = [m for m in markers if m.success]
+        failed = [m for m in markers if not m.success]
+
+        avg_success_fee = (
+            sum(m.fee_ppm for m in successful) / len(successful)
+            if successful else 0
+        )
+        avg_failed_fee = (
+            sum(m.fee_ppm for m in failed) / len(failed)
+            if failed else 0
+        )
+
+        return {
+            "total_markers": len(markers),
+            "successful_markers": len(successful),
+            "failed_markers": len(failed),
+            "avg_successful_fee_ppm": int(avg_success_fee),
+            "avg_failed_fee_ppm": int(avg_failed_fee),
+            "markers": [m.to_dict() for m in markers[:50]],  # Limit output
+            "filtered": {
+                "source": source,
+                "destination": destination
+            } if source or destination else None
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get stigmergic markers: {e}"}
+
+
+def deposit_marker(
+    ctx: HiveContext,
+    source: str,
+    destination: str,
+    fee_ppm: int,
+    success: bool,
+    volume_sats: int
+) -> Dict[str, Any]:
+    """
+    Deposit a stigmergic route marker.
+
+    Used to report routing outcomes to the fleet for indirect coordination.
+
+    Args:
+        ctx: HiveContext
+        source: Source peer ID
+        destination: Destination peer ID
+        fee_ppm: Fee charged in ppm
+        success: Whether routing succeeded
+        volume_sats: Volume routed in sats
+
+    Returns:
+        Dict with deposited marker info.
+    """
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination not initialized"}
+
+    try:
+        marker = ctx.fee_coordination_mgr.stigmergic_coord.deposit_marker(
+            source=source,
+            destination=destination,
+            fee_charged=fee_ppm,
+            success=success,
+            volume_sats=volume_sats
+        )
+
+        return {
+            "status": "deposited",
+            "marker": marker.to_dict()
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to deposit marker: {e}"}
+
+
+def defense_status(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get mycelium defense system status.
+
+    Shows active warnings and defensive fee adjustments.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with defense system status.
+    """
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination not initialized"}
+
+    try:
+        return ctx.fee_coordination_mgr.defense_system.get_defense_status()
+
+    except Exception as e:
+        return {"error": f"Failed to get defense status: {e}"}
+
+
+def broadcast_warning(
+    ctx: HiveContext,
+    peer_id: str,
+    threat_type: str = "drain",
+    severity: float = 0.5
+) -> Dict[str, Any]:
+    """
+    Broadcast a peer warning to the fleet.
+
+    Permission: Member only
+
+    Args:
+        ctx: HiveContext
+        peer_id: Peer to warn about
+        threat_type: Type of threat ('drain', 'unreliable', 'force_close')
+        severity: Severity from 0.0 to 1.0
+
+    Returns:
+        Dict with broadcast result.
+    """
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination not initialized"}
+
+    if threat_type not in ("drain", "unreliable", "force_close"):
+        return {"error": f"Invalid threat_type: {threat_type}"}
+
+    if not 0.0 <= severity <= 1.0:
+        return {"error": "Severity must be between 0.0 and 1.0"}
+
+    try:
+        from modules.fee_coordination import PeerWarning, WARNING_TTL_HOURS
+
+        warning = PeerWarning(
+            peer_id=peer_id,
+            threat_type=threat_type,
+            severity=severity,
+            reporter=ctx.our_pubkey,
+            timestamp=time.time(),
+            ttl=WARNING_TTL_HOURS * 3600
+        )
+
+        success = ctx.fee_coordination_mgr.defense_system.broadcast_warning(warning)
+
+        return {
+            "status": "broadcast" if success else "stored_locally",
+            "warning": warning.to_dict()
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to broadcast warning: {e}"}
+
+
+def pheromone_levels(ctx: HiveContext, channel_id: str = None) -> Dict[str, Any]:
+    """
+    Get pheromone levels for adaptive fee control.
+
+    Shows the "memory" of successful fees for channels.
+
+    Args:
+        ctx: HiveContext
+        channel_id: Optional specific channel
+
+    Returns:
+        Dict with pheromone levels.
+    """
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination not initialized"}
+
+    try:
+        all_levels = ctx.fee_coordination_mgr.adaptive_controller.get_all_pheromone_levels()
+
+        if channel_id:
+            level = all_levels.get(channel_id, 0.0)
+            return {
+                "channel_id": channel_id,
+                "pheromone_level": round(level, 2),
+                "above_exploit_threshold": level > 10.0
+            }
+
+        # Sort by level descending
+        sorted_levels = sorted(
+            all_levels.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        return {
+            "total_channels": len(all_levels),
+            "channels_above_threshold": sum(
+                1 for _, v in all_levels.items() if v > 10.0
+            ),
+            "levels": [
+                {"channel_id": k, "level": round(v, 2)}
+                for k, v in sorted_levels[:50]
+            ]
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get pheromone levels: {e}"}
+
+
+def fee_coordination_status(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get overall fee coordination status.
+
+    Comprehensive view of all Phase 2 coordination systems.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with fee coordination status.
+    """
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination not initialized"}
+
+    try:
+        return ctx.fee_coordination_mgr.get_coordination_status()
+
+    except Exception as e:
+        return {"error": f"Failed to get coordination status: {e}"}

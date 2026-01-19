@@ -1334,6 +1334,129 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                 },
                 "required": ["node"]
             }
+        ),
+        # =======================================================================
+        # Phase 2: Fee Coordination Tools
+        # =======================================================================
+        Tool(
+            name="coord_fee_recommendation",
+            description="Get coordinated fee recommendation for a channel (Phase 2 Fee Coordination). Combines corridor assignment, pheromone signals, stigmergic markers, and defensive adjustments.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel ID to get recommendation for"
+                    },
+                    "current_fee": {
+                        "type": "integer",
+                        "description": "Current fee in ppm (default: 500)"
+                    },
+                    "local_balance_pct": {
+                        "type": "number",
+                        "description": "Current local balance percentage (default: 0.5)"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Source peer hint for corridor lookup"
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "Destination peer hint for corridor lookup"
+                    }
+                },
+                "required": ["node", "channel_id"]
+            }
+        ),
+        Tool(
+            name="corridor_assignments",
+            description="Get flow corridor assignments for the fleet. Shows which member is primary for each (source, destination) pair to eliminate internal competition.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "force_refresh": {
+                        "type": "boolean",
+                        "description": "Force refresh of cached assignments (default: false)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="stigmergic_markers",
+            description="Get stigmergic route markers from the fleet. Shows fee signals left by members after routing attempts for indirect coordination.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Filter by source peer"
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "Filter by destination peer"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="defense_status",
+            description="Get mycelium defense system status. Shows active warnings about draining/unreliable peers and defensive fee adjustments.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="pheromone_levels",
+            description="Get pheromone levels for adaptive fee control. Shows the 'memory' of successful fees for channels.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Optional specific channel"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="fee_coordination_status",
+            description="Get overall fee coordination status. Comprehensive view of all Phase 2 coordination systems including corridors, markers, and defense.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
         )
     ]
 
@@ -1451,6 +1574,19 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_critical_velocity(arguments)
         elif name == "internal_competition":
             result = await handle_internal_competition(arguments)
+        # Phase 2: Fee Coordination tools
+        elif name == "coord_fee_recommendation":
+            result = await handle_fee_recommendation(arguments)
+        elif name == "corridor_assignments":
+            result = await handle_corridor_assignments(arguments)
+        elif name == "stigmergic_markers":
+            result = await handle_stigmergic_markers(arguments)
+        elif name == "defense_status":
+            result = await handle_defense_status(arguments)
+        elif name == "pheromone_levels":
+            result = await handle_pheromone_levels(arguments)
+        elif name == "fee_coordination_status":
+            result = await handle_fee_coordination_status(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -3350,6 +3486,110 @@ async def handle_internal_competition(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("hive-internal-competition", {})
+
+
+# =============================================================================
+# Phase 2: Fee Coordination Handlers
+# =============================================================================
+
+async def handle_fee_recommendation(args: Dict) -> Dict:
+    """Get coordinated fee recommendation for a channel."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    current_fee = args.get("current_fee", 500)
+    local_balance_pct = args.get("local_balance_pct", 0.5)
+    source = args.get("source")
+    destination = args.get("destination")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if not channel_id:
+        return {"error": "channel_id is required"}
+
+    params = {
+        "channel_id": channel_id,
+        "current_fee": current_fee,
+        "local_balance_pct": local_balance_pct
+    }
+    if source:
+        params["source"] = source
+    if destination:
+        params["destination"] = destination
+
+    return await node.call("hive-coord-fee-recommendation", params)
+
+
+async def handle_corridor_assignments(args: Dict) -> Dict:
+    """Get flow corridor assignments for the fleet."""
+    node_name = args.get("node")
+    force_refresh = args.get("force_refresh", False)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-corridor-assignments", {
+        "force_refresh": force_refresh
+    })
+
+
+async def handle_stigmergic_markers(args: Dict) -> Dict:
+    """Get stigmergic route markers from the fleet."""
+    node_name = args.get("node")
+    source = args.get("source")
+    destination = args.get("destination")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if source:
+        params["source"] = source
+    if destination:
+        params["destination"] = destination
+
+    return await node.call("hive-stigmergic-markers", params)
+
+
+async def handle_defense_status(args: Dict) -> Dict:
+    """Get mycelium defense system status."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-defense-status", {})
+
+
+async def handle_pheromone_levels(args: Dict) -> Dict:
+    """Get pheromone levels for adaptive fee control."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if channel_id:
+        params["channel_id"] = channel_id
+
+    return await node.call("hive-pheromone-levels", params)
+
+
+async def handle_fee_coordination_status(args: Dict) -> Dict:
+    """Get overall fee coordination status."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-fee-coordination-status", {})
 
 
 # =============================================================================
