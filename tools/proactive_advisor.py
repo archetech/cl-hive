@@ -25,12 +25,73 @@ Usage:
 
 import asyncio
 import json
+import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from goal_manager import GoalManager, Goal, GoalProgress
+
+# =============================================================================
+# Logging Setup
+# =============================================================================
+
+# Default log directory (can be overridden via environment)
+LOG_DIR = os.environ.get("ADVISOR_LOG_DIR", "/home/sat/.lightning/bitcoin/advisor_logs")
+LOG_FILE = os.path.join(LOG_DIR, "proactive_advisor.log")
+
+# Setup logger
+logger = logging.getLogger("proactive_advisor")
+
+
+def setup_file_logging(log_file: str = None, level: int = logging.INFO) -> None:
+    """
+    Configure file logging for the proactive advisor.
+
+    Args:
+        log_file: Path to log file (default: LOG_FILE)
+        level: Logging level (default: INFO)
+    """
+    if log_file is None:
+        log_file = LOG_FILE
+
+    # Create log directory if needed
+    log_dir = os.path.dirname(log_file)
+    if log_dir:
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+
+    # Configure logger
+    logger.setLevel(level)
+
+    # Remove existing handlers to avoid duplicates
+    logger.handlers = []
+
+    # File handler with rotation (10MB max, keep 5 backups)
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(level)
+    file_formatter = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
+    # Also log to console
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+    console_handler.setFormatter(file_formatter)
+    logger.addHandler(console_handler)
+
+    logger.info(f"Logging initialized: {log_file}")
 from learning_engine import LearningEngine, ActionOutcome
 from opportunity_scanner import (
     OpportunityScanner,
@@ -158,14 +219,18 @@ class ProactiveAdvisor:
     safe auto-execution, and learning from outcomes.
     """
 
-    def __init__(self, mcp_client, db):
+    def __init__(self, mcp_client, db, log_file: str = None):
         """
         Initialize proactive advisor.
 
         Args:
             mcp_client: Client for calling MCP tools
             db: AdvisorDB instance
+            log_file: Optional custom log file path
         """
+        # Setup file logging first
+        setup_file_logging(log_file)
+
         self.mcp = mcp_client
         self.db = db
         self.goal_manager = GoalManager(db)
@@ -212,6 +277,11 @@ class ProactiveAdvisor:
         cycle_start = time.time()
         now = datetime.now()
 
+        logger.info("=" * 60)
+        logger.info(f"PROACTIVE ADVISOR CYCLE - {node_name}")
+        logger.info(f"Started: {now.isoformat()}")
+        logger.info("=" * 60)
+
         result = CycleResult(
             cycle_id=f"{node_name}_{int(cycle_start)}",
             node_name=node_name,
@@ -222,19 +292,32 @@ class ProactiveAdvisor:
 
         try:
             # Phase 1: Record snapshot for history
+            logger.info("[Phase 1] Recording snapshot...")
             await self._record_snapshot(node_name)
 
             # Phase 2: Comprehensive state analysis
+            logger.info("[Phase 2] Analyzing node state...")
             state = await self._analyze_node_state(node_name)
             result.node_state_summary = state.get("summary", {})
+            summary = result.node_state_summary
+            logger.info(f"  Capacity: {summary.get('total_capacity_sats', 0):,} sats")
+            logger.info(f"  Channels: {summary.get('channel_count', 0)}")
+            logger.info(f"  ROC: {summary.get('roc_pct', 0):.2f}%")
+            logger.info(f"  Underwater: {summary.get('underwater_pct', 0):.1f}%")
+            logger.info(f"  Bleeders: {summary.get('bleeder_count', 0)}")
 
             # Phase 3: Check goals and adjust strategy
+            logger.info("[Phase 3] Checking goals...")
             goal_status = await self._check_goals(node_name, state)
             result.goals_checked = goal_status.get("goals_checked", 0)
             result.goals_on_track = goal_status.get("goals_on_track", 0)
             result.strategy_adjustments = goal_status.get("strategy_adjustments", [])
+            logger.info(f"  Goals: {result.goals_checked} checked, {result.goals_on_track} on track")
+            for adj in result.strategy_adjustments:
+                logger.info(f"  Strategy adjustment: {adj}")
 
             # Phase 4: Scan for opportunities
+            logger.info("[Phase 4] Scanning for opportunities...")
             opportunities = await self.scanner.scan_all(node_name, state)
             result.opportunities_found = len(opportunities)
 
@@ -244,42 +327,76 @@ class ProactiveAdvisor:
                 result.opportunities_by_type[opp_type] = \
                     result.opportunities_by_type.get(opp_type, 0) + 1
 
+            logger.info(f"  Found {result.opportunities_found} opportunities")
+            for opp_type, count in result.opportunities_by_type.items():
+                logger.info(f"    {opp_type}: {count}")
+
             # Phase 5: Score with learning adjustments
+            logger.info("[Phase 5] Scoring opportunities with learning adjustments...")
             scored = self._score_opportunities(opportunities, state)
 
             # Phase 6: Execute safe auto-actions
+            logger.info("[Phase 6] Executing safe auto-actions...")
             auto_executed, skipped_budget = await self._execute_auto_actions(
                 node_name, scored
             )
             result.auto_executed = [a.to_dict() for a in auto_executed]
+            logger.info(f"  Auto-executed: {len(auto_executed)} actions")
+            for action in auto_executed:
+                logger.info(f"    ✓ {action.opportunity_type.value}: {action.description}")
 
             # Phase 7: Queue remaining for approval
+            logger.info("[Phase 7] Queuing actions for approval...")
             queued = await self._queue_for_approval(node_name, scored, auto_executed)
             result.queued_for_review = [q.to_dict() for q in queued]
             result.skipped = [s.to_dict() for s in skipped_budget]
+            logger.info(f"  Queued for review: {len(queued)}")
+            for q in queued:
+                logger.info(f"    → {q.opportunity_type.value}: {q.description}")
+            if skipped_budget:
+                logger.info(f"  Skipped (budget exhausted): {len(skipped_budget)}")
 
             # Phase 8: Measure past outcomes (learning)
+            logger.info("[Phase 8] Measuring past outcomes for learning...")
             outcomes = self.learning_engine.measure_outcomes(
                 hours_ago_min=6,
                 hours_ago_max=24
             )
             result.outcomes_measured = len(outcomes)
             result.learning_summary = self.learning_engine.get_learning_summary()
+            logger.info(f"  Outcomes measured: {len(outcomes)}")
+            success_count = sum(1 for o in outcomes if o.success)
+            if outcomes:
+                logger.info(f"  Success rate: {success_count}/{len(outcomes)} ({100*success_count/len(outcomes):.0f}%)")
 
             # Phase 9: Plan next cycle
+            logger.info("[Phase 9] Planning next cycle priorities...")
             result.next_cycle_priorities = self._plan_next_cycle(
                 state, goal_status, outcomes
             )
+            for priority in result.next_cycle_priorities:
+                logger.info(f"  • {priority}")
 
             result.success = True
 
         except Exception as e:
+            logger.error(f"Cycle failed with error: {e}", exc_info=True)
             result.errors.append(str(e))
 
         result.duration_seconds = time.time() - cycle_start
 
         # Store cycle result
         self.db.save_cycle_result(result.to_dict())
+
+        # Final summary
+        logger.info("-" * 60)
+        logger.info("CYCLE COMPLETE")
+        logger.info(f"  Duration: {result.duration_seconds:.1f}s")
+        logger.info(f"  Success: {result.success}")
+        logger.info(f"  Auto-executed: {len(result.auto_executed)}")
+        logger.info(f"  Queued: {len(result.queued_for_review)}")
+        logger.info(f"  Outcomes learned: {result.outcomes_measured}")
+        logger.info("=" * 60)
 
         return result
 
