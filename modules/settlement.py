@@ -237,7 +237,7 @@ class SettlementManager:
         ).fetchone()
         return row["bolt12_offer"] if row else None
 
-    def list_offers(self) -> List[Dict[str, Any]]:
+    def list_offers(self) -> Dict[str, Any]:
         """List all registered BOLT12 offers."""
         conn = self._get_connection()
         rows = conn.execute("""
@@ -245,7 +245,7 @@ class SettlementManager:
             FROM settlement_offers
             ORDER BY registered_at DESC
         """).fetchall()
-        return [dict(row) for row in rows]
+        return {"offers": [dict(row) for row in rows]}
 
     def deactivate_offer(self, peer_id: str) -> Dict[str, Any]:
         """Deactivate a member's BOLT12 offer."""

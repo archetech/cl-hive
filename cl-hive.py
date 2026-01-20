@@ -8156,7 +8156,7 @@ def hive_settlement_history(plugin: Plugin, limit: int = 10):
     """
     if not settlement_mgr:
         return {"error": "Settlement manager not initialized"}
-    return settlement_mgr.get_history(limit=limit)
+    return {"settlement_periods": settlement_mgr.get_settlement_history(limit=limit)}
 
 
 @plugin.method("hive-settlement-period-details")
