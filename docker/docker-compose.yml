@@ -36,15 +36,9 @@ services:
           cpus: '${CPU_RESERVATION:-2}'
           memory: ${MEMORY_RESERVATION:-4G}
 
-    # Security hardening
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    # Required capabilities for WireGuard and networking
+    # Network capabilities (for Tor and optional WireGuard)
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
       - NET_RAW
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
