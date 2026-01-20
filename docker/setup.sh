@@ -32,6 +32,7 @@ DEFAULT_RGB="e33502"
 DEFAULT_LIGHTNING_PORT="9736"
 DEFAULT_NETWORK_MODE="tor"
 DEFAULT_WIREGUARD_ENABLED="false"
+DEFAULT_RTL_PORT="3000"
 DEFAULT_BACKUP_LOCATION="/backups"
 DEFAULT_BACKUP_RETENTION="30"
 DEFAULT_CPU_LIMIT="4"
@@ -241,9 +242,9 @@ main() {
     print_success "Network: $NETWORK"
 
     # -------------------------------------------------------------------------
-    # Step 3: Node Identity
+    # Step 3: Node Identity & RTL
     # -------------------------------------------------------------------------
-    print_step 3 6 "Node Identity"
+    print_step 3 6 "Node Identity & Web Interface"
 
     prompt ALIAS "Node Alias" "$DEFAULT_ALIAS"
     prompt RGB "Node Color (hex, no #)" "$DEFAULT_RGB"
@@ -255,6 +256,26 @@ main() {
     fi
 
     print_success "Alias: $ALIAS (color: #$RGB)"
+
+    echo ""
+    print_info "Ride The Lightning (RTL) Web Interface"
+    print_info "RTL provides a web UI for managing your Lightning node."
+    echo ""
+    prompt_yes_no RTL_ENABLED "Enable RTL web interface?" "Y"
+
+    if [[ "$RTL_ENABLED" == "true" ]]; then
+        prompt RTL_PASSWORD "RTL web interface password" "" true
+        if [[ -z "$RTL_PASSWORD" ]]; then
+            RTL_PASSWORD="changeme"
+            print_warning "Using default password 'changeme' - CHANGE THIS IN PRODUCTION!"
+        fi
+        prompt RTL_PORT "RTL web interface port" "$DEFAULT_RTL_PORT"
+        print_success "RTL will be accessible at http://localhost:$RTL_PORT"
+    else
+        RTL_PASSWORD=""
+        RTL_PORT="$DEFAULT_RTL_PORT"
+        print_info "RTL disabled - you can enable it later by editing .env"
+    fi
 
     # -------------------------------------------------------------------------
     # Step 4: Privacy & Networking
@@ -464,6 +485,24 @@ BACKUP_ENCRYPTION=$BACKUP_ENCRYPTION
 GPG_KEY_ID=${GPG_KEY_ID:-}
 
 # =============================================================================
+# RIDE THE LIGHTNING
+# =============================================================================
+RTL_ENABLED=$RTL_ENABLED
+RTL_PASSWORD=${RTL_PASSWORD:-changeme}
+RTL_PORT=${RTL_PORT:-3000}
+EOF
+
+    # Add COMPOSE_PROFILES if RTL is enabled
+    if [[ "$RTL_ENABLED" == "true" ]]; then
+        cat >> .env << EOF
+# Enable RTL profile
+COMPOSE_PROFILES=rtl
+EOF
+    fi
+
+    cat >> .env << EOF
+
+# =============================================================================
 # PORTS
 # =============================================================================
 LIGHTNING_PORT=$LIGHTNING_PORT
@@ -564,6 +603,11 @@ EOF
     echo "  LN Port:     $LIGHTNING_PORT"
     echo "  Net Mode:    $NETWORK_MODE"
     echo "  WireGuard:   $WIREGUARD_ENABLED"
+    if [[ "$RTL_ENABLED" == "true" ]]; then
+        echo "  RTL:         http://localhost:$RTL_PORT"
+    else
+        echo "  RTL:         disabled"
+    fi
     echo "  Resources:   ${CPU_LIMIT} CPUs, ${MEMORY_LIMIT}G RAM"
     echo "  Backups:     $BACKUP_LOCATION (${BACKUP_RETENTION} days)"
     echo ""
@@ -585,6 +629,11 @@ EOF
     echo -e "     ${CYAN}docker-compose logs -f${NC}"
     echo -e "     ${CYAN}docker-compose exec cln lightning-cli getinfo${NC}"
     echo ""
+    if [[ "$RTL_ENABLED" == "true" ]]; then
+        echo -e "  4. Access RTL web interface:"
+        echo -e "     ${CYAN}http://localhost:$RTL_PORT${NC}"
+        echo ""
+    fi
     if [[ "$NETWORK" == "bitcoin" ]]; then
         echo -e "  ${YELLOW}⚠ IMPORTANT: Back up your hsm_secret after first start!${NC}"
         echo -e "     ${CYAN}./scripts/backup.sh${NC}"

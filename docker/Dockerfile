@@ -124,6 +124,17 @@ RUN ARCH=$(uname -m) \
     && rm /tmp/sling.tar.gz
 
 # =============================================================================
+# C-LIGHTNING-REST (for RTL integration)
+# =============================================================================
+# REST API plugin enabling Ride The Lightning web interface
+
+ARG CLN_REST_VERSION=v0.10.7
+RUN git clone --depth 1 --branch ${CLN_REST_VERSION} https://github.com/Ride-The-Lightning/c-lightning-REST.git /opt/c-lightning-REST \
+    && cd /opt/c-lightning-REST \
+    && npm install --omit=dev \
+    && chmod +x cl-rest.js
+
+# =============================================================================
 # CL-REVENUE-OPS PLUGIN
 # =============================================================================
 
@@ -162,7 +173,8 @@ RUN ln -sf /opt/cl-hive/cl-hive.py /root/.lightning/plugins/cl-hive.py \
     && ln -sf /opt/cl-revenue-ops/cl-revenue-ops.py /root/.lightning/plugins/cl-revenue-ops.py \
     && ln -sf /opt/cl-revenue-ops/modules /root/.lightning/plugins/revenue-modules \
     && ln -sf /usr/local/bin/clboss /root/.lightning/plugins/clboss \
-    && ln -sf /usr/local/bin/sling /root/.lightning/plugins/sling
+    && ln -sf /usr/local/bin/sling /root/.lightning/plugins/sling \
+    && ln -sf /opt/c-lightning-REST/cl-rest.js /root/.lightning/plugins/cl-rest.js
 
 # =============================================================================
 # CONFIGURATION FILES
@@ -181,8 +193,8 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Lightning P2P
 EXPOSE 9736
-# Lightning REST API
-EXPOSE 8080
+# c-lightning-REST API (for RTL)
+EXPOSE 3001
 # Tor SOCKS (internal)
 EXPOSE 9050
 # WireGuard

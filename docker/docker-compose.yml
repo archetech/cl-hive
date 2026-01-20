@@ -129,11 +129,65 @@ services:
       - "com.cl-hive.service=lightning"
       - "com.cl-hive.backup=true"
 
+  # =========================================================================
+  # Ride The Lightning - Web UI for Lightning Node Management
+  # =========================================================================
+  # Enable with: docker-compose --profile rtl up -d
+  # Or set RTL_ENABLED=true in .env (automatically added to COMPOSE_PROFILES)
+  rtl:
+    image: shahanafarooqui/rtl:0.15.2
+    container_name: rtl
+    restart: unless-stopped
+    profiles:
+      - rtl
+    depends_on:
+      cln:
+        condition: service_healthy
+
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - APP_PASSWORD=${RTL_PASSWORD:-changeme}
+      - LN_IMPLEMENTATION=CLN
+      - LN_SERVER_URL=https://cln:3001
+      - CONFIG_PATH=/data/RTL
+      # c-lightning-REST stores macaroon in CLN data dir
+      - MACAROON_PATH=/data/cln/${NETWORK:-bitcoin}/c-lightning-REST/certs
+
+    volumes:
+      - rtl-data:/data/RTL
+      # Mount CLN data for macaroon access
+      - lightning-data:/data/cln:ro
+
+    ports:
+      - "${RTL_PORT:-3000}:3000"
+
+    networks:
+      - lightning-network
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    labels:
+      - "com.cl-hive.service=rtl"
+
 volumes:
   lightning-data:
     driver: local
     labels:
       - "com.cl-hive.backup=critical"
+  rtl-data:
+    driver: local
 
 networks:
   lightning-network:

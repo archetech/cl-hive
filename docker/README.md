@@ -5,6 +5,7 @@ Production-ready Docker image for cl-hive Lightning nodes with Tor, WireGuard, a
 ## Features
 
 - **Core Lightning** v25+ with all plugins
+- **Ride The Lightning** web interface for node management
 - **Tor** hidden service for privacy
 - **WireGuard** VPN support (optional)
 - **cl-revenue-ops** for fee optimization
@@ -13,6 +14,7 @@ Production-ready Docker image for cl-hive Lightning nodes with Tor, WireGuard, a
 ### Required Plugins (Pre-installed)
 - **CLBOSS** - Automated channel management (ksedgwic fork with clboss-unmanage)
 - **Sling** - Rebalancing engine (required by cl-revenue-ops)
+- **c-lightning-REST** - REST API for RTL web interface
 - **cl-revenue-ops** - Fee optimization and profitability tracking
 - **cl-hive** - Fleet coordination and swarm intelligence
 
@@ -76,7 +78,8 @@ docker-compose up -d
 - [ ] Bitcoin Core is synced and RPC accessible
 - [ ] Adequate disk space (10GB+ recommended)
 - [ ] Adequate memory (4GB+ recommended)
-- [ ] Firewall configured (port 9736 for Lightning)
+- [ ] Firewall configured (port 9736 for Lightning, 3000 for RTL)
+- [ ] RTL password changed from default
 - [ ] Backup strategy planned
 
 ### 2. Using Docker Secrets (Recommended)
@@ -153,6 +156,15 @@ BACKUP_RETENTION=30  # days
 - **clearnet** - Direct connections only, requires `ANNOUNCE_ADDR`
 - **hybrid** - Both Tor hidden service and clearnet
 
+#### Ride The Lightning (RTL)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RTL_ENABLED` | `true` | Enable RTL web interface |
+| `RTL_PASSWORD` | `changeme` | RTL web interface password (**change this!**) |
+| `RTL_PORT` | `3000` | RTL web interface port |
+| `COMPOSE_PROFILES` | `rtl` | Set to `rtl` to start RTL (auto-set when RTL_ENABLED=true) |
+
 #### Resource Limits
 
 | Variable | Default | Description |
@@ -191,6 +203,32 @@ BACKUP_RETENTION=30  # days
 | `/etc/lightning/custom` | Custom configuration files |
 
 ## Operations
+
+### Ride The Lightning Web Interface
+
+RTL provides a web-based UI for managing your Lightning node.
+
+```bash
+# RTL is enabled by default when using setup.sh
+# Or enable manually by setting in .env:
+RTL_ENABLED=true
+COMPOSE_PROFILES=rtl
+
+# Start with RTL profile (if not set in .env)
+docker-compose --profile rtl up -d
+
+# Access RTL at http://localhost:3000 (or your configured RTL_PORT)
+# Default password is set in RTL_PASSWORD (change from 'changeme'!)
+
+# View RTL logs
+docker-compose logs -f rtl
+
+# Restart RTL
+docker-compose restart rtl
+
+# Disable RTL by removing COMPOSE_PROFILES from .env or:
+docker-compose stop rtl
+```
 
 ### Check Node Status
 
@@ -265,11 +303,16 @@ Tor is enabled by default. The hidden service address is created on first start.
 docker-compose exec cln cat /var/lib/tor/cln-service/hostname
 ```
 
-### Disable Tor
+### Clearnet or Hybrid Mode
 
-Set in `.env`:
+To use clearnet instead of Tor, set in `.env`:
 ```bash
-TOR_ENABLED=false
+# Clearnet only (no Tor)
+NETWORK_MODE=clearnet
+ANNOUNCE_ADDR=your.public.ip:9736
+
+# Or hybrid (both Tor and clearnet)
+NETWORK_MODE=hybrid
 ANNOUNCE_ADDR=your.public.ip:9736
 ```
 
@@ -448,7 +491,7 @@ cp -r /path/to/cl-revenue-ops vendor/cl-revenue-ops
 
 ```bash
 # From cl-hive root directory
-docker build -t cl-hive-node:0.1.0 -f docker/Dockerfile .
+docker build -t cl-hive-node:1.0.0 -f docker/Dockerfile .
 
 # Or via docker-compose
 docker-compose build
@@ -459,14 +502,16 @@ docker-compose build
 | Component | Version | Required |
 |-----------|---------|----------|
 | Ubuntu | 24.04 | Yes |
-| Core Lightning | v25.02.1 | Yes |
+| Core Lightning | v25.12.1 | Yes |
 | CLBOSS | latest (ksedgwic fork) | Yes |
 | Sling | v4.1.3 | Yes |
+| c-lightning-REST | v0.10.7 | Yes |
 | cl-revenue-ops | bundled | Yes |
 | cl-hive | bundled | Yes |
 | Tor | 0.4.8.x | Yes |
 | WireGuard | 1.0.x | Optional |
 | Python | 3.12 | Yes |
+| Ride The Lightning | 0.15.2 | Yes |
 
 ## Support
 
