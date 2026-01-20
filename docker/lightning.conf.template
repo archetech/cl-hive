@@ -7,7 +7,7 @@ network=bitcoin
 
 # Node Identity (set by ALIAS and RGB env vars)
 alias=cl-hive-node
-rgb=FF9900
+rgb=e33502
 
 # Bitcoin Backend (set by BITCOIN_RPC* env vars)
 # bitcoin-rpcconnect=

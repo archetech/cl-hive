@@ -64,7 +64,7 @@ services:
 
       # Node Identity
       - ALIAS=${ALIAS:-cl-hive-node}
-      - RGB=${RGB:-FF9900}
+      - RGB=${RGB:-e33502}
       - ANNOUNCE_ADDR=${ANNOUNCE_ADDR:-}
 
       # Tor

@@ -137,7 +137,7 @@ BACKUP_RETENTION=30  # days
 | `BITCOIN_RPCPASSWORD` | - | Bitcoin RPC password (or use secret) |
 | `NETWORK` | `bitcoin` | Network: bitcoin, testnet, signet, regtest |
 | `ALIAS` | `cl-hive-node` | Node alias |
-| `RGB` | `FF9900` | Node color (hex) |
+| `RGB` | `e33502` | Node color (hex) |
 | `ANNOUNCE_ADDR` | - | Public address to announce |
 
 #### Privacy & Networking

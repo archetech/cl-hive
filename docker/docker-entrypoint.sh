@@ -11,7 +11,7 @@ set -e
 #   BITCOIN_RPCPASSWORD  - Bitcoin RPC password (required)
 #   NETWORK              - bitcoin, testnet, signet, regtest (default: bitcoin)
 #   ALIAS                - Node alias (default: cl-hive-node)
-#   RGB                  - Node color in hex (default: FF9900)
+#   RGB                  - Node color in hex (default: e33502)
 #   ANNOUNCE_ADDR        - Public address to announce (optional)
 #   TOR_ENABLED          - Enable Tor (default: true)
 #   WIREGUARD_ENABLED    - Enable WireGuard (default: false)
@@ -58,7 +58,7 @@ BITCOIN_RPCHOST="${BITCOIN_RPCHOST:-127.0.0.1}"
 BITCOIN_RPCPORT="${BITCOIN_RPCPORT:-8332}"
 NETWORK="${NETWORK:-bitcoin}"
 ALIAS="${ALIAS:-cl-hive-node}"
-RGB="${RGB:-FF9900}"
+RGB="${RGB:-e33502}"
 TOR_ENABLED="${TOR_ENABLED:-true}"
 WIREGUARD_ENABLED="${WIREGUARD_ENABLED:-false}"
 HIVE_GOVERNANCE_MODE="${HIVE_GOVERNANCE_MODE:-advisor}"
