@@ -480,8 +480,6 @@ EOF
 # This file extends docker-compose.yml with production settings.
 # It is automatically loaded by docker-compose.
 
-version: '3.8'
-
 services:
   cln:
     # Resource limits for production stability
@@ -501,25 +499,39 @@ services:
     # Additional volumes for backups
     volumes:
       - lightning-data:/data/lightning
-      - \${WIREGUARD_CONFIG_PATH:-./wireguard}:/etc/wireguard:ro
       - \${CUSTOM_CONFIG_PATH:-./config}:/etc/lightning/custom:ro
       - ${BACKUP_LOCATION}:/backups
 
     # Read secrets from files
     environment:
       - BITCOIN_RPCPASSWORD_FILE=/run/secrets/bitcoin_rpc_password
-      - WG_PRIVATE_KEY_FILE=/run/secrets/wg_private_key
 
     secrets:
       - bitcoin_rpc_password
-      - wg_private_key
 
 secrets:
   bitcoin_rpc_password:
     file: ./secrets/bitcoin_rpc_password
+EOF
+
+    # Add WireGuard configuration if enabled
+    if [[ "$WIREGUARD_ENABLED" == "true" ]]; then
+        cat >> docker-compose.override.yml << EOF
+
+  # WireGuard secret (appended)
+  cln:
+    environment:
+      - WG_PRIVATE_KEY_FILE=/run/secrets/wg_private_key
+    volumes:
+      - \${WIREGUARD_CONFIG_PATH:-./wireguard}:/etc/wireguard:ro
+    secrets:
+      - wg_private_key
+
+secrets:
   wg_private_key:
     file: ./secrets/wg_private_key
 EOF
+    fi
 
     print_success "Created docker-compose.override.yml"
 

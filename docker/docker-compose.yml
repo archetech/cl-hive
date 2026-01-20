@@ -13,8 +13,6 @@
 # Access lightning-cli:
 #   docker-compose exec cln lightning-cli getinfo
 
-version: '3.8'
-
 services:
   cln:
     build:

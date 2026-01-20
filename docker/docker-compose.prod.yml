@@ -13,8 +13,6 @@
 #      - secrets/wg_private_key (if WireGuard enabled)
 #      - secrets/hive_rune (optional, for API access)
 
-version: '3.8'
-
 services:
   cln:
     # Override environment to use secret files
