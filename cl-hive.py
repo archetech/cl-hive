@@ -1459,7 +1459,7 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Check if peer has a channel with us (proof of stake)
     try:
-        channels = safe_plugin.rpc.listpeerchannels(id=peer_id)
+        channels = safe_plugin.rpc.call("listpeerchannels", {"id": peer_id})
         peer_channels = channels.get('channels', [])
         # Look for any active channel
         has_channel = any(
