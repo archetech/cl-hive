@@ -750,8 +750,6 @@ OPTION_TO_CONFIG_MAP: Dict[str, tuple] = {
     'hive-neophyte-fee-discount': ('neophyte_fee_discount_pct', float),
     'hive-member-fee-ppm': ('member_fee_ppm', int),
     'hive-probation-days': ('probation_days', int),
-    'hive-vouch-threshold': ('vouch_threshold_pct', float),
-    'hive-min-vouch-count': ('min_vouch_count', int),
     'hive-max-members': ('max_members', int),
     'hive-market-share-cap': ('market_share_cap_pct', float),
     'hive-membership-enabled': ('membership_enabled', bool),
@@ -894,9 +892,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         ban_autotrigger_enabled=_parse_bool(options.get('hive-ban-autotrigger', 'false')),
         neophyte_fee_discount_pct=float(options.get('hive-neophyte-fee-discount', '0.5')),
         member_fee_ppm=int(options.get('hive-member-fee-ppm', '0')),
-        probation_days=int(options.get('hive-probation-days', '30')),
-        vouch_threshold_pct=float(options.get('hive-vouch-threshold', '0.51')),
-        min_vouch_count=int(options.get('hive-min-vouch-count', '3')),
+        probation_days=int(options.get('hive-probation-days', '90')),
         max_members=int(options.get('hive-max-members', '50')),
         market_share_cap_pct=float(options.get('hive-market-share-cap', '0.20')),
         intent_hold_seconds=int(options.get('hive-intent-hold-seconds', '60')),
@@ -921,8 +917,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     # Initialize handshake manager
     handshake_mgr = HandshakeManager(
-        safe_plugin.rpc, database, safe_plugin,
-        min_vouch_count=config.min_vouch_count
+        safe_plugin.rpc, database, safe_plugin
     )
     plugin.log("cl-hive: Handshake manager initialized")
     
@@ -7421,17 +7416,17 @@ def hive_force_promote(plugin: Plugin, peer_id: str):
     if not database or not our_pubkey or not membership_mgr:
         return {"error": "Database not initialized"}
 
-    # Check we're in bootstrap phase (member count < min_vouch_count)
+    # Check we're in bootstrap phase (member count < 3)
+    # Note: This function is deprecated as admin tier was removed
     members = database.get_all_members()
     member_count = len(members)
-    min_vouch = config.min_vouch_count if config else 3
+    min_for_quorum = 3  # Hardcoded - vouch system removed
 
-    if member_count >= min_vouch:
+    if member_count >= min_for_quorum:
         return {
             "error": "bootstrap_complete",
-            "message": f"Hive has {member_count} members, use normal vouch process",
-            "member_count": member_count,
-            "min_vouch_count": min_vouch
+            "message": f"Hive has {member_count} members, use normal promotion process",
+            "member_count": member_count
         }
 
     # Check target is a neophyte
