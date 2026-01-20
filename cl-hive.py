@@ -8225,7 +8225,10 @@ def hive_deposit_marker(
     destination: str,
     fee_ppm: int,
     success: bool,
-    volume_sats: int = 0
+    volume_sats: int = 0,
+    channel_id: str = None,
+    peer_id: str = None,
+    amount_sats: int = 0
 ):
     """
     Deposit a stigmergic route marker.
@@ -8236,17 +8239,22 @@ def hive_deposit_marker(
         fee_ppm: Fee charged in ppm
         success: Whether routing succeeded
         volume_sats: Volume routed in sats
+        channel_id: Optional channel ID (for compatibility)
+        peer_id: Optional peer ID (for compatibility)
+        amount_sats: Optional amount (alias for volume_sats)
 
     Returns:
         Dict with deposited marker info.
     """
+    # Use amount_sats as fallback for volume_sats
+    actual_volume = volume_sats if volume_sats else amount_sats
     return rpc_deposit_marker(
         _get_hive_context(),
         source=source,
         destination=destination,
         fee_ppm=fee_ppm,
         success=success,
-        volume_sats=volume_sats
+        volume_sats=actual_volume
     )
 
 
