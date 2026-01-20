@@ -465,5 +465,5 @@ docker-compose build
 ## Support
 
 - **Documentation**: See the `runbooks/` directory for operational procedures
-- **Issues**: Report bugs at https://github.com/LightningGoats/cl-hive/issues
+- **Issues**: Report bugs at https://github.com/lightning-goats/cl-hive/issues
 - **Upgrades**: See [UPGRADE.md](UPGRADE.md) for version-specific notes

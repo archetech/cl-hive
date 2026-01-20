@@ -38,7 +38,7 @@ The upgrade script will:
 
 Before upgrading:
 
-- [ ] Read the [release notes](https://github.com/LightningGoats/cl-hive/releases)
+- [ ] Read the [release notes](https://github.com/lightning-goats/cl-hive/releases)
 - [ ] Check disk space: `df -h` (need at least 5GB free)
 - [ ] Verify current backup is recent: `./scripts/backup.sh --verify`
 - [ ] Check channel states: `lightning-cli listpeerchannels`

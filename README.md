@@ -16,7 +16,7 @@ cl-revenue-ops (Execution Layer - "The CFO")
 Core Lightning
 ```
 
-`cl-hive` acts as the **"Diplomat"** or **"Chief Strategy Officer"** that communicates with other nodes in the fleet. It works alongside [cl-revenue-ops](https://github.com/LightningGoats/cl-revenue-ops), which acts as the **"CFO"** managing local channel profitability and fee policies.
+`cl-hive` acts as the **"Diplomat"** or **"Chief Strategy Officer"** that communicates with other nodes in the fleet. It works alongside [cl-revenue-ops](https://github.com/lightning-goats/cl_revenue_ops), which acts as the **"CFO"** managing local channel profitability and fee policies.
 
 ## Core Features
 
@@ -67,7 +67,7 @@ Optional WireGuard VPN integration for secure fleet communication.
 
 ```bash
 # Clone the repository
-git clone https://github.com/santyr/cl-hive.git
+git clone https://github.com/lightning-goats/cl-hive.git
 cd cl-hive
 
 # Install dependencies

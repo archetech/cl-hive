@@ -135,7 +135,7 @@ lightning-cli createrune restrictions='[["method^hive-","method^getinfo","method
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/santyr/cl-hive.git
+git clone https://github.com/lightning-goats/cl-hive.git
 cd cl-hive
 
 # 2. Create Python virtual environment

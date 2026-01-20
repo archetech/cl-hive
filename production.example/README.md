@@ -37,7 +37,7 @@ This folder contains templates for deploying the cl-hive AI Advisor on a product
 
 ```bash
 # On your management server
-git clone https://github.com/santyr/cl-hive.git
+git clone https://github.com/lightning-goats/cl-hive.git
 cd cl-hive
 
 # Create production folder from template

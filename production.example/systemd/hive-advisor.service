@@ -1,6 +1,6 @@
 [Unit]
 Description=Hive AI Advisor - Review and Act on Pending Actions
-Documentation=https://github.com/santyr/cl-hive
+Documentation=https://github.com/lightning-goats/cl-hive
 After=network-online.target
 Wants=network-online.target
 
