@@ -429,7 +429,7 @@ def _check_permission(required_tier: str) -> Optional[Dict[str, Any]]:
     - Any Tier: hive-status, hive-members, hive-contribution, hive-topology
 
     Args:
-        required_tier: 'admin' or 'member'
+        required_tier: 'member' (full member) or 'neophyte' (any member)
 
     Returns:
         None if permission granted, or error dict if denied
@@ -443,22 +443,15 @@ def _check_permission(required_tier: str) -> Optional[Dict[str, Any]]:
 
     current_tier = member.get('tier', 'neophyte')
 
-    if required_tier == 'admin':
-        if current_tier != 'admin':
+    if required_tier == 'member':
+        if current_tier != 'member':
             return {
                 "error": "permission_denied",
-                "message": "This command requires admin privileges",
-                "current_tier": current_tier,
-                "required_tier": "admin"
-            }
-    elif required_tier == 'member':
-        if current_tier not in ('admin', 'member'):
-            return {
-                "error": "permission_denied",
-                "message": "This command requires member or admin privileges",
+                "message": "This command requires full member privileges",
                 "current_tier": current_tier,
                 "required_tier": "member"
             }
+    # 'neophyte' tier means any member (including neophytes) can use the command
 
     return None  # Permission granted
 
@@ -1714,8 +1707,8 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         database.update_member(our_pubkey, metadata=json.dumps({"hive_id": hive_id}))
         plugin.log(f"cl-hive: Stored membership (tier={tier}, hive_id={hive_id})")
 
-        # Also add the peer that welcomed us (they're the admin or existing member)
-        database.add_member(peer_id, tier='admin', joined_at=now)
+        # Also add the peer that welcomed us (they're an existing member)
+        database.add_member(peer_id, tier='member', joined_at=now)
 
     # Initiate state sync with the peer that welcomed us
     if gossip_mgr and safe_plugin:
@@ -1979,8 +1972,8 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
         tier = member_info.get("tier", "neophyte")
         joined_at = member_info.get("joined_at", int(time.time()))
 
-        # Validate tier value
-        if tier not in ("admin", "member", "neophyte"):
+        # Validate tier value (2-tier system: member or neophyte)
+        if tier not in ("member", "neophyte"):
             tier = "neophyte"
 
         try:
@@ -2516,7 +2509,7 @@ def _broadcast_to_members(message_bytes: bytes) -> int:
     for member in database.get_all_members():
         tier = member.get("tier")
         # Broadcast to both members and admins
-        if tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
+        if tier not in (MembershipTier.MEMBER.value,):
             continue
         member_id = member["peer_id"]
         if member_id == our_pubkey:
@@ -2562,7 +2555,7 @@ def _sync_member_policies(plugin: Plugin) -> None:
 
         # Determine if this peer should have HIVE strategy
         # Both admin and member tiers get HIVE strategy
-        is_hive_member = tier in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value)
+        is_hive_member = tier in (MembershipTier.MEMBER.value,)
 
         try:
             # Use bypass_rate_limit=True for startup sync
@@ -2648,7 +2641,7 @@ def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     database.add_promotion_request(target_pubkey, request_id, status="pending")
 
     our_tier = membership_mgr.get_tier(our_pubkey) if our_pubkey else None
-    if our_tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
+    if our_tier not in (MembershipTier.MEMBER.value,):
         return {"result": "continue"}
 
     if not config.auto_vouch_enabled:
@@ -2696,7 +2689,7 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     voucher = database.get_member(peer_id)
-    if not voucher or voucher.get("tier") not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
+    if not voucher or voucher.get("tier") not in (MembershipTier.MEMBER.value,):
         return {"result": "continue"}
 
     target_member = database.get_member(payload["target_pubkey"])
@@ -2723,7 +2716,7 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     local_tier = membership_mgr.get_tier(our_pubkey) if our_pubkey else None
-    if local_tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value, MembershipTier.NEOPHYTE.value):
+    if local_tier not in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value):
         return {"result": "continue"}
 
     stored = database.add_promotion_vouch(
@@ -2737,7 +2730,7 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     # Only members and admins can trigger auto-promotion
-    if local_tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
+    if local_tier not in (MembershipTier.MEMBER.value,):
         return {"result": "continue"}
 
     active_members = membership_mgr.get_active_members()
@@ -2777,7 +2770,7 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     sender = database.get_member(peer_id)
     sender_tier = sender.get("tier") if sender else None
-    if sender_tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
+    if sender_tier not in (MembershipTier.MEMBER.value,):
         return {"result": "continue"}
 
     target_pubkey = payload["target_pubkey"]
@@ -2807,7 +2800,7 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             continue
         member = database.get_member(vouch["voucher_pubkey"])
         member_tier = member.get("tier") if member else None
-        if member_tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
+        if member_tier not in (MembershipTier.MEMBER.value,):
             continue
         canonical = membership_mgr.build_vouch_message(
             vouch["target_pubkey"], vouch["request_id"], vouch["timestamp"]
@@ -2883,11 +2876,11 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         except Exception as e:
             plugin.log(f"cl-hive: Failed to revert policy for {leaving_peer_id[:16]}...: {e}", level='debug')
 
-    # Check if hive is now headless (no admins)
+    # Check if hive is now headless (no full members)
     all_members = database.get_all_members()
-    admin_count = sum(1 for m in all_members if m.get("tier") == MembershipTier.ADMIN.value)
-    if admin_count == 0 and len(all_members) > 0:
-        plugin.log("cl-hive: WARNING - Hive is now headless (no admins). Members can elect a new admin.", level='warn')
+    member_count = sum(1 for m in all_members if m.get("tier") == MembershipTier.MEMBER.value)
+    if member_count == 0 and len(all_members) > 0:
+        plugin.log("cl-hive: WARNING - Hive has no full members (only neophytes). Promote neophytes to restore governance.", level='warn')
 
     return {"result": "continue"}
 
@@ -2933,7 +2926,7 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Verify proposer is a member or admin
     proposer = database.get_member(proposer_peer_id)
-    if not proposer or proposer.get("tier") not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
+    if not proposer or proposer.get("tier") not in (MembershipTier.MEMBER.value,):
         plugin.log(f"cl-hive: BAN_PROPOSAL from non-member", level='warn')
         return {"result": "continue"}
 
@@ -2998,7 +2991,7 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Verify voter is a member or admin
     voter = database.get_member(voter_peer_id)
-    if not voter or voter.get("tier") not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
+    if not voter or voter.get("tier") not in (MembershipTier.MEMBER.value,):
         return {"result": "continue"}
 
     # Get the proposal
@@ -3045,7 +3038,7 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
     all_members = database.get_all_members()
     eligible_voters = [
         m for m in all_members
-        if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value)
+        if m.get("tier") in (MembershipTier.MEMBER.value,)
         and m["peer_id"] != target_peer_id
     ]
     eligible_count = len(eligible_voters)
@@ -5962,7 +5955,7 @@ def hive_test_intent(plugin: Plugin, target: str, intent_type: str = "channel_op
         lightning-cli hive-test-intent 02abc123...
     """
     # Permission check: Admin only (test commands)
-    perm_error = _check_permission('admin')
+    perm_error = _check_permission('member')
     if perm_error:
         return perm_error
 
@@ -6039,7 +6032,7 @@ def hive_test_pending_action(plugin: Plugin, action_type: str = "channel_open",
         lightning-cli hive-test-pending-action channel_open 02abc123... 500000 "underserved_target"
     """
     # Permission check: Admin only (test commands)
-    perm_error = _check_permission('admin')
+    perm_error = _check_permission('member')
     if perm_error:
         return perm_error
 
@@ -7305,8 +7298,8 @@ def hive_vouch(plugin: Plugin, peer_id: str):
 
     # Check our tier - must be member or admin to vouch
     our_tier = membership_mgr.get_tier(our_pubkey)
-    if our_tier not in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value):
-        return {"error": "permission_denied", "required_tier": "member or admin"}
+    if our_tier not in (MembershipTier.MEMBER.value,):
+        return {"error": "permission_denied", "required_tier": "member"}
 
     # Check target is a neophyte
     target = database.get_member(peer_id)
@@ -7414,7 +7407,7 @@ def hive_force_promote(plugin: Plugin, peer_id: str):
     Permission: Admin only, bootstrap phase only
     """
     # Permission check: Admin only
-    perm_error = _check_permission('admin')
+    perm_error = _check_permission('member')
     if perm_error:
         return perm_error
 
@@ -7487,7 +7480,7 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     Permission: Admin only
     """
     # Permission check: Admin only
-    perm_error = _check_permission('admin')
+    perm_error = _check_permission('member')
     if perm_error:
         return perm_error
 
@@ -7504,8 +7497,8 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
         return {"error": "peer_not_member", "peer_id": peer_id}
 
     # Cannot ban admin
-    if member.get("tier") == MembershipTier.ADMIN.value:
-        return {"error": "cannot_ban_admin", "peer_id": peer_id}
+    if member.get("tier") == MembershipTier.MEMBER.value:
+        return {"error": "cannot_ban_member", "peer_id": peer_id}
 
     # Sign the ban reason
     now = int(time.time())
@@ -7543,104 +7536,15 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
 @plugin.method("hive-promote-admin")
 def hive_promote_admin(plugin: Plugin, peer_id: str):
     """
-    Propose or approve promoting a member to admin.
+    DEPRECATED: Admin tier has been removed from the 2-tier membership system.
 
-    Requires 100% admin approval. When an admin calls this:
-    - If no pending proposal exists, creates one and adds their approval
-    - If proposal exists, adds their approval
-    - When all admins have approved, the member is promoted to admin
-
-    Args:
-        peer_id: Public key of the member to promote to admin
-
-    Returns:
-        Dict with promotion status.
-
-    Permission: Admin only
+    The current system uses only NEOPHYTE and MEMBER tiers.
+    Use hive-propose-promotion to promote neophytes to member.
     """
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
-    if perm_error:
-        return perm_error
-
-    if not database or not our_pubkey or not membership_mgr:
-        return {"error": "Database not initialized"}
-
-    # Check target exists and is a member (not neophyte, not already admin)
-    target = database.get_member(peer_id)
-    if not target:
-        return {"error": "peer_not_found", "peer_id": peer_id}
-
-    target_tier = target.get("tier")
-    if target_tier == MembershipTier.ADMIN.value:
-        return {"error": "already_admin", "peer_id": peer_id}
-    if target_tier == MembershipTier.NEOPHYTE.value:
-        return {"error": "must_be_member_first", "peer_id": peer_id,
-                "message": "Neophytes must be promoted to member before admin"}
-
-    # Get all current admins
-    all_members = database.get_all_members()
-    admins = [m for m in all_members if m.get("tier") == MembershipTier.ADMIN.value]
-    admin_count = len(admins)
-    admin_pubkeys = set(m["peer_id"] for m in admins)
-
-    # Create or get existing proposal
-    existing = database.get_admin_promotion(peer_id)
-    if not existing:
-        database.create_admin_promotion(peer_id, our_pubkey)
-        plugin.log(f"cl-hive: Admin promotion proposed for {peer_id[:16]}...")
-
-    # Add our approval
-    database.add_admin_promotion_approval(peer_id, our_pubkey)
-
-    # Check approvals
-    approvals = database.get_admin_promotion_approvals(peer_id)
-    approval_pubkeys = set(a["approver_peer_id"] for a in approvals)
-
-    # Only count approvals from current admins
-    valid_approvals = approval_pubkeys & admin_pubkeys
-    approvals_needed = admin_count
-    approvals_received = len(valid_approvals)
-
-    # Check if 100% approval reached
-    if valid_approvals == admin_pubkeys:
-        # Promote to admin
-        success = membership_mgr.set_tier(peer_id, MembershipTier.ADMIN.value)
-        if success:
-            database.complete_admin_promotion(peer_id)
-            plugin.log(f"cl-hive: Promoted {peer_id[:16]}... to ADMIN (100% approval)")
-
-            # Broadcast promotion
-            promotion_payload = {
-                "target_pubkey": peer_id,
-                "request_id": f"admin_promo_{int(time.time())}",
-                "new_tier": "admin",
-                "vouches": [{"approver": pk} for pk in valid_approvals]
-            }
-            promo_msg = serialize(HiveMessageType.PROMOTION, promotion_payload)
-            _broadcast_to_members(promo_msg)
-
-            return {
-                "status": "promoted",
-                "peer_id": peer_id,
-                "new_tier": "admin",
-                "approvals": list(valid_approvals),
-                "message": f"Promoted to admin with {approvals_received}/{approvals_needed} approvals"
-            }
-        else:
-            return {"error": "promotion_failed", "peer_id": peer_id}
-    else:
-        # Still waiting for more approvals
-        missing = admin_pubkeys - valid_approvals
-        return {
-            "status": "pending",
-            "peer_id": peer_id,
-            "approvals_received": approvals_received,
-            "approvals_needed": approvals_needed,
-            "approved_by": list(valid_approvals),
-            "waiting_for": [pk[:16] + "..." for pk in missing],
-            "message": f"Need {approvals_needed - approvals_received} more admin approval(s)"
-        }
+    return {
+        "error": "deprecated",
+        "message": "Admin tier removed. Use hive-propose-promotion for neophyte->member promotions."
+    }
 
 
 @plugin.method("hive-leave")
@@ -7652,8 +7556,8 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
     Your fee policies will be reverted to dynamic.
 
     Restrictions:
-    - The last admin cannot leave (would make hive headless)
-    - Admins should resign first or promote another admin before leaving
+    - The last full member cannot leave (would make hive headless)
+    - Promote a neophyte to member before leaving if you're the last one
 
     Args:
         reason: Optional reason for leaving (default: "voluntary")
@@ -7673,14 +7577,14 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
 
     our_tier = member.get("tier")
 
-    # Check if we're the last admin
-    if our_tier == MembershipTier.ADMIN.value:
+    # Check if we're the last full member
+    if our_tier == MembershipTier.MEMBER.value:
         all_members = database.get_all_members()
-        admin_count = sum(1 for m in all_members if m.get("tier") == MembershipTier.ADMIN.value)
-        if admin_count <= 1:
+        member_count = sum(1 for m in all_members if m.get("tier") == MembershipTier.MEMBER.value)
+        if member_count <= 1:
             return {
                 "error": "cannot_leave",
-                "message": "Cannot leave: you are the only admin. Promote another member to admin first, or the hive will become headless."
+                "message": "Cannot leave: you are the only full member. Promote a neophyte first, or the hive will become headless."
             }
 
     # Create signed leave message
@@ -7727,7 +7631,7 @@ def hive_propose_ban(plugin: Plugin, peer_id: str, reason: str = "no reason give
     """
     Propose banning a member from the hive.
 
-    Requires quorum vote (51% of members/admins) to execute.
+    Requires quorum vote (51% of members) to execute.
     The proposal is valid for 7 days.
 
     Args:
@@ -7815,7 +7719,7 @@ def hive_propose_ban(plugin: Plugin, peer_id: str, reason: str = "no reason give
     # Calculate quorum info
     all_members = database.get_all_members()
     eligible = [m for m in all_members
-                if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value)
+                if m.get("tier") in (MembershipTier.MEMBER.value,)
                 and m["peer_id"] != peer_id]
     quorum_needed = int(len(eligible) * BAN_QUORUM_THRESHOLD) + 1
 
@@ -7916,7 +7820,7 @@ def hive_vote_ban(plugin: Plugin, proposal_id: str, vote: str):
     all_votes = database.get_ban_votes(proposal_id)
     all_members = database.get_all_members()
     eligible = [m for m in all_members
-                if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.ADMIN.value)
+                if m.get("tier") in (MembershipTier.MEMBER.value,)
                 and m["peer_id"] != proposal["target_peer_id"]]
     eligible_ids = set(m["peer_id"] for m in eligible)
 
@@ -8729,14 +8633,14 @@ def hive_genesis(plugin: Plugin, hive_id: str = None):
     """
     Initialize this node as the Genesis (Admin) node of a new Hive.
     
-    This creates the first member record with admin privileges and
+    This creates the first member record with member privileges and
     generates a self-signed genesis ticket.
     
     Args:
         hive_id: Optional custom Hive identifier (auto-generated if not provided)
     
     Returns:
-        Dict with genesis status and admin ticket
+        Dict with genesis status and member ticket
     """
     if not database or not safe_plugin or not handshake_mgr:
         return {"error": "Hive not initialized"}
@@ -8756,35 +8660,34 @@ def hive_invite(plugin: Plugin, valid_hours: int = 24, requirements: int = 0,
     """
     Generate an invitation ticket for a new member.
 
-    Only Admins can generate invite tickets. Bootstrap invites (tier='admin')
-    can only be generated once (to create the second admin). After 2 admins
-    exist, all new members join as neophytes and need vouches for promotion.
+    Only full members can generate invite tickets. New members join as neophytes
+    and can be promoted to member after meeting the promotion criteria.
 
     Args:
         valid_hours: Hours until ticket expires (default: 24)
         requirements: Bitmask of required features (default: 0 = none)
-        tier: Starting tier - 'neophyte' (default) or 'admin' (bootstrap only)
+        tier: Starting tier - 'neophyte' (default) or 'member' (bootstrap only)
 
     Returns:
         Dict with base64-encoded ticket
 
-    Permission: Admin only
+    Permission: Member only
     """
-    # Permission check: Admin only
-    perm_error = _check_permission('admin')
+    # Permission check: Member only
+    perm_error = _check_permission('member')
     if perm_error:
         return perm_error
 
     if not handshake_mgr:
         return {"error": "Hive not initialized"}
 
-    # Validate tier
-    if tier not in ('neophyte', 'admin'):
-        return {"error": f"Invalid tier: {tier}. Use 'neophyte' or 'admin' (bootstrap)"}
+    # Validate tier (2-tier system: member or neophyte)
+    if tier not in ('neophyte', 'member'):
+        return {"error": f"Invalid tier: {tier}. Use 'neophyte' (default) or 'member' (bootstrap)"}
 
     try:
         ticket = handshake_mgr.generate_invite_ticket(valid_hours, requirements, tier)
-        bootstrap_note = " (BOOTSTRAP - grants admin tier)" if tier == 'admin' else ""
+        bootstrap_note = " (BOOTSTRAP - grants full member tier)" if tier == 'member' else ""
         return {
             "status": "ticket_generated",
             "ticket": ticket,
