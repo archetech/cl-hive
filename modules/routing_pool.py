@@ -519,14 +519,18 @@ class RoutingPool:
     # STATUS AND REPORTING
     # =========================================================================
 
-    def get_pool_status(self) -> Dict[str, Any]:
+    def get_pool_status(self, period: str = None) -> Dict[str, Any]:
         """
         Get current pool status for display/MCP.
+
+        Args:
+            period: Optional period to query (format: YYYY-WW, defaults to current week)
 
         Returns:
             Dict with period, revenue, contributions, projections
         """
-        period = self._current_period()
+        if period is None:
+            period = self._current_period()
 
         # Get revenue
         revenue = self.db.get_pool_revenue(period=period)

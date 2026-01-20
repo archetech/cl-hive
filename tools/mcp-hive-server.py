@@ -5272,7 +5272,12 @@ def get_settlement_manager():
 
         class MockDatabase:
             def __init__(self):
-                self.db_path = os.path.expanduser("~/.lightning/hive_settlement.db")
+                # Use SETTLEMENT_DB_PATH env var, or same directory as ADVISOR_DB_PATH
+                # This ensures we use whatever directory the user has configured for hive data
+                advisor_dir = os.path.dirname(ADVISOR_DB_PATH)
+                default_path = os.path.join(advisor_dir, "hive_settlement.db")
+                self.db_path = os.environ.get('SETTLEMENT_DB_PATH', default_path)
+                logger.info(f"Settlement DB path: {self.db_path}")
                 self._local = threading.local()
 
             def _get_connection(self):
