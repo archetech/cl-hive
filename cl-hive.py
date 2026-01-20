@@ -82,6 +82,7 @@ from modules.health_aggregator import HealthScoreAggregator, HealthTier
 from modules.routing_intelligence import HiveRoutingMap
 from modules.peer_reputation import PeerReputationManager
 from modules.routing_pool import RoutingPool
+from modules.settlement import SettlementManager
 from modules.yield_metrics import YieldMetricsManager
 from modules.fee_coordination import FeeCoordinationManager
 from modules.cost_reduction import CostReductionManager
@@ -294,6 +295,7 @@ splice_coord: Optional[SpliceCoordinator] = None
 routing_map: Optional[HiveRoutingMap] = None
 peer_reputation_mgr: Optional[PeerReputationManager] = None
 routing_pool: Optional[RoutingPool] = None
+settlement_mgr: Optional[SettlementManager] = None
 yield_metrics_mgr: Optional[YieldMetricsManager] = None
 fee_coordination_mgr: Optional[FeeCoordinationManager] = None
 cost_reduction_mgr: Optional[CostReductionManager] = None
@@ -1129,6 +1131,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     routing_pool.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Routing pool initialized (collective economics)")
+
+    # Initialize Settlement Manager (BOLT12 revenue distribution)
+    global settlement_mgr
+    settlement_mgr = SettlementManager(
+        database=database,
+        plugin=safe_plugin
+    )
+    settlement_mgr.initialize_tables()
+    plugin.log("cl-hive: Settlement manager initialized (BOLT12 payouts)")
 
     # Initialize Yield Metrics Manager (Phase 1 - Metrics & Measurement)
     global yield_metrics_mgr
@@ -7978,6 +7989,120 @@ def hive_pool_record_revenue(plugin: Plugin, amount_sats: int,
         channel_id=channel_id,
         payment_hash=payment_hash
     )
+
+
+# =============================================================================
+# SETTLEMENT RPC METHODS (BOLT12 Revenue Distribution)
+# =============================================================================
+
+@plugin.method("hive-settlement-register-offer")
+def hive_settlement_register_offer(plugin: Plugin, peer_id: str, bolt12_offer: str):
+    """
+    Register a BOLT12 offer for receiving settlement payments.
+
+    Each hive member must register their offer to participate in revenue distribution.
+
+    Args:
+        peer_id: Member's node public key
+        bolt12_offer: BOLT12 offer string (starts with lno1...)
+
+    Returns:
+        Dict with registration result.
+    """
+    if not settlement_mgr:
+        return {"error": "Settlement manager not initialized"}
+    return settlement_mgr.register_offer(peer_id, bolt12_offer)
+
+
+@plugin.method("hive-settlement-list-offers")
+def hive_settlement_list_offers(plugin: Plugin):
+    """
+    List all registered BOLT12 offers for settlement.
+
+    Returns:
+        Dict with list of registered offers.
+    """
+    if not settlement_mgr:
+        return {"error": "Settlement manager not initialized"}
+    return settlement_mgr.list_offers()
+
+
+@plugin.method("hive-settlement-calculate")
+def hive_settlement_calculate(plugin: Plugin):
+    """
+    Calculate fair shares for the current period without executing.
+
+    Shows what each member would receive/pay based on:
+    - 40% capacity weight
+    - 40% routing volume weight
+    - 20% uptime weight
+
+    Returns:
+        Dict with calculated fair shares.
+    """
+    if not settlement_mgr:
+        return {"error": "Settlement manager not initialized"}
+    if not routing_pool:
+        return {"error": "Routing pool not initialized"}
+
+    # Get contribution data from routing pool
+    contributions = routing_pool.get_pool_status()
+    return settlement_mgr.calculate_fair_shares(contributions)
+
+
+@plugin.method("hive-settlement-execute")
+def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
+    """
+    Execute settlement for the current period.
+
+    Calculates fair shares and generates BOLT12 payments from members
+    with surplus to members with deficit.
+
+    Args:
+        dry_run: If True, calculate but don't execute payments (default: True)
+
+    Returns:
+        Dict with settlement execution result.
+    """
+    if not settlement_mgr:
+        return {"error": "Settlement manager not initialized"}
+    if not routing_pool:
+        return {"error": "Routing pool not initialized"}
+
+    contributions = routing_pool.get_pool_status()
+    return settlement_mgr.execute_settlement(contributions, dry_run=dry_run)
+
+
+@plugin.method("hive-settlement-history")
+def hive_settlement_history(plugin: Plugin, limit: int = 10):
+    """
+    Get settlement history showing past periods and distributions.
+
+    Args:
+        limit: Number of periods to return (default: 10)
+
+    Returns:
+        Dict with settlement history.
+    """
+    if not settlement_mgr:
+        return {"error": "Settlement manager not initialized"}
+    return settlement_mgr.get_history(limit=limit)
+
+
+@plugin.method("hive-settlement-period-details")
+def hive_settlement_period_details(plugin: Plugin, period_id: int):
+    """
+    Get detailed information about a specific settlement period.
+
+    Args:
+        period_id: Settlement period ID
+
+    Returns:
+        Dict with period details including contributions, fair shares, and payments.
+    """
+    if not settlement_mgr:
+        return {"error": "Settlement manager not initialized"}
+    return settlement_mgr.get_period_details(period_id)
 
 
 # =============================================================================

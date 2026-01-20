@@ -5251,54 +5251,14 @@ async def handle_physarum_status(args: Dict) -> Dict:
 # =============================================================================
 # Settlement Handlers (BOLT12 Revenue Distribution)
 # =============================================================================
-
-# Global settlement manager (lazily initialized)
-_settlement_manager = None
-
-
-def get_settlement_manager():
-    """Get or create the settlement manager."""
-    global _settlement_manager
-    if _settlement_manager is None:
-        # Import here to avoid circular imports
-        import sys
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from modules.settlement import SettlementManager
-
-        # Use dedicated settlement database
-        class MockPlugin:
-            def log(self, msg, level='info'):
-                logger.log(getattr(logging, level.upper(), logging.INFO), msg)
-
-        class MockDatabase:
-            def __init__(self):
-                # Use SETTLEMENT_DB_PATH env var, or same directory as ADVISOR_DB_PATH
-                # This ensures we use whatever directory the user has configured for hive data
-                advisor_dir = os.path.dirname(ADVISOR_DB_PATH)
-                default_path = os.path.join(advisor_dir, "hive_settlement.db")
-                self.db_path = os.environ.get('SETTLEMENT_DB_PATH', default_path)
-                logger.info(f"Settlement DB path: {self.db_path}")
-                self._local = threading.local()
-
-            def _get_connection(self):
-                if not hasattr(self._local, 'conn') or self._local.conn is None:
-                    import sqlite3
-                    os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-                    self._local.conn = sqlite3.connect(self.db_path, isolation_level=None)
-                    self._local.conn.row_factory = sqlite3.Row
-                    self._local.conn.execute("PRAGMA journal_mode=WAL;")
-                return self._local.conn
-
-        db = MockDatabase()
-        plugin = MockPlugin()
-        _settlement_manager = SettlementManager(db, plugin)
-        _settlement_manager.initialize_tables()
-
-    return _settlement_manager
+# Settlement database is managed remotely by cl-hive plugin on each node.
+# All settlement operations are performed via remote RPC calls.
+# =============================================================================
 
 
 async def handle_settlement_register_offer(args: Dict) -> Dict:
     """Register a BOLT12 offer for receiving settlement payments."""
+    node_name = args.get("node")
     peer_id = args.get("peer_id")
     bolt12_offer = args.get("bolt12_offer")
 
@@ -5307,8 +5267,14 @@ async def handle_settlement_register_offer(args: Dict) -> Dict:
     if not bolt12_offer:
         return {"error": "bolt12_offer is required"}
 
-    settlement = get_settlement_manager()
-    result = settlement.register_offer(peer_id, bolt12_offer)
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-settlement-register-offer", {
+        "peer_id": peer_id,
+        "bolt12_offer": bolt12_offer
+    })
 
     if "error" not in result:
         result["ai_note"] = (
@@ -5321,9 +5287,18 @@ async def handle_settlement_register_offer(args: Dict) -> Dict:
 
 async def handle_settlement_list_offers(args: Dict) -> Dict:
     """List all registered BOLT12 offers."""
-    settlement = get_settlement_manager()
-    offers = settlement.list_offers()
+    node_name = args.get("node")
 
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-settlement-list-offers", {})
+
+    if "error" in result:
+        return result
+
+    offers = result.get("offers", [])
     active = [o for o in offers if o.get("active")]
     inactive = [o for o in offers if not o.get("active")]
 
@@ -5343,110 +5318,61 @@ async def handle_settlement_calculate(args: Dict) -> Dict:
     """Calculate fair shares for the current period without executing."""
     node_name = args.get("node")
 
-    # Import here to avoid circular imports
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from modules.settlement import MemberContribution
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        result = await node.call("hive-settlement-calculate", {})
+    except Exception as e:
+        return {"error": f"Failed to calculate settlement: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Add AI-friendly note
+    fair_shares = result.get("fair_shares", [])
+    surplus_members = [r for r in fair_shares if r.get("balance", 0) < 0]
+    deficit_members = [r for r in fair_shares if r.get("balance", 0) > 0]
+    payments = result.get("payments_required", [])
+
+    result["ai_note"] = (
+        f"Settlement calculation complete. {len(surplus_members)} members earned more than fair share "
+        f"and would pay {len(deficit_members)} members who earned less. "
+        f"Total of {len(payments)} payments totaling {sum(p.get('amount_sats', 0) for p in payments)} sats."
+    )
+
+    return result
+
+
+async def handle_settlement_execute(args: Dict) -> Dict:
+    """Execute settlement for the current period."""
+    node_name = args.get("node")
+    dry_run = args.get("dry_run", True)  # Default to dry run for safety
 
     node = fleet.get_node(node_name)
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    settlement = get_settlement_manager()
-
-    # Get member data from hive
     try:
-        members_result = await node.call("hive-members", {})
-        members = members_result.get("members", [])
+        result = await node.call("hive-settlement-execute", {"dry_run": dry_run})
     except Exception as e:
-        return {"error": f"Failed to get hive members: {e}"}
-
-    if not members:
-        return {"error": "No hive members found"}
-
-    # Build contribution data
-    contributions = []
-    for member in members:
-        peer_id = member.get("peer_id")
-        offer = settlement.get_offer(peer_id)
-
-        contributions.append(MemberContribution(
-            peer_id=peer_id,
-            capacity_sats=member.get("capacity_sats", 0),
-            forwards_sats=member.get("contribution_sats", 0),
-            fees_earned_sats=member.get("fees_earned_sats", 0),
-            uptime_pct=member.get("uptime_pct", 100.0),
-            bolt12_offer=offer
-        ))
-
-    # Calculate fair shares
-    results = settlement.calculate_fair_shares(contributions)
-
-    # Generate payments
-    payments = settlement.generate_payments(results)
-
-    # Format results
-    total_fees = sum(r.fees_earned for r in results)
-    surplus_members = [r for r in results if r.balance < 0]
-    deficit_members = [r for r in results if r.balance > 0]
-
-    return {
-        "period_summary": {
-            "total_members": len(results),
-            "total_fees_sats": total_fees,
-            "surplus_members": len(surplus_members),
-            "deficit_members": len(deficit_members),
-            "total_payments": len(payments)
-        },
-        "fair_shares": [
-            {
-                "peer_id": r.peer_id[:16] + "...",
-                "fees_earned": r.fees_earned,
-                "fair_share": r.fair_share,
-                "balance": r.balance,
-                "has_offer": r.bolt12_offer is not None,
-                "status": "pays" if r.balance < 0 else ("receives" if r.balance > 0 else "even")
-            }
-            for r in results
-        ],
-        "payments_required": [
-            {
-                "from": p.from_peer[:16] + "...",
-                "to": p.to_peer[:16] + "...",
-                "amount_sats": p.amount_sats
-            }
-            for p in payments
-        ],
-        "ai_note": (
-            f"Settlement calculation complete. {len(surplus_members)} members earned more than fair share "
-            f"and would pay {len(deficit_members)} members who earned less. "
-            f"Total of {len(payments)} payments totaling {sum(p.amount_sats for p in payments)} sats."
-        )
-    }
-
-
-async def handle_settlement_execute(args: Dict) -> Dict:
-    """Execute settlement for the current period."""
-    dry_run = args.get("dry_run", True)  # Default to dry run for safety
-
-    # Calculate first
-    result = await handle_settlement_calculate(args)
+        return {"error": f"Failed to execute settlement: {e}"}
 
     if "error" in result:
         return result
 
+    # Add AI-friendly note
     if dry_run:
-        result["execution_status"] = "dry_run"
         result["ai_note"] = (
             "DRY RUN - No payments executed. "
             "Set dry_run=false to execute actual payments. "
             "Ensure all participating members have registered BOLT12 offers first."
         )
     else:
-        result["execution_status"] = "not_implemented"
+        payments = result.get("payments_executed", [])
         result["ai_note"] = (
-            "Actual payment execution requires additional infrastructure. "
-            "This shows what would be settled. Implementation pending."
+            f"Settlement executed. {len(payments)} BOLT12 payments initiated."
         )
 
     return result
@@ -5454,29 +5380,45 @@ async def handle_settlement_execute(args: Dict) -> Dict:
 
 async def handle_settlement_history(args: Dict) -> Dict:
     """Get settlement history."""
+    node_name = args.get("node")
     limit = args.get("limit", 10)
 
-    settlement = get_settlement_manager()
-    history = settlement.get_settlement_history(limit=limit)
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
 
-    return {
-        "settlement_periods": history,
-        "total_periods": len(history),
-        "ai_note": f"Showing last {len(history)} settlement periods."
-    }
+    try:
+        result = await node.call("hive-settlement-history", {"limit": limit})
+    except Exception as e:
+        return {"error": f"Failed to get settlement history: {e}"}
+
+    if "error" in result:
+        return result
+
+    periods = result.get("settlement_periods", [])
+    result["ai_note"] = f"Showing last {len(periods)} settlement periods."
+
+    return result
 
 
 async def handle_settlement_period_details(args: Dict) -> Dict:
     """Get detailed information about a specific settlement period."""
+    node_name = args.get("node")
     period_id = args.get("period_id")
 
     if period_id is None:
         return {"error": "period_id is required"}
 
-    settlement = get_settlement_manager()
-    details = settlement.get_period_details(period_id)
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
 
-    return details
+    try:
+        result = await node.call("hive-settlement-period-details", {"period_id": period_id})
+    except Exception as e:
+        return {"error": f"Failed to get period details: {e}"}
+
+    return result
 
 
 # =============================================================================
