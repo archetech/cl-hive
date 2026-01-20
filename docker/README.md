@@ -10,6 +10,12 @@ Production-ready Docker image for cl-hive Lightning nodes with Tor, WireGuard, a
 - **cl-revenue-ops** for fee optimization
 - **cl-hive** for fleet coordination
 
+### Required Plugins (Pre-installed)
+- **CLBOSS** - Automated channel management (ksedgwic fork with clboss-unmanage)
+- **Sling** - Rebalancing engine (required by cl-revenue-ops)
+- **cl-revenue-ops** - Fee optimization and profitability tracking
+- **cl-hive** - Fleet coordination and swarm intelligence
+
 ### Production Features
 
 - Interactive setup wizard
@@ -21,10 +27,6 @@ Production-ready Docker image for cl-hive Lightning nodes with Tor, WireGuard, a
 - Upgrade/rollback with health checks
 - Operational runbooks
 - Structured logging
-
-### Optional Integrations
-- **CLBOSS** for automated channel management (not required - hive uses native expansion)
-- **sling** for rebalancing (not required - handled by cl-revenue-ops)
 
 ## Quick Start
 
@@ -448,17 +450,17 @@ docker-compose build
 
 ### Image Contents
 
-| Component | Version |
-|-----------|---------|
-| Ubuntu | 24.04 |
-| Core Lightning | v25.02.1 |
-| CLBOSS | latest (ksedgwic fork, optional) |
-| Sling | v4.1.3 |
-| cl-revenue-ops | bundled |
-| cl-hive | bundled |
-| Tor | 0.4.8.x |
-| WireGuard | 1.0.x |
-| Python | 3.12 |
+| Component | Version | Required |
+|-----------|---------|----------|
+| Ubuntu | 24.04 | Yes |
+| Core Lightning | v25.02.1 | Yes |
+| CLBOSS | latest (ksedgwic fork) | Yes |
+| Sling | v4.1.3 | Yes |
+| cl-revenue-ops | bundled | Yes |
+| cl-hive | bundled | Yes |
+| Tor | 0.4.8.x | Yes |
+| WireGuard | 1.0.x | Optional |
+| Python | 3.12 | Yes |
 
 ## Support
 

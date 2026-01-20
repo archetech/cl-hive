@@ -83,8 +83,10 @@ RUN pip install --no-cache-dir \
     anthropic
 
 # =============================================================================
-# CLBOSS (ksedgwic fork with clboss-unmanage support)
+# CLBOSS (REQUIRED - ksedgwic fork with clboss-unmanage support)
 # =============================================================================
+# CLBOSS provides automated channel management and liquidity optimization.
+# Required for cl-hive fleet coordination.
 
 WORKDIR /tmp
 
@@ -107,10 +109,10 @@ RUN git clone --depth 1 https://github.com/ksedgwic/clboss.git \
     && rm -rf clboss
 
 # =============================================================================
-# SLING PLUGIN
+# SLING PLUGIN (REQUIRED)
 # =============================================================================
+# Sling provides rebalancing capabilities required by cl-revenue-ops.
 
-# Install sling from latest release (note: archives now named by target triple)
 ARG SLING_VERSION=v4.1.3
 RUN ARCH=$(uname -m) \
     && if [ "$ARCH" = "x86_64" ]; then TRIPLE="x86_64-linux-gnu"; fi \

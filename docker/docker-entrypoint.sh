@@ -62,7 +62,6 @@ RGB="${RGB:-FF9900}"
 TOR_ENABLED="${TOR_ENABLED:-true}"
 WIREGUARD_ENABLED="${WIREGUARD_ENABLED:-false}"
 HIVE_GOVERNANCE_MODE="${HIVE_GOVERNANCE_MODE:-advisor}"
-CLBOSS_ENABLED="${CLBOSS_ENABLED:-true}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 
 # -----------------------------------------------------------------------------
@@ -263,14 +262,25 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# CLBOSS Configuration
+# Required Plugins Verification
 # -----------------------------------------------------------------------------
 
-if [ "$CLBOSS_ENABLED" = "true" ]; then
-    echo "CLBOSS enabled (optional integration)"
+echo "Verifying required plugins..."
+
+# CLBOSS is required for automated channel management
+if [ -x /usr/local/bin/clboss ]; then
+    echo "CLBOSS: installed"
 else
-    echo "CLBOSS disabled (optional) - hive uses native expansion control"
-    rm -f /root/.lightning/plugins/clboss
+    echo "ERROR: CLBOSS not found - required for cl-hive"
+    exit 1
+fi
+
+# Sling is required for rebalancing (used by cl-revenue-ops)
+if [ -x /usr/local/bin/sling ]; then
+    echo "Sling: installed"
+else
+    echo "ERROR: Sling not found - required for cl-revenue-ops"
+    exit 1
 fi
 
 # -----------------------------------------------------------------------------
@@ -340,9 +350,14 @@ echo "Alias:          $ALIAS"
 echo "Bitcoin RPC:    $BITCOIN_RPCHOST:$BITCOIN_RPCPORT"
 echo "Tor:            $TOR_ENABLED"
 echo "WireGuard:      $WIREGUARD_ENABLED"
-echo "CLBOSS:         $CLBOSS_ENABLED"
 echo "Hive Mode:      $HIVE_GOVERNANCE_MODE"
 echo "Lightning Dir:  $LIGHTNING_DIR"
+echo ""
+echo "Required Plugins:"
+echo "  CLBOSS:       installed"
+echo "  Sling:        installed"
+echo "  cl-hive:      installed"
+echo "  cl-revenue-ops: installed"
 echo "============================="
 echo ""
 

@@ -79,9 +79,6 @@ services:
       - WG_DNS=${WG_DNS:-}
       - WG_PEER_KEEPALIVE=${WG_PEER_KEEPALIVE:-25}
 
-      # CLBOSS
-      - CLBOSS_ENABLED=${CLBOSS_ENABLED:-true}
-
       # cl-hive
       - HIVE_GOVERNANCE_MODE=${HIVE_GOVERNANCE_MODE:-advisor}
 
