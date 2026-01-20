@@ -399,6 +399,7 @@ main() {
     mkdir -p secrets
     chmod 700 secrets
     mkdir -p config
+    mkdir -p wireguard
 
     # Write secrets (not in .env)
     echo -n "$BITCOIN_RPCPASSWORD" > secrets/bitcoin_rpc_password

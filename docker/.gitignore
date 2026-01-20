@@ -11,6 +11,7 @@ secrets/
 
 # WireGuard configs (contain private keys)
 wireguard/
+!wireguard/.gitkeep
 
 # Custom configs
 config/
