@@ -89,6 +89,9 @@ services:
       # Persistent data
       - lightning-data:/data/lightning
 
+      # Tor hidden service keys (persist onion address across restarts)
+      - tor-data:/var/lib/tor
+
       # WireGuard config (optional)
       - ${WIREGUARD_CONFIG_PATH:-./wireguard}:/etc/wireguard:ro
 
@@ -187,6 +190,10 @@ services:
 
 volumes:
   lightning-data:
+    driver: local
+    labels:
+      - "com.cl-hive.backup=critical"
+  tor-data:
     driver: local
     labels:
       - "com.cl-hive.backup=critical"
