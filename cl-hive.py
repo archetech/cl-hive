@@ -8733,9 +8733,10 @@ def hive_join(plugin: Plugin, ticket: str, peer_id: str = None):
     if ticket_obj.is_expired():
         return {"error": "Ticket has expired"}
     
-    # Send HELLO message
+    # Send HELLO message with our pubkey (for identity binding)
     from modules.protocol import create_hello
-    hello_msg = create_hello(ticket)
+    our_pubkey = handshake_mgr.get_our_pubkey()
+    hello_msg = create_hello(our_pubkey)
     
     try:
         safe_plugin.rpc.call("sendcustommsg", {
