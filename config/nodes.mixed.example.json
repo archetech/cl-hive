@@ -1,0 +1,24 @@
+{
+  "mode": "rest",
+  "nodes": [
+    {
+      "name": "mainnet-primary",
+      "rest_url": "https://your-node.example.com:3010",
+      "rune": "your-rune-from-commando-rune-command",
+      "ca_cert": null
+    },
+    {
+      "name": "mainnet-secondary",
+      "rest_url": "https://192.168.1.100:3010",
+      "rune": "your-rune-from-commando-rune-command",
+      "ca_cert": "/path/to/ca.pem"
+    },
+    {
+      "name": "docker-node",
+      "mode": "docker",
+      "docker_container": "cln-node-container",
+      "lightning_dir": "/root/.lightning",
+      "network": "bitcoin"
+    }
+  ]
+}

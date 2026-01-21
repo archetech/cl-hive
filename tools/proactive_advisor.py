@@ -413,13 +413,20 @@ class ProactiveAdvisor:
 
     async def _analyze_node_state(self, node_name: str) -> Dict[str, Any]:
         """
-        Comprehensive node state analysis.
+        Comprehensive node state analysis with full intelligence gathering.
 
-        Gathers all available data to build complete picture.
+        Gathers data from all available intelligence systems:
+        - Core: node_info, channels, dashboard, profitability
+        - Fleet coordination: defense_status, internal_competition, fee_coordination
+        - Predictive: anticipatory_predictions, critical_velocity
+        - Strategic: positioning_summary, yield_summary
+        - Cost reduction: rebalance_recommendations, circular_flow_status
+        - Collective warnings: ban_candidates
         """
         # Gather data (some may fail, that's ok)
         results = {}
 
+        # ==== CORE DATA ====
         try:
             results["node_info"] = await self.mcp.call(
                 "hive_node_info", {"node": node_name}
@@ -462,6 +469,122 @@ class ProactiveAdvisor:
         except Exception:
             results["velocities"] = {}
 
+        # ==== FLEET COORDINATION INTELLIGENCE (Phase 2) ====
+        try:
+            results["defense_status"] = await self.mcp.call(
+                "defense_status", {"node": node_name}
+            )
+        except Exception:
+            results["defense_status"] = {}
+
+        try:
+            results["internal_competition"] = await self.mcp.call(
+                "internal_competition", {"node": node_name}
+            )
+        except Exception:
+            results["internal_competition"] = {}
+
+        try:
+            results["fee_coordination"] = await self.mcp.call(
+                "fee_coordination_status", {"node": node_name}
+            )
+        except Exception:
+            results["fee_coordination"] = {}
+
+        try:
+            results["pheromone_levels"] = await self.mcp.call(
+                "pheromone_levels", {"node": node_name}
+            )
+        except Exception:
+            results["pheromone_levels"] = {}
+
+        # ==== PREDICTIVE INTELLIGENCE (Phase 7.1) ====
+        try:
+            results["anticipatory"] = await self.mcp.call(
+                "anticipatory_predictions", {
+                    "node": node_name,
+                    "min_risk": 0.3,
+                    "hours_ahead": 24
+                }
+            )
+        except Exception:
+            results["anticipatory"] = {}
+
+        try:
+            results["critical_velocity"] = await self.mcp.call(
+                "critical_velocity", {"node": node_name, "threshold_hours": 24}
+            )
+        except Exception:
+            results["critical_velocity"] = {}
+
+        # ==== STRATEGIC POSITIONING (Phase 4) ====
+        try:
+            results["positioning"] = await self.mcp.call(
+                "positioning_summary", {"node": node_name}
+            )
+        except Exception:
+            results["positioning"] = {}
+
+        try:
+            results["yield_summary"] = await self.mcp.call(
+                "yield_summary", {"node": node_name}
+            )
+        except Exception:
+            results["yield_summary"] = {}
+
+        try:
+            results["flow_recommendations"] = await self.mcp.call(
+                "flow_recommendations", {"node": node_name}
+            )
+        except Exception:
+            results["flow_recommendations"] = {}
+
+        # ==== COST REDUCTION (Phase 3) ====
+        try:
+            results["rebalance_recommendations"] = await self.mcp.call(
+                "rebalance_recommendations", {"node": node_name}
+            )
+        except Exception:
+            results["rebalance_recommendations"] = {}
+
+        try:
+            results["circular_flows"] = await self.mcp.call(
+                "circular_flow_status", {"node": node_name}
+            )
+        except Exception:
+            results["circular_flows"] = {}
+
+        # ==== COLLECTIVE WARNINGS ====
+        try:
+            results["ban_candidates"] = await self.mcp.call(
+                "ban_candidates", {"node": node_name}
+            )
+        except Exception:
+            results["ban_candidates"] = {}
+
+        # ==== CHANNEL RATIONALIZATION ====
+        try:
+            results["rationalization"] = await self.mcp.call(
+                "rationalization_summary", {"node": node_name}
+            )
+        except Exception:
+            results["rationalization"] = {}
+
+        try:
+            results["close_recommendations"] = await self.mcp.call(
+                "close_recommendations", {"node": node_name, "our_node_only": True}
+            )
+        except Exception:
+            results["close_recommendations"] = {}
+
+        # ==== COMPETITOR ANALYSIS ====
+        try:
+            results["competitor_analysis"] = await self.mcp.call(
+                "competitor_analysis", {"node": node_name, "top_n": 10}
+            )
+        except Exception:
+            results["competitor_analysis"] = {}
+
         # Calculate summary metrics
         channels = results.get("channels", {}).get("channels", [])
         prof_list = results.get("profitability", {}).get("channels", [])
@@ -490,6 +613,12 @@ class ProactiveAdvisor:
         roc_pct = dashboard.get("annualized_roc_pct", 0)
         bleeders = dashboard.get("bleeder_warnings", [])
 
+        # Enhanced summary with intelligence insights
+        defense = results.get("defense_status", {})
+        competition = results.get("internal_competition", {})
+        anticipatory = results.get("anticipatory", {})
+        positioning = results.get("positioning", {})
+
         return {
             "summary": {
                 "total_capacity_sats": total_capacity,
@@ -499,12 +628,39 @@ class ProactiveAdvisor:
                 "underwater_pct": round(underwater_pct, 2),
                 "profitable_pct": round(profitable_pct, 2),
                 "bleeder_count": len(bleeders),
+                # Intelligence indicators
+                "active_warnings": len(defense.get("warnings", [])),
+                "competition_conflicts": len(competition.get("conflicts", [])),
+                "at_risk_channels": len(anticipatory.get("predictions", [])),
+                "close_recommendations": len(results.get("close_recommendations", {}).get("recommendations", [])),
             },
             "channels": channels,
             "profitability": prof_list,
             "context": results.get("context", {}),
             "velocities": results.get("velocities", {}),
-            "dashboard": dashboard
+            "dashboard": dashboard,
+            # Fleet intelligence
+            "defense_status": defense,
+            "internal_competition": competition,
+            "fee_coordination": results.get("fee_coordination", {}),
+            "pheromone_levels": results.get("pheromone_levels", {}),
+            # Predictive intelligence
+            "anticipatory": anticipatory,
+            "critical_velocity": results.get("critical_velocity", {}),
+            # Strategic positioning
+            "positioning": positioning,
+            "yield_summary": results.get("yield_summary", {}),
+            "flow_recommendations": results.get("flow_recommendations", {}),
+            # Cost reduction
+            "rebalance_recommendations": results.get("rebalance_recommendations", {}),
+            "circular_flows": results.get("circular_flows", {}),
+            # Collective warnings
+            "ban_candidates": results.get("ban_candidates", {}),
+            # Rationalization
+            "rationalization": results.get("rationalization", {}),
+            "close_recommendations": results.get("close_recommendations", {}),
+            # Competitor analysis
+            "competitor_analysis": results.get("competitor_analysis", {}),
         }
 
     async def _check_goals(

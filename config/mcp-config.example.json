@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "hive": {
+      "command": "python3",
+      "args": ["/path/to/cl-hive/tools/mcp-hive-server.py"],
+      "env": {
+        "HIVE_NODES_CONFIG": "/path/to/nodes.json",
+        "ADVISOR_DB_PATH": "/path/to/advisor.db",
+        "HIVE_STRATEGY_DIR": "/path/to/strategy-prompts"
+      }
+    }
+  }
+}

@@ -230,34 +230,51 @@ class HiveFleet:
         self.nodes: Dict[str, NodeConnection] = {}
 
     def load_config(self, config_path: str):
-        """Load node configuration from JSON file."""
+        """Load node configuration from JSON file.
+
+        Supports three configuration styles:
+        1. Global mode="rest" - all nodes use REST API
+        2. Global mode="docker" - all nodes use docker exec
+        3. Per-node mode - each node specifies its own connection type
+
+        Per-node config example:
+        {
+            "nodes": [
+                {"name": "mainnet", "mode": "rest", "rest_url": "...", "rune": "..."},
+                {"name": "docker-node", "mode": "docker", "docker_container": "...", "lightning_dir": "...", "network": "..."}
+            ]
+        }
+        """
         with open(config_path) as f:
             config = json.load(f)
 
-        mode = config.get("mode", "rest")
-        network = config.get("network", "regtest")
-        lightning_dir = config.get("lightning_dir", "/home/clightning/.lightning")
+        global_mode = config.get("mode", "rest")
+        global_network = config.get("network", "regtest")
+        global_lightning_dir = config.get("lightning_dir", "/home/clightning/.lightning")
 
         for node_config in config.get("nodes", []):
-            if mode == "docker":
-                # Docker exec mode (for Polar testing)
+            # Per-node mode overrides global mode
+            node_mode = node_config.get("mode", global_mode)
+
+            if node_mode == "docker":
+                # Docker exec mode
                 node = NodeConnection(
                     name=node_config["name"],
-                    docker_container=node_config["docker_container"],
-                    lightning_dir=lightning_dir,
-                    network=network
+                    docker_container=node_config.get("docker_container"),
+                    lightning_dir=node_config.get("lightning_dir", global_lightning_dir),
+                    network=node_config.get("network", global_network)
                 )
             else:
-                # REST mode (for production)
+                # REST mode (default)
                 node = NodeConnection(
                     name=node_config["name"],
-                    rest_url=node_config["rest_url"],
-                    rune=node_config["rune"],
+                    rest_url=node_config.get("rest_url"),
+                    rune=node_config.get("rune"),
                     ca_cert=node_config.get("ca_cert")
                 )
             self.nodes[node.name] = node
 
-        logger.info(f"Loaded {len(self.nodes)} nodes from config (mode={mode})")
+        logger.info(f"Loaded {len(self.nodes)} nodes from config (global_mode={global_mode})")
 
     async def connect_all(self):
         """Connect to all nodes."""
@@ -693,7 +710,26 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="hive_anticipatory_predictions",
-            description="Get liquidity predictions for all channels at risk. Returns channels with significant depletion or saturation risk, enabling proactive rebalancing before problems occur.",
+            description="""Get liquidity predictions for all channels at risk - key for proactive management.
+
+**When to use:** Include in state analysis to identify channels that will need attention soon, before they become critical.
+
+**Returns channels predicted to:**
+- Deplete (run out of outbound liquidity)
+- Saturate (fill up with inbound)
+
+**For each at-risk channel shows:**
+- Depletion/saturation risk score (0.0-1.0)
+- Hours until predicted problem
+- Recommended preemptive action
+- Confidence level based on historical patterns
+
+**Integration:** advisor_run_cycle automatically gathers this. Use standalone when focusing on specific liquidity concerns.
+
+**Action guidance:**
+- Risk >0.7 + <12h: Urgent rebalancing needed
+- Risk >0.5 + <24h: Queue for review
+- Risk >0.3: Monitor and consider fee adjustments""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1053,7 +1089,22 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
         ),
         Tool(
             name="revenue_competitor_analysis",
-            description="Get competitor fee analysis from hive intelligence. Shows how our fees compare to competitors, market positioning opportunities, and recommended fee adjustments.",
+            description="""Get competitor fee analysis - understand market positioning.
+
+**When to use:** Before adjusting fees on high-volume channels, check competitive landscape.
+
+**Shows for each analyzed peer:**
+- Our fee vs competitor median fee
+- Market position (underpricing, premium, competitive)
+- Fee gap in ppm
+- Recommendation: 'undercut' (we can raise), 'premium' (we're high), 'hold'
+
+**Integration:** advisor_scan_opportunities uses this to identify fee adjustment opportunities.
+
+**Action guidance:**
+- Large positive gap (competitors higher): Opportunity to raise fees
+- Large negative gap (we're higher): May be losing routes, consider reduction
+- Competitive: Hold current fee, focus elsewhere""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1244,7 +1295,23 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
         # =====================================================================
         Tool(
             name="advisor_get_context_brief",
-            description="Get a pre-run context summary with situational awareness. Call this at the START of each run to understand: revenue/capacity trends, velocity alerts, unresolved flags, and recent decisions. This gives you memory across runs.",
+            description="""Get a pre-run context summary with situational awareness and memory across runs.
+
+**When to use:** Call this at the START of every advisory session to establish context before taking any actions.
+
+**Provides:**
+- Revenue and capacity trends over the analysis period
+- Velocity alerts for channels at risk of depletion/saturation
+- Unresolved flags that need attention
+- Recent AI decisions to avoid repeating advice
+- Key performance indicators (KPIs) compared to baseline
+
+**Why this matters:** Without context, you'll repeat the same observations and recommendations. This tool gives you "memory" so you can track progress and identify what's changed since last run.
+
+**Best practice workflow:**
+1. advisor_get_context_brief (understand current state)
+2. advisor_scan_opportunities (see what needs attention)
+3. Take targeted actions based on findings""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1373,7 +1440,28 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
         # =====================================================================
         Tool(
             name="advisor_run_cycle",
-            description="Run one complete proactive advisor cycle. Analyzes state, checks goals, scans opportunities, executes safe actions, queues risky ones, measures outcomes, and plans next cycle. Run every 3 hours for optimal management.",
+            description="""Run one complete proactive advisor cycle with comprehensive intelligence gathering.
+
+**When to use:** Run this every 3 hours or when you need a full analysis with auto-execution of safe actions.
+
+**What it does:**
+1. Records state snapshot for historical tracking
+2. Gathers comprehensive intelligence from ALL available systems:
+   - Core: node info, channels, dashboard, profitability
+   - Fleet coordination: defense warnings, internal competition, fee coordination
+   - Predictive: anticipatory predictions, critical velocity
+   - Strategic: positioning, yield, flow recommendations
+   - Cost reduction: rebalance recommendations, circular flows
+   - Collective warnings: ban candidates, rationalization
+3. Checks goal progress and adjusts strategy
+4. Scans 14 opportunity sources in parallel
+5. Scores opportunities with learning adjustments
+6. Auto-executes safe actions within daily budget
+7. Queues risky actions for approval
+8. Measures outcomes of past decisions (6-24h ago)
+9. Plans priorities for next cycle
+
+**Returns:** Comprehensive cycle result with opportunities found, actions taken, and next priorities.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1481,7 +1569,24 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
         ),
         Tool(
             name="advisor_scan_opportunities",
-            description="Scan for optimization opportunities without executing. Shows what the advisor would do if run_cycle was called.",
+            description="""Scan for optimization opportunities without executing any actions.
+
+**When to use:** Use this for read-only analysis when you want to see what the advisor recommends without taking action.
+
+**Scans 14 data sources in parallel:**
+- Core: velocity alerts, profitability issues, time-based fees, imbalanced channels, config tuning
+- Fleet coordination: defense warnings, internal competition
+- Cost reduction: circular flows, rebalance recommendations
+- Strategic: positioning opportunities, competitor analysis, rationalization
+- Collective warnings: ban candidates
+
+**Returns:**
+- total_opportunities: Count of all opportunities found
+- auto_execute_safe: Count that would be auto-executed
+- queue_for_review: Count needing human review
+- require_approval: Count needing explicit approval
+- opportunities: Top 20 scored opportunities with details
+- state_summary: Current node health metrics""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1675,7 +1780,16 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
         ),
         Tool(
             name="internal_competition",
-            description="Detect internal competition between hive members. Shows where multiple members compete for the same source/destination routes.",
+            description="""Detect internal competition between hive members.
+
+**When to use:** Check before proposing fee changes to avoid counterproductive fee wars with fleet members.
+
+**Shows:**
+- Conflicts where multiple members compete for the same source/destination routes
+- Wasted resources from internal competition
+- Corridor ownership based on routing activity
+
+**Integration:** The advisor_run_cycle automatically checks this when scanning for opportunities. Use standalone when evaluating specific fee decisions.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1692,7 +1806,16 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
         # =======================================================================
         Tool(
             name="coord_fee_recommendation",
-            description="Get coordinated fee recommendation for a channel (Phase 2 Fee Coordination). Combines corridor assignment, pheromone signals, stigmergic markers, and defensive adjustments.",
+            description="""Get coordinated fee recommendation for a channel using fleet-wide intelligence.
+
+**When to use:** Before making any fee change, call this to get the optimal fee that considers:
+- Corridor assignment (who "owns" this route in the fleet)
+- Pheromone signals (learned successful fees from past routing)
+- Stigmergic markers (signals left by other members after routing attempts)
+- Defensive adjustments (if peer has warnings)
+- Balance state (depleting channels need different fees than saturated ones)
+
+**Best practice:** Use this instead of manually calculating fees. It incorporates collective intelligence from the entire hive.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1766,7 +1889,22 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
         ),
         Tool(
             name="defense_status",
-            description="Get mycelium defense system status. Shows active warnings about draining/unreliable peers and defensive fee adjustments.",
+            description="""Get mycelium defense system status - critical for avoiding bad peers.
+
+**When to use:** Check BEFORE recommending any actions involving specific peers. This is part of the pre-cycle intelligence gathering.
+
+**Shows:**
+- Active warnings about draining peers (peers that consistently take liquidity without sending)
+- Unreliable peers (high failure rates, force-close history)
+- Defensive fee adjustments already applied
+- Severity levels: info, warning, high, critical
+
+**Integration:** advisor_run_cycle automatically incorporates this data. Cross-reference with ban_candidates for severe cases.
+
+**Action guidance:**
+- 'info' warnings: Monitor only
+- 'warning' severity: Apply defensive fee policy
+- 'high'/'critical': Consider channel closure or ban proposal""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1849,7 +1987,25 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
         # Phase 3: Cost Reduction tools
         Tool(
             name="rebalance_recommendations",
-            description="Get predictive rebalance recommendations. Uses velocity prediction to identify channels that will need rebalancing soon and recommends proactive actions.",
+            description="""Get predictive rebalance recommendations - proactive vs reactive liquidity management.
+
+**When to use:** Include in analysis to identify channels that will need rebalancing BEFORE they become critical. Cheaper to rebalance proactively than when urgent.
+
+**Uses:**
+- Velocity prediction (flow rate trends)
+- Historical patterns (temporal flow patterns)
+- EV calculation (expected value of rebalancing)
+
+**Returns recommendations with:**
+- Source and destination channels
+- Recommended amount
+- Urgency level (high/medium/low)
+- Expected ROI
+- Confidence score
+
+**Integration:** advisor_run_cycle checks this automatically. Use standalone when focusing on rebalancing strategy.
+
+**Best practice:** Also call fleet_rebalance_path to check if cheaper internal routes exist.""",
             inputSchema={
                 "type": "object",
                 "properties": {

@@ -200,6 +200,13 @@ class OpportunityScanner:
         """
         Scan all data sources and return prioritized opportunities.
 
+        Integrates with full intelligence suite:
+        - Core: velocity, profitability, time-based fees, imbalanced channels
+        - Fleet coordination: defense warnings, internal competition
+        - Cost reduction: circular flows, rebalance recommendations
+        - Strategic: positioning, competitor analysis, rationalization
+        - Collective warnings: ban candidates
+
         Args:
             node_name: Node to scan
             state: Current node state from analyze_node_state()
@@ -211,12 +218,25 @@ class OpportunityScanner:
 
         # Scan each data source in parallel
         results = await asyncio.gather(
+            # Core scanners
             self._scan_velocity_alerts(node_name, state),
             self._scan_profitability(node_name, state),
             self._scan_time_based_fees(node_name, state),
             self._scan_anticipatory_liquidity(node_name, state),
             self._scan_imbalanced_channels(node_name, state),
             self._scan_config_opportunities(node_name, state),
+            # Fleet coordination scanners (Phase 2)
+            self._scan_defense_warnings(node_name, state),
+            self._scan_internal_competition(node_name, state),
+            # Cost reduction scanners (Phase 3)
+            self._scan_circular_flows(node_name, state),
+            self._scan_rebalance_recommendations(node_name, state),
+            # Strategic positioning scanners (Phase 4)
+            self._scan_positioning_opportunities(node_name, state),
+            self._scan_competitor_opportunities(node_name, state),
+            self._scan_rationalization(node_name, state),
+            # Collective warning scanners
+            self._scan_ban_candidates(node_name, state),
             return_exceptions=True
         )
 
@@ -624,6 +644,435 @@ class OpportunityScanner:
 
         # Low confidence = require explicit approval
         return ActionClassification.REQUIRE_APPROVAL
+
+    async def _scan_defense_warnings(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """Scan mycelium defense system for peer warnings."""
+        opportunities = []
+
+        defense = state.get("defense_status", {})
+        warnings = defense.get("warnings", [])
+
+        for warning in warnings:
+            peer_id = warning.get("peer_id")
+            warning_type = warning.get("type", "unknown")
+            severity = warning.get("severity", "low")
+
+            if not peer_id:
+                continue
+
+            # High severity warnings should trigger action
+            if severity in ["high", "critical"]:
+                priority = 0.9 if severity == "critical" else 0.75
+                opp = Opportunity(
+                    opportunity_type=OpportunityType.POLICY_CHANGE,
+                    action_type=ActionType.POLICY_CHANGE,
+                    channel_id=None,
+                    peer_id=peer_id,
+                    node_name=node_name,
+                    priority_score=priority,
+                    confidence_score=0.85,
+                    roi_estimate=0.8,
+                    description=f"Defense warning: {warning_type} for peer {peer_id[:16]}...",
+                    reasoning=f"Mycelium defense flagged peer with {severity} severity: {warning.get('reason', 'N/A')}",
+                    recommended_action="Apply defensive fee policy or consider channel closure",
+                    predicted_benefit=5000,
+                    classification=ActionClassification.QUEUE_FOR_REVIEW,
+                    auto_execute_safe=False,
+                    current_state=warning
+                )
+                opportunities.append(opp)
+
+        return opportunities
+
+    async def _scan_ban_candidates(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """Scan for peers that should be considered for ban proposals."""
+        opportunities = []
+
+        ban_data = state.get("ban_candidates", {})
+        candidates = ban_data.get("candidates", [])
+
+        for candidate in candidates:
+            peer_id = candidate.get("peer_id")
+            warning_count = candidate.get("warning_count", 0)
+            severity = candidate.get("severity", "low")
+            reasons = candidate.get("reasons", [])
+
+            if not peer_id or warning_count < 2:
+                continue
+
+            priority = 0.95 if severity == "critical" else 0.85 if severity == "high" else 0.7
+            opp = Opportunity(
+                opportunity_type=OpportunityType.CHANNEL_CLOSE,
+                action_type=ActionType.FLAG_FOR_REVIEW,
+                channel_id=None,
+                peer_id=peer_id,
+                node_name=node_name,
+                priority_score=priority,
+                confidence_score=min(0.95, 0.5 + warning_count * 0.1),
+                roi_estimate=0.9,
+                description=f"Ban candidate: {peer_id[:16]}... ({warning_count} warnings)",
+                reasoning=f"Collective warning system flagged peer: {', '.join(reasons[:3])}",
+                recommended_action="Propose ban or close channel to this peer",
+                predicted_benefit=10000,
+                classification=ActionClassification.REQUIRE_APPROVAL,
+                auto_execute_safe=False,
+                current_state=candidate
+            )
+            opportunities.append(opp)
+
+        return opportunities
+
+    async def _scan_circular_flows(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """Scan for wasteful circular flow patterns (Phase 3)."""
+        opportunities = []
+
+        circular = state.get("circular_flows", {})
+        detected_flows = circular.get("detected_flows", [])
+
+        for flow in detected_flows:
+            flow_id = flow.get("flow_id", "unknown")
+            cost_sats = flow.get("cost_sats", 0)
+            frequency = flow.get("frequency", 0)
+
+            if cost_sats < 100:  # Ignore tiny flows
+                continue
+
+            priority = min(0.9, 0.5 + cost_sats / 10000)
+            opp = Opportunity(
+                opportunity_type=OpportunityType.CONFIG_TUNING,
+                action_type=ActionType.FEE_CHANGE,
+                channel_id=flow.get("entry_channel"),
+                peer_id=None,
+                node_name=node_name,
+                priority_score=priority,
+                confidence_score=0.8,
+                roi_estimate=cost_sats / 1000,
+                description=f"Circular flow detected: {cost_sats} sats wasted",
+                reasoning=f"Flow pattern {flow_id} burns fees without net movement",
+                recommended_action="Adjust fees to break circular pattern",
+                predicted_benefit=cost_sats,
+                classification=ActionClassification.QUEUE_FOR_REVIEW,
+                auto_execute_safe=False,
+                current_state=flow
+            )
+            opportunities.append(opp)
+
+        return opportunities
+
+    async def _scan_rationalization(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """Scan for redundant channels that should be closed."""
+        opportunities = []
+
+        close_recs = state.get("close_recommendations", {})
+        recommendations = close_recs.get("recommendations", [])
+
+        for rec in recommendations:
+            channel_id = rec.get("channel_id")
+            peer_id = rec.get("peer_id")
+            reason = rec.get("reason", "redundant")
+            our_activity_pct = rec.get("our_activity_pct", 0)
+
+            if not channel_id:
+                continue
+
+            # Only recommend if we have significantly less activity than owner
+            if our_activity_pct > 20:  # We're actively using this channel
+                continue
+
+            opp = Opportunity(
+                opportunity_type=OpportunityType.CHANNEL_CLOSE,
+                action_type=ActionType.CHANNEL_CLOSE,
+                channel_id=channel_id,
+                peer_id=peer_id,
+                node_name=node_name,
+                priority_score=0.6,
+                confidence_score=0.75,
+                roi_estimate=0.5,
+                description=f"Redundant channel {channel_id} - another member owns this route",
+                reasoning=f"Our routing activity is {our_activity_pct:.0f}% of fleet owner. {reason}",
+                recommended_action="Close channel to free capital for better uses",
+                predicted_benefit=rec.get("capacity_sats", 0) // 100,
+                classification=ActionClassification.REQUIRE_APPROVAL,
+                auto_execute_safe=False,
+                current_state=rec
+            )
+            opportunities.append(opp)
+
+        return opportunities
+
+    async def _scan_positioning_opportunities(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """Scan for strategic positioning opportunities (Phase 4)."""
+        opportunities = []
+
+        positioning = state.get("positioning", {})
+
+        # High-value corridors we're not serving
+        corridors = positioning.get("valuable_corridors", [])
+        for corridor in corridors[:5]:  # Top 5 corridors
+            if corridor.get("we_serve"):
+                continue
+
+            score = corridor.get("value_score", 0)
+            if score < 0.3:
+                continue
+
+            opp = Opportunity(
+                opportunity_type=OpportunityType.CHANNEL_OPEN,
+                action_type=ActionType.CHANNEL_OPEN,
+                channel_id=None,
+                peer_id=corridor.get("target_peer"),
+                node_name=node_name,
+                priority_score=min(0.8, score),
+                confidence_score=0.7,
+                roi_estimate=score,
+                description=f"High-value corridor opportunity: {corridor.get('description', 'N/A')}",
+                reasoning=f"Value score {score:.2f} based on volume, margin, and competition",
+                recommended_action=f"Open channel to {corridor.get('target_peer', 'target')[:16]}...",
+                predicted_benefit=int(score * 50000),
+                classification=ActionClassification.REQUIRE_APPROVAL,
+                auto_execute_safe=False,
+                current_state=corridor
+            )
+            opportunities.append(opp)
+
+        # Exchange coverage gaps
+        exchanges = positioning.get("exchange_gaps", [])
+        for exchange in exchanges[:3]:  # Top 3 missing exchanges
+            opp = Opportunity(
+                opportunity_type=OpportunityType.CHANNEL_OPEN,
+                action_type=ActionType.CHANNEL_OPEN,
+                channel_id=None,
+                peer_id=exchange.get("pubkey"),
+                node_name=node_name,
+                priority_score=0.75,
+                confidence_score=0.8,
+                roi_estimate=0.7,
+                description=f"Missing exchange connection: {exchange.get('name', 'Unknown')}",
+                reasoning="Priority exchanges provide critical liquidity paths",
+                recommended_action=f"Open channel to {exchange.get('name', 'exchange')}",
+                predicted_benefit=20000,
+                classification=ActionClassification.REQUIRE_APPROVAL,
+                auto_execute_safe=False,
+                current_state=exchange
+            )
+            opportunities.append(opp)
+
+        # Physarum flow recommendations
+        flow_recs = state.get("flow_recommendations", {})
+        for rec in flow_recs.get("recommendations", []):
+            action = rec.get("action")
+            channel_id = rec.get("channel_id")
+
+            if action == "atrophy":
+                opp = Opportunity(
+                    opportunity_type=OpportunityType.CHANNEL_CLOSE,
+                    action_type=ActionType.CHANNEL_CLOSE,
+                    channel_id=channel_id,
+                    peer_id=rec.get("peer_id"),
+                    node_name=node_name,
+                    priority_score=0.55,
+                    confidence_score=0.7,
+                    roi_estimate=0.4,
+                    description=f"Low-flow channel {channel_id} - atrophy recommended",
+                    reasoning=f"Flow intensity {rec.get('flow_intensity', 0):.4f} below threshold",
+                    recommended_action="Close channel to free capital",
+                    predicted_benefit=rec.get("capacity_sats", 0) // 100,
+                    classification=ActionClassification.REQUIRE_APPROVAL,
+                    auto_execute_safe=False,
+                    current_state=rec
+                )
+                opportunities.append(opp)
+
+            elif action == "stimulate":
+                opp = Opportunity(
+                    opportunity_type=OpportunityType.STAGNANT_CHANNEL,
+                    action_type=ActionType.FEE_CHANGE,
+                    channel_id=channel_id,
+                    peer_id=rec.get("peer_id"),
+                    node_name=node_name,
+                    priority_score=0.5,
+                    confidence_score=0.75,
+                    roi_estimate=0.5,
+                    description=f"Young channel {channel_id} needs stimulation",
+                    reasoning="New channel with low flow - reduce fees to attract traffic",
+                    recommended_action="Lower fees to stimulate flow",
+                    predicted_benefit=1000,
+                    classification=ActionClassification.AUTO_EXECUTE,
+                    auto_execute_safe=True,
+                    current_state=rec
+                )
+                opportunities.append(opp)
+
+        return opportunities
+
+    async def _scan_competitor_opportunities(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """Scan for competitive positioning opportunities."""
+        opportunities = []
+
+        competitor_data = state.get("competitor_analysis", {})
+        analysis = competitor_data.get("analysis", [])
+
+        for peer_analysis in analysis:
+            peer_id = peer_analysis.get("peer_id")
+            our_fee = peer_analysis.get("our_fee_ppm", 0)
+            competitor_fee = peer_analysis.get("competitor_median_fee", 0)
+            recommendation = peer_analysis.get("recommendation", "hold")
+
+            if not peer_id or not our_fee:
+                continue
+
+            if recommendation == "undercut" and competitor_fee > our_fee:
+                # We could raise fees closer to competitors
+                fee_gap = competitor_fee - our_fee
+                if fee_gap > 50:
+                    opp = Opportunity(
+                        opportunity_type=OpportunityType.COMPETITOR_UNDERCUT,
+                        action_type=ActionType.FEE_CHANGE,
+                        channel_id=peer_analysis.get("channel_id"),
+                        peer_id=peer_id,
+                        node_name=node_name,
+                        priority_score=0.6,
+                        confidence_score=0.7,
+                        roi_estimate=fee_gap / our_fee if our_fee > 0 else 0.5,
+                        description=f"Fee increase opportunity: {fee_gap} ppm gap to competitors",
+                        reasoning=f"Our fee {our_fee} ppm vs competitor median {competitor_fee} ppm",
+                        recommended_action=f"Increase fee to capture more margin (suggest: {min(our_fee + fee_gap // 2, competitor_fee - 20)} ppm)",
+                        predicted_benefit=int(fee_gap * 10),
+                        classification=ActionClassification.QUEUE_FOR_REVIEW,
+                        auto_execute_safe=False,
+                        current_state=peer_analysis
+                    )
+                    opportunities.append(opp)
+
+            elif recommendation == "premium" and our_fee > competitor_fee * 1.5:
+                # We're charging too much relative to competitors
+                opp = Opportunity(
+                    opportunity_type=OpportunityType.COMPETITOR_UNDERCUT,
+                    action_type=ActionType.FEE_CHANGE,
+                    channel_id=peer_analysis.get("channel_id"),
+                    peer_id=peer_id,
+                    node_name=node_name,
+                    priority_score=0.55,
+                    confidence_score=0.65,
+                    roi_estimate=0.4,
+                    description=f"Fee potentially too high: {our_fee} vs market {competitor_fee}",
+                    reasoning="May be pricing ourselves out of routes",
+                    recommended_action=f"Consider reducing fee closer to {competitor_fee} ppm",
+                    predicted_benefit=500,
+                    classification=ActionClassification.QUEUE_FOR_REVIEW,
+                    auto_execute_safe=False,
+                    current_state=peer_analysis
+                )
+                opportunities.append(opp)
+
+        return opportunities
+
+    async def _scan_internal_competition(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """Scan for internal fleet competition issues."""
+        opportunities = []
+
+        competition = state.get("internal_competition", {})
+        conflicts = competition.get("conflicts", [])
+
+        for conflict in conflicts:
+            channel_id = conflict.get("our_channel_id")
+            peer_id = conflict.get("peer_id")
+            competing_member = conflict.get("competing_member")
+
+            if not channel_id:
+                continue
+
+            opp = Opportunity(
+                opportunity_type=OpportunityType.CONFIG_TUNING,
+                action_type=ActionType.FEE_CHANGE,
+                channel_id=channel_id,
+                peer_id=peer_id,
+                node_name=node_name,
+                priority_score=0.5,
+                confidence_score=0.7,
+                roi_estimate=0.3,
+                description=f"Internal competition with {competing_member[:16] if competing_member else 'fleet member'}...",
+                reasoning="Multiple hive members competing for same route wastes collective resources",
+                recommended_action="Coordinate fees with fleet member or defer to corridor owner",
+                predicted_benefit=1000,
+                classification=ActionClassification.QUEUE_FOR_REVIEW,
+                auto_execute_safe=False,
+                current_state=conflict
+            )
+            opportunities.append(opp)
+
+        return opportunities
+
+    async def _scan_rebalance_recommendations(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """Scan predictive rebalance recommendations (Phase 3)."""
+        opportunities = []
+
+        rebal_data = state.get("rebalance_recommendations", {})
+        recommendations = rebal_data.get("recommendations", [])
+
+        for rec in recommendations:
+            from_channel = rec.get("from_channel")
+            to_channel = rec.get("to_channel")
+            amount_sats = rec.get("amount_sats", 0)
+            urgency = rec.get("urgency", "low")
+            reason = rec.get("reason", "")
+
+            if not from_channel or not to_channel or amount_sats < 10000:
+                continue
+
+            priority = 0.8 if urgency == "high" else 0.65 if urgency == "medium" else 0.5
+            opp = Opportunity(
+                opportunity_type=OpportunityType.PREEMPTIVE_REBALANCE,
+                action_type=ActionType.REBALANCE,
+                channel_id=to_channel,
+                peer_id=None,
+                node_name=node_name,
+                priority_score=priority,
+                confidence_score=rec.get("confidence", 0.7),
+                roi_estimate=rec.get("expected_roi", 0.5),
+                description=f"Proactive rebalance: {amount_sats:,} sats to {to_channel}",
+                reasoning=reason or f"Predictive analysis suggests rebalancing with {urgency} urgency",
+                recommended_action=f"Rebalance {amount_sats:,} sats from {from_channel} to {to_channel}",
+                predicted_benefit=int(amount_sats * 0.01),
+                classification=ActionClassification.QUEUE_FOR_REVIEW,
+                auto_execute_safe=False,
+                current_state=rec
+            )
+            opportunities.append(opp)
+
+        return opportunities
 
     def filter_safe_opportunities(
         self,
