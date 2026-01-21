@@ -121,6 +121,10 @@ def mock_config():
     cfg.expansion_pause_threshold = 3  # Pause after 3 consecutive rejections
     cfg.planner_safety_reserve_sats = 500_000  # 500k sats safety reserve
     cfg.planner_fee_buffer_sats = 100_000  # 100k sats for on-chain fees
+    # Budget constraints (ensures proposals are within executable limits)
+    cfg.failsafe_budget_per_day = 2_000_000  # 2M sats daily budget
+    cfg.budget_reserve_pct = 0.20  # 20% reserve
+    cfg.budget_max_per_channel_pct = 0.50  # 50% of daily budget per channel (= 1M)
     return cfg
 
 
@@ -918,6 +922,10 @@ class TestPlannerGovernanceIntegration:
         mock_plugin.rpc.listfunds.return_value = {
             'outputs': [{'status': 'confirmed', 'amount_msat': 10000000000}]
         }
+        # Mock budget check to allow channel opens (needs to be > min_channel_sats after per-channel limit)
+        # With default budget_max_per_channel_pct=0.5, we need daily budget of 2M to get 1M per-channel limit
+        mock_database.get_available_budget.return_value = 2_000_000
+        mock_config.failsafe_budget_per_day = 2_000_000  # Results in max_per_channel = 1M
 
         from modules.planner import UnderservedResult
         with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:
@@ -976,6 +984,10 @@ class TestPlannerGovernanceIntegration:
         mock_plugin.rpc.listfunds.return_value = {
             'outputs': [{'status': 'confirmed', 'amount_msat': 10000000000}]
         }
+        # Mock budget check to allow channel opens (needs to be > min_channel_sats after per-channel limit)
+        # With default budget_max_per_channel_pct=0.5, we need daily budget of 2M to get 1M per-channel limit
+        mock_database.get_available_budget.return_value = 2_000_000
+        mock_config.failsafe_budget_per_day = 2_000_000  # Results in max_per_channel = 1M
 
         from modules.planner import UnderservedResult
         with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:

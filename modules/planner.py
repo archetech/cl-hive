@@ -1972,6 +1972,33 @@ class Planner:
                 max_size = getattr(cfg, 'planner_max_channel_sats', 50_000_000)
                 market_share_cap = getattr(cfg, 'market_share_cap_pct', 0.20)
 
+                # Calculate available budget using same logic as approval
+                # This ensures we only propose what can actually be executed
+                daily_budget = getattr(cfg, 'failsafe_budget_per_day', 1_000_000)
+                budget_reserve_pct = getattr(cfg, 'budget_reserve_pct', 0.20)
+                budget_max_per_channel_pct = getattr(cfg, 'budget_max_per_channel_pct', 0.50)
+
+                daily_remaining = self.db.get_available_budget(daily_budget)
+                spendable_onchain = int(onchain_balance * (1.0 - budget_reserve_pct))
+                max_per_channel = int(daily_budget * budget_max_per_channel_pct)
+
+                available_budget = min(daily_remaining, spendable_onchain, max_per_channel)
+
+                # Skip proposal if budget is insufficient for minimum channel
+                if available_budget < min_channel_size:
+                    self._log(
+                        f"Skipping expansion to {selected_target.target[:16]}... - "
+                        f"insufficient budget ({available_budget:,} < {min_channel_size:,} min). "
+                        f"daily_remaining={daily_remaining:,}, spendable={spendable_onchain:,}, "
+                        f"max_per_channel={max_per_channel:,}",
+                        level='info'
+                    )
+                    decisions[-1]['action'] = 'expansion_skipped'
+                    decisions[-1]['reason'] = 'insufficient_budget'
+                    decisions[-1]['available_budget'] = available_budget
+                    decisions[-1]['min_channel_sats'] = min_channel_size
+                    return decisions
+
                 # Get target's channel count for routing potential calculation
                 target_channel_count = self._get_target_channel_count(selected_target.target)
                 avg_fee_rate = self._get_avg_fee_rate()
@@ -1993,6 +2020,8 @@ class Planner:
                     quality_score=selected_target.quality_score,
                     quality_confidence=selected_target.quality_confidence,
                     quality_recommendation=selected_target.quality_recommendation,
+                    # Pass budget constraint so sizer can cap appropriately
+                    available_budget_sats=available_budget,
                 )
 
                 proposed_size = sizing_result.recommended_size_sats
