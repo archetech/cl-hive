@@ -1474,6 +1474,21 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         Tool(
+            name="advisor_run_cycle_all",
+            description="""Run proactive advisor cycle on ALL nodes in the fleet in parallel.
+
+**When to use:** For fleet-wide advisory reports. Runs advisor_run_cycle on every configured node simultaneously.
+
+**Returns:** Combined results from all nodes with:
+- Per-node cycle results
+- Fleet-wide summary (total opportunities, actions, etc.)
+- Aggregated health metrics""",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        Tool(
             name="advisor_get_goals",
             description="Get current advisor goals and progress. Shows what the advisor is optimizing for and whether it's on track.",
             inputSchema={
@@ -2551,6 +2566,8 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
         # Proactive Advisor tools
         elif name == "advisor_run_cycle":
             result = await handle_advisor_run_cycle(arguments)
+        elif name == "advisor_run_cycle_all":
+            result = await handle_advisor_run_cycle_all(arguments)
         elif name == "advisor_get_goals":
             result = await handle_advisor_get_goals(arguments)
         elif name == "advisor_set_goal":
@@ -4841,6 +4858,77 @@ async def handle_advisor_run_cycle(args: Dict) -> Dict:
     except Exception as e:
         logger.exception("Error running advisor cycle")
         return {"error": f"Failed to run cycle: {str(e)}"}
+
+
+async def handle_advisor_run_cycle_all(args: Dict) -> Dict:
+    """Run proactive advisor cycle on ALL nodes in the fleet in parallel."""
+    advisor = _get_proactive_advisor()
+    if not advisor:
+        return {"error": "Proactive advisor modules not available"}
+
+    # Get all node names
+    node_names = list(fleet.nodes.keys())
+    if not node_names:
+        return {"error": "No nodes configured in fleet"}
+
+    # Run cycles in parallel
+    async def run_node_cycle(node_name: str) -> Dict:
+        try:
+            result = await advisor.run_cycle(node_name)
+            return {"node": node_name, "success": True, "result": result.to_dict()}
+        except Exception as e:
+            logger.exception(f"Error running advisor cycle on {node_name}")
+            return {"node": node_name, "success": False, "error": str(e)}
+
+    results = await asyncio.gather(*[run_node_cycle(name) for name in node_names])
+
+    # Aggregate results
+    successful = [r for r in results if r.get("success")]
+    failed = [r for r in results if not r.get("success")]
+
+    # Calculate fleet-wide summary
+    total_opportunities = sum(
+        r.get("result", {}).get("opportunities_found", 0) for r in successful
+    )
+    total_auto_executed = sum(
+        r.get("result", {}).get("auto_executed_count", 0) for r in successful
+    )
+    total_queued = sum(
+        r.get("result", {}).get("queued_count", 0) for r in successful
+    )
+    total_channels = sum(
+        r.get("result", {}).get("node_state_summary", {}).get("channel_count", 0)
+        for r in successful
+    )
+
+    # Collect all strategy adjustments
+    all_adjustments = []
+    for r in successful:
+        node = r.get("node")
+        adjustments = r.get("result", {}).get("strategy_adjustments", [])
+        for adj in adjustments:
+            all_adjustments.append(f"[{node}] {adj}")
+
+    # Collect opportunities by type across fleet
+    fleet_opportunities = {}
+    for r in successful:
+        for opp_type, count in r.get("result", {}).get("opportunities_by_type", {}).items():
+            fleet_opportunities[opp_type] = fleet_opportunities.get(opp_type, 0) + count
+
+    return {
+        "fleet_summary": {
+            "nodes_processed": len(successful),
+            "nodes_failed": len(failed),
+            "total_channels": total_channels,
+            "total_opportunities": total_opportunities,
+            "total_auto_executed": total_auto_executed,
+            "total_queued": total_queued,
+            "opportunities_by_type": fleet_opportunities,
+            "strategy_adjustments": all_adjustments
+        },
+        "node_results": results,
+        "failed_nodes": [r.get("node") for r in failed] if failed else []
+    }
 
 
 async def handle_advisor_get_goals(args: Dict) -> Dict:
