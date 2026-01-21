@@ -7816,6 +7816,58 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
     }
 
 
+@plugin.method("hive-remove-member")
+def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"):
+    """
+    Remove a member from the hive (admin maintenance).
+
+    Use this to clean up stale/orphaned member entries, such as when a node's
+    database was reset and needs to rejoin fresh.
+
+    Args:
+        peer_id: Public key of the member to remove
+        reason: Reason for removal (default: "maintenance")
+
+    Returns:
+        Dict with removal status.
+
+    Permission: Member only (cannot remove yourself - use hive-leave)
+    """
+    if not database or not our_pubkey:
+        return {"error": "Hive not initialized"}
+
+    # Permission check: must be a member
+    perm_error = _check_permission('member')
+    if perm_error:
+        return perm_error
+
+    # Cannot remove yourself - use hive-leave
+    if peer_id == our_pubkey:
+        return {"error": "cannot_remove_self", "message": "Use hive-leave to remove yourself"}
+
+    # Check if target is a member
+    member = database.get_member(peer_id)
+    if not member:
+        return {"error": "peer_not_found", "peer_id": peer_id}
+
+    target_tier = member.get("tier")
+
+    # Remove the member
+    success = database.remove_member(peer_id)
+    if not success:
+        return {"error": "removal_failed", "peer_id": peer_id}
+
+    plugin.log(f"cl-hive: Removed member {peer_id[:16]}... ({target_tier}): {reason}")
+
+    return {
+        "status": "removed",
+        "peer_id": peer_id,
+        "former_tier": target_tier,
+        "reason": reason,
+        "message": f"Member removed. They can rejoin with a new invite ticket."
+    }
+
+
 @plugin.method("hive-propose-ban")
 def hive_propose_ban(plugin: Plugin, peer_id: str, reason: str = "no reason given"):
     """
