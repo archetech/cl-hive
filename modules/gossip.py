@@ -90,15 +90,28 @@ class GossipManager:
         self.state_manager = state_manager
         self.plugin = plugin
         self.heartbeat_interval = heartbeat_interval
-        
+
         # Track our last broadcast state
         self._last_broadcast_state = GossipState()
-        
+
         # Track when we last sent gossip to each peer
         self._peer_gossip_times: Dict[str, int] = {}
-        
+
         # Set of peers we've received gossip from (for connectivity tracking)
         self._active_peers: Set[str] = set()
+
+    def sync_version_from_state_manager(self, our_pubkey: str) -> None:
+        """
+        Sync the broadcast version from persisted state manager data.
+
+        Call this after initialization once our_pubkey is known, to restore
+        the version number after a restart.
+        """
+        our_state = self.state_manager.get_peer_state(our_pubkey)
+        if our_state and our_state.version > self._last_broadcast_state.version:
+            old_version = self._last_broadcast_state.version
+            self._last_broadcast_state.version = our_state.version
+            self._log(f"Synced version from state manager: v{old_version} -> v{our_state.version}")
     
     def _log(self, msg: str, level: str = "info") -> None:
         """Log a message if plugin is available."""

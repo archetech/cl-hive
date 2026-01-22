@@ -955,6 +955,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize intent manager (Phase 3)
     # Get our pubkey for tie-breaker logic
     our_pubkey = safe_plugin.rpc.getinfo()['id']
+
+    # Sync gossip version from persisted state to avoid version reset on restart
+    gossip_mgr.sync_version_from_state_manager(our_pubkey)
+
     intent_mgr = IntentManager(
         database,
         safe_plugin,
