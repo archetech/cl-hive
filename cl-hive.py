@@ -319,6 +319,86 @@ FEE_BROADCAST_MIN_SATS = 10  # Minimum cumulative fee change to trigger broadcas
 FEE_BROADCAST_MIN_INTERVAL = 30  # Minimum seconds between broadcasts
 
 
+def _load_fee_tracking_state() -> None:
+    """
+    Load persisted fee tracking state from database on startup.
+
+    This prevents loss of accumulated fees when the plugin restarts.
+    """
+    global _local_fees_earned_sats, _local_fees_forward_count
+    global _local_fees_period_start, _local_fees_last_broadcast
+    global _local_fees_last_broadcast_amount
+
+    if not database:
+        return
+
+    saved = database.load_local_fee_tracking()
+    if not saved:
+        return
+
+    now = int(time.time())
+
+    # Check if saved state is from the current settlement period
+    # (Weekly periods aligned to Monday 00:00 UTC)
+    from datetime import datetime, timezone
+    dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    days_since_monday = dt.weekday()
+    current_week_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    current_week_start = int(current_week_start.timestamp() - (days_since_monday * 86400))
+
+    saved_period_start = saved.get("period_start_ts", 0)
+
+    with _local_fees_lock:
+        if saved_period_start >= current_week_start:
+            # Same settlement period - restore the state
+            _local_fees_earned_sats = saved.get("earned_sats", 0)
+            _local_fees_forward_count = saved.get("forward_count", 0)
+            _local_fees_period_start = saved_period_start
+            _local_fees_last_broadcast = saved.get("last_broadcast_ts", 0)
+            _local_fees_last_broadcast_amount = saved.get("last_broadcast_amount", 0)
+
+            if safe_plugin:
+                safe_plugin.log(
+                    f"cl-hive: Restored fee tracking - {_local_fees_earned_sats} sats, "
+                    f"{_local_fees_forward_count} forwards from period {saved_period_start}",
+                    level="info"
+                )
+        else:
+            # New settlement period - start fresh but log the old data
+            if safe_plugin:
+                safe_plugin.log(
+                    f"cl-hive: Fee tracking from previous period "
+                    f"({saved.get('earned_sats', 0)} sats) - starting new period",
+                    level="info"
+                )
+
+
+def _save_fee_tracking_state() -> None:
+    """
+    Persist current fee tracking state to database.
+
+    Called after every fee update to prevent loss on crash.
+    """
+    if not database:
+        return
+
+    # Read under lock but save outside to minimize lock time
+    with _local_fees_lock:
+        earned = _local_fees_earned_sats
+        count = _local_fees_forward_count
+        period_start = _local_fees_period_start
+        last_broadcast = _local_fees_last_broadcast
+        last_amount = _local_fees_last_broadcast_amount
+
+    database.save_local_fee_tracking(
+        earned_sats=earned,
+        forward_count=count,
+        period_start_ts=period_start,
+        last_broadcast_ts=last_broadcast,
+        last_broadcast_amount=last_amount
+    )
+
+
 # =============================================================================
 # RATE LIMITER (Security Enhancement)
 # =============================================================================
@@ -1106,6 +1186,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     gossip_thread.start()
     plugin.log("cl-hive: Gossip thread started")
+
+    # Load persisted fee tracking state (Settlement Phase)
+    _load_fee_tracking_state()
+    plugin.log("cl-hive: Fee tracking state loaded")
 
     # Initialize Liquidity Coordinator (Phase 7.3 - Cooperative Rebalancing)
     global liquidity_coord
@@ -2409,6 +2493,8 @@ def _update_and_broadcast_fees(new_fee_sats: int):
                     f"(need {FEE_BROADCAST_MIN_INTERVAL})",
                     level="debug"
                 )
+            # Still save updated totals for persistence across restarts
+            _save_fee_tracking_state()
             return
 
         # Capture values for broadcast
@@ -2426,6 +2512,9 @@ def _update_and_broadcast_fees(new_fee_sats: int):
             level="info"
         )
     _broadcast_fee_report(fees_to_broadcast, forwards_to_broadcast, period_start, now)
+
+    # Save state after broadcast (captures last_broadcast values updated in the lock)
+    _save_fee_tracking_state()
 
 
 def _broadcast_fee_report(fees_earned: int, forward_count: int,

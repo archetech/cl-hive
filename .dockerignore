@@ -21,3 +21,4 @@ vendor/cl-revenue-ops/.venv
 vendor/cl-revenue-ops/__pycache__
 vendor/cl-revenue-ops/tests
 vendor/cl-revenue-ops/*.md
+docker/backups/

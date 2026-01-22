@@ -18,7 +18,7 @@ import os
 import time
 import json
 import threading
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 
 
@@ -240,6 +240,42 @@ class HiveDatabase:
                 voted_at INTEGER NOT NULL,
                 signature TEXT NOT NULL,
                 PRIMARY KEY (proposal_id, voter_peer_id)
+            )
+        """)
+
+        # =====================================================================
+        # LOCAL FEE TRACKING TABLE (Settlement Phase)
+        # =====================================================================
+        # Persists fee tracking state across restarts to prevent revenue loss
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS local_fee_tracking (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                earned_sats INTEGER NOT NULL DEFAULT 0,
+                forward_count INTEGER NOT NULL DEFAULT 0,
+                period_start_ts INTEGER NOT NULL DEFAULT 0,
+                last_broadcast_ts INTEGER NOT NULL DEFAULT 0,
+                last_broadcast_amount INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+        # =====================================================================
+        # CONTRIBUTION RATE LIMITS TABLE
+        # =====================================================================
+        # Persists rate limit state across restarts to prevent bypass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS contribution_rate_limits (
+                peer_id TEXT PRIMARY KEY,
+                window_start INTEGER NOT NULL,
+                event_count INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS contribution_daily_stats (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                window_start_ts INTEGER NOT NULL DEFAULT 0,
+                event_count INTEGER NOT NULL DEFAULT 0
             )
         """)
 
@@ -4170,5 +4206,181 @@ class HiveDatabase:
             """, (channel_id,))
         else:
             result = conn.execute("DELETE FROM temporal_patterns")
+
+        return result.rowcount
+
+    # =========================================================================
+    # LOCAL FEE TRACKING OPERATIONS
+    # =========================================================================
+
+    def save_local_fee_tracking(self, earned_sats: int, forward_count: int,
+                                 period_start_ts: int, last_broadcast_ts: int,
+                                 last_broadcast_amount: int) -> bool:
+        """
+        Persist local fee tracking state to survive restarts.
+
+        Args:
+            earned_sats: Total fees earned in current period
+            forward_count: Number of forwards in current period
+            period_start_ts: Period start timestamp
+            last_broadcast_ts: Timestamp of last fee broadcast
+            last_broadcast_amount: Fees at last broadcast
+
+        Returns:
+            True if saved successfully
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO local_fee_tracking
+                (id, earned_sats, forward_count, period_start_ts,
+                 last_broadcast_ts, last_broadcast_amount, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?)
+            """, (earned_sats, forward_count, period_start_ts,
+                  last_broadcast_ts, last_broadcast_amount, now))
+            return True
+        except Exception:
+            return False
+
+    def load_local_fee_tracking(self) -> Optional[Dict[str, int]]:
+        """
+        Load persisted fee tracking state.
+
+        Returns:
+            Dict with earned_sats, forward_count, period_start_ts,
+            last_broadcast_ts, last_broadcast_amount, or None if not found
+        """
+        conn = self._get_connection()
+
+        row = conn.execute("""
+            SELECT earned_sats, forward_count, period_start_ts,
+                   last_broadcast_ts, last_broadcast_amount
+            FROM local_fee_tracking WHERE id = 1
+        """).fetchone()
+
+        if not row:
+            return None
+
+        return {
+            "earned_sats": row["earned_sats"],
+            "forward_count": row["forward_count"],
+            "period_start_ts": row["period_start_ts"],
+            "last_broadcast_ts": row["last_broadcast_ts"],
+            "last_broadcast_amount": row["last_broadcast_amount"]
+        }
+
+    # =========================================================================
+    # CONTRIBUTION RATE LIMIT OPERATIONS
+    # =========================================================================
+
+    def save_contribution_rate_limit(self, peer_id: str, window_start: int,
+                                      event_count: int) -> bool:
+        """
+        Persist per-peer contribution rate limit state.
+
+        Args:
+            peer_id: Peer's public key
+            window_start: Window start timestamp
+            event_count: Events in current window
+
+        Returns:
+            True if saved successfully
+        """
+        conn = self._get_connection()
+
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO contribution_rate_limits
+                (peer_id, window_start, event_count)
+                VALUES (?, ?, ?)
+            """, (peer_id, window_start, event_count))
+            return True
+        except Exception:
+            return False
+
+    def load_contribution_rate_limits(self) -> Dict[str, Tuple[int, int]]:
+        """
+        Load all persisted contribution rate limits.
+
+        Returns:
+            Dict mapping peer_id to (window_start, event_count)
+        """
+        conn = self._get_connection()
+
+        rows = conn.execute("""
+            SELECT peer_id, window_start, event_count
+            FROM contribution_rate_limits
+        """).fetchall()
+
+        return {
+            row["peer_id"]: (row["window_start"], row["event_count"])
+            for row in rows
+        }
+
+    def save_contribution_daily_stats(self, window_start_ts: int,
+                                       event_count: int) -> bool:
+        """
+        Persist global daily contribution stats.
+
+        Args:
+            window_start_ts: Daily window start timestamp
+            event_count: Total events in current window
+
+        Returns:
+            True if saved successfully
+        """
+        conn = self._get_connection()
+
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO contribution_daily_stats
+                (id, window_start_ts, event_count)
+                VALUES (1, ?, ?)
+            """, (window_start_ts, event_count))
+            return True
+        except Exception:
+            return False
+
+    def load_contribution_daily_stats(self) -> Optional[Dict[str, int]]:
+        """
+        Load persisted global daily contribution stats.
+
+        Returns:
+            Dict with window_start_ts and event_count, or None if not found
+        """
+        conn = self._get_connection()
+
+        row = conn.execute("""
+            SELECT window_start_ts, event_count
+            FROM contribution_daily_stats WHERE id = 1
+        """).fetchone()
+
+        if not row:
+            return None
+
+        return {
+            "window_start_ts": row["window_start_ts"],
+            "event_count": row["event_count"]
+        }
+
+    def cleanup_old_rate_limits(self, max_age_seconds: int = 86400) -> int:
+        """
+        Clean up rate limit entries older than max_age_seconds.
+
+        Args:
+            max_age_seconds: Maximum age before cleanup (default 24h)
+
+        Returns:
+            Number of entries removed
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - max_age_seconds
+
+        result = conn.execute("""
+            DELETE FROM contribution_rate_limits
+            WHERE window_start < ?
+        """, (cutoff,))
 
         return result.rowcount

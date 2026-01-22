@@ -34,9 +34,45 @@ class ContributionManager:
         self._daily_count = 0
         self._daily_window_start = int(time.time())
 
+        # Load persisted rate limit state from database
+        self._load_persisted_state()
+
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
             self.plugin.log(f"[Contribution] {msg}", level=level)
+
+    def _load_persisted_state(self) -> None:
+        """Load persisted rate limit state from database on startup."""
+        if not self.db:
+            return
+
+        now = int(time.time())
+
+        # Load per-peer rate limits
+        try:
+            saved_limits = self.db.load_contribution_rate_limits()
+            if saved_limits:
+                # Filter out stale entries (older than 1 hour)
+                for peer_id, (window_start, count) in saved_limits.items():
+                    if now - window_start < 3600:
+                        self._rate_limits[peer_id] = (window_start, count)
+                self._log(f"Loaded {len(self._rate_limits)} rate limit entries from database")
+        except Exception as exc:
+            self._log(f"Failed to load rate limits: {exc}", level="warn")
+
+        # Load global daily stats
+        try:
+            daily_stats = self.db.load_contribution_daily_stats()
+            if daily_stats:
+                saved_window = daily_stats.get("window_start_ts", 0)
+                saved_count = daily_stats.get("event_count", 0)
+                # Only restore if within current 24h window
+                if now - saved_window < 86400:
+                    self._daily_window_start = saved_window
+                    self._daily_count = saved_count
+                    self._log(f"Loaded daily stats: {saved_count} events since {saved_window}")
+        except Exception as exc:
+            self._log(f"Failed to load daily stats: {exc}", level="warn")
 
     def _parse_msat(self, value: Any) -> Optional[int]:
         if isinstance(value, int):
@@ -93,6 +129,15 @@ class ContributionManager:
         if self._daily_count >= MAX_CONTRIB_EVENTS_PER_DAY_TOTAL:
             return False
         self._daily_count += 1
+
+        # Persist updated daily stats
+        if self.db:
+            try:
+                self.db.save_contribution_daily_stats(
+                    self._daily_window_start, self._daily_count
+                )
+            except Exception:
+                pass  # Non-critical, don't spam logs
         return True
 
     def _allow_record(self, peer_id: str) -> bool:
@@ -108,7 +153,15 @@ class ContributionManager:
             count = 0
         if count >= MAX_CONTRIB_EVENTS_PER_PEER_PER_HOUR:
             return False
-        self._rate_limits[peer_id] = (window_start, count + 1)
+        new_count = count + 1
+        self._rate_limits[peer_id] = (window_start, new_count)
+
+        # Persist updated rate limit
+        if self.db:
+            try:
+                self.db.save_contribution_rate_limit(peer_id, window_start, new_count)
+            except Exception:
+                pass  # Non-critical, don't spam logs
         return True
 
     def handle_forward_event(self, payload: Dict[str, Any]) -> None:
