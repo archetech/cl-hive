@@ -187,80 +187,55 @@ balance = fair_share - fees_earned
 
 Three-node hive scenario:
 
-| Node | Capacity | Uptime | Fees Earned |
-|------|----------|--------|-------------|
-| Alice | 4M sats | 95% | 300 sats |
-| Bob | 6M sats | 80% | 100 sats |
-| Carol | 2M sats | 99% | 200 sats |
+| Node | Capacity | Uptime | Forwards | Fees Earned |
+|------|----------|--------|----------|-------------|
+| Alice | 4M sats | 95% | 100K sats | 100 sats |
+| Bob | 6M sats | 80% | 50K sats | 400 sats |
+| Carol | 2M sats | 99% | 150K sats | 100 sats |
 
-**Total Fees: 600 sats**
+**Totals: 12M capacity, 300K forwards, 600 sats fees**
 
 **Score Calculations:**
 
 ```
 Alice:
   capacity_score = 4M / 12M = 0.333
-  forwards_score = 0.5 (assume from contribution data)
+  forwards_score = 100K / 300K = 0.333
   uptime_score = 0.95
-  weighted = 0.40×0.333 + 0.40×0.5 + 0.20×0.95 = 0.523
+  weighted = 0.30×0.333 + 0.60×0.333 + 0.10×0.95 = 0.395
 
 Bob:
   capacity_score = 6M / 12M = 0.5
-  forwards_score = 0.167
+  forwards_score = 50K / 300K = 0.167
   uptime_score = 0.80
-  weighted = 0.40×0.5 + 0.40×0.167 + 0.20×0.80 = 0.427
+  weighted = 0.30×0.5 + 0.60×0.167 + 0.10×0.80 = 0.330
 
 Carol:
   capacity_score = 2M / 12M = 0.167
-  forwards_score = 0.333
+  forwards_score = 150K / 300K = 0.5
   uptime_score = 0.99
-  weighted = 0.40×0.167 + 0.40×0.333 + 0.20×0.99 = 0.398
+  weighted = 0.30×0.167 + 0.60×0.5 + 0.10×0.99 = 0.449
 ```
 
 **Fair Shares:**
 
 ```
-Alice fair_share = 600 × 0.523 = 314 sats
-Bob fair_share = 600 × 0.427 = 256 sats
-Carol fair_share = 600 × 0.398 = 239 sats
+Alice fair_share = 600 × 0.337 = 202 sats
+Bob fair_share = 600 × 0.281 = 169 sats
+Carol fair_share = 600 × 0.382 = 229 sats
 ```
 
 **Balances:**
 
 ```
-Alice: 314 - 300 = +14 sats (owed 14)
-Bob: 256 - 100 = +156 sats (owed 156)
-Carol: 239 - 200 = +39 sats (owed 39)
-
-Wait - everyone is owed money? That's impossible...
-```
-
-Let's recalculate with correct numbers where total balances sum to zero:
-
-Actually, the issue is that forwards_sats is separate from fees_earned. A member could earn lots of fees but forward little volume (or vice versa). The algorithm correctly redistributes from high earners to high contributors.
-
-**Corrected Example:**
-
-| Node | Capacity | Uptime | Forwards | Fees Earned |
-|------|----------|--------|----------|-------------|
-| Alice | 4M | 95% | 100K | 100 sats |
-| Bob | 6M | 80% | 50K | 400 sats |
-| Carol | 2M | 99% | 150K | 100 sats |
-
-**Total Fees: 600 sats, Total Forwards: 300K sats**
-
-```
-Alice weighted = 0.40×(4/12) + 0.40×(100/300) + 0.20×0.95 = 0.457
-Bob weighted = 0.40×(6/12) + 0.40×(50/300) + 0.20×0.80 = 0.427
-Carol weighted = 0.40×(2/12) + 0.40×(150/300) + 0.20×0.99 = 0.465
-
-Alice fair_share = 600 × 0.339 = 274 sats → balance = 274 - 100 = +174 (owed)
-Bob fair_share = 600 × 0.317 = 256 sats → balance = 256 - 400 = -144 (owes)
-Carol fair_share = 600 × 0.345 = 276 sats → balance = 276 - 100 = +176 (owed)
+Alice: 202 - 100 = +102 sats (receiver)
+Bob: 169 - 400 = -231 sats (payer)
+Carol: 229 - 100 = +129 sats (receiver)
 ```
 
 **Payment Generated:**
-- Bob pays 144 sats → split between Alice (74 sats) and Carol (70 sats)
+
+Bob pays 231 sats total, split proportionally between Alice and Carol based on their positive balances
 
 ## Settlement Execution
 
