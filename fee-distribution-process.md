@@ -31,9 +31,9 @@ The settlement system redistributes routing fees based on each member's **contri
 │                      ▼                                                   │
 │   ┌──────────────────────────────────────┐                              │
 │   │      WEIGHTED CONTRIBUTION SCORE     │                              │
-│   │  40% × (member_capacity / total)     │                              │
-│   │  40% × (member_forwards / total)     │                              │
-│   │  20% × (member_uptime / 100)         │                              │
+│   │  30% × (member_capacity / total)     │                              │
+│   │  60% × (member_forwards / total)     │                              │
+│   │  10% × (member_uptime / 100)         │                              │
 │   └──────────────────┬───────────────────┘                              │
 │                      │                                                   │
 │                      ▼                                                   │
@@ -152,9 +152,9 @@ contribution = MemberContribution(
 
 ```python
 # Weights from settlement.py
-WEIGHT_CAPACITY = 0.40  # 40% for providing capacity
-WEIGHT_FORWARDS = 0.40  # 40% for routing volume
-WEIGHT_UPTIME = 0.20    # 20% for reliability
+WEIGHT_CAPACITY = 0.30  # 30% for providing capacity
+WEIGHT_FORWARDS = 0.60  # 60% for routing volume
+WEIGHT_UPTIME = 0.10    # 10% for reliability
 
 # Calculate individual scores (0.0 to 1.0)
 capacity_score = member_capacity / total_fleet_capacity
@@ -163,9 +163,9 @@ uptime_score = member_uptime / 100.0
 
 # Combined weighted score
 weighted_score = (
-    0.40 * capacity_score +
-    0.40 * forwards_score +
-    0.20 * uptime_score
+    0.30 * capacity_score +
+    0.60 * forwards_score +
+    0.10 * uptime_score
 )
 ```
 
@@ -399,9 +399,9 @@ cl-revenue-ops already tracks all forwarding activity for its profitability anal
 ### Why weighted fair shares?
 
 Pure fee-based distribution would concentrate rewards on well-positioned nodes. The weighted system:
-- Rewards capacity (40%): Incentivizes providing liquidity
-- Rewards routing (40%): Rewards actual work
-- Rewards uptime (20%): Ensures reliability
+- Rewards routing (60%): Rewards actual work forwarding payments
+- Rewards capacity (30%): Incentivizes providing liquidity
+- Rewards uptime (10%): Ensures reliability
 
 This creates a cooperative incentive structure where all members benefit from the fleet's success.
 
