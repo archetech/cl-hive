@@ -1126,6 +1126,41 @@ class Planner:
         members = self.db.get_all_members()
         return [m['peer_id'] for m in members if m.get('tier') == 'member']
 
+    def _has_existing_or_pending_channel(self, target: str) -> Tuple[bool, Optional[str], Optional[int]]:
+        """
+        Check if we already have an existing or pending channel to this target.
+
+        This prevents double-opening channels to the same peer when one is
+        already in CHANNELD_AWAITING_LOCKIN state.
+
+        Args:
+            target: Target node pubkey
+
+        Returns:
+            Tuple of (has_channel, state, capacity_sats)
+            - has_channel: True if we have an active or pending channel
+            - state: Channel state if found (e.g., 'CHANNELD_NORMAL', 'CHANNELD_AWAITING_LOCKIN')
+            - capacity_sats: Channel capacity if found
+        """
+        if not self.plugin:
+            return (False, None, None)
+
+        try:
+            peer_channels = self.plugin.rpc.listpeerchannels(target)
+            channels = peer_channels.get('channels', [])
+            for ch in channels:
+                state = ch.get('state', '')
+                # Check for active or pending channels
+                if state in ('CHANNELD_AWAITING_LOCKIN', 'CHANNELD_NORMAL',
+                             'DUALOPEND_AWAITING_LOCKIN', 'DUALOPEND_OPEN_INIT'):
+                    capacity_sats = ch.get('total_msat', 0) // 1000
+                    return (True, state, capacity_sats)
+        except Exception:
+            # If RPC fails, assume no channel (conservative)
+            pass
+
+        return (False, None, None)
+
     def _get_hive_capacity_to_target(self, target: str, hive_members: List[str]) -> int:
         """
         Calculate total Hive capacity to a target.
@@ -1498,6 +1533,30 @@ class Planner:
             public_capacity = self._get_public_capacity_to_target(target)
             if public_capacity < MIN_TARGET_CAPACITY_SATS:
                 continue
+
+            # Skip if we already have an existing or pending channel to this target
+            has_channel, ch_state, ch_capacity = self._has_existing_or_pending_channel(target)
+            if has_channel:
+                self._log(
+                    f"Skipping {target[:16]}... - already have {ch_state} channel "
+                    f"({ch_capacity:,} sats)",
+                    level='debug'
+                )
+                continue
+
+            # Skip if another hive member has a pending intent to open to this target
+            if self.intent_manager:
+                remote_intents = self.intent_manager.get_remote_intents(target=target)
+                pending_opens = [i for i in remote_intents
+                                 if i.intent_type == 'channel_open' and i.status == 'pending']
+                if pending_opens:
+                    initiator = pending_opens[0].initiator[:16] if pending_opens[0].initiator else 'unknown'
+                    self._log(
+                        f"Skipping {target[:16]}... - hive member {initiator}... "
+                        f"has pending channel open intent",
+                        level='debug'
+                    )
+                    continue
 
             # Calculate Hive share
             result = self._calculate_hive_share(target, cfg)

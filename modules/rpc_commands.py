@@ -666,6 +666,30 @@ def _execute_channel_open(
     if not target:
         return {"error": "Missing target in action payload", "action_id": action_id}
 
+    # Check for existing or pending channels to this target
+    try:
+        peer_channels = ctx.safe_plugin.rpc.listpeerchannels(target)
+        channels = peer_channels.get('channels', [])
+        for ch in channels:
+            state = ch.get('state', '')
+            # Block if there's already an active or pending channel
+            if state in ('CHANNELD_AWAITING_LOCKIN', 'CHANNELD_NORMAL', 'DUALOPEND_AWAITING_LOCKIN'):
+                existing_capacity = ch.get('total_msat', 0) // 1000
+                funding_txid = ch.get('funding_txid', 'unknown')
+                return {
+                    "error": f"Already have {'pending' if 'AWAITING' in state else 'active'} channel to this peer",
+                    "action_id": action_id,
+                    "target": target,
+                    "existing_channel_state": state,
+                    "existing_capacity_sats": existing_capacity,
+                    "existing_funding_txid": funding_txid,
+                    "hint": "Wait for pending channel to confirm or close existing channel first"
+                }
+    except Exception as e:
+        # If listpeerchannels fails, log but continue (peer might not be known yet)
+        if ctx.log:
+            ctx.log(f"cl-hive: Could not check existing channels: {e}", 'debug')
+
     # Calculate intelligent budget limits
     cfg = ctx.config.snapshot() if ctx.config else None
     budget_info = {}
