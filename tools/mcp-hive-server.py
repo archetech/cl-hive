@@ -2481,6 +2481,8 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_governance_mode(arguments)
         elif name == "hive_expansion_mode":
             result = await handle_expansion_mode(arguments)
+        elif name == "hive_bump_version":
+            result = await handle_bump_version(arguments)
         # Splice coordination tools
         elif name == "hive_splice_check":
             result = await handle_splice_check(arguments)
@@ -3024,6 +3026,21 @@ async def handle_expansion_mode(args: Dict) -> Dict:
             "expansions_enabled": planner.get("expansions_enabled", False),
             "max_feerate_perkb": planner.get("max_expansion_feerate_perkb", 5000)
         }
+
+
+async def handle_bump_version(args: Dict) -> Dict:
+    """Bump the gossip state version for restart recovery."""
+    node_name = args.get("node")
+    version = args.get("version")
+
+    if not version:
+        return {"error": "version is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-bump-version", {"version": version})
 
 
 # =============================================================================

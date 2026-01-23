@@ -65,7 +65,7 @@ from modules.protocol import (
     create_settlement_offer, get_settlement_offer_signing_payload,
 )
 from modules.handshake import HandshakeManager, Ticket, CHALLENGE_TTL_SECONDS
-from modules.state_manager import StateManager
+from modules.state_manager import StateManager, HivePeerState
 from modules.gossip import GossipManager
 from modules.intent_manager import IntentManager, Intent, IntentType
 from modules.bridge import Bridge, BridgeStatus, CircuitOpenError
@@ -7942,6 +7942,64 @@ def hive_enable_expansions(plugin: Plugin, enabled: bool = True):
     Permission: Admin only
     """
     return rpc_enable_expansions(_get_hive_context(), enabled)
+
+
+@plugin.method("hive-bump-version")
+def hive_bump_version(plugin: Plugin, version: int):
+    """
+    Manually set the gossip state version for restart recovery.
+
+    Use this to fix version sync issues where the persisted version
+    diverged from what peers remember.
+
+    Args:
+        version: New version number (must be higher than current)
+
+    Returns:
+        Dict with old and new version.
+    """
+    if not state_manager or not gossip_mgr or not our_pubkey:
+        return {"error": "state_manager_unavailable"}
+
+    # Get current versions
+    our_state = state_manager.get_peer_state(our_pubkey)
+    old_db_version = our_state.version if our_state else 0
+    old_gossip_version = gossip_mgr._last_broadcast_state.version
+
+    # Update database
+    database.update_hive_state(
+        peer_id=our_pubkey,
+        capacity_sats=our_state.capacity_sats if our_state else 0,
+        available_sats=our_state.available_sats if our_state else 0,
+        fee_policy=our_state.fee_policy if our_state else {},
+        topology=our_state.topology if our_state else [],
+        state_hash="",
+        version=version
+    )
+
+    # Update in-memory state
+    if our_state:
+        # Create new state with updated version
+        new_state = HivePeerState(
+            peer_id=our_pubkey,
+            capacity_sats=our_state.capacity_sats,
+            available_sats=our_state.available_sats,
+            fee_policy=our_state.fee_policy,
+            topology=our_state.topology,
+            version=version,
+            last_update=our_state.last_update,
+            state_hash=our_state.state_hash
+        )
+        state_manager._local_state[our_pubkey] = new_state
+
+    # Update gossip manager version
+    gossip_mgr._last_broadcast_state.version = version
+
+    return {
+        "old_db_version": old_db_version,
+        "old_gossip_version": old_gossip_version,
+        "new_version": version
+    }
 
 
 @plugin.method("hive-vouch")
