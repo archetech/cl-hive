@@ -26,9 +26,14 @@ from .protocol import (
     HiveMessageType,
     serialize,
     create_liquidity_need,
+    create_liquidity_snapshot,
     validate_liquidity_need_payload,
+    validate_liquidity_snapshot_payload,
     get_liquidity_need_signing_payload,
+    get_liquidity_snapshot_signing_payload,
     LIQUIDITY_NEED_RATE_LIMIT,
+    LIQUIDITY_SNAPSHOT_RATE_LIMIT,
+    MAX_NEEDS_IN_SNAPSHOT,
 )
 
 
@@ -112,6 +117,7 @@ class LiquidityCoordinator:
 
         # Rate limiting
         self._need_rate: Dict[str, List[float]] = defaultdict(list)
+        self._snapshot_rate: Dict[str, List[float]] = defaultdict(list)
 
     def _check_rate_limit(
         self,
@@ -314,6 +320,189 @@ class LiquidityCoordinator:
             )
 
         return {"success": True, "stored": True}
+
+    def handle_liquidity_snapshot(
+        self,
+        peer_id: str,
+        payload: Dict[str, Any],
+        rpc: Any
+    ) -> Dict[str, Any]:
+        """
+        Handle incoming LIQUIDITY_SNAPSHOT message.
+
+        This is the preferred method for receiving liquidity needs - one message
+        contains multiple needs instead of N individual messages.
+
+        Args:
+            peer_id: Sender peer ID
+            payload: Message payload
+            rpc: RPC interface for signature verification
+
+        Returns:
+            Result dict with success/error
+        """
+        # Validate payload structure
+        if not validate_liquidity_snapshot_payload(payload):
+            return {"error": "invalid payload"}
+
+        reporter_id = payload.get("reporter_id")
+
+        # Identity binding: sender must match reporter (prevent relay attacks)
+        if peer_id != reporter_id:
+            return {"error": "identity binding failed"}
+
+        # Verify sender is a hive member
+        member = self.database.get_member(reporter_id)
+        if not member:
+            return {"error": "reporter not a member"}
+
+        # Rate limit check for snapshot messages
+        if not self._check_rate_limit(
+            reporter_id,
+            self._snapshot_rate,
+            LIQUIDITY_SNAPSHOT_RATE_LIMIT
+        ):
+            return {"error": "rate limited"}
+
+        # Verify signature
+        signature = payload.get("signature")
+        if not signature:
+            return {"error": "missing signature"}
+
+        signing_message = get_liquidity_snapshot_signing_payload(payload)
+
+        try:
+            verify_result = rpc.checkmessage(signing_message, signature)
+            if not verify_result.get("verified"):
+                return {"error": "signature verification failed"}
+
+            if verify_result.get("pubkey") != reporter_id:
+                return {"error": "signature pubkey mismatch"}
+        except Exception as e:
+            return {"error": f"signature check failed: {e}"}
+
+        # Record rate limit
+        self._record_message(reporter_id, self._snapshot_rate)
+
+        # Process each need in the snapshot
+        needs = payload.get("needs", [])
+        stored_count = 0
+        batch_timestamp = payload.get("timestamp", int(time.time()))
+
+        for need_data in needs:
+            # Store the liquidity need
+            need = LiquidityNeed(
+                reporter_id=reporter_id,
+                need_type=need_data.get("need_type", NEED_REBALANCE),
+                target_peer_id=need_data.get("target_peer_id", ""),
+                amount_sats=need_data.get("amount_sats", 0),
+                urgency=need_data.get("urgency", URGENCY_LOW),
+                max_fee_ppm=need_data.get("max_fee_ppm", 0),
+                reason=need_data.get("reason", ""),
+                current_balance_pct=need_data.get("current_balance_pct", 0.5),
+                can_provide_inbound=need_data.get("can_provide_inbound", 0),
+                can_provide_outbound=need_data.get("can_provide_outbound", 0),
+                timestamp=batch_timestamp,
+                signature=signature
+            )
+
+            # Use composite key for multiple needs from same reporter
+            key = f"{reporter_id}:{need.target_peer_id}"
+            self._liquidity_needs[key] = need
+
+            # Store in database
+            self.database.store_liquidity_need(
+                reporter_id=need.reporter_id,
+                need_type=need.need_type,
+                target_peer_id=need.target_peer_id,
+                amount_sats=need.amount_sats,
+                urgency=need.urgency,
+                max_fee_ppm=need.max_fee_ppm,
+                reason=need.reason,
+                current_balance_pct=need.current_balance_pct,
+                timestamp=need.timestamp
+            )
+
+            stored_count += 1
+
+        # Prune old needs if over limit
+        self._prune_old_needs()
+
+        if self.plugin:
+            self.plugin.log(
+                f"cl-hive: Received liquidity snapshot from {reporter_id[:16]}... "
+                f"with {stored_count} needs",
+                level='debug'
+            )
+
+        return {"success": True, "needs_stored": stored_count}
+
+    def create_liquidity_snapshot_message(
+        self,
+        needs: List[Dict[str, Any]],
+        rpc: Any
+    ) -> Optional[bytes]:
+        """
+        Create a signed LIQUIDITY_SNAPSHOT message.
+
+        This is the preferred method for sharing liquidity needs. Instead of
+        sending N individual messages for N needs, send one snapshot with all
+        liquidity needs.
+
+        Args:
+            needs: List of liquidity needs, each containing:
+                - target_peer_id: External peer or hive member
+                - need_type: 'inbound', 'outbound', 'rebalance'
+                - amount_sats: How much is needed
+                - urgency: 'critical', 'high', 'medium', 'low'
+                - max_fee_ppm: Maximum fee willing to pay
+                - reason: Why this liquidity is needed
+                - current_balance_pct: Current local balance percentage
+                - can_provide_inbound: Sats of inbound that can be provided
+                - can_provide_outbound: Sats of outbound that can be provided
+            rpc: RPC interface for signing
+
+        Returns:
+            Serialized message bytes, or None on error
+        """
+        # Enforce bounds
+        if len(needs) > MAX_NEEDS_IN_SNAPSHOT:
+            if self.plugin:
+                self.plugin.log(
+                    f"cl-hive: Liquidity snapshot too large ({len(needs)} > {MAX_NEEDS_IN_SNAPSHOT})",
+                    level='warn'
+                )
+            return None
+
+        timestamp = int(time.time())
+
+        # Build payload for signing
+        payload = {
+            "reporter_id": self.our_pubkey,
+            "timestamp": timestamp,
+            "needs": needs,
+        }
+
+        # Sign the payload
+        signing_message = get_liquidity_snapshot_signing_payload(payload)
+
+        try:
+            sig_result = rpc.signmessage(signing_message)
+            signature = sig_result["zbase"]
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"cl-hive: Failed to sign liquidity snapshot: {e}",
+                    level='warn'
+                )
+            return None
+
+        return create_liquidity_snapshot(
+            reporter_id=self.our_pubkey,
+            timestamp=timestamp,
+            signature=signature,
+            needs=needs
+        )
 
     def _prune_old_needs(self):
         """Remove old liquidity needs to stay under limit."""

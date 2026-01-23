@@ -24,10 +24,15 @@ from modules.routing_intelligence import (
 )
 from modules.protocol import (
     validate_route_probe_payload,
+    validate_route_probe_batch_payload,
     get_route_probe_signing_payload,
+    get_route_probe_batch_signing_payload,
     create_route_probe,
+    create_route_probe_batch,
     ROUTE_PROBE_RATE_LIMIT,
+    ROUTE_PROBE_BATCH_RATE_LIMIT,
     MAX_PATH_LENGTH,
+    MAX_PROBES_IN_BATCH,
 )
 
 
@@ -770,3 +775,237 @@ class TestRouteSuggestion:
         assert suggestion.success_rate == 0.95
         assert suggestion.confidence == 0.8
         assert suggestion.hive_hop_count == 1
+
+
+class TestRouteProbeBatch:
+    """Test ROUTE_PROBE_BATCH message handling."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.mock_db = MockDatabase()
+        self.mock_plugin = MagicMock()
+        self.our_pubkey = "02" + "0" * 64
+        self.routing_map = HiveRoutingMap(
+            database=self.mock_db,
+            plugin=self.mock_plugin,
+            our_pubkey=self.our_pubkey
+        )
+
+        # Add member
+        self.member1 = "02" + "a" * 64
+        self.mock_db.members[self.member1] = {
+            "peer_id": self.member1,
+            "tier": "member"
+        }
+
+        # Destination
+        self.destination = "03" + "x" * 64
+
+    def test_batch_payload_validation(self):
+        """Test ROUTE_PROBE_BATCH payload validation."""
+        now = int(time.time())
+        valid_payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "probes": [
+                {
+                    "destination": "03" + "b" * 64,
+                    "path": ["02" + "c" * 64],
+                    "success": True,
+                    "latency_ms": 500,
+                    "failure_reason": "",
+                    "failure_hop": -1,
+                    "estimated_capacity_sats": 1000000,
+                    "total_fee_ppm": 100,
+                    "per_hop_fees": [100],
+                    "amount_probed_sats": 100000
+                }
+            ]
+        }
+
+        assert validate_route_probe_batch_payload(valid_payload) is True
+
+    def test_batch_rejects_invalid_probes(self):
+        """Test that invalid probe entries are rejected."""
+        now = int(time.time())
+        invalid_payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "probes": [
+                {
+                    "destination": "",  # Empty destination
+                    "path": [],
+                    "success": True,
+                    "latency_ms": 500,
+                }
+            ]
+        }
+
+        assert validate_route_probe_batch_payload(invalid_payload) is False
+
+    def test_batch_rejects_too_many_probes(self):
+        """Test that batches with too many probes are rejected."""
+        now = int(time.time())
+        too_many_probes = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "probes": [
+                {
+                    "destination": f"03{'x' * 63}{i:x}",
+                    "path": [],
+                    "success": True,
+                    "latency_ms": 100,
+                    "failure_reason": "",
+                    "failure_hop": -1,
+                }
+                for i in range(MAX_PROBES_IN_BATCH + 1)
+            ]
+        }
+
+        assert validate_route_probe_batch_payload(too_many_probes) is False
+
+    def test_batch_signing_deterministic(self):
+        """Test that batch signing payload is deterministic."""
+        now = int(time.time())
+        payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "probes": [
+                {"destination": "03" + "b" * 64, "path": [], "success": True, "latency_ms": 100},
+                {"destination": "03" + "c" * 64, "path": [], "success": False, "latency_ms": 200},
+            ]
+        }
+
+        # Different order should produce same signing payload (sorted by destination)
+        payload_reordered = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "probes": [
+                {"destination": "03" + "c" * 64, "path": [], "success": False, "latency_ms": 200},
+                {"destination": "03" + "b" * 64, "path": [], "success": True, "latency_ms": 100},
+            ]
+        }
+
+        sig1 = get_route_probe_batch_signing_payload(payload)
+        sig2 = get_route_probe_batch_signing_payload(payload_reordered)
+
+        assert sig1 == sig2
+
+    def test_batch_rate_limiting(self):
+        """Test batch rate limiting."""
+        sender_id = "02" + "b" * 64
+        self.mock_db.members[sender_id] = {"peer_id": sender_id, "tier": "member"}
+
+        # Should allow first few batches
+        for i in range(ROUTE_PROBE_BATCH_RATE_LIMIT[0]):
+            allowed = self.routing_map._check_rate_limit(
+                sender_id,
+                self.routing_map._batch_rate,
+                ROUTE_PROBE_BATCH_RATE_LIMIT
+            )
+            self.routing_map._record_message(sender_id, self.routing_map._batch_rate)
+            assert allowed is True
+
+        # Should reject the next one
+        allowed = self.routing_map._check_rate_limit(
+            sender_id,
+            self.routing_map._batch_rate,
+            ROUTE_PROBE_BATCH_RATE_LIMIT
+        )
+        assert allowed is False
+
+    def test_handle_batch_valid(self):
+        """Test handling a valid route probe batch."""
+        mock_rpc = MagicMock()
+        mock_rpc.checkmessage.return_value = {
+            "verified": True,
+            "pubkey": self.member1
+        }
+
+        now = int(time.time())
+        payload = {
+            "reporter_id": self.member1,
+            "timestamp": now,
+            "signature": "valid_signature_here",
+            "probes": [
+                {
+                    "destination": self.destination,
+                    "path": ["02" + "c" * 64],
+                    "success": True,
+                    "latency_ms": 500,
+                    "failure_reason": "",
+                    "failure_hop": -1,
+                    "estimated_capacity_sats": 1000000,
+                    "total_fee_ppm": 100,
+                    "per_hop_fees": [100],
+                    "amount_probed_sats": 100000
+                },
+                {
+                    "destination": "03" + "y" * 64,
+                    "path": [],
+                    "success": False,
+                    "latency_ms": 200,
+                    "failure_reason": "temporary",
+                    "failure_hop": -1,
+                }
+            ]
+        }
+
+        result = self.routing_map.handle_route_probe_batch(
+            self.member1, payload, mock_rpc
+        )
+
+        assert result.get("success") is True
+        assert result.get("probes_stored") == 2
+        assert len(self.mock_db.route_probes) == 2
+
+    def test_handle_batch_non_member(self):
+        """Test rejecting batch from non-member."""
+        mock_rpc = MagicMock()
+        non_member = "02" + "z" * 64
+
+        now = int(time.time())
+        payload = {
+            "reporter_id": non_member,
+            "timestamp": now,
+            "signature": "valid_signature_here",
+            "probes": []
+        }
+
+        result = self.routing_map.handle_route_probe_batch(
+            non_member, payload, mock_rpc
+        )
+
+        assert result.get("error") == "reporter not a member"
+
+    def test_create_batch_message(self):
+        """Test creating a signed route probe batch message."""
+        mock_rpc = MagicMock()
+        mock_rpc.signmessage.return_value = {"signature": "base64sig", "zbase": "zbasesig"}
+
+        probes = [
+            {
+                "destination": "03" + "b" * 64,
+                "path": ["02" + "c" * 64],
+                "success": True,
+                "latency_ms": 500,
+                "failure_reason": "",
+                "failure_hop": -1,
+                "estimated_capacity_sats": 1000000,
+                "total_fee_ppm": 100,
+                "per_hop_fees": [100],
+                "amount_probed_sats": 100000
+            }
+        ]
+
+        msg = self.routing_map.create_route_probe_batch_message(
+            probes=probes,
+            rpc=mock_rpc
+        )
+
+        assert msg is not None
+        assert isinstance(msg, bytes)
+        assert mock_rpc.signmessage.called

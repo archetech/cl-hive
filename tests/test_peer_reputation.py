@@ -21,10 +21,10 @@ from modules.peer_reputation import (
     REPUTATION_STALENESS_HOURS,
 )
 from modules.protocol import (
-    validate_peer_reputation_payload,
-    get_peer_reputation_signing_payload,
-    create_peer_reputation,
-    PEER_REPUTATION_RATE_LIMIT,
+    validate_peer_reputation_snapshot_payload,
+    get_peer_reputation_snapshot_signing_payload,
+    create_peer_reputation_snapshot,
+    PEER_REPUTATION_SNAPSHOT_RATE_LIMIT,
     VALID_WARNINGS,
     MAX_WARNINGS_COUNT,
 )
@@ -63,158 +63,6 @@ class MockDatabase:
         return 0
 
 
-class TestPeerReputationPayload:
-    """Test PEER_REPUTATION payload validation."""
-
-    def test_valid_payload(self):
-        """Test that valid payload passes validation."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "valid_signature_here",
-            "uptime_pct": 0.95,
-            "response_time_ms": 500,
-            "force_close_count": 0,
-            "fee_stability": 0.9,
-            "htlc_success_rate": 0.98,
-            "channel_age_days": 30,
-            "total_routed_sats": 1000000,
-            "warnings": [],
-            "observation_days": 7,
-        }
-        assert validate_peer_reputation_payload(payload) is True
-
-    def test_missing_reporter(self):
-        """Test that missing reporter fails validation."""
-        payload = {
-            "peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "valid_signature_here",
-        }
-        assert validate_peer_reputation_payload(payload) is False
-
-    def test_missing_peer_id(self):
-        """Test that missing peer_id fails validation."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "timestamp": int(time.time()),
-            "signature": "valid_signature_here",
-        }
-        assert validate_peer_reputation_payload(payload) is False
-
-    def test_invalid_uptime_pct(self):
-        """Test that uptime outside 0-1 fails validation."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "valid_signature_here",
-            "uptime_pct": 1.5,  # Invalid - must be 0-1
-        }
-        assert validate_peer_reputation_payload(payload) is False
-
-    def test_invalid_htlc_success_rate(self):
-        """Test that HTLC rate outside 0-1 fails validation."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "valid_signature_here",
-            "htlc_success_rate": -0.1,  # Invalid - must be 0-1
-        }
-        assert validate_peer_reputation_payload(payload) is False
-
-    def test_negative_response_time(self):
-        """Test that negative response time fails validation."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "valid_signature_here",
-            "response_time_ms": -100,
-        }
-        assert validate_peer_reputation_payload(payload) is False
-
-    def test_valid_warnings(self):
-        """Test that valid warnings pass validation."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "valid_signature_here",
-            "warnings": ["fee_spike", "force_close"],
-        }
-        assert validate_peer_reputation_payload(payload) is True
-
-    def test_invalid_warnings(self):
-        """Test that invalid warning code fails validation."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "valid_signature_here",
-            "warnings": ["invalid_warning_code"],
-        }
-        assert validate_peer_reputation_payload(payload) is False
-
-    def test_too_many_warnings(self):
-        """Test that too many warnings fails validation."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "valid_signature_here",
-            "warnings": list(VALID_WARNINGS)[:MAX_WARNINGS_COUNT + 1],
-        }
-        # This will fail because we're trying to have more warnings than allowed
-        payload["warnings"] = ["fee_spike"] * (MAX_WARNINGS_COUNT + 1)
-        assert validate_peer_reputation_payload(payload) is False
-
-    def test_short_signature(self):
-        """Test that short signature fails validation."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "short",  # Too short
-        }
-        assert validate_peer_reputation_payload(payload) is False
-
-
-class TestPeerReputationSigningPayload:
-    """Test peer reputation signing payload generation."""
-
-    def test_signing_payload_deterministic(self):
-        """Test that signing payload is deterministic."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "peer_id": "03" + "b" * 64,
-            "timestamp": 1700000000,
-            "uptime_pct": 0.95,
-            "htlc_success_rate": 0.98,
-            "force_close_count": 0,
-        }
-        sig1 = get_peer_reputation_signing_payload(payload)
-        sig2 = get_peer_reputation_signing_payload(payload)
-        assert sig1 == sig2
-
-    def test_signing_payload_contains_essential_fields(self):
-        """Test that signing payload contains essential fields."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "peer_id": "03" + "b" * 64,
-            "timestamp": 1700000000,
-            "uptime_pct": 0.95,
-            "htlc_success_rate": 0.98,
-            "force_close_count": 1,
-        }
-        sig = get_peer_reputation_signing_payload(payload)
-        assert payload["reporter_id"] in sig
-        assert payload["peer_id"] in sig
-        assert "1700000000" in sig
-
-
 class TestPeerReputationManager:
     """Test PeerReputationManager class."""
 
@@ -248,107 +96,6 @@ class TestPeerReputationManager:
 
         # External peer
         self.external_peer = "03" + "x" * 64
-
-    def test_handle_peer_reputation_valid(self):
-        """Test handling a valid peer reputation report."""
-        mock_rpc = MagicMock()
-        mock_rpc.checkmessage.return_value = {
-            "verified": True,
-            "pubkey": self.member1
-        }
-
-        payload = {
-            "reporter_id": self.member1,
-            "peer_id": self.external_peer,
-            "timestamp": int(time.time()),
-            "signature": "valid_signature_here",
-            "uptime_pct": 0.95,
-            "htlc_success_rate": 0.98,
-            "force_close_count": 0,
-            "warnings": [],
-        }
-
-        result = self.rep_mgr.handle_peer_reputation(
-            self.member1, payload, mock_rpc
-        )
-
-        assert result.get("success") is True
-        assert result.get("stored") is True
-        assert len(self.mock_db.peer_reputation) == 1
-
-    def test_handle_peer_reputation_non_member(self):
-        """Test rejecting report from non-member."""
-        mock_rpc = MagicMock()
-        non_member = "02" + "z" * 64
-
-        payload = {
-            "reporter_id": non_member,
-            "peer_id": self.external_peer,
-            "timestamp": int(time.time()),
-            "signature": "valid_signature_here",
-        }
-
-        result = self.rep_mgr.handle_peer_reputation(
-            non_member, payload, mock_rpc
-        )
-
-        assert result.get("error") == "reporter not a member"
-        assert len(self.mock_db.peer_reputation) == 0
-
-    def test_handle_peer_reputation_invalid_signature(self):
-        """Test rejecting report with invalid signature."""
-        mock_rpc = MagicMock()
-        mock_rpc.checkmessage.return_value = {"verified": False}
-
-        payload = {
-            "reporter_id": self.member1,
-            "peer_id": self.external_peer,
-            "timestamp": int(time.time()),
-            "signature": "invalid_signature",
-        }
-
-        result = self.rep_mgr.handle_peer_reputation(
-            self.member1, payload, mock_rpc
-        )
-
-        assert "signature" in result.get("error", "").lower()
-        assert len(self.mock_db.peer_reputation) == 0
-
-    def test_handle_peer_reputation_rate_limited(self):
-        """Test rate limiting of peer reputation reports."""
-        mock_rpc = MagicMock()
-        mock_rpc.checkmessage.return_value = {
-            "verified": True,
-            "pubkey": self.member1
-        }
-
-        max_reports, period = PEER_REPUTATION_RATE_LIMIT
-
-        # Send reports up to rate limit
-        for i in range(max_reports):
-            payload = {
-                "reporter_id": self.member1,
-                "peer_id": self.external_peer,
-                "timestamp": int(time.time()),
-                "signature": f"signature_for_report_{i:02d}",
-            }
-            result = self.rep_mgr.handle_peer_reputation(
-                self.member1, payload, mock_rpc
-            )
-            assert result.get("success") is True
-
-        # Next report should be rate limited
-        payload = {
-            "reporter_id": self.member1,
-            "peer_id": self.external_peer,
-            "timestamp": int(time.time()),
-            "signature": "extra_signature_here",
-        }
-        result = self.rep_mgr.handle_peer_reputation(
-            self.member1, payload, mock_rpc
-        )
-
-        assert result.get("error") == "rate limited"
 
     def test_reputation_aggregation(self):
         """Test aggregation of multiple reputation reports."""
@@ -699,31 +446,6 @@ class TestPeerReputationManager:
         assert rep.confidence == "high"
 
 
-class TestCreatePeerReputation:
-    """Test peer reputation message creation."""
-
-    def test_create_peer_reputation(self):
-        """Test creating a signed peer reputation message."""
-        mock_rpc = MagicMock()
-        mock_rpc.signmessage.return_value = {"signature": "base64sig", "zbase": "zbasesig"}
-
-        reporter_id = "02" + "a" * 64
-        peer_id = "03" + "b" * 64
-
-        msg = create_peer_reputation(
-            reporter_id=reporter_id,
-            peer_id=peer_id,
-            rpc=mock_rpc,
-            uptime_pct=0.95,
-            htlc_success_rate=0.98,
-            warnings=["fee_spike"]
-        )
-
-        assert msg is not None
-        assert isinstance(msg, bytes)
-        assert mock_rpc.signmessage.called
-
-
 class TestAggregatedReputation:
     """Test AggregatedReputation dataclass."""
 
@@ -740,3 +462,158 @@ class TestAggregatedReputation:
         assert rep.report_count == 0
         assert rep.confidence == "low"
         assert rep.reputation_score == 50
+
+
+class TestPeerReputationSnapshot:
+    """Test PEER_REPUTATION_SNAPSHOT message handling."""
+
+    def test_snapshot_payload_validation(self):
+        """Test PEER_REPUTATION_SNAPSHOT payload validation."""
+        from modules.protocol import validate_peer_reputation_snapshot_payload
+
+        now = int(time.time())
+        valid_payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "peers": [
+                {
+                    "peer_id": "03" + "b" * 64,
+                    "uptime_pct": 0.99,
+                    "response_time_ms": 150,
+                    "force_close_count": 0,
+                    "fee_stability": 0.95,
+                    "htlc_success_rate": 0.98,
+                    "channel_age_days": 90,
+                    "total_routed_sats": 1000000,
+                    "warnings": [],
+                    "observation_days": 7
+                }
+            ]
+        }
+
+        assert validate_peer_reputation_snapshot_payload(valid_payload) is True
+
+    def test_snapshot_rejects_invalid_uptime(self):
+        """Test that invalid uptime values are rejected."""
+        from modules.protocol import validate_peer_reputation_snapshot_payload
+
+        now = int(time.time())
+        invalid_payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "peers": [
+                {
+                    "peer_id": "03" + "b" * 64,
+                    "uptime_pct": 1.5,  # Invalid - > 1
+                }
+            ]
+        }
+
+        assert validate_peer_reputation_snapshot_payload(invalid_payload) is False
+
+    def test_snapshot_rejects_invalid_warnings(self):
+        """Test that invalid warning codes are rejected."""
+        from modules.protocol import validate_peer_reputation_snapshot_payload
+
+        now = int(time.time())
+        invalid_payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "peers": [
+                {
+                    "peer_id": "03" + "b" * 64,
+                    "warnings": ["invalid_warning_code"],  # Not in VALID_WARNINGS
+                }
+            ]
+        }
+
+        assert validate_peer_reputation_snapshot_payload(invalid_payload) is False
+
+    def test_snapshot_rejects_too_many_peers(self):
+        """Test that snapshots with too many peers are rejected."""
+        from modules.protocol import (
+            validate_peer_reputation_snapshot_payload,
+            MAX_PEERS_IN_REPUTATION_SNAPSHOT
+        )
+
+        now = int(time.time())
+        too_many_peers = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "peers": [
+                {
+                    "peer_id": f"03{'x' * 63}{i:x}",
+                    "uptime_pct": 0.99,
+                }
+                for i in range(MAX_PEERS_IN_REPUTATION_SNAPSHOT + 1)
+            ]
+        }
+
+        assert validate_peer_reputation_snapshot_payload(too_many_peers) is False
+
+    def test_snapshot_signing_deterministic(self):
+        """Test that snapshot signing payload is deterministic."""
+        from modules.protocol import get_peer_reputation_snapshot_signing_payload
+
+        now = int(time.time())
+        payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "peers": [
+                {"peer_id": "03" + "b" * 64, "uptime_pct": 0.99},
+                {"peer_id": "03" + "c" * 64, "uptime_pct": 0.95},
+            ]
+        }
+
+        # Different order should produce same signing payload (sorted by peer_id)
+        payload_reordered = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "peers": [
+                {"peer_id": "03" + "c" * 64, "uptime_pct": 0.95},
+                {"peer_id": "03" + "b" * 64, "uptime_pct": 0.99},
+            ]
+        }
+
+        sig1 = get_peer_reputation_snapshot_signing_payload(payload)
+        sig2 = get_peer_reputation_snapshot_signing_payload(payload_reordered)
+
+        assert sig1 == sig2
+
+    def test_snapshot_rate_limiting(self):
+        """Test snapshot rate limiting."""
+        from modules.protocol import PEER_REPUTATION_SNAPSHOT_RATE_LIMIT
+        from modules.peer_reputation import PeerReputationManager
+
+        mock_db = MagicMock()
+        mock_plugin = MagicMock()
+
+        mgr = PeerReputationManager(
+            database=mock_db,
+            plugin=mock_plugin,
+            our_pubkey="02" + "a" * 64
+        )
+
+        sender_id = "02" + "b" * 64
+
+        # Should allow first few snapshots
+        for i in range(PEER_REPUTATION_SNAPSHOT_RATE_LIMIT[0]):
+            allowed = mgr._check_rate_limit(
+                sender_id,
+                mgr._snapshot_rate,
+                PEER_REPUTATION_SNAPSHOT_RATE_LIMIT
+            )
+            mgr._record_message(sender_id, mgr._snapshot_rate)
+            assert allowed is True
+
+        # Should reject the next one
+        allowed = mgr._check_rate_limit(
+            sender_id,
+            mgr._snapshot_rate,
+            PEER_REPUTATION_SNAPSHOT_RATE_LIMIT
+        )
+        assert allowed is False

@@ -97,11 +97,13 @@ class HiveMessageType(IntEnum):
     FEE_REPORT = 32823          # Real-time fee earnings report for settlement
 
     # Phase 7: Cooperative Fee Coordination
-    FEE_INTELLIGENCE = 32809    # Share fee observations with hive
+    FEE_INTELLIGENCE_SNAPSHOT = 32825  # Batch fee observations for all peers
+    PEER_REPUTATION_SNAPSHOT = 32827   # Batch peer reputation for all peers
+    ROUTE_PROBE_BATCH = 32829          # Batch route probe observations
+    LIQUIDITY_SNAPSHOT = 32831         # Batch liquidity needs
     LIQUIDITY_NEED = 32811      # Broadcast rebalancing needs
     HEALTH_REPORT = 32813       # NNLB health status report
     ROUTE_PROBE = 32815         # Share routing observations (Phase 4)
-    PEER_REPUTATION = 32817     # Share peer reputation observations (Phase 5)
 
 
 # =============================================================================
@@ -286,41 +288,6 @@ class RouteProbePayload:
     amount_probed_sats: int = 0
 
 
-@dataclass
-class PeerReputationPayload:
-    """
-    PEER_REPUTATION message payload - External peer reputation sharing.
-
-    Share reputation observations about external (non-hive) peers to
-    build collective intelligence about peer reliability and behavior.
-    """
-    reporter_id: str           # Who observed this
-    timestamp: int
-    signature: str
-
-    # Target peer (external)
-    peer_id: str               # External peer being reported on
-
-    # Reliability metrics
-    uptime_pct: float = 1.0    # How often peer is online (0-1)
-    response_time_ms: int = 0  # Average HTLC response time
-    force_close_count: int = 0 # Number of force closes initiated by peer
-
-    # Behavior metrics
-    fee_stability: float = 1.0 # How stable are their fees (0-1)
-    htlc_success_rate: float = 1.0  # % of HTLCs that succeed (0-1)
-
-    # Channel metrics
-    channel_age_days: int = 0  # How long we've had channel with them
-    total_routed_sats: int = 0 # Total volume routed through this peer
-
-    # Warnings (optional)
-    warnings: List[str] = field(default_factory=list)  # Specific issues
-
-    # Observation period
-    observation_days: int = 7  # How many days this report covers
-
-
 # =============================================================================
 # PHASE 7 VALIDATION CONSTANTS
 # =============================================================================
@@ -342,11 +309,17 @@ MAX_HEALTH_SCORE = 100
 MIN_HEALTH_SCORE = 0
 
 # Rate limits (count, period_seconds)
-FEE_INTELLIGENCE_RATE_LIMIT = (10, 3600)    # 10 per hour per sender
+FEE_INTELLIGENCE_SNAPSHOT_RATE_LIMIT = (2, 3600)  # 2 snapshots per hour per sender
+MAX_PEERS_IN_SNAPSHOT = 200                 # Maximum peers in one snapshot message
 LIQUIDITY_NEED_RATE_LIMIT = (5, 3600)       # 5 per hour per sender
+LIQUIDITY_SNAPSHOT_RATE_LIMIT = (2, 3600)  # 2 snapshots per hour per sender
+MAX_NEEDS_IN_SNAPSHOT = 50                 # Maximum liquidity needs in one snapshot message
 HEALTH_REPORT_RATE_LIMIT = (1, 3600)        # 1 per hour per sender
 ROUTE_PROBE_RATE_LIMIT = (20, 3600)         # 20 per hour per sender
-PEER_REPUTATION_RATE_LIMIT = (5, 86400)     # 5 per day per sender
+ROUTE_PROBE_BATCH_RATE_LIMIT = (2, 3600)   # 2 batches per hour per sender
+MAX_PROBES_IN_BATCH = 100                  # Maximum route probes in one batch message
+PEER_REPUTATION_SNAPSHOT_RATE_LIMIT = (2, 86400)  # 2 snapshots per day per sender
+MAX_PEERS_IN_REPUTATION_SNAPSHOT = 200      # Maximum peers in one reputation snapshot
 
 # Route probe constants
 MAX_PATH_LENGTH = 20                        # Maximum hops in a path
@@ -1604,44 +1577,47 @@ def create_expansion_decline(
 # PHASE 7: FEE INTELLIGENCE SIGNING & VALIDATION
 # =============================================================================
 
-def get_fee_intelligence_signing_payload(payload: Dict[str, Any]) -> str:
+def get_fee_intelligence_snapshot_signing_payload(payload: Dict[str, Any]) -> str:
     """
-    Get the canonical string to sign for FEE_INTELLIGENCE messages.
+    Get the canonical string to sign for FEE_INTELLIGENCE_SNAPSHOT messages.
 
-    Includes all critical fields to prevent tampering:
-    - reporter_id, target_peer_id, timestamp
-    - Fee and performance metrics
-    - Flow analysis data
+    Signs over: reporter_id, timestamp, and a hash of the sorted peer data.
+    This ensures the entire snapshot is authenticated without making the
+    signing string excessively long.
 
     Args:
-        payload: FEE_INTELLIGENCE message payload
+        payload: FEE_INTELLIGENCE_SNAPSHOT message payload
 
     Returns:
         Canonical string for signmessage()
     """
+    import hashlib
+    import json
+
+    # Create deterministic hash of peers data
+    peers = payload.get("peers", [])
+    # Sort by peer_id for deterministic ordering
+    sorted_peers = sorted(peers, key=lambda p: p.get("peer_id", ""))
+    peers_json = json.dumps(sorted_peers, sort_keys=True, separators=(',', ':'))
+    peers_hash = hashlib.sha256(peers_json.encode()).hexdigest()[:16]
+
     return (
-        f"FEE_INTELLIGENCE:"
+        f"FEE_INTELLIGENCE_SNAPSHOT:"
         f"{payload.get('reporter_id', '')}:"
-        f"{payload.get('target_peer_id', '')}:"
         f"{payload.get('timestamp', 0)}:"
-        f"{payload.get('our_fee_ppm', 0)}:"
-        f"{payload.get('their_fee_ppm', 0)}:"
-        f"{payload.get('forward_count', 0)}:"
-        f"{payload.get('forward_volume_sats', 0)}:"
-        f"{payload.get('revenue_sats', 0)}:"
-        f"{payload.get('flow_direction', '')}:"
-        f"{payload.get('utilization_pct', 0.0):.4f}"
+        f"{len(peers)}:"
+        f"{peers_hash}"
     )
 
 
-def validate_fee_intelligence_payload(payload: Dict[str, Any]) -> bool:
+def validate_fee_intelligence_snapshot_payload(payload: Dict[str, Any]) -> bool:
     """
-    Validate a FEE_INTELLIGENCE payload.
+    Validate a FEE_INTELLIGENCE_SNAPSHOT payload.
 
     SECURITY: Bounds all values to prevent manipulation and overflow.
 
     Args:
-        payload: FEE_INTELLIGENCE message payload
+        payload: FEE_INTELLIGENCE_SNAPSHOT message payload
 
     Returns:
         True if valid, False otherwise
@@ -1650,12 +1626,9 @@ def validate_fee_intelligence_payload(payload: Dict[str, Any]) -> bool:
 
     # Required string fields
     reporter_id = payload.get("reporter_id")
-    target_peer_id = payload.get("target_peer_id")
     signature = payload.get("signature")
 
     if not isinstance(reporter_id, str) or not reporter_id:
-        return False
-    if not isinstance(target_peer_id, str) or not target_peer_id:
         return False
     if not isinstance(signature, str) or len(signature) < 10:
         return False
@@ -1667,40 +1640,51 @@ def validate_fee_intelligence_payload(payload: Dict[str, Any]) -> bool:
     if abs(time_module.time() - timestamp) > FEE_INTELLIGENCE_MAX_AGE:
         return False
 
-    # Fee bounds
-    our_fee_ppm = payload.get("our_fee_ppm", 0)
-    their_fee_ppm = payload.get("their_fee_ppm", 0)
-    if not isinstance(our_fee_ppm, int) or not (0 <= our_fee_ppm <= MAX_FEE_PPM):
+    # Peers array
+    peers = payload.get("peers")
+    if not isinstance(peers, list):
         return False
-    if not isinstance(their_fee_ppm, int) or not (0 <= their_fee_ppm <= MAX_FEE_PPM):
-        return False
-
-    # Volume bounds (prevent overflow)
-    forward_count = payload.get("forward_count", 0)
-    forward_volume_sats = payload.get("forward_volume_sats", 0)
-    revenue_sats = payload.get("revenue_sats", 0)
-
-    if not isinstance(forward_count, int) or forward_count < 0:
-        return False
-    if not isinstance(forward_volume_sats, int) or not (0 <= forward_volume_sats <= MAX_VOLUME_SATS):
-        return False
-    if not isinstance(revenue_sats, int) or not (0 <= revenue_sats <= MAX_VOLUME_SATS):
+    if len(peers) > MAX_PEERS_IN_SNAPSHOT:
         return False
 
-    # Flow direction
-    flow_direction = payload.get("flow_direction", "")
-    if flow_direction and flow_direction not in VALID_FLOW_DIRECTIONS:
-        return False
+    # Validate each peer entry
+    for peer in peers:
+        if not isinstance(peer, dict):
+            return False
 
-    # Utilization bounds
-    utilization_pct = payload.get("utilization_pct", 0.0)
-    if not isinstance(utilization_pct, (int, float)) or not (0 <= utilization_pct <= 1):
-        return False
+        peer_id = peer.get("peer_id")
+        if not isinstance(peer_id, str) or not peer_id:
+            return False
 
-    # Days observed bounds
-    days_observed = payload.get("days_observed", 1)
-    if not isinstance(days_observed, int) or not (1 <= days_observed <= MAX_DAYS_OBSERVED):
-        return False
+        # Fee bounds
+        our_fee_ppm = peer.get("our_fee_ppm", 0)
+        their_fee_ppm = peer.get("their_fee_ppm", 0)
+        if not isinstance(our_fee_ppm, int) or not (0 <= our_fee_ppm <= MAX_FEE_PPM):
+            return False
+        if not isinstance(their_fee_ppm, int) or not (0 <= their_fee_ppm <= MAX_FEE_PPM):
+            return False
+
+        # Volume bounds
+        forward_count = peer.get("forward_count", 0)
+        forward_volume_sats = peer.get("forward_volume_sats", 0)
+        revenue_sats = peer.get("revenue_sats", 0)
+
+        if not isinstance(forward_count, int) or forward_count < 0:
+            return False
+        if not isinstance(forward_volume_sats, int) or not (0 <= forward_volume_sats <= MAX_VOLUME_SATS):
+            return False
+        if not isinstance(revenue_sats, int) or not (0 <= revenue_sats <= MAX_VOLUME_SATS):
+            return False
+
+        # Flow direction
+        flow_direction = peer.get("flow_direction", "")
+        if flow_direction and flow_direction not in VALID_FLOW_DIRECTIONS:
+            return False
+
+        # Utilization bounds
+        utilization_pct = peer.get("utilization_pct", 0.0)
+        if not isinstance(utilization_pct, (int, float)) or not (0 <= utilization_pct <= 1):
+            return False
 
     return True
 
@@ -1780,6 +1764,158 @@ def validate_liquidity_need_payload(payload: Dict[str, Any]) -> bool:
         return False
 
     return True
+
+
+def get_liquidity_snapshot_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for LIQUIDITY_SNAPSHOT messages.
+
+    Signs over: reporter_id, timestamp, and a hash of the sorted needs data.
+    This ensures the entire snapshot is authenticated without making the
+    signing string excessively long.
+
+    Args:
+        payload: LIQUIDITY_SNAPSHOT message payload
+
+    Returns:
+        Canonical string for signmessage()
+    """
+    import hashlib
+    import json
+
+    # Create deterministic hash of needs data
+    needs = payload.get("needs", [])
+    # Sort by target_peer_id for deterministic ordering
+    sorted_needs = sorted(needs, key=lambda n: (n.get("target_peer_id", ""), n.get("need_type", "")))
+    needs_json = json.dumps(sorted_needs, sort_keys=True, separators=(',', ':'))
+    needs_hash = hashlib.sha256(needs_json.encode()).hexdigest()[:16]
+
+    return (
+        f"LIQUIDITY_SNAPSHOT:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{len(needs)}:"
+        f"{needs_hash}"
+    )
+
+
+def validate_liquidity_snapshot_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a LIQUIDITY_SNAPSHOT payload.
+
+    SECURITY: Bounds all values to prevent manipulation and overflow.
+
+    Args:
+        payload: LIQUIDITY_SNAPSHOT message payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    import time as time_module
+
+    # Required string fields
+    reporter_id = payload.get("reporter_id")
+    signature = payload.get("signature")
+
+    if not isinstance(reporter_id, str) or not reporter_id:
+        return False
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    # Timestamp freshness (allow 1 hour for snapshot messages)
+    timestamp = payload.get("timestamp", 0)
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+    if abs(time_module.time() - timestamp) > 3600:
+        return False
+
+    # Needs array
+    needs = payload.get("needs")
+    if not isinstance(needs, list):
+        return False
+    if len(needs) > MAX_NEEDS_IN_SNAPSHOT:
+        return False
+
+    # Validate each need entry
+    for need in needs:
+        if not isinstance(need, dict):
+            return False
+
+        # Target peer required
+        target_peer_id = need.get("target_peer_id")
+        if not isinstance(target_peer_id, str) or not target_peer_id:
+            return False
+
+        # Need type validation
+        need_type = need.get("need_type")
+        if need_type not in VALID_NEED_TYPES:
+            return False
+
+        # Urgency validation
+        urgency = need.get("urgency")
+        if urgency not in VALID_URGENCY_LEVELS:
+            return False
+
+        # Amount bounds
+        amount_sats = need.get("amount_sats", 0)
+        if not isinstance(amount_sats, int) or not (0 < amount_sats <= MAX_LIQUIDITY_AMOUNT):
+            return False
+
+        # Fee bounds
+        max_fee_ppm = need.get("max_fee_ppm", 0)
+        if not isinstance(max_fee_ppm, int) or not (0 <= max_fee_ppm <= MAX_FEE_PPM):
+            return False
+
+        # Balance percentage
+        current_balance_pct = need.get("current_balance_pct", 0.0)
+        if not isinstance(current_balance_pct, (int, float)) or not (0 <= current_balance_pct <= 1):
+            return False
+
+    return True
+
+
+def create_liquidity_snapshot(
+    reporter_id: str,
+    timestamp: int,
+    signature: str,
+    needs: list
+) -> bytes:
+    """
+    Create a LIQUIDITY_SNAPSHOT message.
+
+    This is the preferred method for sharing liquidity needs, replacing
+    individual LIQUIDITY_NEED messages. Send one snapshot with all needs
+    instead of N individual messages.
+
+    SECURITY: The signature must be created using signmessage() over the
+    canonical payload returned by get_liquidity_snapshot_signing_payload().
+
+    Args:
+        reporter_id: Hive member reporting these needs
+        timestamp: Unix timestamp
+        signature: zbase-encoded signature from signmessage()
+        needs: List of liquidity needs, each containing:
+            - target_peer_id: External peer or hive member
+            - need_type: 'inbound', 'outbound', 'rebalance'
+            - amount_sats: How much is needed
+            - urgency: 'critical', 'high', 'medium', 'low'
+            - max_fee_ppm: Maximum fee willing to pay
+            - reason: Why this liquidity is needed
+            - current_balance_pct: Current local balance percentage
+            - can_provide_inbound: Sats of inbound that can be provided
+            - can_provide_outbound: Sats of outbound that can be provided
+
+    Returns:
+        Serialized LIQUIDITY_SNAPSHOT message
+    """
+    payload = {
+        "reporter_id": reporter_id,
+        "timestamp": timestamp,
+        "signature": signature,
+        "needs": needs,
+    }
+
+    return serialize(HiveMessageType.LIQUIDITY_SNAPSHOT, payload)
 
 
 def get_health_report_signing_payload(payload: Dict[str, Any]) -> str:
@@ -2014,235 +2150,404 @@ def create_route_probe(
     return serialize(HiveMessageType.ROUTE_PROBE, payload)
 
 
-def get_peer_reputation_signing_payload(payload: Dict[str, Any]) -> str:
+def get_route_probe_batch_signing_payload(payload: Dict[str, Any]) -> str:
     """
-    Generate signing payload for PEER_REPUTATION message.
+    Get the canonical string to sign for ROUTE_PROBE_BATCH messages.
 
-    Creates a deterministic string for signature verification.
+    Signs over: reporter_id, timestamp, and a hash of the sorted probes data.
+    This ensures the entire batch is authenticated without making the
+    signing string excessively long.
 
     Args:
-        payload: PEER_REPUTATION payload dict
+        payload: ROUTE_PROBE_BATCH message payload
 
     Returns:
-        Canonical string for signing
+        Canonical string for signmessage()
     """
+    import hashlib
+    import json
+
+    # Create deterministic hash of probes data
+    probes = payload.get("probes", [])
+    # Sort by destination for deterministic ordering
+    sorted_probes = sorted(probes, key=lambda p: (p.get("destination", ""), p.get("timestamp", 0)))
+    probes_json = json.dumps(sorted_probes, sort_keys=True, separators=(',', ':'))
+    probes_hash = hashlib.sha256(probes_json.encode()).hexdigest()[:16]
+
     return (
-        f"HIVE_PEER_REPUTATION:"
+        f"ROUTE_PROBE_BATCH:"
         f"{payload.get('reporter_id', '')}:"
-        f"{payload.get('peer_id', '')}:"
         f"{payload.get('timestamp', 0)}:"
-        f"{payload.get('uptime_pct', 1.0):.2f}:"
-        f"{payload.get('htlc_success_rate', 1.0):.2f}:"
-        f"{payload.get('force_close_count', 0)}"
+        f"{len(probes)}:"
+        f"{probes_hash}"
     )
 
 
-def validate_peer_reputation_payload(payload: Dict[str, Any]) -> bool:
+def validate_route_probe_batch_payload(payload: Dict[str, Any]) -> bool:
     """
-    Validate a PEER_REPUTATION payload.
+    Validate a ROUTE_PROBE_BATCH payload.
+
+    SECURITY: Bounds all values to prevent manipulation and overflow.
 
     Args:
-        payload: PEER_REPUTATION message payload
+        payload: ROUTE_PROBE_BATCH message payload
 
     Returns:
         True if valid, False otherwise
     """
+    import time as time_module
+
     # Required string fields
     reporter_id = payload.get("reporter_id")
-    peer_id = payload.get("peer_id")
     signature = payload.get("signature")
 
     if not isinstance(reporter_id, str) or not reporter_id:
         return False
-    if not isinstance(peer_id, str) or not peer_id:
-        return False
     if not isinstance(signature, str) or len(signature) < 10:
         return False
 
-    # Timestamp
+    # Timestamp freshness (allow 1 hour for batch messages)
     timestamp = payload.get("timestamp", 0)
     if not isinstance(timestamp, int) or timestamp < 0:
         return False
-
-    # Uptime percentage bounds (0-1)
-    uptime_pct = payload.get("uptime_pct", 1.0)
-    if not isinstance(uptime_pct, (int, float)) or not (0 <= uptime_pct <= 1):
+    if abs(time_module.time() - timestamp) > 3600:
         return False
 
-    # Response time bounds
-    response_time_ms = payload.get("response_time_ms", 0)
-    if not isinstance(response_time_ms, int) or not (0 <= response_time_ms <= MAX_RESPONSE_TIME_MS):
+    # Probes array
+    probes = payload.get("probes")
+    if not isinstance(probes, list):
+        return False
+    if len(probes) > MAX_PROBES_IN_BATCH:
         return False
 
-    # Force close count bounds
-    force_close_count = payload.get("force_close_count", 0)
-    if not isinstance(force_close_count, int) or not (0 <= force_close_count <= MAX_FORCE_CLOSE_COUNT):
-        return False
-
-    # Fee stability bounds (0-1)
-    fee_stability = payload.get("fee_stability", 1.0)
-    if not isinstance(fee_stability, (int, float)) or not (0 <= fee_stability <= 1):
-        return False
-
-    # HTLC success rate bounds (0-1)
-    htlc_success_rate = payload.get("htlc_success_rate", 1.0)
-    if not isinstance(htlc_success_rate, (int, float)) or not (0 <= htlc_success_rate <= 1):
-        return False
-
-    # Channel age bounds
-    channel_age_days = payload.get("channel_age_days", 0)
-    if not isinstance(channel_age_days, int) or not (0 <= channel_age_days <= MAX_CHANNEL_AGE_DAYS):
-        return False
-
-    # Total routed bounds
-    total_routed_sats = payload.get("total_routed_sats", 0)
-    if not isinstance(total_routed_sats, int) or total_routed_sats < 0:
-        return False
-
-    # Observation days bounds
-    observation_days = payload.get("observation_days", 7)
-    if not isinstance(observation_days, int) or not (1 <= observation_days <= MAX_OBSERVATION_DAYS):
-        return False
-
-    # Warnings validation
-    warnings = payload.get("warnings", [])
-    if not isinstance(warnings, list):
-        return False
-    if len(warnings) > MAX_WARNINGS_COUNT:
-        return False
-    for warning in warnings:
-        if not isinstance(warning, str):
+    # Validate each probe entry
+    for probe in probes:
+        if not isinstance(probe, dict):
             return False
-        if len(warning) > MAX_WARNING_LENGTH:
+
+        # Destination required
+        destination = probe.get("destination")
+        if not isinstance(destination, str) or not destination:
             return False
-        # Warning must be from valid set
-        if warning and warning not in VALID_WARNINGS:
+
+        # Path validation
+        path = probe.get("path", [])
+        if not isinstance(path, list):
+            return False
+        if len(path) > MAX_PATH_LENGTH:
+            return False
+        for hop in path:
+            if not isinstance(hop, str):
+                return False
+
+        # Success must be boolean
+        success = probe.get("success")
+        if not isinstance(success, bool):
+            return False
+
+        # Latency bounds
+        latency_ms = probe.get("latency_ms", 0)
+        if not isinstance(latency_ms, int) or not (0 <= latency_ms <= MAX_LATENCY_MS):
+            return False
+
+        # Failure reason validation
+        failure_reason = probe.get("failure_reason", "")
+        if failure_reason not in VALID_FAILURE_REASONS:
+            return False
+
+        # Failure hop must be valid index or -1
+        failure_hop = probe.get("failure_hop", -1)
+        if not isinstance(failure_hop, int):
+            return False
+        if failure_hop != -1 and (failure_hop < 0 or failure_hop >= len(path)):
+            return False
+
+        # Capacity bounds
+        estimated_capacity = probe.get("estimated_capacity_sats", 0)
+        if not isinstance(estimated_capacity, int) or not (0 <= estimated_capacity <= MAX_CAPACITY_SATS):
+            return False
+
+        # Fee bounds
+        total_fee_ppm = probe.get("total_fee_ppm", 0)
+        if not isinstance(total_fee_ppm, int) or not (0 <= total_fee_ppm <= MAX_FEE_PPM * MAX_PATH_LENGTH):
+            return False
+
+        # Per-hop fees validation
+        per_hop_fees = probe.get("per_hop_fees", [])
+        if not isinstance(per_hop_fees, list):
+            return False
+        for fee in per_hop_fees:
+            if not isinstance(fee, int) or fee < 0:
+                return False
+
+        # Amount probed bounds
+        amount_probed = probe.get("amount_probed_sats", 0)
+        if not isinstance(amount_probed, int) or amount_probed < 0:
             return False
 
     return True
 
 
-def create_peer_reputation(
+def create_route_probe_batch(
     reporter_id: str,
-    peer_id: str,
-    rpc,
-    uptime_pct: float = 1.0,
-    response_time_ms: int = 0,
-    force_close_count: int = 0,
-    fee_stability: float = 1.0,
-    htlc_success_rate: float = 1.0,
-    channel_age_days: int = 0,
-    total_routed_sats: int = 0,
-    warnings: List[str] = None,
-    observation_days: int = 7
-) -> Optional[bytes]:
-    """
-    Create a signed PEER_REPUTATION message.
-
-    Args:
-        reporter_id: Hive member reporting this observation
-        peer_id: External peer being reported on
-        rpc: RPC interface for signing
-        uptime_pct: Peer uptime percentage (0-1)
-        response_time_ms: Average HTLC response time
-        force_close_count: Number of force closes by peer
-        fee_stability: Fee stability score (0-1)
-        htlc_success_rate: HTLC success rate (0-1)
-        channel_age_days: Channel age in days
-        total_routed_sats: Total volume routed through peer
-        warnings: List of warning codes
-        observation_days: Days covered by this report
-
-    Returns:
-        Serialized and signed PEER_REPUTATION message, or None on error
-    """
-    timestamp = int(time.time())
-
-    payload = {
-        "reporter_id": reporter_id,
-        "peer_id": peer_id,
-        "timestamp": timestamp,
-        "uptime_pct": uptime_pct,
-        "response_time_ms": response_time_ms,
-        "force_close_count": force_close_count,
-        "fee_stability": fee_stability,
-        "htlc_success_rate": htlc_success_rate,
-        "channel_age_days": channel_age_days,
-        "total_routed_sats": total_routed_sats,
-        "warnings": warnings or [],
-        "observation_days": observation_days,
-    }
-
-    # Sign the payload
-    signing_message = get_peer_reputation_signing_payload(payload)
-    try:
-        sig_result = rpc.signmessage(signing_message)
-        payload["signature"] = sig_result["zbase"]
-    except Exception:
-        return None
-
-    return serialize(HiveMessageType.PEER_REPUTATION, payload)
-
-
-def create_fee_intelligence(
-    reporter_id: str,
-    target_peer_id: str,
     timestamp: int,
     signature: str,
-    our_fee_ppm: int,
-    their_fee_ppm: int,
-    forward_count: int,
-    forward_volume_sats: int,
-    revenue_sats: int,
-    flow_direction: str,
-    utilization_pct: float,
-    last_fee_change_ppm: int = 0,
-    volume_delta_pct: float = 0.0,
-    days_observed: int = 1
+    probes: list
 ) -> bytes:
     """
-    Create a FEE_INTELLIGENCE message.
+    Create a ROUTE_PROBE_BATCH message.
+
+    This is the preferred method for sharing route probes, replacing
+    individual ROUTE_PROBE messages. Send one batch with all probe
+    observations instead of N individual messages.
 
     SECURITY: The signature must be created using signmessage() over the
-    canonical payload returned by get_fee_intelligence_signing_payload().
+    canonical payload returned by get_route_probe_batch_signing_payload().
 
     Args:
-        reporter_id: Hive member reporting this observation
-        target_peer_id: External peer being reported on
+        reporter_id: Hive member reporting these observations
         timestamp: Unix timestamp
         signature: zbase-encoded signature from signmessage()
-        our_fee_ppm: Fee we charge to this peer
-        their_fee_ppm: Fee they charge us
-        forward_count: Number of forwards
-        forward_volume_sats: Total volume routed
-        revenue_sats: Fees earned
-        flow_direction: 'source', 'sink', or 'balanced'
-        utilization_pct: Channel utilization (0.0-1.0)
-        last_fee_change_ppm: Previous fee rate (for elasticity)
-        volume_delta_pct: Volume change after fee change
-        days_observed: How long this peer has been observed
+        probes: List of probe observations, each containing:
+            - destination: Final destination pubkey
+            - path: List of intermediate hop pubkeys
+            - success: Whether probe succeeded
+            - latency_ms: Round-trip time in milliseconds
+            - failure_reason: Reason for failure (if any)
+            - failure_hop: Index of failing hop (if any)
+            - estimated_capacity_sats: Estimated route capacity
+            - total_fee_ppm: Total fees for route
+            - per_hop_fees: Fee at each hop
+            - amount_probed_sats: Amount that was probed
 
     Returns:
-        Serialized FEE_INTELLIGENCE message
+        Serialized ROUTE_PROBE_BATCH message
     """
     payload = {
         "reporter_id": reporter_id,
-        "target_peer_id": target_peer_id,
         "timestamp": timestamp,
         "signature": signature,
-        "our_fee_ppm": our_fee_ppm,
-        "their_fee_ppm": their_fee_ppm,
-        "forward_count": forward_count,
-        "forward_volume_sats": forward_volume_sats,
-        "revenue_sats": revenue_sats,
-        "flow_direction": flow_direction,
-        "utilization_pct": utilization_pct,
-        "last_fee_change_ppm": last_fee_change_ppm,
-        "volume_delta_pct": volume_delta_pct,
-        "days_observed": days_observed,
+        "probes": probes,
     }
 
-    return serialize(HiveMessageType.FEE_INTELLIGENCE, payload)
+    return serialize(HiveMessageType.ROUTE_PROBE_BATCH, payload)
+
+
+def get_peer_reputation_snapshot_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for PEER_REPUTATION_SNAPSHOT messages.
+
+    Signs over: reporter_id, timestamp, and a hash of the sorted peer data.
+    This ensures the entire snapshot is authenticated without making the
+    signing string excessively long.
+
+    Args:
+        payload: PEER_REPUTATION_SNAPSHOT message payload
+
+    Returns:
+        Canonical string for signmessage()
+    """
+    import hashlib
+    import json
+
+    # Create deterministic hash of peers data
+    peers = payload.get("peers", [])
+    # Sort by peer_id for deterministic ordering
+    sorted_peers = sorted(peers, key=lambda p: p.get("peer_id", ""))
+    peers_json = json.dumps(sorted_peers, sort_keys=True, separators=(',', ':'))
+    peers_hash = hashlib.sha256(peers_json.encode()).hexdigest()[:16]
+
+    return (
+        f"PEER_REPUTATION_SNAPSHOT:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{len(peers)}:"
+        f"{peers_hash}"
+    )
+
+
+def validate_peer_reputation_snapshot_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a PEER_REPUTATION_SNAPSHOT payload.
+
+    SECURITY: Bounds all values to prevent manipulation and overflow.
+
+    Args:
+        payload: PEER_REPUTATION_SNAPSHOT message payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    import time as time_module
+
+    # Required string fields
+    reporter_id = payload.get("reporter_id")
+    signature = payload.get("signature")
+
+    if not isinstance(reporter_id, str) or not reporter_id:
+        return False
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    # Timestamp freshness (allow 1 hour for reputation snapshots)
+    timestamp = payload.get("timestamp", 0)
+    if not isinstance(timestamp, int) or timestamp < 0:
+        return False
+    if abs(time_module.time() - timestamp) > 3600:
+        return False
+
+    # Peers array
+    peers = payload.get("peers")
+    if not isinstance(peers, list):
+        return False
+    if len(peers) > MAX_PEERS_IN_REPUTATION_SNAPSHOT:
+        return False
+
+    # Validate each peer entry
+    for peer in peers:
+        if not isinstance(peer, dict):
+            return False
+
+        peer_id = peer.get("peer_id")
+        if not isinstance(peer_id, str) or not peer_id:
+            return False
+
+        # Uptime percentage bounds (0-1)
+        uptime_pct = peer.get("uptime_pct", 1.0)
+        if not isinstance(uptime_pct, (int, float)) or not (0 <= uptime_pct <= 1):
+            return False
+
+        # Response time bounds
+        response_time_ms = peer.get("response_time_ms", 0)
+        if not isinstance(response_time_ms, int) or not (0 <= response_time_ms <= MAX_RESPONSE_TIME_MS):
+            return False
+
+        # Force close count bounds
+        force_close_count = peer.get("force_close_count", 0)
+        if not isinstance(force_close_count, int) or not (0 <= force_close_count <= MAX_FORCE_CLOSE_COUNT):
+            return False
+
+        # Fee stability bounds (0-1)
+        fee_stability = peer.get("fee_stability", 1.0)
+        if not isinstance(fee_stability, (int, float)) or not (0 <= fee_stability <= 1):
+            return False
+
+        # HTLC success rate bounds (0-1)
+        htlc_success_rate = peer.get("htlc_success_rate", 1.0)
+        if not isinstance(htlc_success_rate, (int, float)) or not (0 <= htlc_success_rate <= 1):
+            return False
+
+        # Channel age bounds
+        channel_age_days = peer.get("channel_age_days", 0)
+        if not isinstance(channel_age_days, int) or not (0 <= channel_age_days <= MAX_CHANNEL_AGE_DAYS):
+            return False
+
+        # Total routed bounds
+        total_routed_sats = peer.get("total_routed_sats", 0)
+        if not isinstance(total_routed_sats, int) or total_routed_sats < 0:
+            return False
+
+        # Warnings validation
+        warnings = peer.get("warnings", [])
+        if not isinstance(warnings, list):
+            return False
+        if len(warnings) > MAX_WARNINGS_COUNT:
+            return False
+        for warning in warnings:
+            if not isinstance(warning, str):
+                return False
+            if warning and warning not in VALID_WARNINGS:
+                return False
+
+    return True
+
+
+def create_peer_reputation_snapshot(
+    reporter_id: str,
+    timestamp: int,
+    signature: str,
+    peers: list
+) -> bytes:
+    """
+    Create a PEER_REPUTATION_SNAPSHOT message.
+
+    This is the preferred method for sharing peer reputation, replacing
+    individual PEER_REPUTATION messages. Send one snapshot with all peer
+    observations instead of N individual messages.
+
+    SECURITY: The signature must be created using signmessage() over the
+    canonical payload returned by get_peer_reputation_snapshot_signing_payload().
+
+    Args:
+        reporter_id: Hive member reporting these observations
+        timestamp: Unix timestamp
+        signature: zbase-encoded signature from signmessage()
+        peers: List of peer observations, each containing:
+            - peer_id: External peer being reported on
+            - uptime_pct: Peer uptime (0-1)
+            - response_time_ms: Average HTLC response time
+            - force_close_count: Force closes by peer
+            - fee_stability: Fee stability (0-1)
+            - htlc_success_rate: HTLC success rate (0-1)
+            - channel_age_days: Channel age
+            - total_routed_sats: Total volume routed
+            - warnings: Warning codes list
+            - observation_days: Days covered
+
+    Returns:
+        Serialized PEER_REPUTATION_SNAPSHOT message
+    """
+    payload = {
+        "reporter_id": reporter_id,
+        "timestamp": timestamp,
+        "signature": signature,
+        "peers": peers,
+    }
+
+    return serialize(HiveMessageType.PEER_REPUTATION_SNAPSHOT, payload)
+
+
+def create_fee_intelligence_snapshot(
+    reporter_id: str,
+    timestamp: int,
+    signature: str,
+    peers: list
+) -> bytes:
+    """
+    Create a FEE_INTELLIGENCE_SNAPSHOT message.
+
+    This is the preferred method for sharing fee intelligence, replacing
+    individual FEE_INTELLIGENCE messages. Send one snapshot with all peer
+    observations instead of N individual messages.
+
+    SECURITY: The signature must be created using signmessage() over the
+    canonical payload returned by get_fee_intelligence_snapshot_signing_payload().
+
+    Args:
+        reporter_id: Hive member reporting these observations
+        timestamp: Unix timestamp
+        signature: zbase-encoded signature from signmessage()
+        peers: List of peer observations, each containing:
+            - peer_id: External peer being reported on
+            - our_fee_ppm: Fee we charge to this peer
+            - their_fee_ppm: Fee they charge us
+            - forward_count: Number of forwards
+            - forward_volume_sats: Total volume routed
+            - revenue_sats: Fees earned
+            - flow_direction: 'source', 'sink', or 'balanced'
+            - utilization_pct: Channel utilization (0.0-1.0)
+
+    Returns:
+        Serialized FEE_INTELLIGENCE_SNAPSHOT message
+    """
+    payload = {
+        "reporter_id": reporter_id,
+        "timestamp": timestamp,
+        "signature": signature,
+        "peers": peers,
+    }
+
+    return serialize(HiveMessageType.FEE_INTELLIGENCE_SNAPSHOT, payload)
 
 
 def create_liquidity_need(

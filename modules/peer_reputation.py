@@ -20,10 +20,11 @@ from collections import defaultdict
 from .protocol import (
     HiveMessageType,
     serialize,
-    create_peer_reputation,
-    validate_peer_reputation_payload,
-    get_peer_reputation_signing_payload,
-    PEER_REPUTATION_RATE_LIMIT,
+    create_peer_reputation_snapshot,
+    validate_peer_reputation_snapshot_payload,
+    get_peer_reputation_snapshot_signing_payload,
+    PEER_REPUTATION_SNAPSHOT_RATE_LIMIT,
+    MAX_PEERS_IN_REPUTATION_SNAPSHOT,
     MAX_WARNINGS_COUNT,
     VALID_WARNINGS,
 )
@@ -111,8 +112,8 @@ class PeerReputationManager:
         # Key: peer_id
         self._aggregated: Dict[str, AggregatedReputation] = {}
 
-        # Rate limiting
-        self._report_rate: Dict[str, List[float]] = defaultdict(list)
+        # Rate limiting for snapshots
+        self._snapshot_rate: Dict[str, List[float]] = defaultdict(list)
 
     def _check_rate_limit(
         self,
@@ -140,86 +141,115 @@ class PeerReputationManager:
         """Record a message for rate limiting."""
         rate_tracker[sender].append(time.time())
 
-    def create_reputation_message(
+    def create_reputation_snapshot_message(
         self,
-        peer_id: str,
-        rpc: Any,
-        uptime_pct: float = 1.0,
-        response_time_ms: int = 0,
-        force_close_count: int = 0,
-        fee_stability: float = 1.0,
-        htlc_success_rate: float = 1.0,
-        channel_age_days: int = 0,
-        total_routed_sats: int = 0,
-        warnings: List[str] = None,
-        observation_days: int = 7
+        peers: List[Dict[str, Any]],
+        rpc: Any
     ) -> Optional[bytes]:
         """
-        Create a signed PEER_REPUTATION message.
+        Create a signed PEER_REPUTATION_SNAPSHOT message.
+
+        This is the preferred method for sharing peer reputation. Instead of
+        sending N individual messages for N peers, send one snapshot with all
+        peer observations.
 
         Args:
-            peer_id: External peer being reported on
+            peers: List of peer observations, each containing:
+                - peer_id: External peer being reported on
+                - uptime_pct: Peer uptime (0-1)
+                - response_time_ms: Average HTLC response time
+                - force_close_count: Force closes by peer
+                - fee_stability: Fee stability (0-1)
+                - htlc_success_rate: HTLC success rate (0-1)
+                - channel_age_days: Channel age
+                - total_routed_sats: Total volume routed
+                - warnings: Warning codes list
+                - observation_days: Days covered
             rpc: RPC interface for signing
-            uptime_pct: Peer uptime (0-1)
-            response_time_ms: Average HTLC response time
-            force_close_count: Force closes by peer
-            fee_stability: Fee stability (0-1)
-            htlc_success_rate: HTLC success rate (0-1)
-            channel_age_days: Channel age
-            total_routed_sats: Total volume routed
-            warnings: Warning codes
-            observation_days: Days covered
 
         Returns:
             Serialized message bytes, or None on error
         """
-        try:
-            return create_peer_reputation(
-                reporter_id=self.our_pubkey,
-                peer_id=peer_id,
-                rpc=rpc,
-                uptime_pct=uptime_pct,
-                response_time_ms=response_time_ms,
-                force_close_count=force_close_count,
-                fee_stability=fee_stability,
-                htlc_success_rate=htlc_success_rate,
-                channel_age_days=channel_age_days,
-                total_routed_sats=total_routed_sats,
-                warnings=warnings,
-                observation_days=observation_days
-            )
-        except Exception as e:
+        if not self.our_pubkey:
             if self.plugin:
                 self.plugin.log(
-                    f"cl-hive: Failed to create peer reputation message: {e}",
+                    "cl-hive: Cannot create reputation snapshot: no pubkey set",
                     level='warn'
                 )
             return None
 
-    def handle_peer_reputation(
+        if not peers:
+            if self.plugin:
+                self.plugin.log(
+                    "cl-hive: Cannot create reputation snapshot: no peers",
+                    level='warn'
+                )
+            return None
+
+        if len(peers) > MAX_PEERS_IN_REPUTATION_SNAPSHOT:
+            if self.plugin:
+                self.plugin.log(
+                    f"cl-hive: Too many peers in snapshot ({len(peers)} > {MAX_PEERS_IN_REPUTATION_SNAPSHOT}), truncating",
+                    level='warn'
+                )
+            peers = peers[:MAX_PEERS_IN_REPUTATION_SNAPSHOT]
+
+        timestamp = int(time.time())
+
+        # Build payload for signing
+        payload = {
+            "reporter_id": self.our_pubkey,
+            "timestamp": timestamp,
+            "peers": peers,
+        }
+
+        # Sign the payload
+        signing_msg = get_peer_reputation_snapshot_signing_payload(payload)
+        try:
+            sig_result = rpc.signmessage(signing_msg)
+            signature = sig_result['zbase']
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"cl-hive: Failed to sign peer reputation snapshot: {e}",
+                    level='error'
+                )
+            return None
+
+        return create_peer_reputation_snapshot(
+            reporter_id=self.our_pubkey,
+            timestamp=timestamp,
+            signature=signature,
+            peers=peers
+        )
+
+    def handle_peer_reputation_snapshot(
         self,
         peer_id: str,
         payload: Dict[str, Any],
         rpc: Any
     ) -> Dict[str, Any]:
         """
-        Handle incoming PEER_REPUTATION message.
+        Handle incoming PEER_REPUTATION_SNAPSHOT message.
+
+        Validates signature and stores reputation for all peers in the snapshot.
+        This is the preferred method - one message contains all peer observations.
 
         Args:
             peer_id: Sender peer ID
-            payload: Message payload
+            payload: Message payload containing peers list
             rpc: RPC interface for signature verification
 
         Returns:
             Result dict with success/error
         """
         # Validate payload structure
-        if not validate_peer_reputation_payload(payload):
+        if not validate_peer_reputation_snapshot_payload(payload):
             return {"error": "invalid payload"}
 
         reporter_id = payload.get("reporter_id")
 
-        # Identity binding: sender must match reporter (prevent relay attacks)
+        # Identity binding: sender must match reporter
         if peer_id != reporter_id:
             return {"error": "identity binding failed"}
 
@@ -231,8 +261,8 @@ class PeerReputationManager:
         # Rate limit check
         if not self._check_rate_limit(
             reporter_id,
-            self._report_rate,
-            PEER_REPUTATION_RATE_LIMIT
+            self._snapshot_rate,
+            PEER_REPUTATION_SNAPSHOT_RATE_LIMIT
         ):
             return {"error": "rate limited"}
 
@@ -241,7 +271,7 @@ class PeerReputationManager:
         if not signature:
             return {"error": "missing signature"}
 
-        signing_message = get_peer_reputation_signing_payload(payload)
+        signing_message = get_peer_reputation_snapshot_signing_payload(payload)
 
         try:
             verify_result = rpc.checkmessage(signing_message, signature)
@@ -254,35 +284,45 @@ class PeerReputationManager:
             return {"error": f"signature check failed: {e}"}
 
         # Record rate limit
-        self._record_message(reporter_id, self._report_rate)
+        self._record_message(reporter_id, self._snapshot_rate)
 
-        # Store in database
-        self.database.store_peer_reputation(
-            reporter_id=reporter_id,
-            peer_id=payload.get("peer_id", ""),
-            timestamp=payload.get("timestamp", int(time.time())),
-            uptime_pct=payload.get("uptime_pct", 1.0),
-            response_time_ms=payload.get("response_time_ms", 0),
-            force_close_count=payload.get("force_close_count", 0),
-            fee_stability=payload.get("fee_stability", 1.0),
-            htlc_success_rate=payload.get("htlc_success_rate", 1.0),
-            channel_age_days=payload.get("channel_age_days", 0),
-            total_routed_sats=payload.get("total_routed_sats", 0),
-            warnings=payload.get("warnings", []),
-            observation_days=payload.get("observation_days", 7)
-        )
+        # Store reputation for each peer
+        peers = payload.get("peers", [])
+        timestamp = payload.get("timestamp", int(time.time()))
+        stored_count = 0
 
-        # Update aggregation
-        self._update_aggregation(payload.get("peer_id", ""))
+        for peer_data in peers:
+            target_peer_id = peer_data.get("peer_id")
+            if not target_peer_id:
+                continue
+
+            self.database.store_peer_reputation(
+                reporter_id=reporter_id,
+                peer_id=target_peer_id,
+                timestamp=timestamp,
+                uptime_pct=peer_data.get("uptime_pct", 1.0),
+                response_time_ms=peer_data.get("response_time_ms", 0),
+                force_close_count=peer_data.get("force_close_count", 0),
+                fee_stability=peer_data.get("fee_stability", 1.0),
+                htlc_success_rate=peer_data.get("htlc_success_rate", 1.0),
+                channel_age_days=peer_data.get("channel_age_days", 0),
+                total_routed_sats=peer_data.get("total_routed_sats", 0),
+                warnings=peer_data.get("warnings", []),
+                observation_days=peer_data.get("observation_days", 7)
+            )
+
+            # Update aggregation for this peer
+            self._update_aggregation(target_peer_id)
+            stored_count += 1
 
         if self.plugin:
             self.plugin.log(
-                f"cl-hive: Peer reputation from {reporter_id[:16]}... "
-                f"about {payload.get('peer_id', '')[:16]}...",
+                f"cl-hive: Peer reputation snapshot from {reporter_id[:16]}... "
+                f"with {stored_count} peer observations",
                 level='debug'
             )
 
-        return {"success": True, "stored": True}
+        return {"success": True, "peers_stored": stored_count}
 
     def _update_aggregation(self, peer_id: str):
         """Update aggregated reputation for a peer."""

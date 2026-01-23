@@ -20,13 +20,14 @@ from modules.fee_intelligence import (
 )
 from modules.protocol import (
     HiveMessageType,
-    get_fee_intelligence_signing_payload,
+    get_fee_intelligence_snapshot_signing_payload,
     get_health_report_signing_payload,
-    validate_fee_intelligence_payload,
+    validate_fee_intelligence_snapshot_payload,
     validate_health_report_payload,
-    create_fee_intelligence,
+    create_fee_intelligence_snapshot,
     create_health_report,
-    FEE_INTELLIGENCE_RATE_LIMIT,
+    FEE_INTELLIGENCE_SNAPSHOT_RATE_LIMIT,
+    MAX_PEERS_IN_SNAPSHOT,
 )
 
 
@@ -77,62 +78,6 @@ class MockDatabase:
         return [h for h in self.member_health.values() if h.get("can_help_others")]
 
 
-class TestFeeIntelligencePayload:
-    """Test FEE_INTELLIGENCE payload validation."""
-
-    def test_valid_payload(self):
-        """Test that valid payload passes validation."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "target_peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "a" * 100,
-            "our_fee_ppm": 100,
-            "their_fee_ppm": 50,
-            "forward_count": 10,
-            "forward_volume_sats": 1000000,
-            "revenue_sats": 100,
-            "flow_direction": "source",
-            "utilization_pct": 0.5,
-            "days_observed": 7
-        }
-        assert validate_fee_intelligence_payload(payload) is True
-
-    def test_missing_reporter(self):
-        """Test that missing reporter fails validation."""
-        payload = {
-            "target_peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "a" * 100,
-            "our_fee_ppm": 100,
-        }
-        assert validate_fee_intelligence_payload(payload) is False
-
-    def test_invalid_fee_bounds(self):
-        """Test that out-of-bounds fees fail validation."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "target_peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "a" * 100,
-            "our_fee_ppm": 100000,  # Too high
-            "their_fee_ppm": 50,
-        }
-        assert validate_fee_intelligence_payload(payload) is False
-
-    def test_invalid_utilization(self):
-        """Test that out-of-bounds utilization fails validation."""
-        payload = {
-            "reporter_id": "02" + "a" * 64,
-            "target_peer_id": "03" + "b" * 64,
-            "timestamp": int(time.time()),
-            "signature": "a" * 100,
-            "our_fee_ppm": 100,
-            "utilization_pct": 1.5,  # Too high
-        }
-        assert validate_fee_intelligence_payload(payload) is False
-
-
 class TestHealthReportPayload:
     """Test HEALTH_REPORT payload validation."""
 
@@ -165,28 +110,6 @@ class TestHealthReportPayload:
 
 class TestSigningPayloads:
     """Test signing payload generation."""
-
-    def test_fee_intelligence_signing_deterministic(self):
-        """Test that fee intelligence signing payload is deterministic."""
-        payload = {
-            "reporter_id": "02aaa",
-            "target_peer_id": "03bbb",
-            "timestamp": 1700000000,
-            "our_fee_ppm": 100,
-            "their_fee_ppm": 50,
-            "forward_count": 10,
-            "forward_volume_sats": 1000000,
-            "revenue_sats": 100,
-            "flow_direction": "source",
-            "utilization_pct": 0.5,
-        }
-
-        msg1 = get_fee_intelligence_signing_payload(payload)
-        msg2 = get_fee_intelligence_signing_payload(payload)
-
-        assert msg1 == msg2
-        assert "FEE_INTELLIGENCE:" in msg1
-        assert "02aaa" in msg1
 
     def test_health_report_signing_deterministic(self):
         """Test that health report signing payload is deterministic."""
@@ -442,7 +365,7 @@ class TestNNLBStatus:
 
 
 class TestRateLimiting:
-    """Test rate limiting functionality."""
+    """Test rate limiting functionality for fee intelligence snapshots."""
 
     def setup_method(self):
         """Set up test fixtures."""
@@ -454,28 +377,28 @@ class TestRateLimiting:
         )
 
     def test_rate_limit_allows_initial(self):
-        """Test that initial messages are allowed."""
+        """Test that initial snapshot messages are allowed."""
         sender = "02" + "b" * 64
         assert self.manager._check_rate_limit(
             sender,
-            self.manager._fee_intel_rate,
-            FEE_INTELLIGENCE_RATE_LIMIT
+            self.manager._fee_intel_snapshot_rate,
+            FEE_INTELLIGENCE_SNAPSHOT_RATE_LIMIT
         ) is True
 
     def test_rate_limit_blocks_excess(self):
-        """Test that excess messages are blocked."""
+        """Test that excess snapshot messages are blocked."""
         sender = "02" + "b" * 64
-        max_count, period = FEE_INTELLIGENCE_RATE_LIMIT
+        max_count, period = FEE_INTELLIGENCE_SNAPSHOT_RATE_LIMIT
 
         # Fill up to limit
         for _ in range(max_count):
-            self.manager._record_message(sender, self.manager._fee_intel_rate)
+            self.manager._record_message(sender, self.manager._fee_intel_snapshot_rate)
 
         # Next should be blocked
         assert self.manager._check_rate_limit(
             sender,
-            self.manager._fee_intel_rate,
-            FEE_INTELLIGENCE_RATE_LIMIT
+            self.manager._fee_intel_snapshot_rate,
+            FEE_INTELLIGENCE_SNAPSHOT_RATE_LIMIT
         ) is False
 
 
@@ -666,3 +589,143 @@ class TestFeeRecommendationEdgeCases:
 
         # Low confidence should still return a recommendation but note the low confidence
         assert "recommended_fee_ppm" in recommendation
+
+
+class TestFeeIntelligenceSnapshot:
+    """Test FEE_INTELLIGENCE_SNAPSHOT message handling."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.db = MockDatabase()
+        self.manager = FeeIntelligenceManager(
+            database=self.db,
+            plugin=MagicMock(),
+            our_pubkey="02" + "a" * 64
+        )
+
+    def test_snapshot_payload_validation(self):
+        """Test FEE_INTELLIGENCE_SNAPSHOT payload validation."""
+        from modules.protocol import validate_fee_intelligence_snapshot_payload
+
+        now = int(time.time())
+        valid_payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "peers": [
+                {
+                    "peer_id": "03" + "b" * 64,
+                    "our_fee_ppm": 250,
+                    "their_fee_ppm": 300,
+                    "forward_count": 10,
+                    "forward_volume_sats": 100000,
+                    "revenue_sats": 25,
+                    "flow_direction": "source",
+                    "utilization_pct": 0.65
+                }
+            ]
+        }
+
+        assert validate_fee_intelligence_snapshot_payload(valid_payload) is True
+
+    def test_snapshot_rejects_invalid_peers(self):
+        """Test that invalid peer entries are rejected."""
+        from modules.protocol import validate_fee_intelligence_snapshot_payload
+
+        now = int(time.time())
+        invalid_payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "peers": [
+                {
+                    "peer_id": "",  # Empty peer_id
+                    "our_fee_ppm": 250,
+                }
+            ]
+        }
+
+        assert validate_fee_intelligence_snapshot_payload(invalid_payload) is False
+
+    def test_snapshot_rejects_too_many_peers(self):
+        """Test that snapshots with too many peers are rejected."""
+        from modules.protocol import (
+            validate_fee_intelligence_snapshot_payload,
+            MAX_PEERS_IN_SNAPSHOT
+        )
+
+        now = int(time.time())
+        too_many_peers = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "peers": [
+                {
+                    "peer_id": f"03{'x' * 63}{i:x}",
+                    "our_fee_ppm": 100,
+                    "their_fee_ppm": 100,
+                    "forward_count": 1,
+                    "forward_volume_sats": 1000,
+                    "revenue_sats": 1,
+                    "flow_direction": "balanced",
+                    "utilization_pct": 0.5
+                }
+                for i in range(MAX_PEERS_IN_SNAPSHOT + 1)
+            ]
+        }
+
+        assert validate_fee_intelligence_snapshot_payload(too_many_peers) is False
+
+    def test_snapshot_signing_deterministic(self):
+        """Test that snapshot signing payload is deterministic."""
+        from modules.protocol import get_fee_intelligence_snapshot_signing_payload
+
+        now = int(time.time())
+        payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "peers": [
+                {"peer_id": "03" + "b" * 64, "our_fee_ppm": 100},
+                {"peer_id": "03" + "c" * 64, "our_fee_ppm": 200},
+            ]
+        }
+
+        # Different order should produce same signing payload (sorted by peer_id)
+        payload_reordered = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "peers": [
+                {"peer_id": "03" + "c" * 64, "our_fee_ppm": 200},
+                {"peer_id": "03" + "b" * 64, "our_fee_ppm": 100},
+            ]
+        }
+
+        sig1 = get_fee_intelligence_snapshot_signing_payload(payload)
+        sig2 = get_fee_intelligence_snapshot_signing_payload(payload_reordered)
+
+        assert sig1 == sig2
+
+    def test_snapshot_rate_limiting(self):
+        """Test snapshot rate limiting."""
+        from modules.protocol import FEE_INTELLIGENCE_SNAPSHOT_RATE_LIMIT
+
+        sender_id = "02" + "b" * 64
+        self.db.members[sender_id] = {"peer_id": sender_id, "tier": "member"}
+
+        # Should allow first few messages
+        for i in range(FEE_INTELLIGENCE_SNAPSHOT_RATE_LIMIT[0]):
+            allowed = self.manager._check_rate_limit(
+                sender_id,
+                self.manager._fee_intel_snapshot_rate,
+                FEE_INTELLIGENCE_SNAPSHOT_RATE_LIMIT
+            )
+            self.manager._record_message(sender_id, self.manager._fee_intel_snapshot_rate)
+            assert allowed is True
+
+        # Should reject the next one
+        allowed = self.manager._check_rate_limit(
+            sender_id,
+            self.manager._fee_intel_snapshot_rate,
+            FEE_INTELLIGENCE_SNAPSHOT_RATE_LIMIT
+        )
+        assert allowed is False

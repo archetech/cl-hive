@@ -15,14 +15,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from modules.protocol import (
     HiveMessageType,
-    get_fee_intelligence_signing_payload,
-    validate_fee_intelligence_payload,
+    get_fee_intelligence_snapshot_signing_payload,
+    validate_fee_intelligence_snapshot_payload,
     get_health_report_signing_payload,
     validate_health_report_payload,
-    create_fee_intelligence,
+    create_fee_intelligence_snapshot,
     create_health_report,
-    FEE_INTELLIGENCE_RATE_LIMIT,
+    FEE_INTELLIGENCE_SNAPSHOT_RATE_LIMIT,
     HEALTH_REPORT_RATE_LIMIT,
+    MAX_PEERS_IN_SNAPSHOT,
 )
 
 
@@ -124,8 +125,8 @@ class FeeIntelligenceManager:
         self.plugin = plugin
         self.our_pubkey = our_pubkey
 
-        # Rate limiting: {sender_id: [(timestamp, count), ...]}
-        self._fee_intel_rate: Dict[str, List[int]] = {}
+        # Rate limiting: {sender_id: [timestamp, ...]}
+        self._fee_intel_snapshot_rate: Dict[str, List[int]] = {}
         self._health_report_rate: Dict[str, List[int]] = {}
 
     def _log(self, msg: str, level: str = "info") -> None:
@@ -183,105 +184,92 @@ class FeeIntelligenceManager:
     # FEE INTELLIGENCE CREATION
     # =========================================================================
 
-    def create_fee_intelligence_message(
+    def create_fee_intelligence_snapshot_message(
         self,
-        target_peer_id: str,
-        our_fee_ppm: int,
-        their_fee_ppm: int,
-        forward_count: int,
-        forward_volume_sats: int,
-        revenue_sats: int,
-        flow_direction: str,
-        utilization_pct: float,
-        rpc,
-        last_fee_change_ppm: int = 0,
-        volume_delta_pct: float = 0.0,
-        days_observed: int = 1
+        peers: List[Dict[str, Any]],
+        rpc
     ) -> Optional[bytes]:
         """
-        Create a signed FEE_INTELLIGENCE message.
+        Create a signed FEE_INTELLIGENCE_SNAPSHOT message.
+
+        This is the preferred method for sharing fee intelligence. Instead of
+        sending N individual messages for N peers, send one snapshot with all
+        peer observations.
 
         Args:
-            target_peer_id: External peer being reported on
-            our_fee_ppm: Fee we charge to this peer
-            their_fee_ppm: Fee they charge us
-            forward_count: Number of forwards
-            forward_volume_sats: Total volume routed
-            revenue_sats: Fees earned
-            flow_direction: 'source', 'sink', or 'balanced'
-            utilization_pct: Channel utilization (0.0-1.0)
+            peers: List of peer observations, each containing:
+                - peer_id: External peer being reported on
+                - our_fee_ppm: Fee we charge to this peer
+                - their_fee_ppm: Fee they charge us (optional)
+                - forward_count: Number of forwards
+                - forward_volume_sats: Total volume routed
+                - revenue_sats: Fees earned
+                - flow_direction: 'source', 'sink', or 'balanced'
+                - utilization_pct: Channel utilization (0.0-1.0)
             rpc: RPC proxy for signmessage
-            last_fee_change_ppm: Previous fee rate
-            volume_delta_pct: Volume change after fee change
-            days_observed: How long peer has been observed
 
         Returns:
             Serialized message bytes or None on error
         """
         if not self.our_pubkey:
-            self._log("Cannot create fee intelligence: no pubkey set", level='warn')
+            self._log("Cannot create fee intelligence snapshot: no pubkey set", level='warn')
             return None
+
+        if not peers:
+            self._log("Cannot create fee intelligence snapshot: no peers", level='warn')
+            return None
+
+        if len(peers) > MAX_PEERS_IN_SNAPSHOT:
+            self._log(
+                f"Too many peers in snapshot ({len(peers)} > {MAX_PEERS_IN_SNAPSHOT}), truncating",
+                level='warn'
+            )
+            peers = peers[:MAX_PEERS_IN_SNAPSHOT]
 
         timestamp = int(time.time())
 
         # Build payload for signing
         payload = {
             "reporter_id": self.our_pubkey,
-            "target_peer_id": target_peer_id,
             "timestamp": timestamp,
-            "our_fee_ppm": our_fee_ppm,
-            "their_fee_ppm": their_fee_ppm,
-            "forward_count": forward_count,
-            "forward_volume_sats": forward_volume_sats,
-            "revenue_sats": revenue_sats,
-            "flow_direction": flow_direction,
-            "utilization_pct": utilization_pct,
+            "peers": peers,
         }
 
         # Sign the payload
-        signing_msg = get_fee_intelligence_signing_payload(payload)
+        signing_msg = get_fee_intelligence_snapshot_signing_payload(payload)
         try:
             sig_result = rpc.signmessage(signing_msg)
             signature = sig_result['zbase']
         except Exception as e:
-            self._log(f"Failed to sign fee intelligence: {e}", level='error')
+            self._log(f"Failed to sign fee intelligence snapshot: {e}", level='error')
             return None
 
-        return create_fee_intelligence(
+        return create_fee_intelligence_snapshot(
             reporter_id=self.our_pubkey,
-            target_peer_id=target_peer_id,
             timestamp=timestamp,
             signature=signature,
-            our_fee_ppm=our_fee_ppm,
-            their_fee_ppm=their_fee_ppm,
-            forward_count=forward_count,
-            forward_volume_sats=forward_volume_sats,
-            revenue_sats=revenue_sats,
-            flow_direction=flow_direction,
-            utilization_pct=utilization_pct,
-            last_fee_change_ppm=last_fee_change_ppm,
-            volume_delta_pct=volume_delta_pct,
-            days_observed=days_observed
+            peers=peers
         )
 
     # =========================================================================
     # FEE INTELLIGENCE PROCESSING
     # =========================================================================
 
-    def handle_fee_intelligence(
+    def handle_fee_intelligence_snapshot(
         self,
         sender_id: str,
         payload: Dict[str, Any],
         rpc
     ) -> Dict[str, Any]:
         """
-        Handle incoming FEE_INTELLIGENCE message.
+        Handle incoming FEE_INTELLIGENCE_SNAPSHOT message.
 
-        Validates signature and stores the intelligence.
+        Validates signature and stores intelligence for all peers in the snapshot.
+        This is the preferred method - one message contains all peer observations.
 
         Args:
             sender_id: Peer who sent the message
-            payload: Message payload
+            payload: Message payload containing peers list
             rpc: RPC proxy for checkmessage
 
         Returns:
@@ -289,72 +277,83 @@ class FeeIntelligenceManager:
         """
         # Rate limit check
         if not self._check_rate_limit(
-            sender_id, self._fee_intel_rate, FEE_INTELLIGENCE_RATE_LIMIT
+            sender_id, self._fee_intel_snapshot_rate, FEE_INTELLIGENCE_SNAPSHOT_RATE_LIMIT
         ):
-            self._log(f"Rate limited fee intelligence from {sender_id[:16]}...")
+            self._log(f"Rate limited fee intelligence snapshot from {sender_id[:16]}...")
             return {"error": "rate_limited"}
 
         # Validate payload structure
-        if not validate_fee_intelligence_payload(payload):
-            self._log(f"Invalid fee intelligence payload from {sender_id[:16]}...")
+        if not validate_fee_intelligence_snapshot_payload(payload):
+            self._log(f"Invalid fee intelligence snapshot payload from {sender_id[:16]}...")
             return {"error": "invalid_payload"}
 
         # Verify reporter matches sender
         reporter_id = payload.get("reporter_id")
         if reporter_id != sender_id:
             self._log(
-                f"Fee intelligence reporter mismatch: {reporter_id[:16]}... != {sender_id[:16]}..."
+                f"Fee intelligence snapshot reporter mismatch: {reporter_id[:16]}... != {sender_id[:16]}..."
             )
             return {"error": "reporter_mismatch"}
 
         # Verify reporter is a hive member
         member = self.db.get_member(reporter_id)
         if not member:
-            self._log(f"Fee intelligence from non-member {reporter_id[:16]}...")
+            self._log(f"Fee intelligence snapshot from non-member {reporter_id[:16]}...")
             return {"error": "not_a_member"}
 
         # Verify signature
         signature = payload.get("signature")
-        signing_msg = get_fee_intelligence_signing_payload(payload)
+        signing_msg = get_fee_intelligence_snapshot_signing_payload(payload)
 
         try:
             verify_result = rpc.checkmessage(signing_msg, signature)
             if not verify_result.get("verified"):
-                self._log(f"Fee intelligence signature verification failed")
+                self._log(f"Fee intelligence snapshot signature verification failed")
                 return {"error": "invalid_signature"}
             if verify_result.get("pubkey") != reporter_id:
-                self._log(f"Fee intelligence signature pubkey mismatch")
+                self._log(f"Fee intelligence snapshot signature pubkey mismatch")
                 return {"error": "signature_mismatch"}
         except Exception as e:
             self._log(f"Signature verification error: {e}", level='error')
             return {"error": "verification_failed"}
 
-        # Store the intelligence
-        self._record_message(sender_id, self._fee_intel_rate)
+        # Record for rate limiting
+        self._record_message(sender_id, self._fee_intel_snapshot_rate)
 
-        self.db.store_fee_intelligence(
-            reporter_id=reporter_id,
-            target_peer_id=payload.get("target_peer_id"),
-            timestamp=payload.get("timestamp"),
-            our_fee_ppm=payload.get("our_fee_ppm", 0),
-            their_fee_ppm=payload.get("their_fee_ppm", 0),
-            forward_count=payload.get("forward_count", 0),
-            forward_volume_sats=payload.get("forward_volume_sats", 0),
-            revenue_sats=payload.get("revenue_sats", 0),
-            flow_direction=payload.get("flow_direction", "balanced"),
-            utilization_pct=payload.get("utilization_pct", 0.0),
-            signature=signature,
-            last_fee_change_ppm=payload.get("last_fee_change_ppm", 0),
-            volume_delta_pct=payload.get("volume_delta_pct", 0.0),
-            days_observed=payload.get("days_observed", 1)
-        )
+        # Store intelligence for each peer
+        peers = payload.get("peers", [])
+        timestamp = payload.get("timestamp")
+        stored_count = 0
+
+        for peer in peers:
+            peer_id = peer.get("peer_id")
+            if not peer_id:
+                continue
+
+            self.db.store_fee_intelligence(
+                reporter_id=reporter_id,
+                target_peer_id=peer_id,
+                timestamp=timestamp,
+                our_fee_ppm=peer.get("our_fee_ppm", 0),
+                their_fee_ppm=peer.get("their_fee_ppm", 0),
+                forward_count=peer.get("forward_count", 0),
+                forward_volume_sats=peer.get("forward_volume_sats", 0),
+                revenue_sats=peer.get("revenue_sats", 0),
+                flow_direction=peer.get("flow_direction", "balanced"),
+                utilization_pct=peer.get("utilization_pct", 0.0),
+                signature=signature,  # Same signature for all peers in snapshot
+                last_fee_change_ppm=peer.get("last_fee_change_ppm", 0),
+                volume_delta_pct=peer.get("volume_delta_pct", 0.0),
+                days_observed=peer.get("days_observed", 1)
+            )
+            stored_count += 1
 
         self._log(
-            f"Stored fee intelligence from {reporter_id[:16]}... "
-            f"for peer {payload.get('target_peer_id', '')[:16]}..."
+            f"Stored fee intelligence snapshot from {reporter_id[:16]}... "
+            f"with {stored_count} peer observations"
         )
 
-        return {"success": True}
+        return {"success": True, "peers_stored": stored_count}
 
     # =========================================================================
     # FEE PROFILE AGGREGATION

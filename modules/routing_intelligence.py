@@ -19,10 +19,15 @@ from .protocol import (
     HiveMessageType,
     serialize,
     create_route_probe,
+    create_route_probe_batch,
     validate_route_probe_payload,
+    validate_route_probe_batch_payload,
     get_route_probe_signing_payload,
+    get_route_probe_batch_signing_payload,
     ROUTE_PROBE_RATE_LIMIT,
+    ROUTE_PROBE_BATCH_RATE_LIMIT,
     MAX_PATH_LENGTH,
+    MAX_PROBES_IN_BATCH,
 )
 
 
@@ -94,6 +99,7 @@ class HiveRoutingMap:
 
         # Rate limiting
         self._probe_rate: Dict[str, List[float]] = defaultdict(list)
+        self._batch_rate: Dict[str, List[float]] = defaultdict(list)
 
     def _check_rate_limit(
         self,
@@ -283,6 +289,190 @@ class HiveRoutingMap:
             )
 
         return {"success": True, "stored": True}
+
+    def handle_route_probe_batch(
+        self,
+        peer_id: str,
+        payload: Dict[str, Any],
+        rpc: Any
+    ) -> Dict[str, Any]:
+        """
+        Handle incoming ROUTE_PROBE_BATCH message.
+
+        This is the preferred method for receiving route probes - one message
+        contains multiple probe observations instead of N individual messages.
+
+        Args:
+            peer_id: Sender peer ID
+            payload: Message payload
+            rpc: RPC interface for signature verification
+
+        Returns:
+            Result dict with success/error
+        """
+        # Validate payload structure
+        if not validate_route_probe_batch_payload(payload):
+            return {"error": "invalid payload"}
+
+        reporter_id = payload.get("reporter_id")
+
+        # Identity binding: sender must match reporter (prevent relay attacks)
+        if peer_id != reporter_id:
+            return {"error": "identity binding failed"}
+
+        # Verify sender is a hive member
+        member = self.database.get_member(reporter_id)
+        if not member:
+            return {"error": "reporter not a member"}
+
+        # Rate limit check for batch messages
+        if not self._check_rate_limit(
+            reporter_id,
+            self._batch_rate,
+            ROUTE_PROBE_BATCH_RATE_LIMIT
+        ):
+            return {"error": "rate limited"}
+
+        # Verify signature
+        signature = payload.get("signature")
+        if not signature:
+            return {"error": "missing signature"}
+
+        signing_message = get_route_probe_batch_signing_payload(payload)
+
+        try:
+            verify_result = rpc.checkmessage(signing_message, signature)
+            if not verify_result.get("verified"):
+                return {"error": "signature verification failed"}
+
+            if verify_result.get("pubkey") != reporter_id:
+                return {"error": "signature pubkey mismatch"}
+        except Exception as e:
+            return {"error": f"signature check failed: {e}"}
+
+        # Record rate limit
+        self._record_message(reporter_id, self._batch_rate)
+
+        # Process each probe in the batch
+        probes = payload.get("probes", [])
+        stored_count = 0
+        batch_timestamp = payload.get("timestamp", int(time.time()))
+
+        for probe_data in probes:
+            destination = probe_data.get("destination", "")
+            path = tuple(probe_data.get("path", []))
+            success = probe_data.get("success", False)
+            latency_ms = probe_data.get("latency_ms", 0)
+            failure_reason = probe_data.get("failure_reason", "")
+            total_fee_ppm = probe_data.get("total_fee_ppm", 0)
+            estimated_capacity = probe_data.get("estimated_capacity_sats", 0)
+
+            # Update path statistics
+            self._update_path_stats(
+                destination=destination,
+                path=path,
+                success=success,
+                latency_ms=latency_ms,
+                fee_ppm=total_fee_ppm,
+                capacity_sats=estimated_capacity,
+                reporter_id=reporter_id,
+                failure_reason=failure_reason,
+                timestamp=batch_timestamp
+            )
+
+            # Store in database
+            self.database.store_route_probe(
+                reporter_id=reporter_id,
+                destination=destination,
+                path=list(path),
+                success=success,
+                latency_ms=latency_ms,
+                failure_reason=failure_reason,
+                failure_hop=probe_data.get("failure_hop", -1),
+                estimated_capacity_sats=estimated_capacity,
+                total_fee_ppm=total_fee_ppm,
+                amount_probed_sats=probe_data.get("amount_probed_sats", 0),
+                timestamp=batch_timestamp
+            )
+
+            stored_count += 1
+
+        if self.plugin:
+            self.plugin.log(
+                f"cl-hive: Route probe batch from {reporter_id[:16]}... "
+                f"with {stored_count} probe observations",
+                level='debug'
+            )
+
+        return {"success": True, "probes_stored": stored_count}
+
+    def create_route_probe_batch_message(
+        self,
+        probes: List[Dict[str, Any]],
+        rpc: Any
+    ) -> Optional[bytes]:
+        """
+        Create a signed ROUTE_PROBE_BATCH message.
+
+        This is the preferred method for sharing route probes. Instead of
+        sending N individual messages for N probes, send one batch with all
+        probe observations.
+
+        Args:
+            probes: List of probe observations, each containing:
+                - destination: Final destination pubkey
+                - path: List of intermediate hop pubkeys
+                - success: Whether probe succeeded
+                - latency_ms: Round-trip time in milliseconds
+                - failure_reason: Reason for failure (if any)
+                - failure_hop: Index of failing hop (if any)
+                - estimated_capacity_sats: Estimated route capacity
+                - total_fee_ppm: Total fees for route
+                - per_hop_fees: Fee at each hop
+                - amount_probed_sats: Amount that was probed
+            rpc: RPC interface for signing
+
+        Returns:
+            Serialized message bytes, or None on error
+        """
+        # Enforce bounds
+        if len(probes) > MAX_PROBES_IN_BATCH:
+            if self.plugin:
+                self.plugin.log(
+                    f"cl-hive: Route probe batch too large ({len(probes)} > {MAX_PROBES_IN_BATCH})",
+                    level='warn'
+                )
+            return None
+
+        timestamp = int(time.time())
+
+        # Build payload for signing
+        payload = {
+            "reporter_id": self.our_pubkey,
+            "timestamp": timestamp,
+            "probes": probes,
+        }
+
+        # Sign the payload
+        signing_message = get_route_probe_batch_signing_payload(payload)
+
+        try:
+            sig_result = rpc.signmessage(signing_message)
+            signature = sig_result["zbase"]
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"cl-hive: Failed to sign route probe batch: {e}",
+                    level='warn'
+                )
+            return None
+
+        return create_route_probe_batch(
+            reporter_id=self.our_pubkey,
+            timestamp=timestamp,
+            signature=signature,
+            probes=probes
+        )
 
     def _update_path_stats(
         self,

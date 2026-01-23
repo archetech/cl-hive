@@ -1547,16 +1547,20 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
         elif msg_type == HiveMessageType.EXPANSION_DECLINE:
             return handle_expansion_decline(peer_id, msg_payload, plugin)
         # Phase 7: Cooperative Fee Coordination
-        elif msg_type == HiveMessageType.FEE_INTELLIGENCE:
-            return handle_fee_intelligence(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.FEE_INTELLIGENCE_SNAPSHOT:
+            return handle_fee_intelligence_snapshot(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.HEALTH_REPORT:
             return handle_health_report(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.LIQUIDITY_NEED:
             return handle_liquidity_need(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.LIQUIDITY_SNAPSHOT:
+            return handle_liquidity_snapshot(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.ROUTE_PROBE:
             return handle_route_probe(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.PEER_REPUTATION:
-            return handle_peer_reputation(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.ROUTE_PROBE_BATCH:
+            return handle_route_probe_batch(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.PEER_REPUTATION_SNAPSHOT:
+            return handle_peer_reputation_snapshot(peer_id, msg_payload, plugin)
         # Phase 9: Settlement
         elif msg_type == HiveMessageType.SETTLEMENT_OFFER:
             return handle_settlement_offer(peer_id, msg_payload, plugin)
@@ -4503,11 +4507,12 @@ def handle_expansion_decline(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
 # PHASE 7: FEE INTELLIGENCE MESSAGE HANDLERS
 # =============================================================================
 
-def handle_fee_intelligence(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+def handle_fee_intelligence_snapshot(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
-    Handle FEE_INTELLIGENCE message from a hive member.
+    Handle FEE_INTELLIGENCE_SNAPSHOT message from a hive member.
 
-    Validates signature and stores the fee observation for aggregation.
+    This is the preferred method for receiving fee intelligence - one message
+    contains observations for all peers instead of N individual messages.
     """
     if not fee_intel_mgr or not database:
         return {"result": "continue"}
@@ -4515,21 +4520,21 @@ def handle_fee_intelligence(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
     # Verify sender is a hive member and not banned
     sender = database.get_member(peer_id)
     if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: FEE_INTELLIGENCE from non-member {peer_id[:16]}...", level='debug')
+        plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT from non-member {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     # Delegate to fee intelligence manager
-    result = fee_intel_mgr.handle_fee_intelligence(peer_id, payload, safe_plugin.rpc)
+    result = fee_intel_mgr.handle_fee_intelligence_snapshot(peer_id, payload, safe_plugin.rpc)
 
     if result.get("success"):
         plugin.log(
-            f"cl-hive: Stored fee intelligence from {peer_id[:16]}... "
-            f"for {payload.get('target_peer_id', '')[:16]}...",
+            f"cl-hive: Stored fee intelligence snapshot from {peer_id[:16]}... "
+            f"with {result.get('peers_stored', 0)} peers",
             level='debug'
         )
     elif result.get("error"):
         plugin.log(
-            f"cl-hive: FEE_INTELLIGENCE rejected from {peer_id[:16]}...: {result.get('error')}",
+            f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT rejected from {peer_id[:16]}...: {result.get('error')}",
             level='debug'
         )
 
@@ -4601,6 +4606,40 @@ def handle_liquidity_need(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     return {"result": "continue"}
 
 
+def handle_liquidity_snapshot(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle LIQUIDITY_SNAPSHOT message from a hive member.
+
+    This is the preferred method for receiving liquidity needs - one message
+    contains multiple needs instead of N individual messages.
+    """
+    if not liquidity_coord or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: LIQUIDITY_SNAPSHOT from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to liquidity coordinator
+    result = liquidity_coord.handle_liquidity_snapshot(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        plugin.log(
+            f"cl-hive: Stored liquidity snapshot from {peer_id[:16]}... "
+            f"with {result.get('needs_stored', 0)} needs",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: LIQUIDITY_SNAPSHOT rejected from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
 def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle ROUTE_PROBE message from a hive member.
@@ -4633,11 +4672,46 @@ def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     return {"result": "continue"}
 
 
-def handle_peer_reputation(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+def handle_route_probe_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
-    Handle PEER_REPUTATION message from a hive member.
+    Handle ROUTE_PROBE_BATCH message from a hive member.
 
-    Used for collective peer reputation tracking.
+    This is the preferred method for receiving route probes - one message
+    contains multiple probe observations instead of N individual messages.
+    """
+    if not routing_map or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: ROUTE_PROBE_BATCH from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to routing map
+    result = routing_map.handle_route_probe_batch(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("success"):
+        plugin.log(
+            f"cl-hive: Stored route probe batch from {peer_id[:16]}... "
+            f"with {result.get('probes_stored', 0)} probes",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: ROUTE_PROBE_BATCH rejected from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_peer_reputation_snapshot(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle PEER_REPUTATION_SNAPSHOT message from a hive member.
+
+    This is the preferred method for receiving peer reputation - one message
+    contains observations for all peers instead of N individual messages.
     """
     if not peer_reputation_mgr or not database:
         return {"result": "continue"}
@@ -4645,20 +4719,21 @@ def handle_peer_reputation(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Verify sender is a hive member and not banned
     sender = database.get_member(peer_id)
     if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: PEER_REPUTATION from non-member {peer_id[:16]}...", level='debug')
+        plugin.log(f"cl-hive: PEER_REPUTATION_SNAPSHOT from non-member {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     # Delegate to peer reputation manager
-    result = peer_reputation_mgr.handle_peer_reputation(peer_id, payload, safe_plugin.rpc)
+    result = peer_reputation_mgr.handle_peer_reputation_snapshot(peer_id, payload, safe_plugin.rpc)
 
     if result.get("success"):
         plugin.log(
-            f"cl-hive: Stored peer reputation from {peer_id[:16]}...",
+            f"cl-hive: Stored peer reputation snapshot from {peer_id[:16]}... "
+            f"with {result.get('peers_stored', 0)} peers",
             level='debug'
         )
     elif result.get("error"):
         plugin.log(
-            f"cl-hive: PEER_REPUTATION rejected from {peer_id[:16]}...: {result.get('error')}",
+            f"cl-hive: PEER_REPUTATION_SNAPSHOT rejected from {peer_id[:16]}...: {result.get('error')}",
             level='debug'
         )
 
@@ -5313,7 +5388,8 @@ def _broadcast_our_fee_intelligence():
     Collect fee observations from our channels and broadcast to hive.
 
     Gathers fee and performance data for each external peer we have
-    channels with and broadcasts FEE_INTELLIGENCE messages.
+    channels with and broadcasts a single FEE_INTELLIGENCE_SNAPSHOT message
+    containing all peer observations.
     """
     if not fee_intel_mgr or not safe_plugin or not database or not our_pubkey:
         return
@@ -5355,8 +5431,8 @@ def _broadcast_our_fee_intelligence():
                 peer_forwards[out_channel]["volume_msat"] += fwd.get("out_msat", 0)
                 peer_forwards[out_channel]["fee_msat"] += fwd.get("fee_msat", 0)
 
-        # Collect fee intelligence for each external peer
-        broadcast_count = 0
+        # Collect fee intelligence for each external peer into a list
+        peers_data = []
         for channel in channels:
             if channel.get("state") != "CHANNELD_NORMAL":
                 continue
@@ -5398,45 +5474,55 @@ def _broadcast_our_fee_intelligence():
             # Get our fee rate for this channel (simplified - would need listpeerchannels)
             our_fee_ppm = 100  # Default, would query actual fee
 
-            # Create and broadcast fee intelligence message
-            try:
-                msg = fee_intel_mgr.create_fee_intelligence_message(
-                    target_peer_id=peer_id,
-                    our_fee_ppm=our_fee_ppm,
-                    their_fee_ppm=0,  # Would need to look up
-                    forward_count=forward_count,
-                    forward_volume_sats=forward_volume_sats,
-                    revenue_sats=revenue_sats,
-                    flow_direction=flow_direction,
-                    utilization_pct=utilization_pct,
-                    rpc=safe_plugin.rpc,
-                    days_observed=7
-                )
+            # Add peer data to snapshot list
+            peers_data.append({
+                "peer_id": peer_id,
+                "our_fee_ppm": our_fee_ppm,
+                "their_fee_ppm": 0,  # Would need to look up
+                "forward_count": forward_count,
+                "forward_volume_sats": forward_volume_sats,
+                "revenue_sats": revenue_sats,
+                "flow_direction": flow_direction,
+                "utilization_pct": round(utilization_pct, 4),
+                "days_observed": 7
+            })
 
-                if msg:
-                    # Broadcast to all hive members
-                    for member in members:
-                        member_id = member.get("peer_id")
-                        if not member_id or member_id == our_pubkey:
-                            continue
-                        try:
-                            safe_plugin.rpc.call("sendcustommsg", {
-                                "node_id": member_id,
-                                "msg": msg.hex()
-                            })
-                            broadcast_count += 1
-                        except Exception:
-                            pass  # Peer might be offline
+        if not peers_data:
+            return
 
-            except Exception as e:
-                safe_plugin.log(
-                    f"cl-hive: Failed to create fee intelligence for {peer_id[:16]}...: {e}",
-                    level='debug'
-                )
+        # Create single snapshot message with all peer data
+        try:
+            msg = fee_intel_mgr.create_fee_intelligence_snapshot_message(
+                peers=peers_data,
+                rpc=safe_plugin.rpc
+            )
 
-        if broadcast_count > 0:
+            if msg:
+                # Broadcast single snapshot to all hive members
+                broadcast_count = 0
+                for member in members:
+                    member_id = member.get("peer_id")
+                    if not member_id or member_id == our_pubkey:
+                        continue
+                    try:
+                        safe_plugin.rpc.call("sendcustommsg", {
+                            "node_id": member_id,
+                            "msg": msg.hex()
+                        })
+                        broadcast_count += 1
+                    except Exception:
+                        pass  # Peer might be offline
+
+                if broadcast_count > 0:
+                    safe_plugin.log(
+                        f"cl-hive: Broadcast fee intelligence snapshot "
+                        f"({len(peers_data)} peers to {broadcast_count} members)",
+                        level='debug'
+                    )
+
+        except Exception as e:
             safe_plugin.log(
-                f"cl-hive: Broadcast fee intelligence ({broadcast_count} messages)",
+                f"cl-hive: Failed to create fee intelligence snapshot: {e}",
                 level='debug'
             )
 

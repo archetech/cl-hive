@@ -26,9 +26,14 @@ from modules.liquidity_coordinator import (
 )
 from modules.protocol import (
     validate_liquidity_need_payload,
+    validate_liquidity_snapshot_payload,
     get_liquidity_need_signing_payload,
+    get_liquidity_snapshot_signing_payload,
     create_liquidity_need,
+    create_liquidity_snapshot,
     LIQUIDITY_NEED_RATE_LIMIT,
+    LIQUIDITY_SNAPSHOT_RATE_LIMIT,
+    MAX_NEEDS_IN_SNAPSHOT,
 )
 
 
@@ -41,7 +46,7 @@ class MockDatabase:
         self.member_health = {}
 
     def get_member(self, peer_id):
-        return self.members.get(peer_id, {"peer_id": peer_id, "tier": "member"})
+        return self.members.get(peer_id)  # Returns None for non-members
 
     def get_all_members(self):
         return list(self.members.values()) if self.members else []
@@ -191,8 +196,7 @@ class TestLiquidityCoordinator:
     def test_handle_liquidity_need_non_member(self):
         """Test that non-members are rejected."""
         reporter_id = "02" + "x" * 64
-        # Don't add to members - remove from default mock
-        self.db.get_member = lambda pid: None
+        # reporter_id not in self.db.members, so get_member returns None
 
         payload = {
             "reporter_id": reporter_id,
@@ -530,3 +534,231 @@ class TestInternalCompetitionDetection:
         # With 3+ competitors, should flag as high competition
         if len(result) > 0:
             assert result[0]["member_count"] >= 2
+
+
+class TestLiquiditySnapshot:
+    """Test LIQUIDITY_SNAPSHOT message handling."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.db = MockDatabase()
+        self.plugin = MagicMock()
+        self.our_pubkey = "02" + "0" * 64
+        self.coordinator = LiquidityCoordinator(
+            database=self.db,
+            plugin=self.plugin,
+            our_pubkey=self.our_pubkey
+        )
+
+        # Add member
+        self.member1 = "02" + "a" * 64
+        self.db.members[self.member1] = {
+            "peer_id": self.member1,
+            "tier": "member"
+        }
+
+        # Target peer
+        self.target_peer = "03" + "x" * 64
+
+    def test_snapshot_payload_validation(self):
+        """Test LIQUIDITY_SNAPSHOT payload validation."""
+        now = int(time.time())
+        valid_payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "needs": [
+                {
+                    "target_peer_id": "03" + "b" * 64,
+                    "need_type": "outbound",
+                    "amount_sats": 1000000,
+                    "urgency": "high",
+                    "max_fee_ppm": 500,
+                    "reason": "channel_depleted",
+                    "current_balance_pct": 0.1,
+                    "can_provide_inbound": 0,
+                    "can_provide_outbound": 0
+                }
+            ]
+        }
+
+        assert validate_liquidity_snapshot_payload(valid_payload) is True
+
+    def test_snapshot_rejects_invalid_need_type(self):
+        """Test that invalid need types are rejected."""
+        now = int(time.time())
+        invalid_payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "needs": [
+                {
+                    "target_peer_id": "03" + "b" * 64,
+                    "need_type": "invalid_type",  # Invalid
+                    "amount_sats": 1000000,
+                    "urgency": "high",
+                    "max_fee_ppm": 500,
+                }
+            ]
+        }
+
+        assert validate_liquidity_snapshot_payload(invalid_payload) is False
+
+    def test_snapshot_rejects_too_many_needs(self):
+        """Test that snapshots with too many needs are rejected."""
+        now = int(time.time())
+        too_many_needs = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "signature": "testsig12345",
+            "needs": [
+                {
+                    "target_peer_id": f"03{'x' * 63}{i:x}",
+                    "need_type": "outbound",
+                    "amount_sats": 1000000,
+                    "urgency": "medium",
+                    "max_fee_ppm": 500,
+                    "current_balance_pct": 0.5,
+                }
+                for i in range(MAX_NEEDS_IN_SNAPSHOT + 1)
+            ]
+        }
+
+        assert validate_liquidity_snapshot_payload(too_many_needs) is False
+
+    def test_snapshot_signing_deterministic(self):
+        """Test that snapshot signing payload is deterministic."""
+        now = int(time.time())
+        payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "needs": [
+                {"target_peer_id": "03" + "b" * 64, "need_type": "outbound", "amount_sats": 100000, "urgency": "medium", "max_fee_ppm": 500, "current_balance_pct": 0.5},
+                {"target_peer_id": "03" + "c" * 64, "need_type": "inbound", "amount_sats": 200000, "urgency": "high", "max_fee_ppm": 300, "current_balance_pct": 0.9},
+            ]
+        }
+
+        # Different order should produce same signing payload (sorted by target_peer_id)
+        payload_reordered = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": now,
+            "needs": [
+                {"target_peer_id": "03" + "c" * 64, "need_type": "inbound", "amount_sats": 200000, "urgency": "high", "max_fee_ppm": 300, "current_balance_pct": 0.9},
+                {"target_peer_id": "03" + "b" * 64, "need_type": "outbound", "amount_sats": 100000, "urgency": "medium", "max_fee_ppm": 500, "current_balance_pct": 0.5},
+            ]
+        }
+
+        sig1 = get_liquidity_snapshot_signing_payload(payload)
+        sig2 = get_liquidity_snapshot_signing_payload(payload_reordered)
+
+        assert sig1 == sig2
+
+    def test_snapshot_rate_limiting(self):
+        """Test snapshot rate limiting."""
+        sender_id = "02" + "b" * 64
+        self.db.members[sender_id] = {"peer_id": sender_id, "tier": "member"}
+
+        # Should allow first few snapshots
+        for i in range(LIQUIDITY_SNAPSHOT_RATE_LIMIT[0]):
+            allowed = self.coordinator._check_rate_limit(
+                sender_id,
+                self.coordinator._snapshot_rate,
+                LIQUIDITY_SNAPSHOT_RATE_LIMIT
+            )
+            self.coordinator._record_message(sender_id, self.coordinator._snapshot_rate)
+            assert allowed is True
+
+        # Should reject the next one
+        allowed = self.coordinator._check_rate_limit(
+            sender_id,
+            self.coordinator._snapshot_rate,
+            LIQUIDITY_SNAPSHOT_RATE_LIMIT
+        )
+        assert allowed is False
+
+    def test_handle_snapshot_valid(self):
+        """Test handling a valid liquidity snapshot."""
+        mock_rpc = MagicMock()
+        mock_rpc.checkmessage.return_value = {
+            "verified": True,
+            "pubkey": self.member1
+        }
+
+        now = int(time.time())
+        payload = {
+            "reporter_id": self.member1,
+            "timestamp": now,
+            "signature": "valid_signature_here",
+            "needs": [
+                {
+                    "target_peer_id": self.target_peer,
+                    "need_type": "outbound",
+                    "amount_sats": 1000000,
+                    "urgency": "high",
+                    "max_fee_ppm": 500,
+                    "reason": "channel_depleted",
+                    "current_balance_pct": 0.1,
+                },
+                {
+                    "target_peer_id": "03" + "y" * 64,
+                    "need_type": "inbound",
+                    "amount_sats": 500000,
+                    "urgency": "medium",
+                    "max_fee_ppm": 300,
+                    "current_balance_pct": 0.9,
+                }
+            ]
+        }
+
+        result = self.coordinator.handle_liquidity_snapshot(
+            self.member1, payload, mock_rpc
+        )
+
+        assert result.get("success") is True
+        assert result.get("needs_stored") == 2
+        assert len(self.db.liquidity_needs) == 2
+
+    def test_handle_snapshot_non_member(self):
+        """Test rejecting snapshot from non-member."""
+        mock_rpc = MagicMock()
+        non_member = "02" + "z" * 64
+
+        now = int(time.time())
+        payload = {
+            "reporter_id": non_member,
+            "timestamp": now,
+            "signature": "valid_signature_here",
+            "needs": []
+        }
+
+        result = self.coordinator.handle_liquidity_snapshot(
+            non_member, payload, mock_rpc
+        )
+
+        assert result.get("error") == "reporter not a member"
+
+    def test_create_snapshot_message(self):
+        """Test creating a signed liquidity snapshot message."""
+        mock_rpc = MagicMock()
+        mock_rpc.signmessage.return_value = {"signature": "base64sig", "zbase": "zbasesig"}
+
+        needs = [
+            {
+                "target_peer_id": "03" + "b" * 64,
+                "need_type": "outbound",
+                "amount_sats": 1000000,
+                "urgency": "high",
+                "max_fee_ppm": 500,
+                "reason": "channel_depleted",
+                "current_balance_pct": 0.1,
+            }
+        ]
+
+        msg = self.coordinator.create_liquidity_snapshot_message(
+            needs=needs,
+            rpc=mock_rpc
+        )
+
+        assert msg is not None
+        assert isinstance(msg, bytes)
+        assert mock_rpc.signmessage.called
