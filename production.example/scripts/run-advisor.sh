@@ -68,7 +68,22 @@ MCPEOF
 # 5) Score with learning 6) Auto-execute safe actions 7) Queue risky actions
 # 8) Measure outcomes 9) Plan next cycle
 # --allowedTools restricts to only hive/revenue/advisor tools for safety
-claude -p "Run the proactive advisor cycle on ALL nodes using advisor_run_cycle_all. After the cycle completes, provide a summary report FOR EACH NODE including: 1) Node state (capacity, channels, ROC%, underwater%) 2) Goals progress and any strategy adjustments needed 3) Opportunities found by type and actions taken/queued 4) Learning outcomes (success rate of past decisions) 5) Next cycle priorities. Also check hive_pending_actions for any actions needing human review on each node - list them with your recommendations. Include goat feeder P&L from revenue_dashboard if available." \
+claude -p "Run the proactive advisor cycle on ALL nodes using advisor_run_cycle_all. After the cycle completes, provide a report with these sections:
+
+## FLEET HEALTH (use advisor_get_trends and hive_status)
+- Total nodes and their status (online/offline)
+- Fleet-wide capacity and revenue trends (7-day)
+- Hive membership summary (members/neophytes)
+- Any internal competition or coordination issues
+
+## PER-NODE SUMMARIES (for each node)
+1) Node state (capacity, channels, ROC%, underwater%)
+2) Goals progress and strategy adjustments needed
+3) Opportunities found by type and actions taken/queued
+4) Next cycle priorities
+
+## PENDING ACTIONS (check hive_pending_actions on each node)
+- List actions needing human review with your recommendations" \
     --mcp-config "$MCP_CONFIG_TMP" \
     --system-prompt "$SYSTEM_PROMPT" \
     --model sonnet \
