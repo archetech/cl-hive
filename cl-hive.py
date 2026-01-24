@@ -10574,17 +10574,20 @@ def hive_backfill_fees(plugin: Plugin, period: str = None, source: str = "revenu
             )
 
             # Also update local_fee_tracking so gossip loop broadcasts correct fees
+            now = int(time.time())
             database._get_connection().execute("""
-                INSERT INTO local_fee_tracking (id, cumulative_fees_sats, cumulative_forward_count,
-                                                period_start, last_broadcast_fees, last_broadcast_time)
-                VALUES (1, ?, ?, ?, ?, ?)
+                INSERT INTO local_fee_tracking (id, earned_sats, forward_count,
+                                                period_start_ts, last_broadcast_ts,
+                                                last_broadcast_amount, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
-                    cumulative_fees_sats = excluded.cumulative_fees_sats,
-                    cumulative_forward_count = excluded.cumulative_forward_count,
-                    period_start = excluded.period_start,
-                    last_broadcast_fees = excluded.last_broadcast_fees,
-                    last_broadcast_time = excluded.last_broadcast_time
-            """, (fees_earned, forwards, period_start, fees_earned, period_end))
+                    earned_sats = excluded.earned_sats,
+                    forward_count = excluded.forward_count,
+                    period_start_ts = excluded.period_start_ts,
+                    last_broadcast_ts = excluded.last_broadcast_ts,
+                    last_broadcast_amount = excluded.last_broadcast_amount,
+                    updated_at = excluded.updated_at
+            """, (fees_earned, forwards, period_start, now, fees_earned, now))
 
             # Trigger immediate fee report broadcast
             _broadcast_fee_report(fees_earned, forwards, period_start, period_end)
@@ -10609,9 +10612,9 @@ def hive_backfill_fees(plugin: Plugin, period: str = None, source: str = "revenu
             ).fetchone()
 
             if row:
-                fees_earned = row["cumulative_fees_sats"] or 0
-                forwards = row["cumulative_forward_count"] or 0
-                period_start = row["period_start"] or int(time.time())
+                fees_earned = row["earned_sats"] or 0
+                forwards = row["forward_count"] or 0
+                period_start = row["period_start_ts"] or int(time.time())
                 period_end = int(time.time())
 
                 database.save_fee_report(
