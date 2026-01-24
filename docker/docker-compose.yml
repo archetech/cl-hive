@@ -88,6 +88,12 @@ services:
       # Experimental features
       - EXPERIMENTAL_SPLICING=${EXPERIMENTAL_SPLICING:-false}
 
+      # Channel policy (tune for new node reputation building)
+      - MIN_CAPACITY_SAT=${MIN_CAPACITY_SAT:-500000}
+      - FEE_BASE=${FEE_BASE:-0}
+      - FEE_PER_SATOSHI=${FEE_PER_SATOSHI:-100}
+      - HTLC_MINIMUM_MSAT=${HTLC_MINIMUM_MSAT:-1000}
+
       # Lightning directory (used by supervisord)
       - LIGHTNING_DIR=/data/lightning/${NETWORK:-bitcoin}
 

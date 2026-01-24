@@ -180,6 +180,17 @@ grpc-port=9937
 clnrest-port=3001
 clnrest-protocol=https
 clnrest-host=0.0.0.0
+
+# Channel Policy
+min-capacity-sat=${MIN_CAPACITY_SAT:-500000}
+large-channels
+
+# Default Fees (can be overridden per-channel by cl-revenue-ops)
+fee-base=${FEE_BASE:-0}
+fee-per-satoshi=${FEE_PER_SATOSHI:-100}
+
+# HTLC Limits
+htlc-minimum-msat=${HTLC_MINIMUM_MSAT:-1000}
 EOF
 
 # Enable experimental splicing if requested
