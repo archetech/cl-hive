@@ -10562,13 +10562,15 @@ def hive_backfill_fees(plugin: Plugin, period: str = None, source: str = "revenu
             fees_earned = period_data.get("gross_revenue_sats", 0)
             forwards = period_data.get("total_forwards", 0)
 
-            # Calculate period timestamps
-            # Parse the period to get week start
+            # Calculate period timestamps using ISO week (proper handling)
             year, week = map(int, period.split('-'))
-            dt = datetime.datetime.strptime(f'{year}-W{week:02d}-1', '%Y-W%W-%w')
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
+            # Use fromisocalendar for correct ISO week handling
+            week_start = datetime.date.fromisocalendar(year, week, 1)  # Monday
+            dt = datetime.datetime.combine(week_start, datetime.time.min, tzinfo=datetime.timezone.utc)
             period_start = int(dt.timestamp())
             period_end = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp())
+            # Ensure period_end >= period_start (in case of edge cases)
+            period_end = max(period_end, period_start)
 
             # Save our fee report to database
             database.save_fee_report(
