@@ -108,6 +108,74 @@ Fair share calculation:
 - 60% weight: Routing volume (forwards)
 - 10% weight: Uptime
 
+## Updating Your Node
+
+When new versions are released, update your node with these steps:
+
+### Step 1: Pull Latest Changes
+
+```bash
+cd cl-hive
+git pull origin main
+```
+
+### Step 2: Rebuild the Docker Image
+
+```bash
+cd docker
+docker-compose build --no-cache
+```
+
+The `--no-cache` flag ensures all layers are rebuilt with the latest code.
+
+### Step 3: Restart the Container
+
+```bash
+docker-compose down
+docker-compose up -d
+```
+
+### Step 4: Verify the Update
+
+Check that the node started correctly:
+
+```bash
+docker logs -f cl-hive-node
+```
+
+Verify the plugin loaded:
+
+```bash
+docker exec cl-hive-node lightning-cli plugin list | grep hive
+```
+
+### Quick Update (Single Command)
+
+For a quick update when you're confident about the changes:
+
+```bash
+cd cl-hive && git pull && cd docker && docker-compose build --no-cache && docker-compose down && docker-compose up -d
+```
+
+### Preserving Data
+
+Your Lightning data is stored in Docker volumes and persists across updates:
+- `/data/lightning` - Channel database, keys, and state
+- `/data/bitcoin` - Bitcoin data (if not using external node)
+
+These volumes are NOT deleted by `docker-compose down`. Only `docker-compose down -v` removes volumes (avoid this unless you want to start fresh).
+
+### Rollback
+
+If an update causes issues, rollback to a previous version:
+
+```bash
+git checkout <previous-commit-hash>
+cd docker
+docker-compose build --no-cache
+docker-compose down && docker-compose up -d
+```
+
 ## Troubleshooting
 
 ### Node not connecting to peers
