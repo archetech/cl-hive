@@ -51,7 +51,14 @@ Contact an existing hive member and request their connection info:
 - Their node's pubkey
 - Their connection address (pubkey@host:port)
 
-You can find active members via the Lightning network explorers or community channels.
+**Current Hive Members:**
+
+| Node | Connection String |
+|------|-------------------|
+| Hive-Nexus-01 | `0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3@45.76.234.192:9735` |
+| Hive-Nexus-02 | `03fe48e8a64f14fa0aa7d9d16500754b3b906c729acfb867c00423fd4b0b9b56c2@45.76.234.192:9736` |
+
+You can also find active members via Lightning network explorers or community channels.
 
 ## Step 4: Open Channel and Request Membership
 
