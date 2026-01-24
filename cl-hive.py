@@ -2657,6 +2657,18 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
                 period_end=period_end
             )
 
+        # Persist our own fee report to database for settlement
+        from modules.settlement import SettlementManager
+        period = SettlementManager.get_period_string(period_start)
+        database.save_fee_report(
+            peer_id=our_pubkey,
+            period=period,
+            fees_earned_sats=fees_earned,
+            forward_count=forward_count,
+            period_start=period_start,
+            period_end=period_end
+        )
+
     except Exception as e:
         if safe_plugin:
             safe_plugin.log(f"cl-hive: Fee report broadcast error: {e}", level="warn")
@@ -4935,9 +4947,21 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: FEE_REPORT signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
-    # Update state manager with fee data
+    # Update state manager with fee data (in-memory)
     updated = state_manager.update_peer_fees(
         peer_id=report_peer_id,
+        fees_earned_sats=fees_earned_sats,
+        forward_count=forward_count,
+        period_start=period_start,
+        period_end=period_end
+    )
+
+    # Also persist to database for settlement calculations
+    from modules.settlement import SettlementManager
+    period = SettlementManager.get_period_string(period_start)
+    database.save_fee_report(
+        peer_id=report_peer_id,
+        period=period,
         fees_earned_sats=fees_earned_sats,
         forward_count=forward_count,
         period_start=period_start,
@@ -4947,7 +4971,7 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if updated:
         plugin.log(
             f"FEE_GOSSIP: Received FEE_REPORT from {peer_id[:16]}...: {fees_earned_sats} sats, "
-            f"{forward_count} forwards",
+            f"{forward_count} forwards (period {period})",
             level='info'
         )
 
@@ -10470,6 +10494,165 @@ def hive_distributed_settlement_participation(plugin: Plugin, periods: int = 10)
         "members": member_stats,
         "periods_analyzed": period_count,
         "total_members": len(member_stats)
+    }
+
+
+@plugin.method("hive-backfill-fees")
+def hive_backfill_fees(plugin: Plugin, period: str = None, source: str = "revenue-ops"):
+    """
+    Backfill fee reports from historical data.
+
+    This populates the fee_reports table with historical fee data from
+    cl-revenue-ops or local tracking, enabling accurate settlement
+    calculations even after node restarts.
+
+    Args:
+        period: Optional specific period to backfill (YYYY-WW format).
+                If not provided, backfills current period.
+        source: Data source - "revenue-ops" (default) or "local"
+
+    Returns:
+        Dict with backfill status and amounts
+    """
+    if not database or not our_pubkey:
+        return {"error": "Plugin not initialized"}
+
+    from modules.settlement import SettlementManager
+    import datetime
+
+    # Determine period
+    if period is None:
+        period = SettlementManager.get_period_string()
+
+    results = {
+        "period": period,
+        "source": source,
+        "backfilled": []
+    }
+
+    if source == "revenue-ops":
+        # Try to get fee data from cl-revenue-ops
+        try:
+            # Get dashboard data which includes fee totals
+            dashboard = safe_plugin.rpc.call("revenue-dashboard", {
+                "window_days": 7
+            })
+
+            # Fee data is in the 'period' sub-object
+            period_data = dashboard.get("period", {})
+            fees_earned = period_data.get("gross_revenue_sats", 0)
+            forwards = period_data.get("total_forwards", 0)
+
+            # Calculate period timestamps
+            # Parse the period to get week start
+            year, week = map(int, period.split('-'))
+            dt = datetime.datetime.strptime(f'{year}-W{week:02d}-1', '%Y-W%W-%w')
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+            period_start = int(dt.timestamp())
+            period_end = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp())
+
+            # Save our fee report
+            database.save_fee_report(
+                peer_id=our_pubkey,
+                period=period,
+                fees_earned_sats=fees_earned,
+                forward_count=forwards,
+                period_start=period_start,
+                period_end=period_end
+            )
+
+            results["backfilled"].append({
+                "peer_id": our_pubkey[:16] + "...",
+                "fees_earned_sats": fees_earned,
+                "forward_count": forwards
+            })
+
+            plugin.log(f"Backfilled fees for {period}: {fees_earned} sats", level='info')
+
+        except Exception as e:
+            results["error"] = f"Failed to get data from cl-revenue-ops: {e}"
+
+    elif source == "local":
+        # Use local fee tracking state
+        try:
+            row = database._get_connection().execute(
+                "SELECT * FROM local_fee_tracking WHERE id = 1"
+            ).fetchone()
+
+            if row:
+                fees_earned = row["cumulative_fees_sats"] or 0
+                forwards = row["cumulative_forward_count"] or 0
+                period_start = row["period_start"] or int(time.time())
+                period_end = int(time.time())
+
+                database.save_fee_report(
+                    peer_id=our_pubkey,
+                    period=period,
+                    fees_earned_sats=fees_earned,
+                    forward_count=forwards,
+                    period_start=period_start,
+                    period_end=period_end
+                )
+
+                results["backfilled"].append({
+                    "peer_id": our_pubkey[:16] + "...",
+                    "fees_earned_sats": fees_earned,
+                    "forward_count": forwards
+                })
+
+                plugin.log(f"Backfilled local fees for {period}: {fees_earned} sats", level='info')
+            else:
+                results["error"] = "No local fee tracking data found"
+
+        except Exception as e:
+            results["error"] = f"Failed to read local fee data: {e}"
+
+    else:
+        results["error"] = f"Unknown source: {source}. Use 'revenue-ops' or 'local'"
+
+    return results
+
+
+@plugin.method("hive-fee-reports")
+def hive_fee_reports(plugin: Plugin, period: str = None):
+    """
+    Get all fee reports stored in the database.
+
+    Args:
+        period: Optional specific period (YYYY-WW format). If not provided,
+                returns the latest report for each peer.
+
+    Returns:
+        Dict with fee reports and totals
+    """
+    if not database:
+        return {"error": "Plugin not initialized"}
+
+    from modules.settlement import SettlementManager
+
+    if period:
+        reports = database.get_fee_reports_for_period(period)
+    else:
+        reports = database.get_latest_fee_reports()
+
+    total_fees = sum(r.get('fees_earned_sats', 0) for r in reports)
+    total_forwards = sum(r.get('forward_count', 0) for r in reports)
+
+    return {
+        "period": period or "latest",
+        "reports": [
+            {
+                "peer_id": r.get('peer_id', '')[:16] + "...",
+                "fees_earned_sats": r.get('fees_earned_sats', 0),
+                "forward_count": r.get('forward_count', 0),
+                "period": r.get('period', ''),
+                "received_at": r.get('received_at', 0)
+            }
+            for r in reports
+        ],
+        "total_fees_sats": total_fees,
+        "total_forwards": total_forwards,
+        "report_count": len(reports)
     }
 
 

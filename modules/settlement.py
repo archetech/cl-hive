@@ -755,8 +755,8 @@ class SettlementManager:
         """
         Gather contribution data from gossiped FEE_REPORT messages.
 
-        This uses the state_manager to get fee data that has been
-        gossiped by other members via FEE_REPORT messages.
+        This uses PERSISTED fee reports from the database (survives restarts),
+        falling back to in-memory state_manager data if needed.
 
         Args:
             state_manager: HiveStateManager with gossiped fee data
@@ -770,21 +770,33 @@ class SettlementManager:
         # Get all members
         all_members = self.db.get_all_members()
 
+        # Get persisted fee reports for this period from database
+        db_fee_reports = self.db.get_fee_reports_for_period(period)
+        db_fees_by_peer = {r['peer_id']: r for r in db_fee_reports}
+
         for member in all_members:
             peer_id = member['peer_id']
 
-            # Get gossiped fee data from state manager
-            fee_data = state_manager.get_peer_fees(peer_id)
+            # First try database (persisted), then fall back to state manager (in-memory)
+            if peer_id in db_fees_by_peer:
+                db_report = db_fees_by_peer[peer_id]
+                fees_earned = db_report.get('fees_earned_sats', 0)
+                forward_count = db_report.get('forward_count', 0)
+            else:
+                # Fall back to in-memory state (may be from current session)
+                fee_data = state_manager.get_peer_fees(peer_id)
+                fees_earned = fee_data.get('fees_earned_sats', 0)
+                forward_count = fee_data.get('forward_count', 0)
 
             # Get capacity from state
             peer_state = state_manager.get_peer_state(peer_id)
 
             contributions.append({
                 'peer_id': peer_id,
-                'fees_earned': fee_data.get('fees_earned_sats', 0),
+                'fees_earned': fees_earned,
                 'capacity': peer_state.capacity_sats if peer_state else 0,
                 'uptime': int(member.get('uptime_pct', 100)),
-                'forward_count': fee_data.get('forward_count', 0),
+                'forward_count': forward_count,
             })
 
         return contributions

@@ -984,6 +984,25 @@ class HiveDatabase:
             )
         """)
 
+        # Fee reports from hive members - persisted for settlement calculations
+        # This stores FEE_REPORT gossip data so it survives restarts
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fee_reports (
+                peer_id TEXT NOT NULL,
+                period TEXT NOT NULL,
+                fees_earned_sats INTEGER NOT NULL,
+                forward_count INTEGER NOT NULL,
+                period_start INTEGER NOT NULL,
+                period_end INTEGER NOT NULL,
+                received_at INTEGER NOT NULL,
+                PRIMARY KEY (peer_id, period)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_fee_reports_period
+            ON fee_reports(period)
+        """)
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -5047,6 +5066,120 @@ class HiveDatabase:
             DELETE FROM splice_sessions WHERE session_id = ?
         """, (session_id,))
         return result.rowcount > 0
+
+    # =========================================================================
+    # FEE REPORT PERSISTENCE
+    # =========================================================================
+
+    def save_fee_report(
+        self,
+        peer_id: str,
+        period: str,
+        fees_earned_sats: int,
+        forward_count: int,
+        period_start: int,
+        period_end: int
+    ) -> bool:
+        """
+        Save or update a fee report from a hive member.
+
+        This persists FEE_REPORT gossip data so it survives node restarts.
+        Uses UPSERT to handle updates from the same peer for the same period.
+
+        Args:
+            peer_id: Member's node public key
+            period: Settlement period (YYYY-WW format)
+            fees_earned_sats: Fees earned in the period
+            forward_count: Number of forwards in the period
+            period_start: Period start timestamp
+            period_end: Period end timestamp (report time)
+
+        Returns:
+            True if saved successfully
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        try:
+            conn.execute("""
+                INSERT INTO fee_reports
+                (peer_id, period, fees_earned_sats, forward_count,
+                 period_start, period_end, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(peer_id, period) DO UPDATE SET
+                    fees_earned_sats = excluded.fees_earned_sats,
+                    forward_count = excluded.forward_count,
+                    period_end = excluded.period_end,
+                    received_at = excluded.received_at
+            """, (peer_id, period, fees_earned_sats, forward_count,
+                  period_start, period_end, now))
+            return True
+        except Exception as e:
+            self.plugin.log(f"HiveDatabase: Failed to save fee report: {e}", level='warn')
+            return False
+
+    def get_fee_reports_for_period(self, period: str) -> List[Dict[str, Any]]:
+        """
+        Get all fee reports for a settlement period.
+
+        Args:
+            period: Settlement period (YYYY-WW format)
+
+        Returns:
+            List of fee report dicts with peer_id, fees_earned_sats, etc.
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT peer_id, fees_earned_sats, forward_count,
+                   period_start, period_end, received_at
+            FROM fee_reports
+            WHERE period = ?
+            ORDER BY peer_id
+        """, (period,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_latest_fee_reports(self) -> List[Dict[str, Any]]:
+        """
+        Get the most recent fee report for each peer.
+
+        Returns:
+            List of the latest fee report for each peer
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT f1.peer_id, f1.period, f1.fees_earned_sats, f1.forward_count,
+                   f1.period_start, f1.period_end, f1.received_at
+            FROM fee_reports f1
+            INNER JOIN (
+                SELECT peer_id, MAX(received_at) as max_received
+                FROM fee_reports
+                GROUP BY peer_id
+            ) f2 ON f1.peer_id = f2.peer_id AND f1.received_at = f2.max_received
+            ORDER BY f1.peer_id
+        """).fetchall()
+        return [dict(row) for row in rows]
+
+    def cleanup_old_fee_reports(self, keep_periods: int = 4) -> int:
+        """
+        Remove fee reports older than keep_periods weeks.
+
+        Args:
+            keep_periods: Number of recent periods to keep (default 4 weeks)
+
+        Returns:
+            Number of rows deleted
+        """
+        conn = self._get_connection()
+        # Get current period and calculate cutoff
+        import datetime
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        cutoff_date = now - datetime.timedelta(weeks=keep_periods)
+        cutoff_period = f"{cutoff_date.isocalendar()[0]}-{cutoff_date.isocalendar()[1]:02d}"
+
+        result = conn.execute("""
+            DELETE FROM fee_reports WHERE period < ?
+        """, (cutoff_period,))
+        return result.rowcount
 
     # =========================================================================
     # DISTRIBUTED SETTLEMENT OPERATIONS (Phase 12)
