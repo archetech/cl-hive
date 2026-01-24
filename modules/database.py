@@ -481,6 +481,74 @@ class HiveDatabase:
         """)
 
         # =====================================================================
+        # TASK REQUESTS TABLE (Phase 10 - Task Delegation Protocol)
+        # =====================================================================
+        # Tracks tasks we've requested from other hive members
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_requests_outgoing (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                target_member_id TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                task_target TEXT NOT NULL,
+                amount_sats INTEGER,
+                priority TEXT NOT NULL,
+                deadline_timestamp INTEGER NOT NULL,
+                failure_context TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL,
+                responded_at INTEGER,
+                response_status TEXT,
+                response_reason TEXT,
+                result_data TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_task_outgoing_status
+            ON task_requests_outgoing(status)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_task_outgoing_member
+            ON task_requests_outgoing(target_member_id)
+        """)
+
+        # =====================================================================
+        # TASK ASSIGNMENTS TABLE (Phase 10 - Task Delegation Protocol)
+        # =====================================================================
+        # Tracks tasks other hive members have requested from us
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_requests_incoming (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                requester_id TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                task_target TEXT NOT NULL,
+                amount_sats INTEGER,
+                priority TEXT NOT NULL,
+                deadline_timestamp INTEGER NOT NULL,
+                failure_context TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                received_at INTEGER NOT NULL,
+                accepted_at INTEGER,
+                completed_at INTEGER,
+                result_data TEXT,
+                failure_reason TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_task_incoming_status
+            ON task_requests_incoming(status)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_task_incoming_requester
+            ON task_requests_incoming(requester_id)
+        """)
+
+        # =====================================================================
         # FEE INTELLIGENCE TABLE (Phase 7 - Cooperative Fee Coordination)
         # =====================================================================
         # Stores fee intelligence reports from hive members
@@ -2451,6 +2519,263 @@ class HiveDatabase:
             # Table might not exist yet - that's OK for new feature
             self.plugin.log(f"Failed to record delegation attempt: {e}", level='debug')
             return False
+
+    # =========================================================================
+    # TASK DELEGATION (Phase 10)
+    # =========================================================================
+
+    def create_outgoing_task_request(
+        self,
+        request_id: str,
+        target_member_id: str,
+        task_type: str,
+        task_target: str,
+        amount_sats: Optional[int],
+        priority: str,
+        deadline_timestamp: int,
+        failure_context: Optional[str] = None
+    ) -> bool:
+        """
+        Record an outgoing task request to another hive member.
+
+        Args:
+            request_id: Unique request identifier
+            target_member_id: Member we're asking to perform the task
+            task_type: Type of task (expand_to, etc.)
+            task_target: Target of the task (peer to open channel to, etc.)
+            amount_sats: Amount in satoshis (if applicable)
+            priority: Task priority
+            deadline_timestamp: When the task should be completed
+            failure_context: JSON string with context about why we're delegating
+
+        Returns:
+            True if recorded successfully
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        try:
+            conn.execute("""
+                INSERT INTO task_requests_outgoing
+                (request_id, target_member_id, task_type, task_target, amount_sats,
+                 priority, deadline_timestamp, failure_context, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            """, (request_id, target_member_id, task_type, task_target, amount_sats,
+                  priority, deadline_timestamp, failure_context, now))
+            return True
+        except Exception as e:
+            self.plugin.log(f"Failed to create outgoing task request: {e}", level='debug')
+            return False
+
+    def update_outgoing_task_response(
+        self,
+        request_id: str,
+        response_status: str,
+        response_reason: Optional[str] = None,
+        result_data: Optional[str] = None
+    ) -> bool:
+        """
+        Update an outgoing task request with the response.
+
+        Args:
+            request_id: Request to update
+            response_status: Status from response (accepted/rejected/completed/failed)
+            response_reason: Reason for rejection/failure
+            result_data: JSON string with result data
+
+        Returns:
+            True if updated successfully
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        # Map response status to our tracking status
+        if response_status == 'accepted':
+            new_status = 'in_progress'
+        elif response_status == 'completed':
+            new_status = 'completed'
+        elif response_status in ('rejected', 'failed'):
+            new_status = 'failed'
+        else:
+            new_status = response_status
+
+        try:
+            conn.execute("""
+                UPDATE task_requests_outgoing
+                SET status = ?, responded_at = ?, response_status = ?,
+                    response_reason = ?, result_data = ?
+                WHERE request_id = ?
+            """, (new_status, now, response_status, response_reason, result_data, request_id))
+            return True
+        except Exception as e:
+            self.plugin.log(f"Failed to update outgoing task: {e}", level='debug')
+            return False
+
+    def get_outgoing_task(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """Get an outgoing task request by ID."""
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM task_requests_outgoing WHERE request_id = ?
+        """, (request_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_pending_outgoing_tasks(self) -> List[Dict[str, Any]]:
+        """Get all pending outgoing task requests."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM task_requests_outgoing
+            WHERE status IN ('pending', 'in_progress')
+            ORDER BY created_at DESC
+        """).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_incoming_task_request(
+        self,
+        request_id: str,
+        requester_id: str,
+        task_type: str,
+        task_target: str,
+        amount_sats: Optional[int],
+        priority: str,
+        deadline_timestamp: int,
+        failure_context: Optional[str] = None
+    ) -> bool:
+        """
+        Record an incoming task request from another hive member.
+
+        Args:
+            request_id: Unique request identifier
+            requester_id: Member requesting the task
+            task_type: Type of task
+            task_target: Target of the task
+            amount_sats: Amount in satoshis (if applicable)
+            priority: Task priority
+            deadline_timestamp: When the task should be completed
+            failure_context: JSON string with context
+
+        Returns:
+            True if recorded successfully
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        try:
+            conn.execute("""
+                INSERT INTO task_requests_incoming
+                (request_id, requester_id, task_type, task_target, amount_sats,
+                 priority, deadline_timestamp, failure_context, status, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            """, (request_id, requester_id, task_type, task_target, amount_sats,
+                  priority, deadline_timestamp, failure_context, now))
+            return True
+        except Exception as e:
+            self.plugin.log(f"Failed to create incoming task request: {e}", level='debug')
+            return False
+
+    def update_incoming_task_status(
+        self,
+        request_id: str,
+        status: str,
+        result_data: Optional[str] = None,
+        failure_reason: Optional[str] = None
+    ) -> bool:
+        """
+        Update an incoming task request status.
+
+        Args:
+            request_id: Request to update
+            status: New status (accepted/completed/failed/rejected)
+            result_data: JSON string with result data
+            failure_reason: Reason for failure/rejection
+
+        Returns:
+            True if updated successfully
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        try:
+            if status == 'accepted':
+                conn.execute("""
+                    UPDATE task_requests_incoming
+                    SET status = ?, accepted_at = ?
+                    WHERE request_id = ?
+                """, (status, now, request_id))
+            elif status == 'completed':
+                conn.execute("""
+                    UPDATE task_requests_incoming
+                    SET status = ?, completed_at = ?, result_data = ?
+                    WHERE request_id = ?
+                """, (status, now, result_data, request_id))
+            else:
+                conn.execute("""
+                    UPDATE task_requests_incoming
+                    SET status = ?, failure_reason = ?
+                    WHERE request_id = ?
+                """, (status, failure_reason, request_id))
+            return True
+        except Exception as e:
+            self.plugin.log(f"Failed to update incoming task: {e}", level='debug')
+            return False
+
+    def get_incoming_task(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """Get an incoming task request by ID."""
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM task_requests_incoming WHERE request_id = ?
+        """, (request_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_pending_incoming_tasks(self) -> List[Dict[str, Any]]:
+        """Get all pending/accepted incoming task requests."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM task_requests_incoming
+            WHERE status IN ('pending', 'accepted')
+            ORDER BY priority DESC, received_at ASC
+        """).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_active_incoming_tasks(self) -> int:
+        """Count tasks we've accepted but not completed."""
+        conn = self._get_connection()
+        result = conn.execute("""
+            SELECT COUNT(*) as count FROM task_requests_incoming
+            WHERE status = 'accepted'
+        """).fetchone()
+        return result['count'] if result else 0
+
+    def cleanup_expired_tasks(self, max_age_hours: int = 24) -> int:
+        """
+        Clean up old task requests.
+
+        Args:
+            max_age_hours: Delete tasks older than this
+
+        Returns:
+            Number of tasks deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (max_age_hours * 3600)
+
+        try:
+            # Clean outgoing
+            cursor = conn.execute("""
+                DELETE FROM task_requests_outgoing
+                WHERE created_at < ? AND status IN ('completed', 'failed')
+            """, (cutoff,))
+            deleted = cursor.rowcount
+
+            # Clean incoming
+            cursor = conn.execute("""
+                DELETE FROM task_requests_incoming
+                WHERE received_at < ? AND status IN ('completed', 'failed', 'rejected')
+            """, (cutoff,))
+            deleted += cursor.rowcount
+
+            return deleted
+        except Exception:
+            return 0
 
     def get_daily_spend(self, date_key: str = None) -> int:
         """

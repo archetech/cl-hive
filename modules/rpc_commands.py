@@ -999,26 +999,76 @@ def _attempt_channel_open_delegation(
     """
     Attempt to delegate a failed channel open to another hive member.
 
-    NOTE: Task delegation protocol not yet implemented. This function
-    returns a placeholder status. Future implementation will use
-    AI_TASK_REQUEST messages to coordinate channel opens across the fleet.
+    Uses the Task Delegation Protocol (Phase 10) to ask another hive
+    member to open the channel on our behalf when we can't connect
+    to the target peer.
 
     Returns:
-        Dict with delegation status indicating feature not yet available
+        Dict with delegation status
     """
-    if ctx.log:
-        ctx.log(
-            f"cl-hive: Channel open delegation not yet implemented "
-            f"(target={target[:16]}..., failure={failure_info.get('type', 'unknown')})",
-            'debug'
+    if not ctx.database or not ctx.safe_plugin:
+        return None
+
+    # Import task manager from main module
+    try:
+        from modules.task_manager import TaskManager
+
+        # Get task_mgr from the global context
+        # We need to access it through the plugin's globals
+        import sys
+        main_module = sys.modules.get('__main__')
+        if not main_module:
+            # Try cl-hive module
+            main_module = sys.modules.get('cl-hive')
+
+        task_mgr = getattr(main_module, 'task_mgr', None) if main_module else None
+
+        if not task_mgr:
+            if ctx.log:
+                ctx.log("cl-hive: Task manager not available for delegation", 'debug')
+            return {
+                "status": "delegation_unavailable",
+                "message": "Task manager not initialized"
+            }
+
+        # Prepare failure context
+        failure_context = {
+            "original_action_id": original_action_id,
+            "failure_type": failure_info.get("type", "unknown"),
+            "failure_reason": failure_info.get("reason", ""),
+            "requester_pubkey": ctx.our_pubkey
+        }
+
+        # Request channel open delegation
+        result = task_mgr.request_channel_open_delegation(
+            target_peer=target,
+            channel_size_sats=channel_size_sats,
+            rpc=ctx.safe_plugin.rpc,
+            failure_context=failure_context
         )
 
-    return {
-        "status": "delegation_not_implemented",
-        "message": "Channel open delegation to other hive members not yet available",
-        "failure_type": failure_info.get("type", "unknown"),
-        "suggestion": "Retry later or open channel manually from another node"
-    }
+        if ctx.log:
+            if result.get("status") == "delegation_requested":
+                ctx.log(
+                    f"cl-hive: Delegated channel open to {result.get('delegated_to', 'unknown')} "
+                    f"(request_id={result.get('request_id', '')})",
+                    'info'
+                )
+            else:
+                ctx.log(
+                    f"cl-hive: Delegation failed: {result.get('status', 'unknown')}",
+                    'debug'
+                )
+
+        return result
+
+    except Exception as e:
+        if ctx.log:
+            ctx.log(f"cl-hive: Delegation error: {e}", 'warn')
+        return {
+            "status": "delegation_error",
+            "message": str(e)
+        }
 
 
 # =============================================================================

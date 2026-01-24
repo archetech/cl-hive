@@ -105,6 +105,10 @@ class HiveMessageType(IntEnum):
     HEALTH_REPORT = 32813       # NNLB health status report
     ROUTE_PROBE = 32815         # Share routing observations (Phase 4)
 
+    # Phase 10: Task Delegation
+    TASK_REQUEST = 32833        # Request another member to perform a task
+    TASK_RESPONSE = 32835       # Response to task request (accept/reject/complete)
+
 
 # =============================================================================
 # PHASE 5 VALIDATION CONSTANTS
@@ -2811,3 +2815,378 @@ def validate_fee_report(payload: Dict[str, Any]) -> bool:
         return False
 
     return True
+
+
+# =============================================================================
+# PHASE 10: TASK DELEGATION PROTOCOL
+# =============================================================================
+#
+# Enables hive members to delegate tasks to each other when they can't
+# complete them directly (e.g., peer rejects connection from node A,
+# so A asks node B to try opening the channel instead).
+#
+
+# Task types supported
+TASK_TYPE_EXPAND_TO = "expand_to"           # Open channel to a target peer
+TASK_TYPE_REBALANCE_THROUGH = "rebalance"   # Coordinate rebalancing (future)
+
+VALID_TASK_TYPES = {TASK_TYPE_EXPAND_TO, TASK_TYPE_REBALANCE_THROUGH}
+
+# Task priorities
+TASK_PRIORITY_LOW = "low"
+TASK_PRIORITY_NORMAL = "normal"
+TASK_PRIORITY_HIGH = "high"
+TASK_PRIORITY_URGENT = "urgent"
+
+VALID_TASK_PRIORITIES = {
+    TASK_PRIORITY_LOW,
+    TASK_PRIORITY_NORMAL,
+    TASK_PRIORITY_HIGH,
+    TASK_PRIORITY_URGENT
+}
+
+# Task response statuses
+TASK_STATUS_ACCEPTED = "accepted"       # Will attempt the task
+TASK_STATUS_REJECTED = "rejected"       # Cannot/won't do the task
+TASK_STATUS_COMPLETED = "completed"     # Task finished successfully
+TASK_STATUS_FAILED = "failed"           # Task attempted but failed
+
+VALID_TASK_STATUSES = {
+    TASK_STATUS_ACCEPTED,
+    TASK_STATUS_REJECTED,
+    TASK_STATUS_COMPLETED,
+    TASK_STATUS_FAILED
+}
+
+# Rejection reasons
+TASK_REJECT_BUSY = "busy"                   # Too many pending tasks
+TASK_REJECT_NO_FUNDS = "insufficient_funds" # Not enough on-chain/channel funds
+TASK_REJECT_NO_CONNECTION = "no_connection" # Can't connect to target either
+TASK_REJECT_POLICY = "policy"               # Policy prevents this task
+TASK_REJECT_INVALID = "invalid_request"     # Malformed request
+
+# Compensation types
+COMPENSATION_NONE = "none"              # No compensation expected
+COMPENSATION_RECIPROCAL = "reciprocal"  # Requester will do a favor in return
+COMPENSATION_FEE = "fee"                # Pay a fee for the service
+
+VALID_COMPENSATION_TYPES = {COMPENSATION_NONE, COMPENSATION_RECIPROCAL, COMPENSATION_FEE}
+
+# Rate limits
+TASK_REQUEST_RATE_LIMIT = (5, 3600)     # 5 requests per hour per sender
+TASK_RESPONSE_RATE_LIMIT = (10, 3600)   # 10 responses per hour per sender
+
+# Limits
+MAX_PENDING_TASKS = 10                  # Max tasks a node will accept at once
+MAX_REQUEST_ID_LENGTH = 128             # Max length of request_id
+TASK_REQUEST_MAX_AGE = 300              # 5 minute freshness window
+TASK_DEFAULT_DEADLINE_HOURS = 1         # Default deadline if not specified
+
+
+def get_task_request_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for TASK_REQUEST messages.
+
+    Args:
+        payload: TASK_REQUEST message payload
+
+    Returns:
+        Canonical string for signmessage()
+    """
+    # Include key fields that must not be tampered with
+    task_params = payload.get("task_params", {})
+    return (
+        f"TASK_REQUEST:"
+        f"{payload.get('requester_id', '')}:"
+        f"{payload.get('request_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{payload.get('task_type', '')}:"
+        f"{task_params.get('target', '')}:"
+        f"{task_params.get('amount_sats', 0)}:"
+        f"{payload.get('deadline_timestamp', 0)}"
+    )
+
+
+def get_task_response_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for TASK_RESPONSE messages.
+
+    Args:
+        payload: TASK_RESPONSE message payload
+
+    Returns:
+        Canonical string for signmessage()
+    """
+    return (
+        f"TASK_RESPONSE:"
+        f"{payload.get('responder_id', '')}:"
+        f"{payload.get('request_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{payload.get('status', '')}"
+    )
+
+
+def validate_task_request_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a TASK_REQUEST payload.
+
+    SECURITY: Bounds all values to prevent manipulation.
+
+    Args:
+        payload: TASK_REQUEST message payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    import time as time_module
+
+    # Required fields
+    required = ["requester_id", "request_id", "timestamp", "task_type",
+                "task_params", "priority", "deadline_timestamp", "signature"]
+
+    for field in required:
+        if field not in payload:
+            return False
+
+    # Type checks
+    if not isinstance(payload["requester_id"], str):
+        return False
+    if not isinstance(payload["request_id"], str):
+        return False
+    if not isinstance(payload["timestamp"], int):
+        return False
+    if not isinstance(payload["task_type"], str):
+        return False
+    if not isinstance(payload["task_params"], dict):
+        return False
+    if not isinstance(payload["priority"], str):
+        return False
+    if not isinstance(payload["deadline_timestamp"], int):
+        return False
+    if not isinstance(payload["signature"], str):
+        return False
+
+    # Validate task type
+    if payload["task_type"] not in VALID_TASK_TYPES:
+        return False
+
+    # Validate priority
+    if payload["priority"] not in VALID_TASK_PRIORITIES:
+        return False
+
+    # Bounds checks
+    if len(payload["requester_id"]) > MAX_PEER_ID_LEN:
+        return False
+    if len(payload["request_id"]) > MAX_REQUEST_ID_LENGTH:
+        return False
+    if len(payload["signature"]) < 10:
+        return False
+
+    # Timestamp freshness
+    now = int(time_module.time())
+    if abs(now - payload["timestamp"]) > TASK_REQUEST_MAX_AGE:
+        return False
+
+    # Deadline must be in the future
+    if payload["deadline_timestamp"] <= now:
+        return False
+
+    # Validate task_params based on task_type
+    task_params = payload["task_params"]
+
+    if payload["task_type"] == TASK_TYPE_EXPAND_TO:
+        # expand_to requires target and amount_sats
+        if "target" not in task_params or not isinstance(task_params["target"], str):
+            return False
+        if "amount_sats" not in task_params or not isinstance(task_params["amount_sats"], int):
+            return False
+        if len(task_params["target"]) > MAX_PEER_ID_LEN:
+            return False
+        if task_params["amount_sats"] < 100000 or task_params["amount_sats"] > 10_000_000_000:
+            return False
+
+    # Validate compensation if present
+    compensation = payload.get("compensation", {})
+    if compensation:
+        comp_type = compensation.get("type", COMPENSATION_NONE)
+        if comp_type not in VALID_COMPENSATION_TYPES:
+            return False
+
+    return True
+
+
+def validate_task_response_payload(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a TASK_RESPONSE payload.
+
+    Args:
+        payload: TASK_RESPONSE message payload
+
+    Returns:
+        True if valid, False otherwise
+    """
+    import time as time_module
+
+    # Required fields
+    required = ["responder_id", "request_id", "timestamp", "status", "signature"]
+
+    for field in required:
+        if field not in payload:
+            return False
+
+    # Type checks
+    if not isinstance(payload["responder_id"], str):
+        return False
+    if not isinstance(payload["request_id"], str):
+        return False
+    if not isinstance(payload["timestamp"], int):
+        return False
+    if not isinstance(payload["status"], str):
+        return False
+    if not isinstance(payload["signature"], str):
+        return False
+
+    # Validate status
+    if payload["status"] not in VALID_TASK_STATUSES:
+        return False
+
+    # Bounds checks
+    if len(payload["responder_id"]) > MAX_PEER_ID_LEN:
+        return False
+    if len(payload["request_id"]) > MAX_REQUEST_ID_LENGTH:
+        return False
+    if len(payload["signature"]) < 10:
+        return False
+
+    # Timestamp freshness (responses can be slightly older due to task execution time)
+    now = int(time_module.time())
+    if abs(now - payload["timestamp"]) > 3600:  # 1 hour tolerance for responses
+        return False
+
+    # If rejected, reason should be present
+    if payload["status"] == TASK_STATUS_REJECTED:
+        reason = payload.get("reason", "")
+        if not reason or not isinstance(reason, str):
+            return False
+
+    # If completed, result should be present
+    if payload["status"] == TASK_STATUS_COMPLETED:
+        result = payload.get("result", {})
+        if not isinstance(result, dict):
+            return False
+
+    return True
+
+
+def create_task_request(
+    requester_id: str,
+    request_id: str,
+    timestamp: int,
+    task_type: str,
+    task_params: Dict[str, Any],
+    priority: str,
+    deadline_timestamp: int,
+    rpc,
+    compensation: Optional[Dict[str, Any]] = None,
+    failure_context: Optional[Dict[str, Any]] = None
+) -> Optional[bytes]:
+    """
+    Create a signed TASK_REQUEST message.
+
+    Args:
+        requester_id: Our node pubkey
+        request_id: Unique request identifier
+        timestamp: Unix timestamp
+        task_type: Type of task (expand_to, rebalance, etc.)
+        task_params: Task-specific parameters
+        priority: Task priority level
+        deadline_timestamp: When the task should be completed by
+        rpc: RPC proxy for signmessage
+        compensation: Optional compensation offer
+        failure_context: Optional context about why we're delegating
+
+    Returns:
+        Serialized message bytes, or None on error
+    """
+    payload = {
+        "requester_id": requester_id,
+        "request_id": request_id,
+        "timestamp": timestamp,
+        "task_type": task_type,
+        "task_params": task_params,
+        "priority": priority,
+        "deadline_timestamp": deadline_timestamp,
+        "compensation": compensation or {"type": COMPENSATION_RECIPROCAL},
+        "signature": ""  # Placeholder for validation
+    }
+
+    # Add failure context if provided (helps responder understand why)
+    if failure_context:
+        payload["failure_context"] = failure_context
+
+    # Validate before signing
+    if not validate_task_request_payload(payload):
+        return None
+
+    # Sign the message
+    signing_payload = get_task_request_signing_payload(payload)
+    try:
+        sign_result = rpc.signmessage(signing_payload)
+        payload["signature"] = sign_result.get("signature", "")
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.TASK_REQUEST, payload)
+
+
+def create_task_response(
+    responder_id: str,
+    request_id: str,
+    timestamp: int,
+    status: str,
+    rpc,
+    reason: Optional[str] = None,
+    result: Optional[Dict[str, Any]] = None
+) -> Optional[bytes]:
+    """
+    Create a signed TASK_RESPONSE message.
+
+    Args:
+        responder_id: Our node pubkey
+        request_id: Original request ID we're responding to
+        timestamp: Unix timestamp
+        status: Response status (accepted/rejected/completed/failed)
+        rpc: RPC proxy for signmessage
+        reason: Reason for rejection/failure (required if rejected/failed)
+        result: Task result (required if completed)
+
+    Returns:
+        Serialized message bytes, or None on error
+    """
+    payload = {
+        "responder_id": responder_id,
+        "request_id": request_id,
+        "timestamp": timestamp,
+        "status": status,
+        "signature": ""  # Placeholder
+    }
+
+    if reason:
+        payload["reason"] = reason
+
+    if result:
+        payload["result"] = result
+
+    # Validate before signing
+    if not validate_task_response_payload(payload):
+        return None
+
+    # Sign the message
+    signing_payload = get_task_response_signing_payload(payload)
+    try:
+        sign_result = rpc.signmessage(signing_payload)
+        payload["signature"] = sign_result.get("signature", "")
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.TASK_RESPONSE, payload)

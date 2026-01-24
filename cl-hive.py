@@ -91,6 +91,7 @@ from modules.cost_reduction import CostReductionManager
 from modules.channel_rationalization import RationalizationManager
 from modules.strategic_positioning import StrategicPositioningManager
 from modules.anticipatory_liquidity import AnticipatoryLiquidityManager
+from modules.task_manager import TaskManager
 from modules.rpc_commands import (
     HiveContext,
     status as rpc_status,
@@ -304,6 +305,7 @@ cost_reduction_mgr: Optional[CostReductionManager] = None
 rationalization_mgr: Optional[RationalizationManager] = None
 strategic_positioning_mgr: Optional[StrategicPositioningManager] = None
 anticipatory_liquidity_mgr: Optional[AnticipatoryLiquidityManager] = None
+task_mgr: Optional[TaskManager] = None
 our_pubkey: Optional[str] = None
 
 # Fee tracking for real-time gossip (Settlement Phase)
@@ -1345,6 +1347,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Anticipatory liquidity manager initialized (Phase 7.1)")
 
+    # Initialize Task Manager (Phase 10 - Task Delegation Protocol)
+    global task_mgr
+    task_mgr = TaskManager(
+        database=database,
+        plugin=safe_plugin,
+        our_pubkey=our_pubkey
+    )
+    plugin.log("cl-hive: Task manager initialized (Phase 10)")
+
     # Link anticipatory manager to fee coordination for time-based fees (Phase 7.4)
     if fee_coordination_mgr:
         fee_coordination_mgr.set_anticipatory_manager(anticipatory_liquidity_mgr)
@@ -1566,6 +1577,11 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_settlement_offer(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.FEE_REPORT:
             return handle_fee_report(peer_id, msg_payload, plugin)
+        # Phase 10: Task Delegation
+        elif msg_type == HiveMessageType.TASK_REQUEST:
+            return handle_task_request(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.TASK_RESPONSE:
+            return handle_task_response(peer_id, msg_payload, plugin)
         else:
             # Known but unimplemented message type
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
@@ -4864,6 +4880,83 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             f"FEE_GOSSIP: Received FEE_REPORT from {peer_id[:16]}...: {fees_earned_sats} sats, "
             f"{forward_count} forwards",
             level='info'
+        )
+
+    return {"result": "continue"}
+
+
+# =============================================================================
+# PHASE 10: TASK DELEGATION MESSAGE HANDLERS
+# =============================================================================
+
+def handle_task_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle TASK_REQUEST message from a hive member.
+
+    When another member can't complete a task (e.g., peer rejected their
+    channel open), they can delegate it to us.
+    """
+    if not task_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: TASK_REQUEST from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to task manager
+    result = task_mgr.handle_task_request(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("status") == "accepted":
+        plugin.log(
+            f"cl-hive: Accepted task {result.get('request_id', '')} from {peer_id[:16]}...",
+            level='info'
+        )
+    elif result.get("status") == "rejected":
+        plugin.log(
+            f"cl-hive: Rejected task from {peer_id[:16]}...: {result.get('reason', 'unknown')}",
+            level='debug'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: TASK_REQUEST error from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_task_response(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle TASK_RESPONSE message from a hive member.
+
+    When we've delegated a task to another member, they send back
+    the result (accepted/rejected/completed/failed).
+    """
+    if not task_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member
+    sender = database.get_member(peer_id)
+    if not sender:
+        plugin.log(f"cl-hive: TASK_RESPONSE from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Delegate to task manager
+    result = task_mgr.handle_task_response(peer_id, payload, safe_plugin.rpc)
+
+    if result.get("status") == "processed":
+        response_status = result.get("response_status", "")
+        request_id = result.get("request_id", "")
+        plugin.log(
+            f"cl-hive: Task {request_id} response: {response_status}",
+            level='info'
+        )
+    elif result.get("error"):
+        plugin.log(
+            f"cl-hive: TASK_RESPONSE error from {peer_id[:16]}...: {result.get('error')}",
+            level='debug'
         )
 
     return {"result": "continue"}
