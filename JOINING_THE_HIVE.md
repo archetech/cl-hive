@@ -6,7 +6,8 @@ This guide covers how to join an existing cl-hive fleet using the Docker image.
 
 - Docker and Docker Compose installed
 - Bitcoin Core node (mainnet) with RPC access
-- Existing hive admin's node pubkey for vouching
+- On-chain funds for opening a channel (skin in the game)
+- Contact with an existing hive member willing to vouch for you
 
 ## Step 1: Clone and Configure
 
@@ -44,26 +45,37 @@ Wait for the node to sync (check logs):
 docker logs -f cl-hive-node
 ```
 
-## Step 3: Get Your Node Info
+## Step 3: Get Member Connection Info
 
-Once synced, get your node's pubkey:
+Contact an existing hive member and request their connection info:
+- Their node's pubkey
+- Their connection address (pubkey@host:port)
 
+You can find active members via the Lightning network explorers or community channels.
+
+## Step 4: Open Channel and Request Membership
+
+**Skin in the game**: You open a channel to the member first, demonstrating commitment.
+
+1. Connect to the member's node:
 ```bash
-docker exec cl-hive-node lightning-cli getinfo
+docker exec cl-hive-node lightning-cli connect <member-pubkey>@<host>:<port>
 ```
 
-Note your `id` (pubkey) - you'll need this for the admin to vouch for you.
+2. Open a channel (recommended: 1M+ sats):
+```bash
+docker exec cl-hive-node lightning-cli fundchannel <member-pubkey> 1000000
+```
 
-## Step 4: Request Membership
+3. Wait for the channel to confirm (3+ confirmations).
 
-Contact an existing hive admin and provide:
-- Your node's pubkey
-- Your node's connection address (pubkey@host:port)
+4. The member will vouch for you:
+```bash
+# Member runs this on their node:
+lightning-cli hive-vouch <your-pubkey>
+```
 
-The admin will:
-1. Connect to your node
-2. Open a channel (hive channels use 0 fees)
-3. Vouch for you with: `lightning-cli hive-vouch <your-pubkey>`
+**Note**: The original flow also works - a member can open a channel to you and then vouch. Both approaches are valid; opening the channel yourself shows commitment.
 
 ## Step 5: Verify Membership
 
