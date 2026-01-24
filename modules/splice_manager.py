@@ -152,7 +152,7 @@ class SpliceManager:
     def _get_channel_for_peer(self, peer_id: str, rpc) -> Optional[Dict[str, Any]]:
         """Get the channel with a hive member peer."""
         try:
-            result = rpc.listpeerchannels(id=peer_id)
+            result = rpc.call("listpeerchannels", {"id": peer_id})
             channels = result.get("channels", [])
             # Return first normal channel
             for ch in channels:
