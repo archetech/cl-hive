@@ -10563,7 +10563,7 @@ def hive_backfill_fees(plugin: Plugin, period: str = None, source: str = "revenu
             period_start = int(dt.timestamp())
             period_end = int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp())
 
-            # Save our fee report
+            # Save our fee report to database
             database.save_fee_report(
                 peer_id=our_pubkey,
                 period=period,
@@ -10573,13 +10573,30 @@ def hive_backfill_fees(plugin: Plugin, period: str = None, source: str = "revenu
                 period_end=period_end
             )
 
+            # Also update local_fee_tracking so gossip loop broadcasts correct fees
+            database._get_connection().execute("""
+                INSERT INTO local_fee_tracking (id, cumulative_fees_sats, cumulative_forward_count,
+                                                period_start, last_broadcast_fees, last_broadcast_time)
+                VALUES (1, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    cumulative_fees_sats = excluded.cumulative_fees_sats,
+                    cumulative_forward_count = excluded.cumulative_forward_count,
+                    period_start = excluded.period_start,
+                    last_broadcast_fees = excluded.last_broadcast_fees,
+                    last_broadcast_time = excluded.last_broadcast_time
+            """, (fees_earned, forwards, period_start, fees_earned, period_end))
+
+            # Trigger immediate fee report broadcast
+            _broadcast_fee_report(fees_earned, forwards, period_start, period_end)
+
             results["backfilled"].append({
                 "peer_id": our_pubkey[:16] + "...",
                 "fees_earned_sats": fees_earned,
-                "forward_count": forwards
+                "forward_count": forwards,
+                "broadcast": True
             })
 
-            plugin.log(f"Backfilled fees for {period}: {fees_earned} sats", level='info')
+            plugin.log(f"Backfilled fees for {period}: {fees_earned} sats (broadcast triggered)", level='info')
 
         except Exception as e:
             results["error"] = f"Failed to get data from cl-revenue-ops: {e}"
