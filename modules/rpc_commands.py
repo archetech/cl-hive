@@ -1720,12 +1720,32 @@ def pool_snapshot(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
         return {"error": "Routing pool not initialized"}
 
     try:
-        result = ctx.routing_pool.snapshot_contributions(period)
+        import datetime
+        # Get period if not specified
+        if period is None:
+            now = datetime.datetime.now()
+            year, week, _ = now.isocalendar()
+            period = f"{year}-W{week:02d}"
+
+        # snapshot_contributions returns List[MemberContribution]
+        contributions = ctx.routing_pool.snapshot_contributions(period)
+
+        # Convert to serializable format
+        contrib_list = []
+        for c in contributions:
+            contrib_list.append({
+                "member_id": c.member_id[:16] + "..." if c.member_id else "",
+                "member_id_full": c.member_id,
+                "capacity_sats": c.capacity_sats,
+                "uptime_pct": round(c.uptime_pct * 100, 1),
+                "pool_share": round(c.pool_share * 100, 2),
+            })
+
         return {
             "status": "ok",
-            "period": result.get("period"),
-            "members_snapshotted": result.get("members_snapshotted", 0),
-            "contributions": result.get("contributions", [])
+            "period": period,
+            "members_snapshotted": len(contributions),
+            "contributions": contrib_list
         }
     except Exception as e:
         return {"error": f"Failed to snapshot contributions: {e}"}
