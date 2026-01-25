@@ -244,7 +244,7 @@ class PredictiveRebalancer:
         try:
             # Get critical velocity channels
             critical_channels = self.yield_metrics.get_critical_velocity_channels(
-                hours_threshold=prediction_hours
+                threshold_hours=prediction_hours
             )
 
             for pred in critical_channels:
