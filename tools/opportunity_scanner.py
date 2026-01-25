@@ -52,6 +52,9 @@ class OpportunityType(Enum):
     CHANNEL_CLOSE = "channel_close"
     UNDERSERVED_TARGET = "underserved_target"
 
+    # New member onboarding
+    NEW_MEMBER_CHANNEL = "new_member_channel"
+
 
 class ActionType(Enum):
     """Types of actions the advisor can take."""
@@ -237,6 +240,8 @@ class OpportunityScanner:
             self._scan_rationalization(node_name, state),
             # Collective warning scanners
             self._scan_ban_candidates(node_name, state),
+            # New member onboarding scanner
+            self._scan_new_member_opportunities(node_name, state),
             return_exceptions=True
         )
 
@@ -1071,6 +1076,208 @@ class OpportunityScanner:
                 current_state=rec
             )
             opportunities.append(opp)
+
+        return opportunities
+
+    async def _scan_new_member_opportunities(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """
+        Scan for new hive member onboarding opportunities.
+
+        When new members (neophytes) join the hive, this scanner:
+        1. Identifies members who haven't been "onboarded" yet
+        2. Analyzes their topology and connectivity
+        3. Suggests strategic channel openings:
+           - Existing members opening channels TO the new member
+           - New member opening channels to strategic targets
+
+        This ensures new members integrate well into the fleet topology.
+        """
+        opportunities = []
+
+        # Get hive members from state
+        hive_members = state.get("hive_members", {})
+        members_list = hive_members.get("members", [])
+
+        if not members_list:
+            return opportunities
+
+        # Get our node's pubkey
+        node_info = state.get("node_info", {})
+        our_pubkey = node_info.get("id", "")
+
+        # Get existing channels to understand current topology
+        channels = state.get("channels", [])
+        our_peers = set()
+        for ch in channels:
+            peer_id = ch.get("peer_id")
+            if peer_id:
+                our_peers.add(peer_id)
+
+        # Get positioning data for strategic targets
+        positioning = state.get("positioning", {})
+        valuable_corridors = positioning.get("valuable_corridors", [])
+        exchange_gaps = positioning.get("exchange_gaps", [])
+
+        # Check for recently joined members (neophytes or recently promoted)
+        for member in members_list:
+            member_pubkey = member.get("pubkey") or member.get("peer_id")
+            member_alias = member.get("alias", "")
+            tier = member.get("tier", "unknown")
+            joined_at = member.get("joined_at", 0)
+
+            if not member_pubkey:
+                continue
+
+            # Skip ourselves
+            if member_pubkey == our_pubkey:
+                continue
+
+            # Check if this is a new member (neophyte or recently joined)
+            is_neophyte = tier == "neophyte"
+            is_recent = False
+            if joined_at:
+                age_days = (time.time() - joined_at) / 86400
+                is_recent = age_days < 30  # Joined in last 30 days
+
+            # Skip if not new
+            if not is_neophyte and not is_recent:
+                continue
+
+            # Check if already onboarded (using advisor DB)
+            onboard_key = f"onboarded_{member_pubkey[:16]}"
+            if self.db.get_metadata(onboard_key):
+                continue
+
+            # Check if we already have a channel to this member
+            if member_pubkey in our_peers:
+                # We have a channel - no need to suggest one from us
+                # But still suggest strategic openings FOR them
+                pass
+            else:
+                # We don't have a channel to this new member
+                # Suggest opening one if we have capacity
+
+                # Get member's current connectivity
+                member_topology = member.get("topology", [])
+                member_channel_count = len(member_topology)
+
+                # Higher priority for members with fewer connections
+                connectivity_factor = max(0.3, 1.0 - (member_channel_count / 20))
+
+                opp = Opportunity(
+                    opportunity_type=OpportunityType.NEW_MEMBER_CHANNEL,
+                    action_type=ActionType.CHANNEL_OPEN,
+                    channel_id=None,
+                    peer_id=member_pubkey,
+                    node_name=node_name,
+                    priority_score=0.7 * connectivity_factor,
+                    confidence_score=0.8,
+                    roi_estimate=0.6,
+                    description=f"Open channel to new {tier} member: {member_alias or member_pubkey[:16]}...",
+                    reasoning=f"New member joined hive with {member_channel_count} existing channels. "
+                              f"Opening a channel strengthens fleet connectivity.",
+                    recommended_action=f"Open 2-5M sat channel to {member_alias or member_pubkey[:16]}...",
+                    predicted_benefit=5000,
+                    classification=ActionClassification.QUEUE_FOR_REVIEW,
+                    auto_execute_safe=False,
+                    current_state={
+                        "member_pubkey": member_pubkey,
+                        "member_alias": member_alias,
+                        "tier": tier,
+                        "member_channel_count": member_channel_count,
+                        "is_neophyte": is_neophyte,
+                        "onboarding": True
+                    }
+                )
+                opportunities.append(opp)
+
+            # Suggest strategic targets for the new member to open channels to
+            # (if they have few channels and there are high-value gaps)
+            member_topology = member.get("topology", [])
+            member_peers = set(member_topology) if member_topology else set()
+
+            # Check valuable corridors the new member could serve
+            for corridor in valuable_corridors[:3]:
+                target_peer = corridor.get("target_peer") or corridor.get("destination_peer_id")
+                if not target_peer:
+                    continue
+
+                # Skip if new member already has this peer
+                if target_peer in member_peers:
+                    continue
+
+                score = corridor.get("value_score", 0)
+                if score < 0.2:
+                    continue
+
+                opp = Opportunity(
+                    opportunity_type=OpportunityType.NEW_MEMBER_CHANNEL,
+                    action_type=ActionType.FLAG_FOR_REVIEW,
+                    channel_id=None,
+                    peer_id=target_peer,
+                    node_name=node_name,
+                    priority_score=0.6 * score,
+                    confidence_score=0.7,
+                    roi_estimate=score,
+                    description=f"Suggest {member_alias or member_pubkey[:16]}... open to valuable target",
+                    reasoning=f"New member could strengthen fleet coverage of high-value corridor "
+                              f"(score: {score:.2f})",
+                    recommended_action=f"Recommend {member_alias or 'new member'} open channel to target "
+                                       f"{target_peer[:16]}...",
+                    predicted_benefit=int(score * 10000),
+                    classification=ActionClassification.QUEUE_FOR_REVIEW,
+                    auto_execute_safe=False,
+                    current_state={
+                        "new_member_pubkey": member_pubkey,
+                        "new_member_alias": member_alias,
+                        "suggested_target": target_peer,
+                        "corridor_value_score": score,
+                        "suggestion_for_new_member": True
+                    }
+                )
+                opportunities.append(opp)
+
+            # Check exchange coverage gaps the new member could fill
+            for exchange in exchange_gaps[:2]:
+                exchange_pubkey = exchange.get("pubkey")
+                exchange_name = exchange.get("name", "Unknown Exchange")
+
+                if not exchange_pubkey:
+                    continue
+
+                # Skip if new member already connected to this exchange
+                if exchange_pubkey in member_peers:
+                    continue
+
+                opp = Opportunity(
+                    opportunity_type=OpportunityType.NEW_MEMBER_CHANNEL,
+                    action_type=ActionType.FLAG_FOR_REVIEW,
+                    channel_id=None,
+                    peer_id=exchange_pubkey,
+                    node_name=node_name,
+                    priority_score=0.65,
+                    confidence_score=0.75,
+                    roi_estimate=0.7,
+                    description=f"Suggest {member_alias or member_pubkey[:16]}... connect to {exchange_name}",
+                    reasoning=f"Fleet lacks connection to {exchange_name}. "
+                              f"New member could fill this gap.",
+                    recommended_action=f"Recommend {member_alias or 'new member'} open channel to {exchange_name}",
+                    predicted_benefit=15000,
+                    classification=ActionClassification.QUEUE_FOR_REVIEW,
+                    auto_execute_safe=False,
+                    current_state={
+                        "new_member_pubkey": member_pubkey,
+                        "new_member_alias": member_alias,
+                        "suggested_exchange": exchange_name,
+                        "exchange_pubkey": exchange_pubkey,
+                        "suggestion_for_new_member": True
+                    }
+                )
+                opportunities.append(opp)
 
         return opportunities
 

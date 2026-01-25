@@ -2005,3 +2005,75 @@ class AdvisorDB:
                 int(datetime.now().timestamp())
             ))
             conn.commit()
+
+    # =========================================================================
+    # Generic Metadata (for tracking onboarded members, etc.)
+    # =========================================================================
+
+    def get_metadata(self, key: str) -> Optional[Any]:
+        """
+        Get a metadata value by key.
+
+        Uses the learning_params table for simple key-value storage.
+        Useful for tracking state like onboarded members.
+
+        Args:
+            key: Metadata key
+
+        Returns:
+            Value or None if not found
+        """
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT param_value FROM learning_params WHERE param_key = ?",
+                (key,)
+            ).fetchone()
+
+            if not row:
+                return None
+
+            try:
+                return json.loads(row["param_value"])
+            except json.JSONDecodeError:
+                return row["param_value"]
+
+    def set_metadata(self, key: str, value: Any) -> None:
+        """
+        Set a metadata value.
+
+        Args:
+            key: Metadata key
+            value: Value to store (will be JSON-serialized)
+        """
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO learning_params (param_key, param_value, updated_at)
+                VALUES (?, ?, ?)
+            """, (key, json.dumps(value), int(datetime.now().timestamp())))
+            conn.commit()
+
+    def mark_member_onboarded(self, member_pubkey: str) -> None:
+        """
+        Mark a hive member as onboarded (received channel suggestions).
+
+        Args:
+            member_pubkey: Member's public key
+        """
+        key = f"onboarded_{member_pubkey[:16]}"
+        self.set_metadata(key, {
+            "pubkey": member_pubkey,
+            "onboarded_at": int(datetime.now().timestamp())
+        })
+
+    def is_member_onboarded(self, member_pubkey: str) -> bool:
+        """
+        Check if a member has been onboarded.
+
+        Args:
+            member_pubkey: Member's public key
+
+        Returns:
+            True if member was previously onboarded
+        """
+        key = f"onboarded_{member_pubkey[:16]}"
+        return self.get_metadata(key) is not None

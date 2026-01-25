@@ -750,6 +750,14 @@ class ProactiveAdvisor:
         except Exception:
             results["competitor_analysis"] = {}
 
+        # ==== HIVE MEMBERSHIP (for new member detection) ====
+        try:
+            results["hive_members"] = await self.mcp.call(
+                "hive_members", {"node": node_name}
+            )
+        except Exception:
+            results["hive_members"] = {}
+
         # Calculate summary metrics
         channels = results.get("channels", {}).get("channels", [])
         prof_list = results.get("profitability", {}).get("channels", [])
