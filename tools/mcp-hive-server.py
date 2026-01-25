@@ -5532,14 +5532,21 @@ async def handle_advisor_get_peer_intel(args: Dict) -> Dict:
         if node:
             try:
                 # Query listnodes for peer info
-                nodes_result = await node.call("listnodes", id=peer_id)
-                if nodes_result and nodes_result.get("nodes"):
+                # NOTE: Requires listnodes, listchannels, listpeers permissions in rune
+                nodes_result = await node.call("listnodes", {"id": peer_id})
+                if nodes_result.get("error"):
+                    graph_data["rpc_errors"] = graph_data.get("rpc_errors", [])
+                    graph_data["rpc_errors"].append(f"listnodes: {nodes_result['error']}")
+                elif nodes_result and nodes_result.get("nodes"):
                     node_info = nodes_result["nodes"][0]
                     graph_data["alias"] = node_info.get("alias", "")
                     graph_data["last_timestamp"] = node_info.get("last_timestamp", 0)
 
                 # Query listchannels for peer's channels
-                channels_result = await node.call("listchannels", source=peer_id)
+                channels_result = await node.call("listchannels", {"source": peer_id})
+                if channels_result.get("error"):
+                    graph_data["rpc_errors"] = graph_data.get("rpc_errors", [])
+                    graph_data["rpc_errors"].append(f"listchannels: {channels_result['error']}")
                 channels = channels_result.get("channels", [])
 
                 graph_data["channel_count"] = len(channels)
@@ -5569,8 +5576,11 @@ async def handle_advisor_get_peer_intel(args: Dict) -> Dict:
                     graph_data["is_well_connected"] = len(channels) >= 15
 
                 # Check if we already have a channel with this peer
-                peers_result = await node.call("listpeers", id=peer_id)
-                if peers_result and peers_result.get("peers"):
+                peers_result = await node.call("listpeers", {"id": peer_id})
+                if peers_result.get("error"):
+                    graph_data["rpc_errors"] = graph_data.get("rpc_errors", [])
+                    graph_data["rpc_errors"].append(f"listpeers: {peers_result['error']}")
+                elif peers_result and peers_result.get("peers"):
                     peer_info = peers_result["peers"][0]
                     if peer_info.get("channels"):
                         is_existing_peer = True

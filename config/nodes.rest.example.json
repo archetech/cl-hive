@@ -1,4 +1,18 @@
 {
+  "_comment": "REST mode node configuration for MCP server",
+  "_rune_permissions": [
+    "Required methods for full functionality:",
+    "- getinfo: node identity",
+    "- listfunds: on-chain balance",
+    "- listpeerchannels: channel data",
+    "- setchannel: fee adjustments",
+    "- feerates: on-chain fee estimates",
+    "- listnodes: peer intelligence (network graph)",
+    "- listchannels: peer intelligence (channel analysis)",
+    "- listpeers: peer intelligence (existing connections)",
+    "- hive-*: all hive plugin methods",
+    "- revenue-*: all revenue-ops methods (optional)"
+  ],
   "mode": "rest",
   "nodes": [
     {
@@ -12,12 +26,6 @@
       "rest_url": "https://node2.example.com:3001",
       "rune": "your-rune-from-createrune-command",
       "ca_cert": "/path/to/node2/ca.pem"
-    },
-    {
-      "name": "node3",
-      "rest_url": "https://node3.example.com:3001",
-      "rune": "your-rune-from-createrune-command",
-      "ca_cert": "/path/to/node3/ca.pem"
     }
   ]
 }
