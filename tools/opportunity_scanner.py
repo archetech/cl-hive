@@ -55,6 +55,11 @@ class OpportunityType(Enum):
     # New member onboarding
     NEW_MEMBER_CHANNEL = "new_member_channel"
 
+    # Routing intelligence (pheromones + stigmergic markers)
+    PHEROMONE_FEE_ADJUST = "pheromone_fee_adjust"
+    STIGMERGIC_COORDINATION = "stigmergic_coordination"
+    ROUTING_INTELLIGENCE = "routing_intelligence"
+
 
 class ActionType(Enum):
     """Types of actions the advisor can take."""
@@ -242,6 +247,8 @@ class OpportunityScanner:
             self._scan_ban_candidates(node_name, state),
             # New member onboarding scanner
             self._scan_new_member_opportunities(node_name, state),
+            # Routing intelligence scanner (pheromones + stigmergic markers)
+            self._scan_routing_intelligence(node_name, state),
             return_exceptions=True
         )
 
@@ -1275,6 +1282,261 @@ class OpportunityScanner:
                         "suggested_exchange": exchange_name,
                         "exchange_pubkey": exchange_pubkey,
                         "suggestion_for_new_member": True
+                    }
+                )
+                opportunities.append(opp)
+
+        return opportunities
+
+    async def _scan_routing_intelligence(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """
+        Scan routing intelligence (pheromones + stigmergic markers) for fee optimization.
+
+        Pheromones indicate successful fee levels - channels with strong pheromones
+        have proven routing at their current fee. Stigmergic markers provide fleet-wide
+        coordination signals about route performance.
+
+        This scanner generates opportunities based on:
+        1. Strong pheromones = fee can potentially be raised (proven demand)
+        2. No pheromones = fee may be too high, needs stimulation
+        3. Stigmergic markers indicating successful routes = follow the signals
+        4. Markers indicating failed routes = avoid or adjust fees
+        """
+        opportunities = []
+
+        pheromones = state.get("pheromone_levels", {})
+        markers = state.get("stigmergic_markers", {})
+        routing_intel = state.get("routing_intelligence", {})
+        channels = state.get("channels", [])
+
+        # Build channel lookup by ID
+        channel_lookup = {}
+        for ch in channels:
+            ch_id = ch.get("short_channel_id") or ch.get("channel_id")
+            if ch_id:
+                channel_lookup[ch_id] = ch
+
+        # === Pheromone-based opportunities ===
+        # pheromone_levels returns {"levels": [{"channel_id": x, "level": y}, ...]}
+        pheromone_list = pheromones.get("levels", [])
+
+        for ph in pheromone_list:
+            channel_id = ph.get("channel_id")
+            pheromone_level = ph.get("level", 0)  # "level" not "pheromone_level"
+
+            if not channel_id:
+                continue
+
+            ch_info = channel_lookup.get(channel_id, {})
+            current_fee = ch_info.get("fee_per_millionth", 0)
+            peer_id = ch_info.get("peer_id")
+
+            # Strong pheromone (>0.1 after our scaling) = channel has proven routing success
+            # Consider raising fee if there's headroom
+            if pheromone_level > 0.1:
+                if current_fee > 0 and current_fee < 1500:
+                    suggested_fee = min(current_fee + int(current_fee * 0.1), 1500)
+
+                    opp = Opportunity(
+                        opportunity_type=OpportunityType.PHEROMONE_FEE_ADJUST,
+                        action_type=ActionType.FEE_CHANGE,
+                        channel_id=channel_id,
+                        peer_id=peer_id,
+                        node_name=node_name,
+                        priority_score=min(0.7, 0.4 + pheromone_level),
+                        confidence_score=min(0.85, 0.5 + pheromone_level * 2),
+                        roi_estimate=0.6,
+                        description=f"Pheromone signal: {channel_id} has proven routing demand",
+                        reasoning=f"Pheromone level {pheromone_level:.3f} indicates successful routing. "
+                                  f"Current fee: {current_fee} ppm.",
+                        recommended_action=f"Consider raising fee to ~{suggested_fee} ppm to capture more margin",
+                        predicted_benefit=int(pheromone_level * 500),
+                        classification=ActionClassification.QUEUE_FOR_REVIEW,
+                        auto_execute_safe=False,
+                        current_state={
+                            "pheromone_level": pheromone_level,
+                            "current_fee": current_fee,
+                            "suggested_fee": suggested_fee
+                        }
+                    )
+                    opportunities.append(opp)
+
+        # Find channels with NO pheromone data (not routing)
+        channels_with_pheromones = {ph.get("channel_id") for ph in pheromone_list if ph.get("channel_id")}
+
+        for ch in channels:
+            ch_id = ch.get("short_channel_id") or ch.get("channel_id")
+            if not ch_id or ch_id in channels_with_pheromones:
+                continue
+
+            # Check if channel has significant capacity but no routing history
+            capacity = ch.get("capacity_sats", 0)
+            if not capacity:
+                total_msat = ch.get("total_msat", 0)
+                if isinstance(total_msat, str):
+                    total_msat = int(total_msat.replace("msat", ""))
+                capacity = total_msat // 1000
+
+            current_fee = ch.get("fee_per_millionth", 0)
+            peer_id = ch.get("peer_id")
+
+            if capacity > 1_000_000 and current_fee > 100:  # 1M+ sat channel with >100 ppm
+                opp = Opportunity(
+                    opportunity_type=OpportunityType.PHEROMONE_FEE_ADJUST,
+                    action_type=ActionType.FEE_CHANGE,
+                    channel_id=ch_id,
+                    peer_id=peer_id,
+                    node_name=node_name,
+                    priority_score=0.5,
+                    confidence_score=0.6,
+                    roi_estimate=0.4,
+                    description=f"No routing history: {ch_id} may need fee reduction",
+                    reasoning=f"No pheromone data (zero routing) with {capacity:,} sat capacity. "
+                              f"Current fee {current_fee} ppm may be too high.",
+                    recommended_action=f"Consider lowering fee from {current_fee} to ~{max(50, current_fee // 2)} ppm",
+                    predicted_benefit=500,
+                    classification=ActionClassification.QUEUE_FOR_REVIEW,
+                    auto_execute_safe=False,
+                    current_state={
+                        "pheromone_level": 0,
+                        "capacity": capacity,
+                        "current_fee": current_fee
+                    }
+                )
+                opportunities.append(opp)
+
+        # === Stigmergic marker-based opportunities ===
+        # Markers are keyed by source/destination peer IDs, not channel IDs
+        marker_list = markers.get("markers", [])
+
+        # Group markers by destination peer (routes TO that peer)
+        peer_markers = {}
+        for marker in marker_list:
+            dest_peer = marker.get("destination_peer_id")
+            if dest_peer:
+                if dest_peer not in peer_markers:
+                    peer_markers[dest_peer] = []
+                peer_markers[dest_peer].append(marker)
+
+        # Build reverse lookup: peer_id -> channel_id
+        peer_to_channel = {}
+        for ch in channels:
+            peer_id = ch.get("peer_id")
+            ch_id = ch.get("short_channel_id") or ch.get("channel_id")
+            if peer_id and ch_id:
+                peer_to_channel[peer_id] = ch_id
+
+        for dest_peer, peer_mk_list in peer_markers.items():
+            if not peer_mk_list:
+                continue
+
+            # Find the channel to this peer
+            channel_id = peer_to_channel.get(dest_peer)
+            if not channel_id:
+                continue
+
+            ch_info = channel_lookup.get(channel_id, {})
+            current_fee = ch_info.get("fee_per_millionth", 0)
+
+            # Analyze marker patterns
+            success_markers = [m for m in peer_mk_list if m.get("success")]
+            fail_markers = [m for m in peer_mk_list if not m.get("success")]
+
+            # Strong success signal from markers
+            if len(success_markers) >= 2 and len(fail_markers) == 0:
+                avg_fee = sum(m.get("fee_ppm", 0) for m in success_markers) / len(success_markers)
+
+                opp = Opportunity(
+                    opportunity_type=OpportunityType.STIGMERGIC_COORDINATION,
+                    action_type=ActionType.FEE_CHANGE,
+                    channel_id=channel_id,
+                    peer_id=dest_peer,
+                    node_name=node_name,
+                    priority_score=0.6,
+                    confidence_score=min(0.8, 0.5 + len(success_markers) * 0.1),
+                    roi_estimate=0.5,
+                    description=f"Stigmergic signal: routes to {dest_peer[:16]}... have {len(success_markers)} success markers",
+                    reasoning=f"Fleet markers indicate successful routing at avg fee {avg_fee:.0f} ppm. "
+                              f"Current fee: {current_fee} ppm. Follow the successful signals.",
+                    recommended_action=f"Align fee closer to marker signal (~{int(avg_fee)} ppm)",
+                    predicted_benefit=int(len(success_markers) * 50),
+                    classification=ActionClassification.QUEUE_FOR_REVIEW,
+                    auto_execute_safe=False,
+                    current_state={
+                        "success_markers": len(success_markers),
+                        "fail_markers": len(fail_markers),
+                        "avg_successful_fee": avg_fee,
+                        "current_fee": current_fee,
+                        "destination_peer": dest_peer
+                    }
+                )
+                opportunities.append(opp)
+
+            # High failure signal from markers
+            elif len(fail_markers) >= 2 and len(success_markers) == 0:
+                avg_fail_fee = sum(m.get("fee_ppm", 0) for m in fail_markers) / len(fail_markers)
+
+                # Current fee is similar to failing fee - consider adjustment
+                if current_fee > 0 and abs(current_fee - avg_fail_fee) < 100:
+                    opp = Opportunity(
+                        opportunity_type=OpportunityType.STIGMERGIC_COORDINATION,
+                        action_type=ActionType.FEE_CHANGE,
+                        channel_id=channel_id,
+                        peer_id=dest_peer,
+                        node_name=node_name,
+                        priority_score=0.55,
+                        confidence_score=0.6,
+                        roi_estimate=0.4,
+                        description=f"Stigmergic warning: routes to {dest_peer[:16]}... have {len(fail_markers)} fail markers",
+                        reasoning=f"Fleet markers indicate routing failures at avg fee {avg_fail_fee:.0f} ppm. "
+                                  f"Current fee {current_fee} ppm is in the failing range.",
+                        recommended_action=f"Consider significant fee adjustment (lower to attract flow or raise if oversupplied)",
+                        predicted_benefit=200,
+                        classification=ActionClassification.QUEUE_FOR_REVIEW,
+                        auto_execute_safe=False,
+                        current_state={
+                            "success_markers": len(success_markers),
+                            "fail_markers": len(fail_markers),
+                            "avg_fail_fee": avg_fail_fee,
+                            "current_fee": current_fee,
+                            "destination_peer": dest_peer
+                        }
+                    )
+                    opportunities.append(opp)
+
+        # === Overall routing intelligence status ===
+        if routing_intel:
+            total_forwards = routing_intel.get("total_forwards_tracked", 0)
+            channels_with_data = routing_intel.get("channels_with_pheromones", 0)
+            total_channels = len(channels)
+
+            # Low coverage warning - not enough routing data being collected
+            if total_channels > 5 and channels_with_data < total_channels * 0.2 and total_forwards < 10:
+                opp = Opportunity(
+                    opportunity_type=OpportunityType.ROUTING_INTELLIGENCE,
+                    action_type=ActionType.FLAG_FOR_REVIEW,
+                    channel_id=None,
+                    peer_id=None,
+                    node_name=node_name,
+                    priority_score=0.4,
+                    confidence_score=0.7,
+                    roi_estimate=0.3,
+                    description=f"Low routing intelligence coverage: {channels_with_data}/{total_channels} channels",
+                    reasoning=f"Only {channels_with_data} of {total_channels} channels have routing data. "
+                              f"Total forwards tracked: {total_forwards}. Consider running backfill or "
+                              f"investigating why routing is low.",
+                    recommended_action="Run hive-backfill-routing-intelligence or review channel selection",
+                    predicted_benefit=0,
+                    classification=ActionClassification.QUEUE_FOR_REVIEW,
+                    auto_execute_safe=False,
+                    current_state={
+                        "total_forwards": total_forwards,
+                        "channels_with_data": channels_with_data,
+                        "total_channels": total_channels
                     }
                 )
                 opportunities.append(opp)

@@ -316,6 +316,10 @@ class ProactiveAdvisor:
             logger.info(f"  ROC: {summary.get('roc_pct', 0):.2f}%")
             logger.info(f"  Underwater: {summary.get('underwater_pct', 0):.1f}%")
             logger.info(f"  Bleeders: {summary.get('bleeder_count', 0)}")
+            # Routing intelligence metrics
+            logger.info(f"  Routing Intelligence:")
+            logger.info(f"    Pheromone channels: {summary.get('channels_with_pheromones', 0)}/{summary.get('total_pheromone_channels', 0)}")
+            logger.info(f"    Stigmergic markers: {summary.get('active_stigmergic_markers', 0)} ({summary.get('successful_markers', 0)} success, {summary.get('failed_markers', 0)} fail)")
 
             # Phase 3: Check goals and adjust strategy
             logger.info("[Phase 3] Checking goals...")
@@ -663,6 +667,20 @@ class ProactiveAdvisor:
         except Exception:
             results["pheromone_levels"] = {}
 
+        try:
+            results["stigmergic_markers"] = await self.mcp.call(
+                "stigmergic_markers", {"node": node_name}
+            )
+        except Exception:
+            results["stigmergic_markers"] = {}
+
+        try:
+            results["routing_intelligence"] = await self.mcp.call(
+                "hive_routing_intelligence_status", {"node": node_name}
+            )
+        except Exception:
+            results["routing_intelligence"] = {}
+
         # ==== PREDICTIVE INTELLIGENCE (Phase 7.1) ====
         try:
             results["anticipatory"] = await self.mcp.call(
@@ -792,6 +810,25 @@ class ProactiveAdvisor:
         anticipatory = results.get("anticipatory", {})
         positioning = results.get("positioning", {})
 
+        # Routing intelligence metrics
+        pheromones = results.get("pheromone_levels", {})
+        markers = results.get("stigmergic_markers", {})
+        routing_intel = results.get("routing_intelligence", {})
+
+        # Count channels with strong pheromone signals (indicates good routing history)
+        # pheromone_levels returns {"levels": [{"channel_id": x, "level": y}, ...]}
+        pheromone_list = pheromones.get("levels", [])
+        strong_pheromone_count = sum(
+            1 for p in pheromone_list
+            if p.get("level", 0) > 0.05
+        )
+
+        # Count active stigmergic markers (fleet coordination signals)
+        marker_list = markers.get("markers", [])
+        active_marker_count = len(marker_list)
+        successful_markers = markers.get("successful_markers", 0)
+        failed_markers = markers.get("failed_markers", 0)
+
         return {
             "summary": {
                 "total_capacity_sats": total_capacity,
@@ -806,6 +843,13 @@ class ProactiveAdvisor:
                 "competition_conflicts": len(competition.get("conflicts", [])),
                 "at_risk_channels": len(anticipatory.get("predictions", [])),
                 "close_recommendations": len(results.get("close_recommendations", {}).get("recommendations", [])),
+                # Routing intelligence indicators
+                "channels_with_pheromones": strong_pheromone_count,
+                "total_pheromone_channels": len(pheromone_list),
+                "active_stigmergic_markers": active_marker_count,
+                "successful_markers": successful_markers,
+                "failed_markers": failed_markers,
+                "routing_intelligence_status": routing_intel.get("status", "unknown"),
             },
             "channels": channels,
             "profitability": prof_list,
@@ -816,7 +860,9 @@ class ProactiveAdvisor:
             "defense_status": defense,
             "internal_competition": competition,
             "fee_coordination": results.get("fee_coordination", {}),
-            "pheromone_levels": results.get("pheromone_levels", {}),
+            "pheromone_levels": pheromones,
+            "stigmergic_markers": markers,
+            "routing_intelligence": routing_intel,
             # Predictive intelligence
             "anticipatory": anticipatory,
             "critical_velocity": results.get("critical_velocity", {}),
