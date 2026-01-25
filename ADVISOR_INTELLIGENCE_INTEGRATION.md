@@ -166,12 +166,25 @@ Suggest strategic channel openings when new members join:
 |------|---------|---------------------|
 | `hive_members` | Get hive membership list | ✅ Gathered in `_analyze_node_state()` |
 | `positioning_summary` | Strategic targets for new members | ✅ Scanned via `_scan_new_member_opportunities()` |
+| `hive_onboard_new_members` | Standalone onboarding check | ✅ Independent MCP tool |
 
 **Integration Points (Implemented):**
-- `_scan_new_member_opportunities()`: Detects neophytes and recent members
+- `_scan_new_member_opportunities()`: Scans during advisor cycles
+- `hive_onboard_new_members`: **Standalone MCP tool** - runs independently of advisor
 - Suggests existing members open channels TO new members
 - Suggests strategic targets FOR new members to improve fleet coverage
 - Tracks onboarded members via `mark_member_onboarded()` to avoid repeating suggestions
+
+**Standalone Usage:**
+```bash
+# Run via MCP independently of advisor cycle
+hive_onboard_new_members node=hive-nexus-01
+
+# Dry run to preview without creating actions
+hive_onboard_new_members node=hive-nexus-01 dry_run=true
+
+# Can be run hourly via cron independent of 3-hour advisor cycle
+```
 
 ---
 
