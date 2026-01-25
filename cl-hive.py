@@ -2516,6 +2516,14 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
             if safe_plugin:
                 safe_plugin.log(f"Pool revenue recording error: {e}", level="debug")
 
+    # Update fee coordination systems (pheromones + stigmergic markers)
+    if fee_coordination_mgr and our_pubkey:
+        try:
+            _record_forward_for_fee_coordination(forward_event, status)
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"Fee coordination recording error: {e}", level="debug")
+
 
 def _update_and_broadcast_fees(new_fee_sats: int):
     """
@@ -2733,6 +2741,66 @@ def _record_forward_as_route_probe(forward_event: Dict):
         )
     except Exception:
         pass  # Silently ignore errors in route probe recording
+
+
+def _record_forward_for_fee_coordination(forward_event: Dict, status: str):
+    """
+    Record a forward event for fee coordination (pheromones + stigmergic markers).
+
+    This feeds the swarm intelligence systems with real routing data:
+    - Pheromone levels: Memory of successful fee levels
+    - Stigmergic markers: Signals for fleet-wide coordination
+    """
+    if not fee_coordination_mgr or not safe_plugin:
+        return
+
+    try:
+        in_channel = forward_event.get("in_channel", "")
+        out_channel = forward_event.get("out_channel", "")
+        fee_msat = forward_event.get("fee_msat", 0)
+        out_msat = forward_event.get("out_msat", 0)
+
+        if not out_channel:
+            return
+
+        # Get peer IDs for the channels
+        funds = safe_plugin.rpc.listfunds()
+        channels = {ch.get("short_channel_id"): ch for ch in funds.get("channels", [])}
+
+        in_peer = channels.get(in_channel, {}).get("peer_id", "") if in_channel else ""
+        out_peer = channels.get(out_channel, {}).get("peer_id", "")
+
+        if not out_peer:
+            return
+
+        # Calculate fee in ppm
+        fee_ppm = int((fee_msat * 1_000_000) / out_msat) if out_msat > 0 else 0
+        fee_sats = fee_msat // 1000
+        volume_sats = out_msat // 1000 if out_msat else 0
+
+        # Determine success based on status
+        success = status == "settled"
+
+        # Record to fee coordination manager
+        fee_coordination_mgr.record_routing_outcome(
+            channel_id=out_channel,
+            peer_id=out_peer,
+            fee_ppm=fee_ppm,
+            success=success,
+            revenue_sats=fee_sats if success else 0,
+            source=in_peer if in_peer else None,
+            destination=out_peer
+        )
+
+        if success and safe_plugin:
+            safe_plugin.log(
+                f"cl-hive: Recorded forward for fee coordination: "
+                f"{out_channel} fee={fee_ppm}ppm revenue={fee_sats}sats",
+                level="debug"
+            )
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Fee coordination record error: {e}", level="debug")
 
 
 # =============================================================================
@@ -12012,6 +12080,197 @@ def hive_time_low_hours(plugin: Plugin, channel_id: str):
         "channel_id": channel_id,
         "low_hours": low_hours,
         "count": len(low_hours)
+    }
+
+
+@plugin.method("hive-backfill-routing-intelligence")
+def hive_backfill_routing_intelligence(
+    plugin: Plugin,
+    days: int = 30,
+    status_filter: str = "settled"
+):
+    """
+    Backfill pheromone levels and stigmergic markers from historical forwards.
+
+    Reads historical forward data and populates the fee coordination systems
+    (pheromones + stigmergic markers) to bootstrap swarm intelligence.
+
+    Args:
+        days: Number of days of history to process (default: 30)
+        status_filter: Forward status to include: "settled", "failed", or "all" (default: settled)
+
+    Returns:
+        Dict with backfill statistics.
+    """
+    if not fee_coordination_mgr:
+        return {"error": "Fee coordination manager not initialized"}
+
+    if not safe_plugin:
+        return {"error": "Plugin not initialized"}
+
+    try:
+        # Get historical forwards
+        forwards_result = safe_plugin.rpc.listforwards(status=status_filter if status_filter != "all" else None)
+        forwards = forwards_result.get("forwards", [])
+
+        if not forwards:
+            return {
+                "status": "no_data",
+                "message": "No forwards found to backfill",
+                "processed": 0
+            }
+
+        # Get channel info for peer mapping
+        funds = safe_plugin.rpc.listfunds()
+        channels = {ch.get("short_channel_id"): ch for ch in funds.get("channels", [])}
+
+        # Calculate cutoff time
+        cutoff_time = int(time.time()) - (days * 86400)
+
+        # Process forwards
+        processed = 0
+        skipped = 0
+        errors = 0
+        pheromone_deposits = 0
+        marker_deposits = 0
+
+        for fwd in forwards:
+            try:
+                # Check timestamp if available
+                received_time = fwd.get("received_time", 0)
+                if received_time and received_time < cutoff_time:
+                    skipped += 1
+                    continue
+
+                out_channel = fwd.get("out_channel", "")
+                in_channel = fwd.get("in_channel", "")
+                fee_msat = fwd.get("fee_msat", 0)
+                out_msat = fwd.get("out_msat", 0)
+                status = fwd.get("status", "unknown")
+
+                if not out_channel:
+                    skipped += 1
+                    continue
+
+                # Get peer IDs
+                out_peer = channels.get(out_channel, {}).get("peer_id", "")
+                in_peer = channels.get(in_channel, {}).get("peer_id", "") if in_channel else ""
+
+                if not out_peer:
+                    skipped += 1
+                    continue
+
+                # Calculate metrics
+                fee_ppm = int((fee_msat * 1_000_000) / out_msat) if out_msat > 0 else 0
+                fee_sats = fee_msat // 1000
+                volume_sats = out_msat // 1000 if out_msat else 0
+                success = status == "settled"
+
+                # Record to fee coordination manager
+                fee_coordination_mgr.record_routing_outcome(
+                    channel_id=out_channel,
+                    peer_id=out_peer,
+                    fee_ppm=fee_ppm,
+                    success=success,
+                    revenue_sats=fee_sats if success else 0,
+                    source=in_peer if in_peer else None,
+                    destination=out_peer
+                )
+
+                processed += 1
+
+                # Track what was deposited
+                if success and fee_sats > 0:
+                    pheromone_deposits += 1
+                if in_peer and out_peer:
+                    marker_deposits += 1
+
+            except Exception as e:
+                errors += 1
+                continue
+
+        # Get current levels after backfill
+        pheromone_levels = fee_coordination_mgr.adaptive_controller.get_all_pheromone_levels()
+        markers = fee_coordination_mgr.stigmergic_coord.get_all_markers()
+
+        return {
+            "status": "success",
+            "days_processed": days,
+            "status_filter": status_filter,
+            "forwards_found": len(forwards),
+            "processed": processed,
+            "skipped": skipped,
+            "errors": errors,
+            "pheromone_deposits": pheromone_deposits,
+            "marker_deposits": marker_deposits,
+            "current_pheromone_channels": len(pheromone_levels),
+            "current_active_markers": len(markers),
+            "pheromone_summary": {
+                ch: round(level, 2)
+                for ch, level in sorted(
+                    pheromone_levels.items(),
+                    key=lambda x: x[1],
+                    reverse=True
+                )[:10]  # Top 10 channels
+            }
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+@plugin.method("hive-routing-intelligence-status")
+def hive_routing_intelligence_status(plugin: Plugin):
+    """
+    Get current status of routing intelligence systems (pheromones + markers).
+
+    Returns current pheromone levels and stigmergic markers.
+
+    Returns:
+        Dict with routing intelligence status.
+    """
+    if not fee_coordination_mgr:
+        return {"error": "Fee coordination manager not initialized"}
+
+    pheromone_levels = fee_coordination_mgr.adaptive_controller.get_all_pheromone_levels()
+    markers = fee_coordination_mgr.stigmergic_coord.get_all_markers()
+
+    # Build marker summary
+    marker_summary = []
+    for m in markers[:20]:  # Limit to 20 most recent
+        marker_summary.append({
+            "source": m.source_peer_id[:12] + "..." if m.source_peer_id else "",
+            "destination": m.destination_peer_id[:12] + "..." if m.destination_peer_id else "",
+            "fee_ppm": m.fee_ppm,
+            "success": m.success,
+            "strength": round(m.strength, 3),
+            "age_hours": round((time.time() - m.timestamp) / 3600, 1)
+        })
+
+    # Build pheromone summary
+    pheromone_summary = []
+    for ch, level in sorted(pheromone_levels.items(), key=lambda x: x[1], reverse=True):
+        pheromone_summary.append({
+            "channel_id": ch,
+            "level": round(level, 3),
+            "above_threshold": level > 10.0  # PHEROMONE_EXPLOIT_THRESHOLD
+        })
+
+    return {
+        "pheromone_channels": len(pheromone_levels),
+        "active_markers": len(markers),
+        "successful_markers": sum(1 for m in markers if m.success),
+        "failed_markers": sum(1 for m in markers if not m.success),
+        "pheromone_levels": pheromone_summary,
+        "stigmergic_markers": marker_summary,
+        "config": {
+            "pheromone_exploit_threshold": 10.0,
+            "marker_half_life_hours": 24,
+            "marker_min_strength": 0.1
+        }
     }
 
 

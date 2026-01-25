@@ -1007,6 +1007,69 @@ Runs independently of the advisor cycle to provide immediate onboarding support 
             }
         ),
         # =====================================================================
+        # Routing Intelligence Tools (Pheromones + Stigmergic Markers)
+        # =====================================================================
+        Tool(
+            name="hive_backfill_routing_intelligence",
+            description="""Backfill pheromone levels and stigmergic markers from historical forwards.
+
+**When to use:** Run this ONCE after enabling routing intelligence to populate
+the swarm systems with historical data. Also useful after restarts.
+
+**What it does:**
+- Reads historical forward events from CLN
+- Populates pheromone levels (fee memory per channel)
+- Creates stigmergic markers (fleet coordination signals)
+
+**Parameters:**
+- days: Number of days of history to process (default: 30)
+- status_filter: "settled" (default), "failed", or "all"
+
+**Returns:** Statistics on processed forwards and current intelligence levels.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Days of history to process (default: 30)"
+                    },
+                    "status_filter": {
+                        "type": "string",
+                        "description": "Forward status: settled, failed, or all (default: settled)",
+                        "enum": ["settled", "failed", "all"]
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_routing_intelligence_status",
+            description="""Get current status of routing intelligence systems (pheromones + markers).
+
+**Shows:**
+- Pheromone levels per channel (memory of successful fees)
+- Active stigmergic markers (fleet coordination signals)
+- Marker success/failure breakdown
+- Configuration thresholds
+
+**Use this to verify routing intelligence is being collected and to understand
+which channels have strong fee signals.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        # =====================================================================
         # cl-revenue-ops Tools
         # =====================================================================
         Tool(
@@ -2757,6 +2820,11 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_time_peak_hours(arguments)
         elif name == "hive_time_low_hours":
             result = await handle_time_low_hours(arguments)
+        # Routing Intelligence tools (Pheromones + Stigmergic Markers)
+        elif name == "hive_backfill_routing_intelligence":
+            result = await handle_backfill_routing_intelligence(arguments)
+        elif name == "hive_routing_intelligence_status":
+            result = await handle_routing_intelligence_status(arguments)
         # cl-revenue-ops tools
         elif name == "revenue_status":
             result = await handle_revenue_status(arguments)
@@ -4037,6 +4105,88 @@ async def handle_time_low_hours(args: Dict) -> Dict:
         result["ai_summary"] = (
             f"No low-activity patterns detected for channel {channel_id}. "
             "Channel may have consistent activity or need more history."
+        )
+
+    return result
+
+
+# =============================================================================
+# Routing Intelligence Handlers (Pheromones + Stigmergic Markers)
+# =============================================================================
+
+async def handle_backfill_routing_intelligence(args: Dict) -> Dict:
+    """
+    Backfill pheromone levels and stigmergic markers from historical forwards.
+
+    Reads historical forward data and populates the fee coordination systems
+    to bootstrap swarm intelligence.
+    """
+    node_name = args.get("node")
+    days = args.get("days", 30)
+    status_filter = args.get("status_filter", "settled")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-backfill-routing-intelligence", {
+        "days": days,
+        "status_filter": status_filter
+    })
+
+    # Add AI summary
+    if result.get("status") == "success":
+        processed = result.get("processed", 0)
+        pheromone_channels = result.get("current_pheromone_channels", 0)
+        active_markers = result.get("current_active_markers", 0)
+        result["ai_summary"] = (
+            f"Backfill complete: processed {processed} forwards from {days} days. "
+            f"Pheromone levels on {pheromone_channels} channels, "
+            f"{active_markers} stigmergic markers active. "
+            "Future forwards will now update swarm intelligence automatically."
+        )
+    elif result.get("status") == "no_data":
+        result["ai_summary"] = (
+            f"No forwards found to backfill. "
+            "Run this again after the node has processed some routing traffic."
+        )
+    else:
+        result["ai_summary"] = f"Backfill failed: {result.get('error', 'unknown error')}"
+
+    return result
+
+
+async def handle_routing_intelligence_status(args: Dict) -> Dict:
+    """
+    Get current status of routing intelligence systems (pheromones + markers).
+
+    Shows pheromone levels, stigmergic markers, and configuration.
+    """
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    result = await node.call("hive-routing-intelligence-status", {})
+
+    # Add AI summary
+    pheromone_count = result.get("pheromone_channels", 0)
+    marker_count = result.get("active_markers", 0)
+    successful = result.get("successful_markers", 0)
+    failed = result.get("failed_markers", 0)
+
+    if pheromone_count == 0 and marker_count == 0:
+        result["ai_summary"] = (
+            "No routing intelligence data yet. "
+            "Run hive_backfill_routing_intelligence to populate from historical forwards, "
+            "or wait for new forwards to accumulate."
+        )
+    else:
+        result["ai_summary"] = (
+            f"Routing intelligence active: {pheromone_count} channels with pheromone levels, "
+            f"{marker_count} stigmergic markers ({successful} successful, {failed} failed). "
+            "This data helps coordinate fees across the hive."
         )
 
     return result
