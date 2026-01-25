@@ -4,7 +4,7 @@ This document describes the full suite of intelligence gathering systems integra
 
 ## Current State (v2.0 - Fully Integrated)
 
-The proactive advisor now uses **all available intelligence sources** via comprehensive data gathering in `_analyze_node_state()` and 14 parallel opportunity scanners.
+The proactive advisor now uses **all available intelligence sources** via comprehensive data gathering in `_analyze_node_state()` and 15 parallel opportunity scanners.
 
 ### Core Intelligence (Always Gathered)
 
@@ -158,9 +158,26 @@ Maximize return on capital:
 
 ---
 
-## All 14 Opportunity Scanners (Implemented)
+### 10. New Member Onboarding ✅
 
-The `OpportunityScanner` runs these 14 scanners in parallel:
+Suggest strategic channel openings when new members join:
+
+| Tool | Purpose | Integration Status |
+|------|---------|---------------------|
+| `hive_members` | Get hive membership list | ✅ Gathered in `_analyze_node_state()` |
+| `positioning_summary` | Strategic targets for new members | ✅ Scanned via `_scan_new_member_opportunities()` |
+
+**Integration Points (Implemented):**
+- `_scan_new_member_opportunities()`: Detects neophytes and recent members
+- Suggests existing members open channels TO new members
+- Suggests strategic targets FOR new members to improve fleet coverage
+- Tracks onboarded members via `mark_member_onboarded()` to avoid repeating suggestions
+
+---
+
+## All 15 Opportunity Scanners (Implemented)
+
+The `OpportunityScanner` runs these 15 scanners in parallel:
 
 | Scanner | Purpose | Data Source |
 |---------|---------|-------------|
@@ -178,6 +195,7 @@ The `OpportunityScanner` runs these 14 scanners in parallel:
 | `_scan_competitor_opportunities` | Market fee positioning | `competitor_analysis` |
 | `_scan_rationalization` | Redundant channel closure | `close_recommendations` |
 | `_scan_ban_candidates` | Peer removal candidates | `ban_candidates` |
+| `_scan_new_member_opportunities` | New member channel suggestions | `hive_members`, `positioning` |
 
 ---
 
@@ -321,6 +339,7 @@ All cl-hive intelligence systems are now **fully integrated** into the proactive
 | Strategic positioning | ✅ Complete | `positioning_summary` + `flow_recommendations` |
 | Avoid bad actors | ✅ Complete | `defense_status` + `ban_candidates` |
 | Learn continuously | ✅ Complete | Pheromone levels + outcome measurement |
+| Onboard new members | ✅ Complete | `hive_members` + strategic channel suggestions |
 
 ### Key Files
 
