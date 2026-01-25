@@ -7667,6 +7667,142 @@ def hive_planner_log(plugin: Plugin, limit: int = 50):
     return rpc_planner_log(_get_hive_context(), limit=limit)
 
 
+@plugin.method("hive-planner-ignore")
+def hive_planner_ignore(plugin: Plugin, peer_id: str, reason: str = "manual",
+                        duration_hours: int = 0):
+    """
+    Add a peer to the planner ignore list (prevents channel opens to this peer).
+
+    Use this when a peer is unreachable, rejected connections, or should be
+    skipped for any reason. The planner will not propose this peer as an
+    expansion target until the ignore is released or expires.
+
+    Args:
+        peer_id: Pubkey of peer to ignore
+        reason: Reason for ignoring (default: "manual")
+        duration_hours: Hours until auto-expire (0 = permanent until released)
+
+    Returns:
+        Dict with result and current ignored peers count.
+
+    Example:
+        lightning-cli hive-planner-ignore 035e4ff418fc... "connection_failed" 24
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    if len(peer_id) != 66:
+        return {"error": "Invalid peer_id format (expected 66 hex chars)"}
+
+    duration = duration_hours if duration_hours > 0 else None
+    success = database.add_ignored_peer(peer_id, reason=reason, duration_hours=duration)
+
+    # Also add to planner's runtime ignore set if available
+    if planner and hasattr(planner, '_ignored_peers'):
+        planner._ignored_peers.add(peer_id)
+
+    # Log the action
+    database.log_planner_action(
+        action_type='ignore',
+        target=peer_id,
+        result='success' if success else 'failed',
+        details={
+            'reason': reason,
+            'type': 'manual',
+            'duration_hours': duration_hours if duration_hours > 0 else 'permanent'
+        }
+    )
+
+    ignored_peers = database.get_ignored_peers()
+
+    return {
+        "result": "success" if success else "already_ignored",
+        "peer_id": peer_id,
+        "reason": reason,
+        "duration_hours": duration_hours if duration_hours > 0 else "permanent",
+        "ignored_peers_count": len(ignored_peers)
+    }
+
+
+@plugin.method("hive-planner-unignore")
+def hive_planner_unignore(plugin: Plugin, peer_id: str):
+    """
+    Remove a peer from the planner ignore list.
+
+    Args:
+        peer_id: Pubkey of peer to unignore
+
+    Returns:
+        Dict with result and current ignored peers count.
+
+    Example:
+        lightning-cli hive-planner-unignore 035e4ff418fc...
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    if len(peer_id) != 66:
+        return {"error": "Invalid peer_id format (expected 66 hex chars)"}
+
+    success = database.remove_ignored_peer(peer_id)
+
+    # Also remove from planner's runtime ignore set if available
+    if planner and hasattr(planner, '_ignored_peers'):
+        planner._ignored_peers.discard(peer_id)
+
+    # Log the action
+    database.log_planner_action(
+        action_type='unignore',
+        target=peer_id,
+        result='success' if success else 'not_found',
+        details={'type': 'manual'}
+    )
+
+    ignored_peers = database.get_ignored_peers()
+
+    return {
+        "result": "success" if success else "not_found",
+        "peer_id": peer_id,
+        "ignored_peers_count": len(ignored_peers)
+    }
+
+
+@plugin.method("hive-planner-ignored-peers")
+def hive_planner_ignored_peers(plugin: Plugin, include_expired: bool = False):
+    """
+    Get list of currently ignored peers.
+
+    Args:
+        include_expired: Include expired ignores (default: False)
+
+    Returns:
+        Dict with ignored peers list and counts.
+
+    Example:
+        lightning-cli hive-planner-ignored-peers
+    """
+    if not database:
+        return {"error": "Database not initialized"}
+
+    # Cleanup expired ignores first
+    expired_count = database.cleanup_expired_ignores()
+
+    ignored_peers = database.get_ignored_peers(include_expired=include_expired)
+
+    # Also get runtime ignores from planner
+    runtime_ignores = set()
+    if planner and hasattr(planner, '_ignored_peers'):
+        runtime_ignores = planner._ignored_peers
+
+    return {
+        "ignored_peers": ignored_peers,
+        "count": len(ignored_peers),
+        "runtime_ignores": list(runtime_ignores),
+        "runtime_count": len(runtime_ignores),
+        "expired_cleaned": expired_count
+    }
+
+
 @plugin.method("hive-test-intent")
 def hive_test_intent(plugin: Plugin, target: str, intent_type: str = "channel_open",
                      broadcast: bool = True):

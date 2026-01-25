@@ -1859,6 +1859,14 @@ class Planner:
         if not self.db:
             return False, ""
 
+        # Check if peer is manually ignored (persistent)
+        if self.db.is_peer_ignored(target):
+            return True, "manually_ignored"
+
+        # Check runtime ignore set (in-memory, includes saturation ignores)
+        if target in self._ignored_peers:
+            return True, "runtime_ignored"
+
         # Check for pending intent
         if self._has_pending_intent(target):
             return True, "pending_intent"

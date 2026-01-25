@@ -357,6 +357,20 @@ class HiveDatabase:
         """)
 
         # =====================================================================
+        # PLANNER IGNORED PEERS TABLE
+        # =====================================================================
+        # Persistent storage for manually ignored peers (prevents planner from
+        # opening channels to these peers until released)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS planner_ignored_peers (
+                peer_id TEXT PRIMARY KEY,
+                ignored_at INTEGER NOT NULL,
+                reason TEXT,
+                expires_at INTEGER
+            )
+        """)
+
+        # =====================================================================
         # PEER EVENTS TABLE (Phase 6.1 - Topology Intelligence)
         # =====================================================================
         # Stores PEER_AVAILABLE events for quality metrics and topology decisions
@@ -2305,10 +2319,10 @@ class HiveDatabase:
         """Get recent planner logs."""
         conn = self._get_connection()
         rows = conn.execute("""
-            SELECT * FROM hive_planner_log 
+            SELECT * FROM hive_planner_log
             ORDER BY timestamp DESC LIMIT ?
         """, (limit,)).fetchall()
-        
+
         results = []
         for row in rows:
             result = dict(row)
@@ -2319,6 +2333,119 @@ class HiveDatabase:
                     pass
             results.append(result)
         return results
+
+    # =========================================================================
+    # PLANNER IGNORED PEERS
+    # =========================================================================
+
+    def add_ignored_peer(self, peer_id: str, reason: str = "manual",
+                         duration_hours: Optional[int] = None) -> bool:
+        """
+        Add a peer to the planner ignore list.
+
+        Ignored peers will not be selected as expansion targets until
+        the ignore is released or expires.
+
+        Args:
+            peer_id: Pubkey of peer to ignore
+            reason: Reason for ignoring (e.g., "manual", "connection_failed")
+            duration_hours: Optional expiration in hours (None = permanent until released)
+
+        Returns:
+            True if added, False if already ignored
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        expires_at = now + (duration_hours * 3600) if duration_hours else None
+
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO planner_ignored_peers
+                (peer_id, ignored_at, reason, expires_at)
+                VALUES (?, ?, ?, ?)
+            """, (peer_id, now, reason, expires_at))
+            return True
+        except Exception as e:
+            self.plugin.log(f"HiveDatabase: Failed to add ignored peer: {e}", level='warning')
+            return False
+
+    def remove_ignored_peer(self, peer_id: str) -> bool:
+        """
+        Remove a peer from the planner ignore list.
+
+        Args:
+            peer_id: Pubkey of peer to unignore
+
+        Returns:
+            True if removed, False if not found
+        """
+        conn = self._get_connection()
+        result = conn.execute(
+            "DELETE FROM planner_ignored_peers WHERE peer_id = ?",
+            (peer_id,)
+        )
+        return result.rowcount > 0
+
+    def get_ignored_peers(self, include_expired: bool = False) -> List[Dict]:
+        """
+        Get list of currently ignored peers.
+
+        Args:
+            include_expired: If True, include expired ignores (default: False)
+
+        Returns:
+            List of ignored peer records
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+
+        if include_expired:
+            rows = conn.execute("""
+                SELECT * FROM planner_ignored_peers
+                ORDER BY ignored_at DESC
+            """).fetchall()
+        else:
+            # Only return non-expired ignores
+            rows = conn.execute("""
+                SELECT * FROM planner_ignored_peers
+                WHERE expires_at IS NULL OR expires_at > ?
+                ORDER BY ignored_at DESC
+            """, (now,)).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def is_peer_ignored(self, peer_id: str) -> bool:
+        """
+        Check if a peer is currently ignored.
+
+        Args:
+            peer_id: Pubkey to check
+
+        Returns:
+            True if peer is ignored (and not expired)
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        row = conn.execute("""
+            SELECT 1 FROM planner_ignored_peers
+            WHERE peer_id = ? AND (expires_at IS NULL OR expires_at > ?)
+        """, (peer_id, now)).fetchone()
+        return row is not None
+
+    def cleanup_expired_ignores(self) -> int:
+        """
+        Remove expired ignore entries.
+
+        Returns:
+            Number of expired ignores removed
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        result = conn.execute(
+            "DELETE FROM planner_ignored_peers WHERE expires_at IS NOT NULL AND expires_at < ?",
+            (now,)
+        )
+        return result.rowcount
 
     def prune_planner_logs(self, older_than_days: int = 30) -> int:
         """

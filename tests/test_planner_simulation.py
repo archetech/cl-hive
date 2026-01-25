@@ -67,6 +67,8 @@ def mock_database():
     # Mock global constraint tracking (BUG-001 fix)
     db.count_consecutive_expansion_rejections.return_value = 0
     db.get_recent_expansion_rejections.return_value = []
+    # Mock ignored peers (planner ignore feature)
+    db.is_peer_ignored.return_value = False
     # Mock peer event summary for quality scorer (neutral values)
     db.get_peer_event_summary.return_value = {
         "peer_id": "",

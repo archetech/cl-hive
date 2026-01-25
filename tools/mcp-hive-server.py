@@ -576,6 +576,68 @@ Runs independently of the advisor cycle to provide immediate onboarding support 
             }
         ),
         Tool(
+            name="hive_planner_ignore",
+            description="Add a peer to the planner ignore list. Ignored peers will not be selected as channel open targets until released or expired. Use when a peer rejects connections or should be skipped.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Pubkey of peer to ignore"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Reason for ignoring (default: 'manual')"
+                    },
+                    "duration_hours": {
+                        "type": "integer",
+                        "description": "Hours until auto-expire (0 = permanent until released)"
+                    }
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="hive_planner_unignore",
+            description="Remove a peer from the planner ignore list, allowing the planner to propose channels to this peer again.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Pubkey of peer to unignore"
+                    }
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="hive_planner_ignored_peers",
+            description="Get list of currently ignored peers for the planner.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "include_expired": {
+                        "type": "boolean",
+                        "description": "Include expired ignores (default: false)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
             name="hive_governance_mode",
             description="Get or set the governance mode for a node (advisor, failsafe). Advisor is the primary AI-driven mode; failsafe is for emergencies when AI is unavailable.",
             inputSchema={
@@ -2650,6 +2712,12 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_set_fees(arguments)
         elif name == "hive_topology_analysis":
             result = await handle_topology_analysis(arguments)
+        elif name == "hive_planner_ignore":
+            result = await handle_planner_ignore(arguments)
+        elif name == "hive_planner_unignore":
+            result = await handle_planner_unignore(arguments)
+        elif name == "hive_planner_ignored_peers":
+            result = await handle_planner_ignored_peers(arguments)
         elif name == "hive_governance_mode":
             result = await handle_governance_mode(arguments)
         elif name == "hive_expansion_mode":
@@ -3362,6 +3430,59 @@ async def handle_topology_analysis(args: Dict) -> Dict:
         "coverage_summary": expansion_recs.get("coverage_summary", {}),
         "cooperation_modules": expansion_recs.get("cooperation_modules", {})
     }
+
+
+async def handle_planner_ignore(args: Dict) -> Dict:
+    """Add a peer to the planner ignore list."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    reason = args.get("reason", "manual")
+    duration_hours = args.get("duration_hours", 0)
+
+    if not node_name or not peer_id:
+        return {"error": "node and peer_id are required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-planner-ignore", {
+        "peer_id": peer_id,
+        "reason": reason,
+        "duration_hours": duration_hours
+    })
+
+
+async def handle_planner_unignore(args: Dict) -> Dict:
+    """Remove a peer from the planner ignore list."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+
+    if not node_name or not peer_id:
+        return {"error": "node and peer_id are required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-planner-unignore", {"peer_id": peer_id})
+
+
+async def handle_planner_ignored_peers(args: Dict) -> Dict:
+    """Get list of ignored peers."""
+    node_name = args.get("node")
+    include_expired = args.get("include_expired", False)
+
+    if not node_name:
+        return {"error": "node is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("hive-planner-ignored-peers", {
+        "include_expired": include_expired
+    })
 
 
 async def handle_governance_mode(args: Dict) -> Dict:
