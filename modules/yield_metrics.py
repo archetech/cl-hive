@@ -772,3 +772,194 @@ class YieldMetricsManager:
             self._log(f"Error calculating fleet yield summary: {e}", level="debug")
 
         return summary
+
+    # =========================================================================
+    # FLEET INTELLIGENCE SHARING (Phase 14)
+    # =========================================================================
+
+    def get_shareable_yield_metrics(
+        self,
+        period_days: int = 30,
+        exclude_peer_ids: Optional[set] = None,
+        max_metrics: int = 200
+    ) -> List[Dict[str, Any]]:
+        """
+        Get yield metrics suitable for sharing with fleet.
+
+        Only shares metrics for external peers (not hive members).
+
+        Args:
+            period_days: Analysis period
+            exclude_peer_ids: Set of peer IDs to exclude (e.g., hive members)
+            max_metrics: Maximum number of entries to return
+
+        Returns:
+            List of yield metric dicts ready for serialization
+        """
+        exclude_peer_ids = exclude_peer_ids or set()
+        shareable = []
+
+        try:
+            metrics = self.get_channel_yield_metrics(period_days=period_days)
+
+            for m in metrics:
+                # Skip hive members
+                if m.peer_id in exclude_peer_ids:
+                    continue
+
+                # Determine profitability tier
+                if m.flow_intensity < FLOW_INTENSITY_LOW and m.roi_pct < 0:
+                    tier = "zombie"
+                elif m.roi_pct < -10:
+                    tier = "underwater"
+                elif m.roi_pct > 0:
+                    tier = "profitable"
+                elif m.flow_intensity < FLOW_INTENSITY_LOW:
+                    tier = "stagnant"
+                else:
+                    tier = "unknown"
+
+                shareable.append({
+                    "peer_id": m.peer_id,
+                    "channel_id": m.channel_id,
+                    "roi_pct": round(m.roi_pct, 2),
+                    "capital_efficiency": round(m.capital_efficiency, 8),
+                    "flow_intensity": round(m.flow_intensity, 4),
+                    "profitability_tier": tier,
+                    "period_days": period_days,
+                    "capacity_sats": m.capacity_sats,
+                    "net_revenue_sats": m.net_revenue_sats
+                })
+
+        except Exception as e:
+            self._log(f"Error collecting shareable yield metrics: {e}", level="debug")
+
+        # Sort by absolute ROI (most informative first)
+        shareable.sort(key=lambda x: -abs(x["roi_pct"]))
+
+        return shareable[:max_metrics]
+
+    def receive_yield_metrics_from_fleet(
+        self,
+        reporter_id: str,
+        metrics_data: Dict[str, Any]
+    ) -> bool:
+        """
+        Receive yield metrics from another fleet member.
+
+        Stores remote metrics for use in positioning decisions.
+
+        Args:
+            reporter_id: The fleet member who reported this
+            metrics_data: Dict with peer_id, roi_pct, etc.
+
+        Returns:
+            True if stored successfully
+        """
+        peer_id = metrics_data.get("peer_id")
+        if not peer_id:
+            return False
+
+        # Initialize remote metrics storage if needed
+        if not hasattr(self, "_remote_yield_metrics"):
+            self._remote_yield_metrics: Dict[str, List[Dict[str, Any]]] = {}
+
+        entry = {
+            "reporter_id": reporter_id,
+            "roi_pct": metrics_data.get("roi_pct", 0),
+            "capital_efficiency": metrics_data.get("capital_efficiency", 0),
+            "flow_intensity": metrics_data.get("flow_intensity", 0),
+            "profitability_tier": metrics_data.get("profitability_tier", "unknown"),
+            "capacity_sats": metrics_data.get("capacity_sats", 0),
+            "timestamp": time.time()
+        }
+
+        if peer_id not in self._remote_yield_metrics:
+            self._remote_yield_metrics[peer_id] = []
+
+        # Keep only recent reports per peer (last 5 reporters)
+        self._remote_yield_metrics[peer_id].append(entry)
+        if len(self._remote_yield_metrics[peer_id]) > 5:
+            self._remote_yield_metrics[peer_id] = self._remote_yield_metrics[peer_id][-5:]
+
+        return True
+
+    def get_fleet_yield_consensus(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get consensus yield metrics for a peer from fleet reports.
+
+        Aggregates reports from multiple members to get consensus view.
+
+        Args:
+            peer_id: External peer to get consensus for
+
+        Returns:
+            Dict with consensus metrics or None if no data
+        """
+        if not hasattr(self, "_remote_yield_metrics"):
+            return None
+
+        reports = self._remote_yield_metrics.get(peer_id, [])
+        if not reports:
+            return None
+
+        # Filter to recent reports (last 7 days)
+        now = time.time()
+        recent = [r for r in reports if now - r.get("timestamp", 0) < 7 * 86400]
+        if not recent:
+            return None
+
+        # Calculate averages
+        avg_roi = sum(r.get("roi_pct", 0) for r in recent) / len(recent)
+        avg_efficiency = sum(r.get("capital_efficiency", 0) for r in recent) / len(recent)
+        avg_flow = sum(r.get("flow_intensity", 0) for r in recent) / len(recent)
+
+        # Consensus tier (majority vote)
+        tier_counts: Dict[str, int] = {}
+        for r in recent:
+            tier = r.get("profitability_tier", "unknown")
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        consensus_tier = max(tier_counts, key=tier_counts.get) if tier_counts else "unknown"
+
+        return {
+            "peer_id": peer_id,
+            "avg_roi_pct": round(avg_roi, 2),
+            "avg_capital_efficiency": round(avg_efficiency, 8),
+            "avg_flow_intensity": round(avg_flow, 4),
+            "consensus_tier": consensus_tier,
+            "reporter_count": len(recent),
+            "confidence": min(1.0, len(recent) / 3)  # 3+ reporters = high confidence
+        }
+
+    def get_all_fleet_yield_consensus(self) -> Dict[str, Dict[str, Any]]:
+        """Get consensus yield metrics for all peers with fleet data."""
+        if not hasattr(self, "_remote_yield_metrics"):
+            return {}
+
+        consensus = {}
+        for peer_id in self._remote_yield_metrics:
+            result = self.get_fleet_yield_consensus(peer_id)
+            if result:
+                consensus[peer_id] = result
+        return consensus
+
+    def cleanup_old_remote_yield_metrics(self, max_age_days: float = 7) -> int:
+        """Remove old remote yield data."""
+        if not hasattr(self, "_remote_yield_metrics"):
+            return 0
+
+        cutoff = time.time() - (max_age_days * 86400)
+        cleaned = 0
+
+        for peer_id in list(self._remote_yield_metrics.keys()):
+            before = len(self._remote_yield_metrics[peer_id])
+            self._remote_yield_metrics[peer_id] = [
+                r for r in self._remote_yield_metrics[peer_id]
+                if r.get("timestamp", 0) > cutoff
+            ]
+            cleaned += before - len(self._remote_yield_metrics[peer_id])
+
+            if not self._remote_yield_metrics[peer_id]:
+                del self._remote_yield_metrics[peer_id]
+
+        return cleaned

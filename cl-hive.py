@@ -1607,6 +1607,13 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
         # Phase 13: Pheromone Sharing
         elif msg_type == HiveMessageType.PHEROMONE_BATCH:
             return handle_pheromone_batch(peer_id, msg_payload, plugin)
+        # Phase 14: Fleet-Wide Intelligence Sharing
+        elif msg_type == HiveMessageType.YIELD_METRICS_BATCH:
+            return handle_yield_metrics_batch(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.CIRCULAR_FLOW_ALERT:
+            return handle_circular_flow_alert(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.TEMPORAL_PATTERN_BATCH:
+            return handle_temporal_pattern_batch(peer_id, msg_payload, plugin)
         # Phase 9: Settlement
         elif msg_type == HiveMessageType.SETTLEMENT_OFFER:
             return handle_settlement_offer(peer_id, msg_payload, plugin)
@@ -5063,6 +5070,200 @@ def handle_pheromone_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     return {"result": "continue"}
 
 
+def handle_yield_metrics_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle YIELD_METRICS_BATCH message from a hive member.
+
+    This enables fleet-wide learning about channel profitability.
+    When a member shares their yield metrics, other members can
+    avoid opening channels to peers known to be unprofitable.
+    """
+    if not yield_metrics_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: YIELD_METRICS_BATCH from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload
+    from modules.protocol import validate_yield_metrics_batch, get_yield_metrics_batch_signing_payload
+    if not validate_yield_metrics_batch(payload):
+        plugin.log(f"cl-hive: YIELD_METRICS_BATCH validation failed from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify signature
+    reporter_id = payload.get("reporter_id", "")
+    if reporter_id != peer_id:
+        plugin.log(f"cl-hive: YIELD_METRICS_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    try:
+        signing_payload = get_yield_metrics_batch_signing_payload(payload)
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: YIELD_METRICS_BATCH signature invalid from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+        if verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: YIELD_METRICS_BATCH pubkey mismatch from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: YIELD_METRICS_BATCH signature check error: {e}", level='debug')
+        return {"result": "continue"}
+
+    # Process each yield metric entry
+    metrics = payload.get("metrics", [])
+    metrics_stored = 0
+
+    for metric_data in metrics:
+        try:
+            result = yield_metrics_mgr.receive_yield_metrics_from_fleet(
+                reporter_id=peer_id,
+                metrics_data=metric_data
+            )
+            if result:
+                metrics_stored += 1
+        except Exception as e:
+            plugin.log(f"cl-hive: Error processing yield metric: {e}", level='debug')
+            continue
+
+    if metrics_stored > 0:
+        plugin.log(
+            f"cl-hive: Stored {metrics_stored} yield metrics from {peer_id[:16]}...",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_circular_flow_alert(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle CIRCULAR_FLOW_ALERT message from a hive member.
+
+    This enables fleet-wide awareness of wasteful circular rebalancing
+    patterns so all members can adjust their behavior.
+    """
+    if not cost_reduction_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: CIRCULAR_FLOW_ALERT from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload
+    from modules.protocol import validate_circular_flow_alert, get_circular_flow_alert_signing_payload
+    if not validate_circular_flow_alert(payload):
+        plugin.log(f"cl-hive: CIRCULAR_FLOW_ALERT validation failed from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify signature
+    reporter_id = payload.get("reporter_id", "")
+    if reporter_id != peer_id:
+        plugin.log(f"cl-hive: CIRCULAR_FLOW_ALERT reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    try:
+        signing_payload = get_circular_flow_alert_signing_payload(payload)
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: CIRCULAR_FLOW_ALERT signature invalid from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+        if verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: CIRCULAR_FLOW_ALERT pubkey mismatch from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: CIRCULAR_FLOW_ALERT signature check error: {e}", level='debug')
+        return {"result": "continue"}
+
+    # Store the circular flow alert
+    try:
+        result = cost_reduction_mgr.circular_flow_detector.receive_circular_flow_alert(
+            reporter_id=peer_id,
+            alert_data=payload
+        )
+        if result:
+            members = payload.get("members_involved", [])
+            cost = payload.get("total_cost_sats", 0)
+            plugin.log(
+                f"cl-hive: Received circular flow alert from {peer_id[:16]}... "
+                f"({len(members)} members, {cost} sats wasted)",
+                level='info'
+            )
+    except Exception as e:
+        plugin.log(f"cl-hive: Error storing circular flow alert: {e}", level='debug')
+
+    return {"result": "continue"}
+
+
+def handle_temporal_pattern_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle TEMPORAL_PATTERN_BATCH message from a hive member.
+
+    This enables fleet-wide learning about temporal flow patterns
+    for coordinated liquidity positioning and fee optimization.
+    """
+    if not anticipatory_liquidity_mgr or not database:
+        return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned
+    sender = database.get_member(peer_id)
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Validate payload
+    from modules.protocol import validate_temporal_pattern_batch, get_temporal_pattern_batch_signing_payload
+    if not validate_temporal_pattern_batch(payload):
+        plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH validation failed from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify signature
+    reporter_id = payload.get("reporter_id", "")
+    if reporter_id != peer_id:
+        plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    try:
+        signing_payload = get_temporal_pattern_batch_signing_payload(payload)
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH signature invalid from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+        if verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH pubkey mismatch from {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH signature check error: {e}", level='debug')
+        return {"result": "continue"}
+
+    # Process each pattern entry
+    patterns = payload.get("patterns", [])
+    patterns_stored = 0
+
+    for pattern_data in patterns:
+        try:
+            result = anticipatory_liquidity_mgr.receive_pattern_from_fleet(
+                reporter_id=peer_id,
+                pattern_data=pattern_data
+            )
+            if result:
+                patterns_stored += 1
+        except Exception as e:
+            plugin.log(f"cl-hive: Error processing temporal pattern: {e}", level='debug')
+            continue
+
+    if patterns_stored > 0:
+        plugin.log(
+            f"cl-hive: Stored {patterns_stored} temporal patterns from {peer_id[:16]}...",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
 def handle_settlement_offer(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle SETTLEMENT_OFFER message from a hive member.
@@ -6038,6 +6239,21 @@ def fee_intelligence_loop():
             # Step 5b: Broadcast pheromones (Phase 13 - Fleet Learning)
             _broadcast_our_pheromones()
 
+            # Step 5c: Broadcast yield metrics (Phase 14 - Daily, only once per day)
+            # Check if we've already broadcast today
+            try:
+                from datetime import datetime
+                today = datetime.utcnow().strftime("%Y-%m-%d")
+                last_yield_broadcast = getattr(_broadcast_our_yield_metrics, '_last_broadcast', None)
+                if last_yield_broadcast != today:
+                    _broadcast_our_yield_metrics()
+                    _broadcast_our_yield_metrics._last_broadcast = today
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Yield metrics broadcast check error: {e}", level='debug')
+
+            # Step 5d: Broadcast circular flow alerts (Phase 14 - Event-driven)
+            _broadcast_circular_flow_alerts()
+
             # Step 6: Cleanup old liquidity needs
             try:
                 deleted_needs = database.cleanup_old_liquidity_needs(max_age_hours=24)
@@ -6899,6 +7115,145 @@ def _broadcast_our_pheromones():
     except Exception as e:
         if safe_plugin:
             safe_plugin.log(f"cl-hive: Pheromone broadcast error: {e}", level='warn')
+
+
+def _broadcast_our_yield_metrics():
+    """
+    Broadcast our yield metrics to hive members for fleet-wide learning.
+
+    Yield metrics include per-channel ROI, capital efficiency, and profitability
+    tier. Sharing these enables the fleet to learn which external peers are
+    profitable and which should be avoided.
+    """
+    if not yield_metrics_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        from modules.protocol import create_yield_metrics_batch, MAX_YIELD_METRICS_IN_BATCH
+
+        # Get hive member IDs to exclude from sharing
+        members = database.get_all_members()
+        member_ids = {m.get("peer_id") for m in members}
+
+        # Get shareable yield metrics (excluding hive members)
+        shareable_metrics = yield_metrics_mgr.get_shareable_yield_metrics(
+            period_days=30,
+            exclude_peer_ids=member_ids,
+            max_metrics=MAX_YIELD_METRICS_IN_BATCH
+        )
+
+        if not shareable_metrics:
+            return
+
+        # Create signed batch message
+        msg = create_yield_metrics_batch(
+            metrics=shareable_metrics,
+            rpc=safe_plugin.rpc,
+            our_pubkey=our_pubkey
+        )
+
+        if not msg:
+            return
+
+        # Broadcast to all hive members
+        broadcast_count = 0
+
+        for member in members:
+            member_id = member.get("peer_id")
+            if not member_id or member_id == our_pubkey:
+                continue
+
+            try:
+                safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": member_id,
+                    "msg": msg.hex()
+                })
+                broadcast_count += 1
+            except Exception:
+                pass  # Peer might be offline
+
+        if broadcast_count > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast {len(shareable_metrics)} yield metrics "
+                f"to {broadcast_count} members",
+                level='debug'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Yield metrics broadcast error: {e}", level='warn')
+
+
+def _broadcast_circular_flow_alerts():
+    """
+    Broadcast detected circular flow alerts to hive members.
+
+    Circular flows (A→B→C→A rebalancing patterns) waste fees without
+    improving liquidity. Sharing detected flows enables fleet-wide
+    prevention and coordination.
+    """
+    if not cost_reduction_mgr or not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        from modules.protocol import (
+            create_circular_flow_alert,
+            MIN_CIRCULAR_FLOW_SATS,
+            MIN_CIRCULAR_FLOW_COST_SATS
+        )
+
+        # Get shareable circular flows
+        shareable_flows = cost_reduction_mgr.circular_flow_detector.get_shareable_circular_flows(
+            min_cost_sats=MIN_CIRCULAR_FLOW_COST_SATS,
+            min_amount_sats=MIN_CIRCULAR_FLOW_SATS
+        )
+
+        if not shareable_flows:
+            return
+
+        members = database.get_all_members()
+
+        # Broadcast each flow as a separate alert (event-driven)
+        total_broadcast = 0
+
+        for flow in shareable_flows:
+            msg = create_circular_flow_alert(
+                members_involved=flow["members_involved"],
+                total_amount_sats=flow["total_amount_sats"],
+                total_cost_sats=flow["total_cost_sats"],
+                cycle_count=flow["cycle_count"],
+                detection_window_hours=flow["detection_window_hours"],
+                recommendation=flow["recommendation"],
+                rpc=safe_plugin.rpc,
+                our_pubkey=our_pubkey
+            )
+
+            if not msg:
+                continue
+
+            for member in members:
+                member_id = member.get("peer_id")
+                if not member_id or member_id == our_pubkey:
+                    continue
+
+                try:
+                    safe_plugin.rpc.call("sendcustommsg", {
+                        "node_id": member_id,
+                        "msg": msg.hex()
+                    })
+                    total_broadcast += 1
+                except Exception:
+                    pass
+
+        if total_broadcast > 0:
+            safe_plugin.log(
+                f"cl-hive: Broadcast {len(shareable_flows)} circular flow alerts",
+                level='info'
+            )
+
+    except Exception as e:
+        if safe_plugin:
+            safe_plugin.log(f"cl-hive: Circular flow alert broadcast error: {e}", level='warn')
 
 
 def _broadcast_health_report():

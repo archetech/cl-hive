@@ -127,6 +127,11 @@ class HiveMessageType(IntEnum):
     # Phase 13: Pheromone Sharing
     PHEROMONE_BATCH = 32855  # Batch of fee pheromone levels for fleet learning
 
+    # Phase 14: Fleet-Wide Intelligence Sharing
+    YIELD_METRICS_BATCH = 32857    # Per-channel ROI and profitability metrics
+    CIRCULAR_FLOW_ALERT = 32859    # Detected wasteful circular rebalancing patterns
+    TEMPORAL_PATTERN_BATCH = 32861 # Hour/day flow patterns and predictions
+
 
 # =============================================================================
 # PHASE 5 VALIDATION CONSTANTS
@@ -354,6 +359,24 @@ PHEROMONE_BATCH_RATE_LIMIT = (1, 3600)      # 1 batch per hour per sender
 MAX_PHEROMONES_IN_BATCH = 100               # Maximum pheromone entries in one batch
 MIN_PHEROMONE_LEVEL = 0.5                   # Minimum level to share (meaningful signal)
 PHEROMONE_WEIGHTING_FACTOR = 0.3            # How much to weight remote pheromones vs local
+
+# Yield metrics sharing constants (Phase 14)
+YIELD_METRICS_BATCH_RATE_LIMIT = (1, 86400)  # 1 batch per day per sender
+MAX_YIELD_METRICS_IN_BATCH = 200             # Maximum channels in one batch
+MIN_YIELD_ROI_TO_SHARE = -100.0              # Share even underwater channels (negative ROI)
+YIELD_WEIGHTING_FACTOR = 0.4                 # How much to weight remote yield data
+
+# Circular flow alert constants (Phase 14)
+CIRCULAR_FLOW_ALERT_RATE_LIMIT = (10, 3600)  # Up to 10 alerts per hour (event-driven)
+MIN_CIRCULAR_FLOW_SATS = 10000               # Minimum amount to report (10k sats)
+MIN_CIRCULAR_FLOW_COST_SATS = 100            # Minimum cost to report (100 sats)
+MAX_CIRCULAR_FLOW_MEMBERS = 10               # Maximum members in one circular flow
+
+# Temporal pattern sharing constants (Phase 14)
+TEMPORAL_PATTERN_BATCH_RATE_LIMIT = (4, 86400)  # 4 batches per day (every 6 hours)
+MAX_PATTERNS_IN_BATCH = 500                     # Maximum patterns in one batch
+MIN_PATTERN_CONFIDENCE = 0.6                    # Minimum confidence to share
+MIN_PATTERN_SAMPLES = 10                        # Minimum samples for pattern validity
 
 # Route probe constants
 MAX_PATH_LENGTH = 20                        # Maximum hops in a path
@@ -4445,3 +4468,405 @@ def create_pheromone_batch(
         return None
 
     return serialize(HiveMessageType.PHEROMONE_BATCH, payload)
+
+
+# =============================================================================
+# YIELD METRICS BATCH FUNCTIONS (Phase 14)
+# =============================================================================
+
+def get_yield_metrics_batch_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for YIELD_METRICS_BATCH messages.
+
+    Signs over: reporter_id, timestamp, and a hash of the sorted yield data.
+    """
+    metrics = payload.get("metrics", [])
+
+    # Sort metrics by peer_id for deterministic ordering
+    sorted_metrics = sorted(metrics, key=lambda m: m.get("peer_id", ""))
+
+    # Create a condensed hash of the metrics data
+    metrics_str = json.dumps(sorted_metrics, sort_keys=True, separators=(',', ':'))
+    metrics_hash = hashlib.sha256(metrics_str.encode()).hexdigest()[:16]
+
+    return (
+        f"YIELD_METRICS_BATCH:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{len(metrics)}:"
+        f"{metrics_hash}"
+    )
+
+
+def validate_yield_metrics_batch(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a YIELD_METRICS_BATCH payload.
+
+    SECURITY: Bounds all values to prevent manipulation and overflow.
+    """
+    # Required fields
+    reporter_id = payload.get("reporter_id")
+    if not reporter_id or not isinstance(reporter_id, str):
+        return False
+    if len(reporter_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)):
+        return False
+    now = time.time()
+    if timestamp > now + 300:  # 5 min future tolerance
+        return False
+    if timestamp < now - (48 * 3600):  # 48 hour max age
+        return False
+
+    signature = payload.get("signature")
+    if not signature or not isinstance(signature, str):
+        return False
+
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, list):
+        return False
+    if len(metrics) > MAX_YIELD_METRICS_IN_BATCH:
+        return False
+
+    # Validate each metrics entry
+    for m in metrics:
+        if not isinstance(m, dict):
+            return False
+
+        peer_id = m.get("peer_id")
+        if not peer_id or not isinstance(peer_id, str):
+            return False
+        if len(peer_id) > MAX_PEER_ID_LEN:
+            return False
+
+        # ROI can be negative (underwater channels)
+        roi_pct = m.get("roi_pct")
+        if not isinstance(roi_pct, (int, float)):
+            return False
+        if roi_pct < -1000 or roi_pct > 10000:  # Reasonable bounds
+            return False
+
+        # Capital efficiency should be small positive
+        capital_efficiency = m.get("capital_efficiency")
+        if not isinstance(capital_efficiency, (int, float)):
+            return False
+        if capital_efficiency < -1 or capital_efficiency > 1:  # Per-sat efficiency
+            return False
+
+        # Flow intensity 0-1
+        flow_intensity = m.get("flow_intensity")
+        if not isinstance(flow_intensity, (int, float)):
+            return False
+        if flow_intensity < 0 or flow_intensity > 1:
+            return False
+
+        # Profitability tier
+        tier = m.get("profitability_tier")
+        if tier not in ("profitable", "underwater", "zombie", "stagnant", "unknown"):
+            return False
+
+    return True
+
+
+def create_yield_metrics_batch(
+    metrics: List[Dict[str, Any]],
+    rpc: Any,
+    our_pubkey: str
+) -> Optional[bytes]:
+    """
+    Create a YIELD_METRICS_BATCH message.
+
+    This message shares per-channel profitability metrics with the fleet,
+    enabling collective learning about which external peers are profitable.
+
+    Args:
+        metrics: List of yield metric entries, each containing:
+            - peer_id: External peer pubkey
+            - channel_id: Channel short ID
+            - roi_pct: Return on investment percentage
+            - capital_efficiency: Revenue per sat of capacity
+            - flow_intensity: Volume / capacity ratio
+            - profitability_tier: profitable/underwater/zombie/stagnant
+            - period_days: Analysis period
+        rpc: CLN RPC interface for signing
+        our_pubkey: Our node's public key
+
+    Returns:
+        Serialized YIELD_METRICS_BATCH message, or None on error
+    """
+    timestamp = int(time.time())
+    reporter_id = our_pubkey
+
+    payload = {
+        "reporter_id": reporter_id,
+        "timestamp": timestamp,
+        "signature": "",
+        "metrics": metrics,
+    }
+
+    try:
+        signing_payload = get_yield_metrics_batch_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.YIELD_METRICS_BATCH, payload)
+
+
+# =============================================================================
+# CIRCULAR FLOW ALERT FUNCTIONS (Phase 14)
+# =============================================================================
+
+def get_circular_flow_alert_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for CIRCULAR_FLOW_ALERT messages.
+    """
+    members = payload.get("members_involved", [])
+    members_str = ",".join(sorted(members))
+
+    return (
+        f"CIRCULAR_FLOW_ALERT:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{payload.get('total_amount_sats', 0)}:"
+        f"{payload.get('total_cost_sats', 0)}:"
+        f"{members_str}"
+    )
+
+
+def validate_circular_flow_alert(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a CIRCULAR_FLOW_ALERT payload.
+    """
+    reporter_id = payload.get("reporter_id")
+    if not reporter_id or not isinstance(reporter_id, str):
+        return False
+    if len(reporter_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)):
+        return False
+    now = time.time()
+    if timestamp > now + 300:
+        return False
+    if timestamp < now - (24 * 3600):  # 24 hour max age for alerts
+        return False
+
+    signature = payload.get("signature")
+    if not signature or not isinstance(signature, str):
+        return False
+
+    members = payload.get("members_involved")
+    if not isinstance(members, list):
+        return False
+    if len(members) < 2 or len(members) > MAX_CIRCULAR_FLOW_MEMBERS:
+        return False
+    for m in members:
+        if not isinstance(m, str) or len(m) > MAX_PEER_ID_LEN:
+            return False
+
+    total_amount = payload.get("total_amount_sats")
+    if not isinstance(total_amount, int) or total_amount < 0:
+        return False
+    if total_amount > 100_000_000_000:  # 1000 BTC max
+        return False
+
+    total_cost = payload.get("total_cost_sats")
+    if not isinstance(total_cost, int) or total_cost < 0:
+        return False
+
+    cycle_count = payload.get("cycle_count")
+    if not isinstance(cycle_count, int) or cycle_count < 1:
+        return False
+
+    return True
+
+
+def create_circular_flow_alert(
+    members_involved: List[str],
+    total_amount_sats: int,
+    total_cost_sats: int,
+    cycle_count: int,
+    detection_window_hours: float,
+    recommendation: str,
+    rpc: Any,
+    our_pubkey: str
+) -> Optional[bytes]:
+    """
+    Create a CIRCULAR_FLOW_ALERT message.
+
+    This message alerts the fleet about detected wasteful circular rebalancing
+    patterns (A→B→C→A) so members can adjust their behavior.
+
+    Args:
+        members_involved: List of member pubkeys in the circular flow
+        total_amount_sats: Total amount flowing in the cycle
+        total_cost_sats: Total fees wasted on the cycle
+        cycle_count: Number of times cycle was detected
+        detection_window_hours: Time window for detection
+        recommendation: Human-readable recommendation
+        rpc: CLN RPC interface for signing
+        our_pubkey: Our node's public key
+
+    Returns:
+        Serialized CIRCULAR_FLOW_ALERT message, or None on error
+    """
+    timestamp = int(time.time())
+
+    payload = {
+        "reporter_id": our_pubkey,
+        "timestamp": timestamp,
+        "signature": "",
+        "members_involved": members_involved,
+        "total_amount_sats": total_amount_sats,
+        "total_cost_sats": total_cost_sats,
+        "cycle_count": cycle_count,
+        "detection_window_hours": detection_window_hours,
+        "recommendation": recommendation[:500],  # Limit recommendation length
+    }
+
+    try:
+        signing_payload = get_circular_flow_alert_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.CIRCULAR_FLOW_ALERT, payload)
+
+
+# =============================================================================
+# TEMPORAL PATTERN BATCH FUNCTIONS (Phase 14)
+# =============================================================================
+
+def get_temporal_pattern_batch_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for TEMPORAL_PATTERN_BATCH messages.
+    """
+    patterns = payload.get("patterns", [])
+    sorted_patterns = sorted(patterns, key=lambda p: (p.get("peer_id", ""), p.get("hour_of_day", 0)))
+    patterns_str = json.dumps(sorted_patterns, sort_keys=True, separators=(',', ':'))
+    patterns_hash = hashlib.sha256(patterns_str.encode()).hexdigest()[:16]
+
+    return (
+        f"TEMPORAL_PATTERN_BATCH:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{len(patterns)}:"
+        f"{patterns_hash}"
+    )
+
+
+def validate_temporal_pattern_batch(payload: Dict[str, Any]) -> bool:
+    """
+    Validate a TEMPORAL_PATTERN_BATCH payload.
+    """
+    reporter_id = payload.get("reporter_id")
+    if not reporter_id or not isinstance(reporter_id, str):
+        return False
+    if len(reporter_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)):
+        return False
+    now = time.time()
+    if timestamp > now + 300:
+        return False
+    if timestamp < now - (48 * 3600):
+        return False
+
+    signature = payload.get("signature")
+    if not signature or not isinstance(signature, str):
+        return False
+
+    patterns = payload.get("patterns")
+    if not isinstance(patterns, list):
+        return False
+    if len(patterns) > MAX_PATTERNS_IN_BATCH:
+        return False
+
+    for p in patterns:
+        if not isinstance(p, dict):
+            return False
+
+        peer_id = p.get("peer_id")
+        if not peer_id or not isinstance(peer_id, str):
+            return False
+        if len(peer_id) > MAX_PEER_ID_LEN:
+            return False
+
+        hour = p.get("hour_of_day")
+        if not isinstance(hour, int) or hour < 0 or hour > 23:
+            return False
+
+        day = p.get("day_of_week")
+        if not isinstance(day, int) or day < -1 or day > 6:  # -1 = every day
+            return False
+
+        direction = p.get("direction")
+        if direction not in ("inbound", "outbound", "bidirectional"):
+            return False
+
+        intensity = p.get("intensity")
+        if not isinstance(intensity, (int, float)) or intensity < 0 or intensity > 1:
+            return False
+
+        confidence = p.get("confidence")
+        if not isinstance(confidence, (int, float)) or confidence < 0 or confidence > 1:
+            return False
+
+    return True
+
+
+def create_temporal_pattern_batch(
+    patterns: List[Dict[str, Any]],
+    rpc: Any,
+    our_pubkey: str
+) -> Optional[bytes]:
+    """
+    Create a TEMPORAL_PATTERN_BATCH message.
+
+    This message shares detected temporal flow patterns with the fleet,
+    enabling coordinated liquidity positioning and fee optimization.
+
+    Args:
+        patterns: List of pattern entries, each containing:
+            - peer_id: External peer pubkey
+            - channel_id: Channel short ID
+            - hour_of_day: 0-23 hour when pattern occurs
+            - day_of_week: 0-6 (Mon-Sun) or -1 for every day
+            - direction: inbound/outbound/bidirectional
+            - intensity: Flow intensity 0-1
+            - confidence: Pattern confidence 0-1
+            - samples: Number of samples used to detect pattern
+        rpc: CLN RPC interface for signing
+        our_pubkey: Our node's public key
+
+    Returns:
+        Serialized TEMPORAL_PATTERN_BATCH message, or None on error
+    """
+    timestamp = int(time.time())
+
+    payload = {
+        "reporter_id": our_pubkey,
+        "timestamp": timestamp,
+        "signature": "",
+        "patterns": patterns,
+    }
+
+    try:
+        signing_payload = get_temporal_pattern_batch_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.TEMPORAL_PATTERN_BATCH, payload)

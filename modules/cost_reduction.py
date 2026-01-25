@@ -868,6 +868,168 @@ class CircularFlowDetector:
             "circular_flows": [cf.to_dict() for cf in circular_flows]
         }
 
+    # =========================================================================
+    # FLEET INTELLIGENCE SHARING (Phase 14)
+    # =========================================================================
+
+    def get_shareable_circular_flows(
+        self,
+        min_cost_sats: int = 100,
+        min_amount_sats: int = 10000
+    ) -> List[Dict[str, Any]]:
+        """
+        Get detected circular flows suitable for sharing with fleet.
+
+        Only shares flows that meet minimum thresholds for significance.
+
+        Args:
+            min_cost_sats: Minimum total cost to report
+            min_amount_sats: Minimum total amount to report
+
+        Returns:
+            List of circular flow dicts ready for fleet broadcast
+        """
+        shareable = []
+
+        try:
+            flows = self.detect_circular_flows()
+
+            for cf in flows:
+                if cf.total_cost_sats < min_cost_sats:
+                    continue
+                if cf.total_amount_sats < min_amount_sats:
+                    continue
+
+                recommendation = self._generate_recommendation(cf.cycle)
+
+                shareable.append({
+                    "members_involved": cf.cycle,
+                    "total_amount_sats": cf.total_amount_sats,
+                    "total_cost_sats": cf.total_cost_sats,
+                    "cycle_count": cf.cycle_count,
+                    "detection_window_hours": cf.detection_window_hours,
+                    "recommendation": recommendation
+                })
+
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(f"cl-hive: Error collecting shareable circular flows: {e}", level="debug")
+
+        return shareable
+
+    def receive_circular_flow_alert(
+        self,
+        reporter_id: str,
+        alert_data: Dict[str, Any]
+    ) -> bool:
+        """
+        Receive a circular flow alert from another fleet member.
+
+        Stores remote alerts for coordination and prevention.
+
+        Args:
+            reporter_id: The fleet member who detected this
+            alert_data: Dict with members_involved, costs, etc.
+
+        Returns:
+            True if stored successfully
+        """
+        members = alert_data.get("members_involved", [])
+        if len(members) < 2:
+            return False
+
+        # Initialize remote alerts storage if needed
+        if not hasattr(self, "_remote_circular_alerts"):
+            self._remote_circular_alerts: List[Dict[str, Any]] = []
+
+        entry = {
+            "reporter_id": reporter_id,
+            "members_involved": members,
+            "total_amount_sats": alert_data.get("total_amount_sats", 0),
+            "total_cost_sats": alert_data.get("total_cost_sats", 0),
+            "cycle_count": alert_data.get("cycle_count", 1),
+            "recommendation": alert_data.get("recommendation", ""),
+            "timestamp": time.time()
+        }
+
+        self._remote_circular_alerts.append(entry)
+
+        # Keep only last 100 alerts
+        if len(self._remote_circular_alerts) > 100:
+            self._remote_circular_alerts = self._remote_circular_alerts[-100:]
+
+        return True
+
+    def get_all_circular_flow_alerts(self, include_remote: bool = True) -> List[Dict[str, Any]]:
+        """
+        Get all circular flow alerts (local and remote).
+
+        Args:
+            include_remote: Whether to include alerts from fleet
+
+        Returns:
+            List of all circular flow alerts
+        """
+        alerts = []
+
+        # Local flows
+        try:
+            local_flows = self.detect_circular_flows()
+            for cf in local_flows:
+                alerts.append({
+                    "source": "local",
+                    "members_involved": cf.cycle,
+                    "total_amount_sats": cf.total_amount_sats,
+                    "total_cost_sats": cf.total_cost_sats,
+                    "cycle_count": cf.cycle_count,
+                    "recommendation": self._generate_recommendation(cf.cycle)
+                })
+        except Exception:
+            pass
+
+        # Remote alerts
+        if include_remote and hasattr(self, "_remote_circular_alerts"):
+            now = time.time()
+            for alert in self._remote_circular_alerts:
+                # Only include recent alerts (last 24 hours)
+                if now - alert.get("timestamp", 0) < 86400:
+                    alert_copy = alert.copy()
+                    alert_copy["source"] = "fleet"
+                    alerts.append(alert_copy)
+
+        return alerts
+
+    def is_member_in_circular_flow(self, member_id: str) -> bool:
+        """
+        Check if a member is involved in any detected circular flow.
+
+        Args:
+            member_id: Member pubkey to check
+
+        Returns:
+            True if member is in an active circular flow
+        """
+        all_alerts = self.get_all_circular_flow_alerts(include_remote=True)
+
+        for alert in all_alerts:
+            if member_id in alert.get("members_involved", []):
+                return True
+
+        return False
+
+    def cleanup_old_remote_alerts(self, max_age_hours: float = 24) -> int:
+        """Remove old remote circular flow alerts."""
+        if not hasattr(self, "_remote_circular_alerts"):
+            return 0
+
+        cutoff = time.time() - (max_age_hours * 3600)
+        before = len(self._remote_circular_alerts)
+        self._remote_circular_alerts = [
+            a for a in self._remote_circular_alerts
+            if a.get("timestamp", 0) > cutoff
+        ]
+        return before - len(self._remote_circular_alerts)
+
 
 # =============================================================================
 # COST REDUCTION MANAGER

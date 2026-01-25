@@ -1263,3 +1263,172 @@ class AnticipatoryLiquidityManager:
             "combined_patterns": len(combined),
             "patterns": all_patterns[:20]  # Limit for display
         }
+
+    # =========================================================================
+    # FLEET INTELLIGENCE SHARING (Phase 14)
+    # =========================================================================
+
+    def get_shareable_patterns(
+        self,
+        min_confidence: float = 0.6,
+        min_samples: int = 10,
+        exclude_peer_ids: Optional[set] = None,
+        max_patterns: int = 500
+    ) -> List[Dict[str, Any]]:
+        """
+        Get temporal patterns suitable for sharing with fleet.
+
+        Only shares patterns with sufficient confidence and samples.
+
+        Args:
+            min_confidence: Minimum pattern confidence to share
+            min_samples: Minimum samples required
+            exclude_peer_ids: Set of peer IDs to exclude
+            max_patterns: Maximum number of patterns to return
+
+        Returns:
+            List of pattern dicts ready for serialization
+        """
+        exclude_peer_ids = exclude_peer_ids or set()
+        shareable = []
+
+        for channel_id, patterns in self._pattern_cache.items():
+            # Get peer_id for this channel (if we have mapping)
+            peer_id = self._channel_peer_map.get(channel_id) if hasattr(self, '_channel_peer_map') else None
+            if not peer_id:
+                continue
+
+            # Skip hive members
+            if peer_id in exclude_peer_ids:
+                continue
+
+            for p in patterns:
+                if p.confidence < min_confidence:
+                    continue
+                if p.samples < min_samples:
+                    continue
+
+                shareable.append({
+                    "peer_id": peer_id,
+                    "channel_id": channel_id,
+                    "hour_of_day": p.hour_of_day if p.hour_of_day is not None else -1,
+                    "day_of_week": p.day_of_week if p.day_of_week is not None else -1,
+                    "direction": p.direction.value,
+                    "intensity": round(p.intensity, 3),
+                    "confidence": round(p.confidence, 3),
+                    "samples": p.samples
+                })
+
+        # Sort by confidence descending
+        shareable.sort(key=lambda x: -x["confidence"])
+
+        return shareable[:max_patterns]
+
+    def set_channel_peer_mapping(self, channel_id: str, peer_id: str) -> None:
+        """Set the mapping from channel_id to peer_id for sharing."""
+        if not hasattr(self, '_channel_peer_map'):
+            self._channel_peer_map: Dict[str, str] = {}
+        self._channel_peer_map[channel_id] = peer_id
+
+    def update_channel_peer_mappings(self, channels: List[Dict[str, Any]]) -> None:
+        """Update channel-to-peer mappings from a list of channel info."""
+        if not hasattr(self, '_channel_peer_map'):
+            self._channel_peer_map: Dict[str, str] = {}
+        for ch in channels:
+            channel_id = ch.get("short_channel_id")
+            peer_id = ch.get("peer_id")
+            if channel_id and peer_id:
+                self._channel_peer_map[channel_id] = peer_id
+
+    def receive_pattern_from_fleet(
+        self,
+        reporter_id: str,
+        pattern_data: Dict[str, Any]
+    ) -> bool:
+        """
+        Receive a temporal pattern from another fleet member.
+
+        Stores remote patterns for use in coordinated liquidity positioning.
+
+        Args:
+            reporter_id: The fleet member who reported this
+            pattern_data: Dict with peer_id, hour_of_day, direction, etc.
+
+        Returns:
+            True if stored successfully
+        """
+        peer_id = pattern_data.get("peer_id")
+        if not peer_id:
+            return False
+
+        # Initialize remote patterns storage if needed
+        if not hasattr(self, "_remote_patterns"):
+            self._remote_patterns: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+        hour = pattern_data.get("hour_of_day", -1)
+        day = pattern_data.get("day_of_week", -1)
+
+        entry = {
+            "reporter_id": reporter_id,
+            "hour_of_day": hour if hour >= 0 else None,
+            "day_of_week": day if day >= 0 else None,
+            "direction": pattern_data.get("direction", "balanced"),
+            "intensity": pattern_data.get("intensity", 0),
+            "confidence": pattern_data.get("confidence", 0),
+            "samples": pattern_data.get("samples", 0),
+            "timestamp": time.time()
+        }
+
+        self._remote_patterns[peer_id].append(entry)
+
+        # Keep only recent patterns per peer (last 50)
+        if len(self._remote_patterns[peer_id]) > 50:
+            self._remote_patterns[peer_id] = self._remote_patterns[peer_id][-50:]
+
+        return True
+
+    def get_fleet_patterns_for_peer(self, peer_id: str) -> List[Dict[str, Any]]:
+        """
+        Get fleet-reported patterns for a specific peer.
+
+        Aggregates patterns from multiple reporters for consensus view.
+
+        Args:
+            peer_id: External peer to get patterns for
+
+        Returns:
+            List of aggregated pattern data
+        """
+        if not hasattr(self, "_remote_patterns"):
+            return []
+
+        patterns = self._remote_patterns.get(peer_id, [])
+        if not patterns:
+            return []
+
+        # Filter to recent patterns (last 7 days)
+        now = time.time()
+        recent = [p for p in patterns if now - p.get("timestamp", 0) < 7 * 86400]
+
+        return recent
+
+    def cleanup_old_remote_patterns(self, max_age_days: float = 7) -> int:
+        """Remove old remote pattern data."""
+        if not hasattr(self, "_remote_patterns"):
+            return 0
+
+        cutoff = time.time() - (max_age_days * 86400)
+        cleaned = 0
+
+        for peer_id in list(self._remote_patterns.keys()):
+            before = len(self._remote_patterns[peer_id])
+            self._remote_patterns[peer_id] = [
+                p for p in self._remote_patterns[peer_id]
+                if p.get("timestamp", 0) > cutoff
+            ]
+            cleaned += before - len(self._remote_patterns[peer_id])
+
+            if not self._remote_patterns[peer_id]:
+                del self._remote_patterns[peer_id]
+
+        return cleaned
