@@ -1,10 +1,12 @@
 # Advisor Intelligence Integration Guide
 
-This document describes how to enhance the proactive advisor cycle with the full suite of intelligence gathering systems available in cl-hive.
+This document describes the full suite of intelligence gathering systems integrated into the proactive advisor cycle in cl-hive.
 
-## Current State (v1.0)
+## Current State (v2.0 - Fully Integrated)
 
-The proactive advisor currently uses a limited set of intelligence sources:
+The proactive advisor now uses **all available intelligence sources** via comprehensive data gathering in `_analyze_node_state()` and 14 parallel opportunity scanners.
+
+### Core Intelligence (Always Gathered)
 
 | Tool | Purpose |
 |------|---------|
@@ -15,183 +17,180 @@ The proactive advisor currently uses a limited set of intelligence sources:
 | `advisor_get_context_brief` | Context and trend summary |
 | `advisor_get_velocities` | Critical velocity alerts |
 
-## Available Intelligence Systems (Not Yet Integrated)
+## Integrated Intelligence Systems
 
-### 1. Fee Coordination (Phase 2) - Fleet-Wide Fee Intelligence
+### 1. Fee Coordination (Phase 2) - Fleet-Wide Fee Intelligence ✅
 
 These tools enable coordinated fee decisions across the hive:
 
-| Tool | Purpose | Integration Benefit |
+| Tool | Purpose | Integration Status |
 |------|---------|---------------------|
-| `fee_coordination_status` | Comprehensive coordination status | Understand fleet-wide fee landscape |
-| `coord_fee_recommendation` | Get coordinated fee for a channel | Use instead of manual fee calculations |
-| `pheromone_levels` | Learned successful fee levels | Apply proven fees from past success |
-| `stigmergic_markers` | Route markers from hive members | Benefit from collective routing experience |
-| `defense_status` | Mycelium warning system status | Avoid bad peers identified by fleet |
+| `fee_coordination_status` | Comprehensive coordination status | ✅ Gathered in `_analyze_node_state()` |
+| `coord_fee_recommendation` | Get coordinated fee for a channel | ✅ Available via MCP |
+| `pheromone_levels` | Learned successful fee levels | ✅ Gathered in `_analyze_node_state()` |
+| `stigmergic_markers` | Route markers from hive members | ✅ Available via MCP |
+| `defense_status` | Mycelium warning system status | ✅ Gathered + scanned via `_scan_defense_warnings()` |
 
-**Integration Points:**
-- In `_scan_profitability()`: Check `defense_status` for peer warnings before recommending actions
-- In `_execute_fee_change()`: Use `coord_fee_recommendation` for fee decisions
-- In `_analyze_node_state()`: Include `pheromone_levels` for fee context
+**Integration Points (Implemented):**
+- `_scan_defense_warnings()`: Checks `defense_status` for peer warnings
+- `_analyze_node_state()`: Gathers `fee_coordination`, `pheromone_levels`, `defense_status`
+- MCP tools available for on-demand coordinated fee recommendations
 
-### 2. Fleet Competition Intelligence
+### 2. Fleet Competition Intelligence ✅
 
 Prevent hive members from competing against each other:
 
-| Tool | Purpose | Integration Benefit |
+| Tool | Purpose | Integration Status |
 |------|---------|---------------------|
-| `internal_competition` | Detect competing members | Avoid counterproductive fee wars |
-| `corridor_assignments` | See who "owns" which routes | Defer to corridor owner on fee decisions |
-| `routing_stats` | Aggregated hive routing data | Learn from collective routing patterns |
-| `accumulated_warnings` | Collective peer warnings | Automatically avoid flagged peers |
-| `ban_candidates` | Peers warranting auto-ban | Proactively address malicious actors |
+| `internal_competition` | Detect competing members | ✅ Gathered + scanned via `_scan_internal_competition()` |
+| `corridor_assignments` | See who "owns" which routes | ✅ Available via MCP |
+| `routing_stats` | Aggregated hive routing data | ✅ Available via MCP |
+| `accumulated_warnings` | Collective peer warnings | ✅ Available via MCP |
+| `ban_candidates` | Peers warranting auto-ban | ✅ Gathered + scanned via `_scan_ban_candidates()` |
 
-**Integration Points:**
-- In `scan_all()`: Check `internal_competition` before proposing fee changes
-- In `_scan_profitability()`: Cross-reference `accumulated_warnings` with bleeder channels
-- Add new scanner: `_scan_ban_candidates()` to flag peers for removal
+**Integration Points (Implemented):**
+- `_scan_internal_competition()`: Detects fee conflicts with fleet members
+- `_scan_ban_candidates()`: Flags peers for removal based on collective warnings
+- `_analyze_node_state()`: Gathers `internal_competition` and `ban_candidates`
 
-### 3. Cost Reduction (Phase 3)
+### 3. Cost Reduction (Phase 3) ✅
 
 Minimize operational costs:
 
-| Tool | Purpose | Integration Benefit |
+| Tool | Purpose | Integration Status |
 |------|---------|---------------------|
-| `rebalance_recommendations` | Predictive rebalance suggestions | Proactive vs reactive rebalancing |
-| `fleet_rebalance_path` | Internal fleet rebalance routes | Lower-cost rebalancing via hive members |
-| `circular_flow_status` | Detect wasteful circular patterns | Eliminate fee-burning circular flows |
-| `cost_reduction_status` | Overall cost reduction summary | Track cost optimization progress |
+| `rebalance_recommendations` | Predictive rebalance suggestions | ✅ Gathered + scanned via `_scan_rebalance_recommendations()` |
+| `fleet_rebalance_path` | Internal fleet rebalance routes | ✅ Available via MCP |
+| `circular_flow_status` | Detect wasteful circular patterns | ✅ Gathered + scanned via `_scan_circular_flows()` |
+| `cost_reduction_status` | Overall cost reduction summary | ✅ Available via MCP |
 
-**Integration Points:**
-- In `_scan_velocity_alerts()`: Use `rebalance_recommendations` for better suggestions
-- In `_execute_rebalance()`: Check `fleet_rebalance_path` first for cheaper routes
-- Add new scanner: `_scan_circular_flows()` to detect and break circular patterns
+**Integration Points (Implemented):**
+- `_scan_rebalance_recommendations()`: Creates opportunities from predictive suggestions
+- `_scan_circular_flows()`: Detects and flags wasteful circular patterns
+- `_analyze_node_state()`: Gathers `rebalance_recommendations` and `circular_flows`
 
-### 4. Strategic Positioning (Phase 4)
+### 4. Strategic Positioning (Phase 4) ✅
 
 Optimize channel topology for maximum routing value:
 
-| Tool | Purpose | Integration Benefit |
+| Tool | Purpose | Integration Status |
 |------|---------|---------------------|
-| `valuable_corridors` | High-value routing corridors | Target profitable routes |
-| `exchange_coverage` | Priority exchange connectivity | Ensure critical liquidity paths |
-| `positioning_recommendations` | Where to open channels | Strategic expansion decisions |
-| `flow_recommendations` | Physarum lifecycle actions | Channel strengthen/atrophy guidance |
-| `positioning_summary` | Strategic positioning overview | Comprehensive topology assessment |
+| `valuable_corridors` | High-value routing corridors | ✅ Available via MCP |
+| `exchange_coverage` | Priority exchange connectivity | ✅ Available via MCP |
+| `positioning_recommendations` | Where to open channels | ✅ Scanned via `_scan_positioning_opportunities()` |
+| `flow_recommendations` | Physarum lifecycle actions | ✅ Gathered in `_analyze_node_state()` |
+| `positioning_summary` | Strategic positioning overview | ✅ Gathered in `_analyze_node_state()` |
 
-**Integration Points:**
-- Add new scanner: `_scan_positioning_opportunities()` for topology improvements
-- In `_plan_next_cycle()`: Include positioning recommendations in priorities
-- Use `flow_recommendations` to identify channels for closure/strengthening
+**Integration Points (Implemented):**
+- `_scan_positioning_opportunities()`: Creates opportunities from positioning recommendations
+- `_analyze_node_state()`: Gathers `positioning`, `yield_summary`, `flow_recommendations`
+- Flow recommendations used to identify channels for closure/strengthening
 
-### 5. Channel Rationalization
+### 5. Channel Rationalization ✅
 
 Eliminate redundant channels across the fleet:
 
-| Tool | Purpose | Integration Benefit |
+| Tool | Purpose | Integration Status |
 |------|---------|---------------------|
-| `coverage_analysis` | Detect redundant channels | Identify duplicate coverage |
-| `close_recommendations` | Which redundant channels to close | Data-driven closure decisions |
-| `rationalization_summary` | Fleet coverage health | Track rationalization progress |
+| `coverage_analysis` | Detect redundant channels | ✅ Available via MCP |
+| `close_recommendations` | Which redundant channels to close | ✅ Scanned via `_scan_rationalization()` |
+| `rationalization_summary` | Fleet coverage health | ✅ Available via MCP |
 
-**Integration Points:**
-- Add new scanner: `_scan_rationalization()` for redundant channel detection
-- When evaluating channel closures, consult `close_recommendations`
+**Integration Points (Implemented):**
+- `_scan_rationalization()`: Creates opportunities for redundant channel closure
+- Close recommendations consulted for data-driven closure decisions
 
-### 6. Anticipatory Intelligence (Phase 7.1)
+### 6. Anticipatory Intelligence (Phase 7.1) ✅
 
 Predict future liquidity needs:
 
-| Tool | Purpose | Integration Benefit |
+| Tool | Purpose | Integration Status |
 |------|---------|---------------------|
-| `anticipatory_status` | Pattern detection state | Understand prediction confidence |
-| `detect_patterns` | Temporal flow patterns | Learn recurring flow behaviors |
-| `predict_liquidity` | Per-channel state prediction | Anticipate depletion/saturation |
-| `anticipatory_predictions` | All at-risk channels | Comprehensive risk assessment |
+| `anticipatory_status` | Pattern detection state | ✅ Available via MCP |
+| `detect_patterns` | Temporal flow patterns | ✅ Available via MCP |
+| `predict_liquidity` | Per-channel state prediction | ✅ Available via MCP |
+| `anticipatory_predictions` | All at-risk channels | ✅ Gathered + scanned via `_scan_anticipatory_liquidity()` |
 
-**Integration Points:**
-- In `_scan_anticipatory_liquidity()`: Use `anticipatory_predictions` instead of just context
-- Add pattern detection to `_analyze_node_state()` for richer context
+**Integration Points (Implemented):**
+- `_scan_anticipatory_liquidity()`: Creates opportunities from at-risk channel predictions
+- `_analyze_node_state()`: Gathers `anticipatory` predictions and `critical_velocity`
 
-### 7. Time-Based Optimization (Phase 7.4)
+### 7. Time-Based Optimization (Phase 7.4) ✅
 
 Optimize fees based on temporal patterns:
 
-| Tool | Purpose | Integration Benefit |
+| Tool | Purpose | Integration Status |
 |------|---------|---------------------|
-| `time_fee_status` | Current temporal fee state | Understand active adjustments |
-| `time_fee_adjustment` | Get time-optimal fee for channel | Dynamic fee recommendations |
-| `time_peak_hours` | Detected high-activity hours | Know when to charge premium |
-| `time_low_hours` | Detected low-activity hours | Know when to discount |
+| `time_fee_status` | Current temporal fee state | ✅ Available via MCP |
+| `time_fee_adjustment` | Get time-optimal fee for channel | ✅ Scanned via `_scan_time_based_fees()` |
+| `time_peak_hours` | Detected high-activity hours | ✅ Available via MCP |
+| `time_low_hours` | Detected low-activity hours | ✅ Available via MCP |
 
-**Integration Points:**
-- In `_scan_time_based_fees()`: Use `time_fee_adjustment` for better recommendations
-- In `_execute_fee_change()`: Apply temporal modifiers automatically
+**Integration Points (Implemented):**
+- `_scan_time_based_fees()`: Creates opportunities for temporal fee adjustments
+- Time-based fee configuration gathered via `fee_coordination_status`
 
-### 8. Competitor Intelligence
+### 8. Competitor Intelligence ✅
 
 Understand competitive landscape:
 
-| Tool | Purpose | Integration Benefit |
+| Tool | Purpose | Integration Status |
 |------|---------|---------------------|
-| `competitor_analysis` | Compare fees to competitors | Market-aware fee setting |
+| `competitor_analysis` | Compare fees to competitors | ✅ Scanned via `_scan_competitor_opportunities()` |
 
-**Integration Points:**
-- Add new scanner: `_scan_competitor_opportunities()` for undercut/premium opportunities
-- In `_score_opportunities()`: Factor in competitive positioning
+**Integration Points (Implemented):**
+- `_scan_competitor_opportunities()`: Creates opportunities for undercut/premium fee adjustments
+- Competitive positioning factored into opportunity scoring
 
-### 9. Yield Optimization
+### 9. Yield Optimization ✅
 
 Maximize return on capital:
 
-| Tool | Purpose | Integration Benefit |
+| Tool | Purpose | Integration Status |
 |------|---------|---------------------|
-| `yield_metrics` | Per-channel ROI, efficiency | Identify best/worst performers |
-| `yield_summary` | Fleet-wide yield analysis | Overall performance tracking |
-| `critical_velocity` | Channels at velocity risk | Urgent attention list |
+| `yield_metrics` | Per-channel ROI, efficiency | ✅ Available via MCP |
+| `yield_summary` | Fleet-wide yield analysis | ✅ Gathered in `_analyze_node_state()` |
+| `critical_velocity` | Channels at velocity risk | ✅ Gathered in `_analyze_node_state()` |
 
-**Integration Points:**
-- In `_analyze_node_state()`: Include `yield_summary` for comprehensive view
-- Use `yield_metrics` for ROI-based opportunity scoring
-
----
-
-## Recommended Integration Priority
-
-### Phase 1: Critical Intelligence (Immediate Value)
-1. **`defense_status` + `accumulated_warnings`** - Avoid known-bad peers
-2. **`coord_fee_recommendation`** - Use coordinated fees instead of manual calc
-3. **`anticipatory_predictions`** - Better liquidity prediction
-4. **`critical_velocity`** - Comprehensive velocity monitoring
-
-### Phase 2: Cost Optimization
-5. **`fleet_rebalance_path`** - Cheaper rebalancing
-6. **`circular_flow_status`** - Eliminate waste
-7. **`rebalance_recommendations`** - Proactive rebalancing
-
-### Phase 3: Strategic Value
-8. **`competitor_analysis`** - Market positioning
-9. **`internal_competition`** - Fleet harmony
-10. **`positioning_recommendations`** - Strategic growth
-
-### Phase 4: Advanced Optimization
-11. **`time_fee_adjustment`** - Temporal optimization
-12. **`pheromone_levels`** - Learned fee memory
-13. **`flow_recommendations`** - Physarum lifecycle
-14. **`close_recommendations`** - Channel rationalization
+**Integration Points (Implemented):**
+- `_analyze_node_state()`: Gathers `yield_summary` and `critical_velocity`
+- Yield metrics available via MCP for ROI-based analysis
 
 ---
 
-## Implementation Example
+## All 14 Opportunity Scanners (Implemented)
 
-Here's how to enhance `_analyze_node_state()` with more intelligence:
+The `OpportunityScanner` runs these 14 scanners in parallel:
+
+| Scanner | Purpose | Data Source |
+|---------|---------|-------------|
+| `_scan_velocity_alerts` | Critical depletion/saturation | `velocities` |
+| `_scan_profitability` | Underwater/stagnant channels | `profitability` |
+| `_scan_time_based_fees` | Temporal fee optimization | `fee_coordination` |
+| `_scan_anticipatory_liquidity` | Predictive liquidity risks | `anticipatory` |
+| `_scan_imbalanced_channels` | Balance ratio issues | `channels` |
+| `_scan_config_opportunities` | Configuration tuning | `dashboard` |
+| `_scan_defense_warnings` | Peer threat detection | `defense_status` |
+| `_scan_internal_competition` | Fleet fee conflicts | `internal_competition` |
+| `_scan_circular_flows` | Wasteful circular patterns | `circular_flows` |
+| `_scan_rebalance_recommendations` | Proactive rebalancing | `rebalance_recommendations` |
+| `_scan_positioning_opportunities` | Strategic channel opens | `positioning` |
+| `_scan_competitor_opportunities` | Market fee positioning | `competitor_analysis` |
+| `_scan_rationalization` | Redundant channel closure | `close_recommendations` |
+| `_scan_ban_candidates` | Peer removal candidates | `ban_candidates` |
+
+---
+
+## Current Implementation
+
+The `_analyze_node_state()` function in `proactive_advisor.py` now gathers all intelligence:
 
 ```python
 async def _analyze_node_state(self, node_name: str) -> Dict[str, Any]:
-    """Comprehensive node state analysis with full intelligence."""
+    """Comprehensive node state analysis with full intelligence gathering."""
     results = {}
 
-    # Current data gathering...
+    # ==== CORE DATA ====
     results["node_info"] = await self.mcp.call("hive_node_info", {"node": node_name})
     results["channels"] = await self.mcp.call("hive_channels", {"node": node_name})
     results["dashboard"] = await self.mcp.call("revenue_dashboard", {"node": node_name})
@@ -199,12 +198,13 @@ async def _analyze_node_state(self, node_name: str) -> Dict[str, Any]:
     results["context"] = await self.mcp.call("advisor_get_context_brief", {"days": 7})
     results["velocities"] = await self.mcp.call("advisor_get_velocities", {"hours_threshold": 24})
 
-    # NEW: Fleet coordination intelligence
-    results["fee_coordination"] = await self.mcp.call("fee_coordination_status", {"node": node_name})
+    # ==== FLEET COORDINATION INTELLIGENCE (Phase 2) ====
     results["defense_status"] = await self.mcp.call("defense_status", {"node": node_name})
     results["internal_competition"] = await self.mcp.call("internal_competition", {"node": node_name})
+    results["fee_coordination"] = await self.mcp.call("fee_coordination_status", {"node": node_name})
+    results["pheromone_levels"] = await self.mcp.call("pheromone_levels", {"node": node_name})
 
-    # NEW: Predictive intelligence
+    # ==== PREDICTIVE INTELLIGENCE (Phase 7.1) ====
     results["anticipatory"] = await self.mcp.call("anticipatory_predictions", {
         "node": node_name, "min_risk": 0.3, "hours_ahead": 24
     })
@@ -212,68 +212,70 @@ async def _analyze_node_state(self, node_name: str) -> Dict[str, Any]:
         "node": node_name, "threshold_hours": 24
     })
 
-    # NEW: Strategic positioning
+    # ==== STRATEGIC POSITIONING (Phase 4) ====
     results["positioning"] = await self.mcp.call("positioning_summary", {"node": node_name})
     results["yield_summary"] = await self.mcp.call("yield_summary", {"node": node_name})
+    results["flow_recommendations"] = await self.mcp.call("flow_recommendations", {"node": node_name})
 
-    # NEW: Cost reduction
-    results["rebalance_recs"] = await self.mcp.call("rebalance_recommendations", {"node": node_name})
+    # ==== COST REDUCTION (Phase 3) ====
+    results["rebalance_recommendations"] = await self.mcp.call("rebalance_recommendations", {"node": node_name})
     results["circular_flows"] = await self.mcp.call("circular_flow_status", {"node": node_name})
 
-    # NEW: Collective warnings
+    # ==== COLLECTIVE WARNINGS ====
     results["ban_candidates"] = await self.mcp.call("ban_candidates", {"node": node_name})
-    results["accumulated_warnings"] = await self.mcp.call("accumulated_warnings", {"node": node_name})
 
-    # Calculate enhanced summary...
-    return {
-        "summary": {...},
-        **results
-    }
+    return results
 ```
+
+All calls include error handling to gracefully degrade if any intelligence source is unavailable.
 
 ---
 
-## AI-Driven Decision Making Enhancement
+## AI-Driven Decision Making (Current Workflow)
 
-When using Claude or another AI advisor via MCP, the following workflow maximizes intelligence utilization:
+The `advisor_run_cycle` MCP tool executes this complete workflow automatically:
 
-### Pre-Cycle Context Gathering
+### 1. State Recording
 ```
-1. advisor_record_snapshot - Record current state
-2. advisor_get_context_brief - Get trend summary with velocity alerts
-3. defense_status - Check for active warnings
-4. ban_candidates - Any peers needing attention?
-5. internal_competition - Any fleet conflicts?
+advisor_record_snapshot - Record current state for historical tracking
 ```
 
-### Per-Channel Analysis
+### 2. Comprehensive Intelligence Gathering
 ```
-For each channel needing attention:
-1. coord_fee_recommendation - Get coordinated fee suggestion
-2. predict_liquidity - Predict future state
-3. time_fee_adjustment - Get time-optimal fee
-4. yield_metrics - Check ROI and efficiency
-5. competitor_analysis - Market positioning
-```
-
-### Action Selection
-```
-For rebalancing decisions:
-1. fleet_rebalance_path - Check for internal fleet route first
-2. rebalance_recommendations - Get proactive recommendations
-3. circular_flow_status - Avoid creating circular waste
-
-For channel operations:
-1. close_recommendations - Check rationalization guidance
-2. flow_recommendations - Physarum lifecycle state
-3. positioning_recommendations - Strategic value assessment
+_analyze_node_state() gathers ALL intelligence sources:
+- Core: node_info, channels, dashboard, profitability, context, velocities
+- Fleet: defense_status, internal_competition, fee_coordination, pheromone_levels
+- Predictive: anticipatory_predictions, critical_velocity
+- Strategic: positioning, yield_summary, flow_recommendations
+- Cost: rebalance_recommendations, circular_flows
+- Warnings: ban_candidates
 ```
 
-### Post-Cycle Learning
+### 3. Opportunity Scanning (14 parallel scanners)
 ```
-1. advisor_record_decision - Log what was decided
-2. advisor_measure_outcomes - Measure past decisions (6-24h ago)
-3. Record any alerts via advisor_record_alert
+OpportunityScanner.scan_all() runs all 14 scanners in parallel,
+creating scored Opportunity objects from each intelligence source
+```
+
+### 4. Goal-Aware Scoring
+```
+Opportunities scored with learning adjustments based on:
+- Past decision outcomes
+- Current goal progress
+- Action type confidence
+```
+
+### 5. Action Execution
+```
+- Safe actions auto-executed within daily budget
+- Risky actions queued for approval
+- All decisions logged for learning
+```
+
+### 6. Outcome Measurement
+```
+advisor_measure_outcomes - Evaluate decisions from 6-24h ago
+Results feed back into learning system
 ```
 
 ---
@@ -309,13 +311,33 @@ This allows the AI advisor to manage both REST-connected and docker-exec connect
 
 ## Summary
 
-The cl-hive intelligence systems provide rich data for AI-driven decision making. By integrating all available tools, the advisor can:
+All cl-hive intelligence systems are now **fully integrated** into the proactive advisor:
 
-1. **Make coordinated decisions** - Use fleet-wide intelligence instead of isolated analysis
-2. **Anticipate problems** - Predict liquidity issues before they occur
-3. **Minimize costs** - Use internal fleet routes and avoid circular flows
-4. **Optimize strategically** - Position for high-value corridors and exchanges
-5. **Avoid bad actors** - Leverage collective warning system
-6. **Learn continuously** - Apply pheromone-based fee memory
+| Capability | Status | Implementation |
+|------------|--------|----------------|
+| Coordinated decisions | ✅ Complete | Fleet-wide intelligence gathered every cycle |
+| Anticipate problems | ✅ Complete | `anticipatory_predictions` + `critical_velocity` |
+| Minimize costs | ✅ Complete | `fleet_rebalance_path` + `circular_flow_status` |
+| Strategic positioning | ✅ Complete | `positioning_summary` + `flow_recommendations` |
+| Avoid bad actors | ✅ Complete | `defense_status` + `ban_candidates` |
+| Learn continuously | ✅ Complete | Pheromone levels + outcome measurement |
 
-The key is ensuring the `_analyze_node_state()` function gathers comprehensive intelligence, and the `OpportunityScanner` creates opportunities based on all available data sources.
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `tools/proactive_advisor.py` | Main advisor with `_analyze_node_state()` |
+| `tools/opportunity_scanner.py` | 14 parallel opportunity scanners |
+| `tools/mcp-hive-server.py` | MCP server exposing all tools |
+
+### Running the Advisor
+
+```bash
+# Via MCP (recommended)
+advisor_run_cycle node=hive-nexus-01
+
+# Or run on all nodes
+advisor_run_cycle_all
+```
+
+The advisor automatically gathers all intelligence, scans for opportunities, executes safe actions, and queues risky ones for approval.
