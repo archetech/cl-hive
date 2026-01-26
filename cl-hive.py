@@ -2284,6 +2284,7 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
         return 0
 
     added = 0
+    updated = 0
     for member_info in members_list:
         if not isinstance(member_info, dict):
             continue
@@ -2292,11 +2293,6 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
         if not member_peer_id or not isinstance(member_peer_id, str):
             continue
 
-        # Check if we already know this member
-        existing = database.get_member(member_peer_id)
-        if existing:
-            continue  # Already have this member
-
         tier = member_info.get("tier", "neophyte")
         joined_at = member_info.get("joined_at", int(time.time()))
         addresses = member_info.get("addresses", [])
@@ -2304,6 +2300,38 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
         # Validate tier value (2-tier system: member or neophyte)
         if tier not in ("member", "neophyte"):
             tier = "neophyte"
+
+        # Check if we already know this member
+        existing = database.get_member(member_peer_id)
+        if existing:
+            # Update tier if remote has higher privilege (neophyte -> member)
+            # Never demote via sync (member -> neophyte requires proper protocol)
+            existing_tier = existing.get("tier", "neophyte")
+            needs_update = False
+
+            if existing_tier == "neophyte" and tier == "member":
+                # Promotion detected - update tier
+                try:
+                    database.update_member(member_peer_id, tier="member", promoted_at=int(time.time()))
+                    plugin.log(f"cl-hive: Synced tier upgrade for {member_peer_id[:16]}... (neophyte -> member)")
+                    needs_update = True
+                    updated += 1
+                except Exception as e:
+                    plugin.log(f"cl-hive: Failed to sync tier upgrade: {e}", level='warn')
+
+            # Update addresses if provided and we don't have them
+            if addresses:
+                existing_addresses = existing.get("addresses")
+                if not existing_addresses:
+                    try:
+                        import json
+                        database.update_member(member_peer_id, addresses=json.dumps(addresses))
+                        if not needs_update:
+                            plugin.log(f"cl-hive: Synced addresses for {member_peer_id[:16]}...")
+                    except Exception as e:
+                        plugin.log(f"cl-hive: Failed to sync addresses: {e}", level='debug')
+
+            continue  # Already have this member, done with updates
 
         try:
             database.add_member(
@@ -2325,7 +2353,10 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
         except Exception as e:
             plugin.log(f"cl-hive: Failed to add synced member: {e}", level='warn')
 
-    return added
+    if updated > 0:
+        plugin.log(f"cl-hive: Membership sync: {added} added, {updated} tiers upgraded")
+
+    return added + updated
 
 
 def _create_membership_payload() -> list:
@@ -3666,11 +3697,20 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     request_id = payload["request_id"]
 
     target_member = database.get_member(target_pubkey)
-    if not target_member or target_member.get("tier") != MembershipTier.NEOPHYTE.value:
+    if not target_member:
+        # Unknown target - relay but don't process locally
+        _relay_message(HiveMessageType.PROMOTION, payload, peer_id)
+        return {"result": "continue"}
+
+    if target_member.get("tier") != MembershipTier.NEOPHYTE.value:
+        # Already promoted locally - still relay for other nodes that may not have seen it
+        _relay_message(HiveMessageType.PROMOTION, payload, peer_id)
         return {"result": "continue"}
 
     request = database.get_promotion_request(target_pubkey, request_id)
     if request and request.get("status") == "accepted":
+        # Already processed locally - still relay for other nodes
+        _relay_message(HiveMessageType.PROMOTION, payload, peer_id)
         return {"result": "continue"}
 
     active_members = membership_mgr.get_active_members()
