@@ -7,7 +7,19 @@ This guide covers how to join an existing cl-hive fleet using the Docker image.
 - Docker and Docker Compose installed
 - Bitcoin Core node (mainnet) with RPC access
 - On-chain funds for opening a channel (skin in the game)
-- Contact with an existing hive member willing to vouch for you
+- Contact with an existing hive member willing to sponsor you
+
+## Membership Flow Overview
+
+```
+1. Get invite ticket from existing member
+2. Start your node and connect to the member
+3. Open a channel (skin in the game)
+4. Use the ticket to join as neophyte
+5. Request promotion
+6. Members vouch for you
+7. Automatic promotion when quorum reached
+```
 
 ## Step 1: Clone and Configure
 
@@ -45,11 +57,17 @@ Wait for the node to sync (check logs):
 docker logs -f cl-hive-node
 ```
 
-## Step 3: Get Member Connection Info
+## Step 3: Get Invite Ticket from Member
 
-Contact an existing hive member and request their connection info:
-- Their node's pubkey
-- Their connection address (pubkey@host:port)
+Contact an existing hive member. They will:
+
+1. Generate an invite ticket for you:
+```bash
+# Member runs this on their node:
+lightning-cli hive-invite
+```
+
+2. Share the resulting ticket (a long base64 string) with you securely.
 
 **Current Hive Members:**
 
@@ -59,7 +77,7 @@ Contact an existing hive member and request their connection info:
 
 You can also find active members via Lightning network explorers or community channels.
 
-## Step 4: Open Channel and Request Membership
+## Step 4: Connect and Open Channel
 
 **Skin in the game**: You open a channel to the member first, demonstrating commitment.
 
@@ -75,25 +93,52 @@ docker exec cl-hive-node lightning-cli fundchannel <member-pubkey> 1000000
 
 3. Wait for the channel to confirm (3+ confirmations).
 
-4. The member will vouch for you:
+## Step 5: Join the Hive
+
+Use the invite ticket to register as a neophyte:
+
 ```bash
-# Member runs this on their node:
+docker exec cl-hive-node lightning-cli hive-join <ticket>
+```
+
+This adds you to the hive membership database as a **neophyte**.
+
+## Step 6: Request Promotion
+
+Once you're a neophyte, request promotion to full member:
+
+```bash
+docker exec cl-hive-node lightning-cli hive-request-promotion
+```
+
+This broadcasts your promotion request to all members.
+
+## Step 7: Get Vouched
+
+Members can now vouch for your promotion:
+
+```bash
+# Members run this on their nodes:
 lightning-cli hive-vouch <your-pubkey>
 ```
 
-**Note**: The original flow also works - a member can open a channel to you and then vouch. Both approaches are valid; opening the channel yourself shows commitment.
+**Important**: Members can only vouch for peers who:
+1. Are already registered as neophytes (via `hive-join`)
+2. Have a pending promotion request (via `hive-request-promotion`)
 
-## Step 5: Verify Membership
+When enough members vouch (51% quorum), you're automatically promoted to member.
 
-Once vouched, check your membership status:
+## Step 8: Verify Membership
+
+Check your membership status:
 
 ```bash
 docker exec cl-hive-node lightning-cli hive-status
 ```
 
-You should see yourself listed as a `neophyte`. After the probation period (or early promotion by member vote), you'll become a full `member`.
+You should see yourself as a `member` once quorum is reached. During the vouching process, you'll appear as `neophyte`.
 
-## Step 6: Register for Settlement
+## Step 9: Register for Settlement
 
 Generate and register your BOLT12 offer for receiving settlement payments:
 
