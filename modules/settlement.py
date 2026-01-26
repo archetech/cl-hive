@@ -23,9 +23,11 @@ import time
 import json
 import sqlite3
 import threading
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional, Any, Tuple
 from decimal import Decimal, ROUND_DOWN
+
+from . import network_metrics
 
 
 # Settlement period (weekly)
@@ -56,10 +58,21 @@ def calculate_min_payment(total_fees: int, member_count: int) -> int:
     dynamic_min = total_fees // (member_count * 10)
     return max(MIN_PAYMENT_FLOOR_SATS, dynamic_min)
 
-# Fair share weights
+# Fair share weights (standard mode)
 WEIGHT_CAPACITY = 0.30
 WEIGHT_FORWARDS = 0.60
 WEIGHT_UPTIME = 0.10
+
+# Fair share weights (network-optimized mode - Use Case 6)
+# Rewards members who contribute more to fleet connectivity
+WEIGHT_CAPACITY_NETWORK = 0.25
+WEIGHT_FORWARDS_NETWORK = 0.55
+WEIGHT_UPTIME_NETWORK = 0.10
+WEIGHT_NETWORK_POSITION = 0.10  # 10% for hive centrality contribution
+
+# Network position calculation settings
+HIGH_CENTRALITY_THRESHOLD = 0.7  # Members above this get full network bonus
+MIN_CENTRALITY_FOR_BONUS = 0.3   # Members below this get no network bonus
 
 
 @dataclass
@@ -71,6 +84,9 @@ class MemberContribution:
     fees_earned_sats: int
     uptime_pct: float
     bolt12_offer: Optional[str] = None
+    # Network position metrics (Use Case 6)
+    hive_centrality: float = 0.0
+    rebalance_hub_score: float = 0.0
 
 
 @dataclass
@@ -81,6 +97,9 @@ class SettlementResult:
     fair_share: int
     balance: int  # positive = owed money, negative = owes money
     bolt12_offer: Optional[str] = None
+    # Network position contribution (Use Case 6)
+    network_score: float = 0.0
+    network_bonus_sats: int = 0
 
 
 @dataclass
@@ -339,15 +358,25 @@ class SettlementManager:
 
     def calculate_fair_shares(
         self,
-        contributions: List[MemberContribution]
+        contributions: List[MemberContribution],
+        network_optimized: bool = False
     ) -> List[SettlementResult]:
         """
         Calculate fair share for each member based on contributions.
 
-        Fair Share Algorithm:
-        - 40% weight: capacity_contribution = member_capacity / total_capacity
-        - 40% weight: routing_contribution = member_forwards / total_forwards
-        - 20% weight: uptime_contribution = member_uptime / 100
+        Standard Fair Share Algorithm:
+        - 30% weight: capacity_contribution = member_capacity / total_capacity
+        - 60% weight: routing_contribution = member_forwards / total_forwards
+        - 10% weight: uptime_contribution = member_uptime / 100
+
+        Network-Optimized Mode (Use Case 6):
+        - 25% weight: capacity_contribution
+        - 55% weight: routing_contribution
+        - 10% weight: uptime_contribution
+        - 10% weight: network_position = normalized hive centrality
+
+        Network position rewards members who maintain better fleet connectivity,
+        contributing to overall routing capability even if they don't earn direct fees.
 
         Each member's fair_share = total_fees * weighted_contribution_score
         Balance = fair_share - fees_earned
@@ -356,6 +385,7 @@ class SettlementManager:
 
         Args:
             contributions: List of member contributions
+            network_optimized: If True, include network position in calculation
 
         Returns:
             List of settlement results with fair shares and balances
@@ -380,6 +410,13 @@ class SettlementManager:
                 for c in contributions
             ]
 
+        # Enrich contributions with network metrics if needed
+        if network_optimized:
+            contributions = self._enrich_with_network_metrics(contributions)
+
+        # Calculate total network score for normalization
+        total_network_score = sum(c.hive_centrality for c in contributions)
+
         results = []
 
         for member in contributions:
@@ -394,12 +431,43 @@ class SettlementManager:
             )
             uptime_score = member.uptime_pct / 100.0
 
-            # Weighted contribution score
-            weighted_score = (
-                WEIGHT_CAPACITY * capacity_score +
-                WEIGHT_FORWARDS * forwards_score +
-                WEIGHT_UPTIME * uptime_score
-            )
+            # Network position score (Use Case 6)
+            network_score = 0.0
+            network_bonus_sats = 0
+
+            if network_optimized:
+                # Normalize network score relative to fleet
+                network_score = (
+                    member.hive_centrality / total_network_score
+                    if total_network_score > 0 else 0
+                )
+
+                # Apply threshold - only give bonus if above minimum
+                if member.hive_centrality < MIN_CENTRALITY_FOR_BONUS:
+                    network_score = 0.0
+
+                # Use network-optimized weights
+                weighted_score = (
+                    WEIGHT_CAPACITY_NETWORK * capacity_score +
+                    WEIGHT_FORWARDS_NETWORK * forwards_score +
+                    WEIGHT_UPTIME_NETWORK * uptime_score +
+                    WEIGHT_NETWORK_POSITION * network_score
+                )
+
+                # Calculate the network bonus portion
+                base_fair_share = int(total_fees * (
+                    WEIGHT_CAPACITY_NETWORK * capacity_score +
+                    WEIGHT_FORWARDS_NETWORK * forwards_score +
+                    WEIGHT_UPTIME_NETWORK * uptime_score
+                ))
+                network_bonus_sats = int(total_fees * WEIGHT_NETWORK_POSITION * network_score)
+            else:
+                # Standard weights
+                weighted_score = (
+                    WEIGHT_CAPACITY * capacity_score +
+                    WEIGHT_FORWARDS * forwards_score +
+                    WEIGHT_UPTIME * uptime_score
+                )
 
             # Fair share of total fees
             fair_share = int(total_fees * weighted_score)
@@ -412,7 +480,9 @@ class SettlementManager:
                 fees_earned=member.fees_earned_sats,
                 fair_share=fair_share,
                 balance=balance,
-                bolt12_offer=member.bolt12_offer
+                bolt12_offer=member.bolt12_offer,
+                network_score=round(network_score, 4),
+                network_bonus_sats=network_bonus_sats
             ))
 
         # Verify settlement balances sum to zero (accounting identity)
@@ -424,6 +494,33 @@ class SettlementManager:
             )
 
         return results
+
+    def _enrich_with_network_metrics(
+        self,
+        contributions: List[MemberContribution]
+    ) -> List[MemberContribution]:
+        """
+        Enrich member contributions with network position metrics.
+
+        Fetches hive centrality and rebalance hub score for each member.
+
+        Args:
+            contributions: List of member contributions
+
+        Returns:
+            Updated list with network metrics populated
+        """
+        calculator = network_metrics.get_calculator()
+        if not calculator:
+            return contributions
+
+        for contrib in contributions:
+            metrics = calculator.get_member_metrics(contrib.peer_id)
+            if metrics:
+                contrib.hive_centrality = metrics.hive_centrality
+                contrib.rebalance_hub_score = metrics.rebalance_hub_score
+
+        return contributions
 
     # =========================================================================
     # PAYMENT GENERATION
