@@ -3474,14 +3474,25 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not config or not config.membership_enabled or not membership_mgr:
         return {"result": "continue"}
 
+    # Deduplication check
+    if not _should_process_message(payload):
+        return {"result": "continue"}
+
     if not validate_promotion(payload):
         plugin.log(f"cl-hive: PROMOTION from {peer_id[:16]}... invalid payload", level='warn')
         return {"result": "continue"}
 
-    sender = database.get_member(peer_id)
-    sender_tier = sender.get("tier") if sender else None
-    if sender_tier not in (MembershipTier.MEMBER.value,):
-        return {"result": "continue"}
+    # For relayed messages, verify peer_id is a member (relay forwarder)
+    # The actual sender verification happens via signature in vouches
+    if _is_relayed_message(payload):
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        sender_tier = sender.get("tier") if sender else None
+        if sender_tier not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
 
     target_pubkey = payload["target_pubkey"]
     request_id = payload["request_id"]
@@ -3525,11 +3536,17 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         valid_vouches.append(vouch)
 
     if len(valid_vouches) < quorum:
+        # Relay even if we don't have quorum - other nodes might
+        _relay_message(HiveMessageType.PROMOTION, payload, peer_id)
         return {"result": "continue"}
 
     database.add_promotion_request(target_pubkey, request_id, status="accepted")
     database.update_promotion_request_status(target_pubkey, request_id, status="accepted")
     membership_mgr.set_tier(target_pubkey, MembershipTier.MEMBER.value)
+
+    # Relay to other members
+    _relay_message(HiveMessageType.PROMOTION, payload, peer_id)
+
     return {"result": "continue"}
 
 
@@ -3542,6 +3559,10 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not config or not database or not safe_plugin:
         return {"result": "continue"}
 
+    # Deduplication check
+    if not _should_process_message(payload):
+        return {"result": "continue"}
+
     if not validate_member_left(payload):
         plugin.log(f"cl-hive: MEMBER_LEFT from {peer_id[:16]}... invalid payload", level='warn')
         return {"result": "continue"}
@@ -3551,9 +3572,8 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     reason = payload["reason"]
     signature = payload["signature"]
 
-    # Verify the message came from the leaving peer (self-signed)
-    # The sender (peer_id) should match the leaving peer
-    if peer_id != leaving_peer_id:
+    # Verify sender (supports relay)
+    if not _validate_relay_sender(peer_id, leaving_peer_id, payload):
         plugin.log(f"cl-hive: MEMBER_LEFT sender mismatch: {peer_id[:16]}... != {leaving_peer_id[:16]}...", level='warn')
         return {"result": "continue"}
 
@@ -3592,6 +3612,9 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if member_count == 0 and len(all_members) > 0:
         plugin.log("cl-hive: WARNING - Hive has no full members (only neophytes). Promote neophytes to restore governance.", level='warn')
 
+    # Relay to other members
+    _relay_message(HiveMessageType.MEMBER_LEFT, payload, peer_id)
+
     return {"result": "continue"}
 
 
@@ -3618,6 +3641,10 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not config or not database or not safe_plugin:
         return {"result": "continue"}
 
+    # Deduplication check
+    if not _should_process_message(payload):
+        return {"result": "continue"}
+
     if not validate_ban_proposal(payload):
         plugin.log(f"cl-hive: BAN_PROPOSAL from {peer_id[:16]}... invalid payload", level='warn')
         return {"result": "continue"}
@@ -3629,8 +3656,8 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     timestamp = payload["timestamp"]
     signature = payload["signature"]
 
-    # Verify sender is the proposer
-    if peer_id != proposer_peer_id:
+    # Verify sender (supports relay)
+    if not _validate_relay_sender(peer_id, proposer_peer_id, payload):
         plugin.log(f"cl-hive: BAN_PROPOSAL sender mismatch", level='warn')
         return {"result": "continue"}
 
@@ -3672,6 +3699,9 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
                                  reason, timestamp, expires_at)
     plugin.log(f"cl-hive: Ban proposal {proposal_id[:16]}... for {target_peer_id[:16]}... by {proposer_peer_id[:16]}...")
 
+    # Relay to other members
+    _relay_message(HiveMessageType.BAN_PROPOSAL, payload, peer_id)
+
     return {"result": "continue"}
 
 
@@ -3684,6 +3714,10 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not config or not database or not safe_plugin or not membership_mgr:
         return {"result": "continue"}
 
+    # Deduplication check
+    if not _should_process_message(payload):
+        return {"result": "continue"}
+
     if not validate_ban_vote(payload):
         plugin.log(f"cl-hive: BAN_VOTE from {peer_id[:16]}... invalid payload", level='warn')
         return {"result": "continue"}
@@ -3694,8 +3728,8 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     timestamp = payload["timestamp"]
     signature = payload["signature"]
 
-    # Verify sender is the voter
-    if peer_id != voter_peer_id:
+    # Verify sender (supports relay)
+    if not _validate_relay_sender(peer_id, voter_peer_id, payload):
         plugin.log(f"cl-hive: BAN_VOTE sender mismatch", level='warn')
         return {"result": "continue"}
 
@@ -3726,6 +3760,9 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Check if quorum reached
     _check_ban_quorum(proposal_id, proposal, plugin)
+
+    # Relay to other members
+    _relay_message(HiveMessageType.BAN_VOTE, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5870,10 +5907,8 @@ def handle_settlement_offer(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
     if not settlement_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: SETTLEMENT_OFFER from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
 
     # Extract payload fields
@@ -5887,9 +5922,15 @@ def handle_settlement_offer(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
         plugin.log(f"cl-hive: SETTLEMENT_OFFER missing required fields from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify the offer peer_id matches the sender (you can only broadcast your own offer)
-    if offer_peer_id != peer_id:
+    # Verify sender (supports relay) - offer_peer_id is the original sender
+    if not _validate_relay_sender(peer_id, offer_peer_id, payload):
         plugin.log(f"cl-hive: SETTLEMENT_OFFER peer_id mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # Verify original sender is a hive member and not banned
+    sender = database.get_member(offer_peer_id)
+    if not sender or database.is_banned(offer_peer_id):
+        plugin.log(f"cl-hive: SETTLEMENT_OFFER from non-member {offer_peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     # Verify the signature
@@ -5911,9 +5952,14 @@ def handle_settlement_offer(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
     result = settlement_mgr.register_offer(offer_peer_id, bolt12_offer)
 
     if "error" not in result:
-        plugin.log(f"cl-hive: Stored settlement offer from {peer_id[:16]}...")
+        is_relayed = _is_relayed_message(payload)
+        relay_info = " (relayed)" if is_relayed else ""
+        plugin.log(f"cl-hive: Stored settlement offer from {offer_peer_id[:16]}...{relay_info}")
     else:
         plugin.log(f"cl-hive: Failed to store settlement offer: {result.get('error')}", level='debug')
+
+    # Relay to other members
+    _relay_message(HiveMessageType.SETTLEMENT_OFFER, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5930,10 +5976,8 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not state_manager or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"[FeeReport] Rejected: non-member or banned {peer_id[:16]}...", level='info')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
 
     # Validate payload schema
@@ -5951,9 +5995,15 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     forward_count = payload.get("forward_count")
     signature = payload.get("signature")
 
-    # Verify the report peer_id matches the sender (you can only report your own fees)
-    if report_peer_id != peer_id:
+    # Verify sender (supports relay) - report_peer_id is the original sender
+    if not _validate_relay_sender(peer_id, report_peer_id, payload):
         plugin.log(f"cl-hive: FEE_REPORT peer_id mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # Verify original sender is a hive member and not banned
+    sender = database.get_member(report_peer_id)
+    if not sender or database.is_banned(report_peer_id):
+        plugin.log(f"[FeeReport] Rejected: non-member or banned {report_peer_id[:16]}...", level='info')
         return {"result": "continue"}
 
     # Verify the signature
@@ -5995,11 +6045,16 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     )
 
     if updated:
+        is_relayed = _is_relayed_message(payload)
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"FEE_GOSSIP: Received FEE_REPORT from {peer_id[:16]}...: {fees_earned_sats} sats, "
+            f"FEE_GOSSIP: Received FEE_REPORT from {report_peer_id[:16]}...{relay_info}: {fees_earned_sats} sats, "
             f"{forward_count} forwards (period {period})",
             level='info'
         )
+
+    # Relay to other members
+    _relay_message(HiveMessageType.FEE_REPORT, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -6025,10 +6080,8 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     if not settlement_mgr or not database or not state_manager:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: SETTLEMENT_PROPOSE from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
 
     # Validate payload schema
@@ -6036,13 +6089,19 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
         plugin.log(f"cl-hive: SETTLEMENT_PROPOSE invalid schema from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify proposer matches sender
+    # Verify proposer (supports relay)
     proposer_peer_id = payload.get("proposer_peer_id")
-    if proposer_peer_id != peer_id:
+    if not _validate_relay_sender(peer_id, proposer_peer_id, payload):
         plugin.log(
             f"cl-hive: SETTLEMENT_PROPOSE proposer mismatch from {peer_id[:16]}...",
             level='warn'
         )
+        return {"result": "continue"}
+
+    # Verify original sender is a hive member and not banned
+    sender = database.get_member(proposer_peer_id)
+    if not sender or database.is_banned(proposer_peer_id):
+        plugin.log(f"cl-hive: SETTLEMENT_PROPOSE from non-member {proposer_peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     # Verify signature
@@ -6101,6 +6160,9 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
         _broadcast_to_members(vote_msg)
         plugin.log(f"SETTLEMENT: Voted on proposal {proposal_id[:16]}... (hash verified)")
 
+    # Relay to other members
+    _relay_message(HiveMessageType.SETTLEMENT_PROPOSE, payload, peer_id)
+
     return {"result": "continue"}
 
 
@@ -6118,10 +6180,8 @@ def handle_settlement_ready(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
     if not settlement_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: SETTLEMENT_READY from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
 
     # Validate payload schema
@@ -6129,13 +6189,19 @@ def handle_settlement_ready(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
         plugin.log(f"cl-hive: SETTLEMENT_READY invalid schema from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify voter matches sender
+    # Verify voter (supports relay)
     voter_peer_id = payload.get("voter_peer_id")
-    if voter_peer_id != peer_id:
+    if not _validate_relay_sender(peer_id, voter_peer_id, payload):
         plugin.log(
             f"cl-hive: SETTLEMENT_READY voter mismatch from {peer_id[:16]}...",
             level='warn'
         )
+        return {"result": "continue"}
+
+    # Verify original sender is a hive member and not banned
+    sender = database.get_member(voter_peer_id)
+    if not sender or database.is_banned(voter_peer_id):
+        plugin.log(f"cl-hive: SETTLEMENT_READY from non-member {voter_peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     # Verify signature
@@ -6178,13 +6244,18 @@ def handle_settlement_ready(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
         data_hash=data_hash,
         signature=signature
     ):
-        plugin.log(f"SETTLEMENT: Recorded vote from {peer_id[:16]}... for {proposal_id[:16]}...")
+        is_relayed = _is_relayed_message(payload)
+        relay_info = " (relayed)" if is_relayed else ""
+        plugin.log(f"SETTLEMENT: Recorded vote from {voter_peer_id[:16]}...{relay_info} for {proposal_id[:16]}...")
 
         # Check if quorum reached
         settlement_mgr.check_quorum_and_mark_ready(
             proposal_id=proposal_id,
             member_count=proposal.get("member_count", 0)
         )
+
+    # Relay to other members
+    _relay_message(HiveMessageType.SETTLEMENT_READY, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -6204,10 +6275,8 @@ def handle_settlement_executed(peer_id: str, payload: Dict, plugin: Plugin) -> D
     if not settlement_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: SETTLEMENT_EXECUTED from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
 
     # Validate payload schema
@@ -6215,13 +6284,19 @@ def handle_settlement_executed(peer_id: str, payload: Dict, plugin: Plugin) -> D
         plugin.log(f"cl-hive: SETTLEMENT_EXECUTED invalid schema from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify executor matches sender
+    # Verify executor (supports relay)
     executor_peer_id = payload.get("executor_peer_id")
-    if executor_peer_id != peer_id:
+    if not _validate_relay_sender(peer_id, executor_peer_id, payload):
         plugin.log(
             f"cl-hive: SETTLEMENT_EXECUTED executor mismatch from {peer_id[:16]}...",
             level='warn'
         )
+        return {"result": "continue"}
+
+    # Verify original sender is a hive member and not banned
+    sender = database.get_member(executor_peer_id)
+    if not sender or database.is_banned(executor_peer_id):
+        plugin.log(f"cl-hive: SETTLEMENT_EXECUTED from non-member {executor_peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     # Verify signature
@@ -6252,18 +6327,23 @@ def handle_settlement_executed(peer_id: str, payload: Dict, plugin: Plugin) -> D
         payment_hash=payment_hash,
         amount_paid_sats=amount_paid
     ):
+        is_relayed = _is_relayed_message(payload)
+        relay_info = " (relayed)" if is_relayed else ""
         if amount_paid > 0:
             plugin.log(
-                f"SETTLEMENT: {peer_id[:16]}... executed payment of {amount_paid} sats "
+                f"SETTLEMENT: {executor_peer_id[:16]}...{relay_info} executed payment of {amount_paid} sats "
                 f"for {proposal_id[:16]}..."
             )
         else:
             plugin.log(
-                f"SETTLEMENT: {peer_id[:16]}... confirmed execution for {proposal_id[:16]}..."
+                f"SETTLEMENT: {executor_peer_id[:16]}...{relay_info} confirmed execution for {proposal_id[:16]}..."
             )
 
         # Check if settlement is complete
         settlement_mgr.check_and_complete_settlement(proposal_id)
+
+    # Relay to other members
+    _relay_message(HiveMessageType.SETTLEMENT_EXECUTED, payload, peer_id)
 
     return {"result": "continue"}
 
