@@ -173,37 +173,19 @@ Fair share calculation:
 
 ## Updating Your Node
 
-When new versions are released, update your node with these steps:
+cl-hive supports **hot updates** - reload the plugin without restarting the node or losing channel state.
 
-### Step 1: Pull Latest Changes
+### Hot Update (Recommended)
 
-```bash
-cd cl-hive
-git pull origin main
-```
-
-### Step 2: Rebuild the Docker Image
+Pull latest code and reload the plugin without downtime:
 
 ```bash
-cd docker
-docker-compose build --no-cache
-```
+# Pull changes inside the container
+docker exec cl-hive-node bash -c "cd /opt/cl-hive && git pull"
 
-The `--no-cache` flag ensures all layers are rebuilt with the latest code.
-
-### Step 3: Restart the Container
-
-```bash
-docker-compose down
-docker-compose up -d
-```
-
-### Step 4: Verify the Update
-
-Check that the node started correctly:
-
-```bash
-docker logs -f cl-hive-node
+# Reload the plugin
+docker exec cl-hive-node lightning-cli plugin stop /opt/cl-hive/cl-hive.py
+docker exec cl-hive-node lightning-cli plugin start /opt/cl-hive/cl-hive.py
 ```
 
 Verify the plugin loaded:
@@ -212,32 +194,51 @@ Verify the plugin loaded:
 docker exec cl-hive-node lightning-cli plugin list | grep hive
 ```
 
-### Quick Update (Single Command)
-
-For a quick update when you're confident about the changes:
+### Updating cl-revenue-ops (if installed)
 
 ```bash
-cd cl-hive && git pull && cd docker && docker-compose build --no-cache && docker-compose down && docker-compose up -d
+docker exec cl-hive-node bash -c "cd /opt/cl-revenue-ops && git pull"
+docker exec cl-hive-node lightning-cli plugin stop /opt/cl-revenue-ops/cl-revenue-ops.py
+docker exec cl-hive-node lightning-cli plugin start /opt/cl-revenue-ops/cl-revenue-ops.py
 ```
 
-### Preserving Data
+### One-Liner Hot Update
+
+```bash
+docker exec cl-hive-node bash -c "cd /opt/cl-hive && git pull" && \
+docker exec cl-hive-node lightning-cli plugin stop /opt/cl-hive/cl-hive.py && \
+docker exec cl-hive-node lightning-cli plugin start /opt/cl-hive/cl-hive.py
+```
+
+### Full Container Rebuild (Major Updates)
+
+For major version updates or dependency changes, rebuild the container:
+
+```bash
+cd cl-hive/docker
+git pull origin main
+docker-compose build --no-cache
+docker-compose down && docker-compose up -d
+```
+
+### Rollback
+
+If an update causes issues:
+
+```bash
+# Rollback to previous version
+docker exec cl-hive-node bash -c "cd /opt/cl-hive && git checkout <previous-commit-hash>"
+docker exec cl-hive-node lightning-cli plugin stop /opt/cl-hive/cl-hive.py
+docker exec cl-hive-node lightning-cli plugin start /opt/cl-hive/cl-hive.py
+```
+
+### Data Persistence
 
 Your Lightning data is stored in Docker volumes and persists across updates:
 - `/data/lightning` - Channel database, keys, and state
 - `/data/bitcoin` - Bitcoin data (if not using external node)
 
 These volumes are NOT deleted by `docker-compose down`. Only `docker-compose down -v` removes volumes (avoid this unless you want to start fresh).
-
-### Rollback
-
-If an update causes issues, rollback to a previous version:
-
-```bash
-git checkout <previous-commit-hash>
-cd docker
-docker-compose build --no-cache
-docker-compose down && docker-compose up -d
-```
 
 ## Troubleshooting
 
