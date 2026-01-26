@@ -3296,9 +3296,10 @@ async def handle_propose_promotion(args: Dict) -> Dict:
     info = await node.call("getinfo")
     proposer_peer_id = info.get("id")
 
-    return await node.call("hive-propose-promotion",
-                           target_peer_id=target_peer_id,
-                           proposer_peer_id=proposer_peer_id)
+    return await node.call("hive-propose-promotion", {
+        "target_peer_id": target_peer_id,
+        "proposer_peer_id": proposer_peer_id
+    })
 
 
 async def handle_vote_promotion(args: Dict) -> Dict:
@@ -3317,9 +3318,10 @@ async def handle_vote_promotion(args: Dict) -> Dict:
     info = await node.call("getinfo")
     voter_peer_id = info.get("id")
 
-    return await node.call("hive-vote-promotion",
-                           target_peer_id=target_peer_id,
-                           voter_peer_id=voter_peer_id)
+    return await node.call("hive-vote-promotion", {
+        "target_peer_id": target_peer_id,
+        "voter_peer_id": voter_peer_id
+    })
 
 
 async def handle_pending_promotions(args: Dict) -> Dict:
@@ -3348,7 +3350,7 @@ async def handle_execute_promotion(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    return await node.call("hive-execute-promotion", target_peer_id=target_peer_id)
+    return await node.call("hive-execute-promotion", {"target_peer_id": target_peer_id})
 
 
 async def handle_node_info(args: Dict) -> Dict:

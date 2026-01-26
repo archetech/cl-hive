@@ -93,6 +93,7 @@ from modules.strategic_positioning import StrategicPositioningManager
 from modules.anticipatory_liquidity import AnticipatoryLiquidityManager
 from modules.task_manager import TaskManager
 from modules.splice_manager import SpliceManager
+from modules.relay import RelayManager
 from modules.rpc_commands import (
     HiveContext,
     status as rpc_status,
@@ -308,6 +309,7 @@ strategic_positioning_mgr: Optional[StrategicPositioningManager] = None
 anticipatory_liquidity_mgr: Optional[AnticipatoryLiquidityManager] = None
 task_mgr: Optional[TaskManager] = None
 splice_mgr: Optional[SpliceManager] = None
+relay_mgr: Optional[RelayManager] = None
 our_pubkey: Optional[str] = None
 
 # Fee tracking for real-time gossip (Settlement Phase)
@@ -976,7 +978,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     5. Verify cl-revenue-ops dependency
     6. Set up signal handlers for graceful shutdown
     """
-    global database, config, safe_plugin, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge, vpn_transport
+    global database, config, safe_plugin, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge, vpn_transport, relay_mgr
     
     plugin.log("cl-hive: Initializing Swarm Intelligence layer...")
     
@@ -1042,6 +1044,35 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Sync gossip version from persisted state to avoid version reset on restart
     gossip_mgr.sync_version_from_state_manager(our_pubkey)
+
+    # Initialize relay manager for gossip propagation in non-mesh topologies
+    def _relay_send_message(peer_id: str, message_bytes: bytes) -> bool:
+        """Send message to peer for relay."""
+        try:
+            safe_plugin.rpc.call("sendcustommsg", {
+                "node_id": peer_id,
+                "msg": message_bytes.hex()
+            })
+            return True
+        except Exception:
+            return False
+
+    def _relay_get_members() -> list:
+        """Get list of member pubkeys for relay."""
+        if not database:
+            return []
+        return [
+            m["peer_id"] for m in database.get_all_members()
+            if m.get("tier") == MembershipTier.MEMBER.value
+        ]
+
+    relay_mgr = RelayManager(
+        our_pubkey=our_pubkey,
+        send_message=_relay_send_message,
+        get_members=_relay_get_members,
+        log=lambda msg, level: safe_plugin.log(f"[Relay] {msg}", level=level)
+    )
+    plugin.log("cl-hive: Relay manager initialized (TTL-based gossip propagation)")
 
     intent_mgr = IntentManager(
         database,
@@ -2004,8 +2035,15 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     The GossipManager handles version validation and StateManager updates.
 
     SECURITY: Requires cryptographic signature verification.
+
+    RELAY: Supports multi-hop relay for non-mesh topologies.
     """
     if not gossip_mgr:
+        return {"result": "continue"}
+
+    # RELAY: Check deduplication before processing
+    if not _should_process_message(payload):
+        plugin.log(f"cl-hive: GOSSIP duplicate from {peer_id[:16]}..., skipping", level='debug')
         return {"result": "continue"}
 
     # SECURITY: Validate payload structure including signature field
@@ -2033,27 +2071,41 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: GOSSIP signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
-    # SECURITY: Verify sender identity matches peer_id
-    if sender_id != peer_id:
-        plugin.log(
-            f"cl-hive: GOSSIP sender mismatch: claimed {sender_id[:16]}... but peer is {peer_id[:16]}...",
-            level='warn'
-        )
+    # SECURITY: Validate sender (supports relay - peer_id may differ from sender_id)
+    if not _validate_relay_sender(peer_id, sender_id, payload):
+        is_relayed = _is_relayed_message(payload)
+        if is_relayed:
+            plugin.log(
+                f"cl-hive: GOSSIP relayed by non-member {peer_id[:16]}..., ignoring",
+                level='warn'
+            )
+        else:
+            plugin.log(
+                f"cl-hive: GOSSIP sender mismatch: claimed {sender_id[:16]}... but peer is {peer_id[:16]}...",
+                level='warn'
+            )
         return {"result": "continue"}
 
-    # Verify sender is a Hive member before processing
+    # Verify original sender is a Hive member before processing
     if not database:
         return {"result": "continue"}
-    member = database.get_member(peer_id)
+    member = database.get_member(sender_id)
     if not member:
-        plugin.log(f"cl-hive: GOSSIP from non-member {peer_id[:16]}..., ignoring", level='warn')
+        plugin.log(f"cl-hive: GOSSIP from non-member {sender_id[:16]}..., ignoring", level='warn')
         return {"result": "continue"}
 
-    accepted = gossip_mgr.process_gossip(peer_id, payload)
+    accepted = gossip_mgr.process_gossip(sender_id, payload)
 
     if accepted:
-        plugin.log(f"cl-hive: GOSSIP accepted from {peer_id[:16]}... "
+        is_relayed = _is_relayed_message(payload)
+        relay_info = " (relayed)" if is_relayed else ""
+        plugin.log(f"cl-hive: GOSSIP accepted from {sender_id[:16]}...{relay_info} "
                    f"(v{payload.get('version', '?')})", level='debug')
+
+    # RELAY: Forward to other members if TTL allows
+    relay_count = _relay_message(HiveMessageType.GOSSIP, payload, peer_id)
+    if relay_count > 0:
+        plugin.log(f"cl-hive: GOSSIP relayed to {relay_count} members", level='debug')
 
     return {"result": "continue"}
 
@@ -3030,6 +3082,110 @@ def _broadcast_to_members(message_bytes: bytes) -> int:
     return sent_count
 
 
+def _is_relayed_message(payload: Dict[str, Any]) -> bool:
+    """Check if message was relayed (not direct from origin)."""
+    relay_data = payload.get("_relay", {})
+    relay_path = relay_data.get("relay_path", [])
+    return len(relay_path) > 1
+
+
+def _get_message_origin(payload: Dict[str, Any]) -> Optional[str]:
+    """Get original sender of message (may differ from peer_id for relayed messages)."""
+    relay_data = payload.get("_relay", {})
+    return relay_data.get("origin")
+
+
+def _validate_relay_sender(peer_id: str, sender_id: str, payload: Dict[str, Any]) -> bool:
+    """
+    Validate sender for both direct and relayed messages.
+
+    For direct messages: sender_id must equal peer_id
+    For relayed messages: sender_id must be in relay_path origin, peer_id must be a member
+
+    Returns:
+        True if sender is valid
+    """
+    if not database:
+        return False
+
+    if _is_relayed_message(payload):
+        # Relayed message: verify peer_id is a known member (they're relaying)
+        relay_peer = database.get_member(peer_id)
+        if not relay_peer or relay_peer.get("tier") != MembershipTier.MEMBER.value:
+            return False
+        # Verify origin matches claimed sender_id
+        origin = _get_message_origin(payload)
+        if origin and origin != sender_id:
+            return False
+        # Verify original sender is also a member
+        original_sender = database.get_member(sender_id)
+        if not original_sender:
+            return False
+        return True
+    else:
+        # Direct message: sender_id must match peer_id
+        return sender_id == peer_id
+
+
+def _relay_message(
+    msg_type: HiveMessageType,
+    payload: Dict[str, Any],
+    sender_peer_id: str
+) -> int:
+    """
+    Relay a received message to other hive members.
+
+    Args:
+        msg_type: The message type
+        payload: The message payload (with _relay metadata if present)
+        sender_peer_id: Who sent us this message
+
+    Returns:
+        Number of members relayed to
+    """
+    if not relay_mgr:
+        return 0
+
+    # Check if should relay (TTL > 0, not in path already)
+    if not relay_mgr.should_relay(payload):
+        return 0
+
+    # Prepare for relay (decrement TTL, add us to path)
+    relay_payload = relay_mgr.prepare_for_relay(payload, sender_peer_id)
+    if not relay_payload:
+        return 0
+
+    # Encode and relay
+    def encode_message(p: Dict[str, Any]) -> bytes:
+        return serialize(msg_type, p)
+
+    return relay_mgr.relay(relay_payload, sender_peer_id, encode_message)
+
+
+def _prepare_broadcast_payload(payload: Dict[str, Any], ttl: int = 3) -> Dict[str, Any]:
+    """
+    Prepare a new message payload with relay metadata for broadcast.
+
+    Call this when originating a new message (not relaying).
+    """
+    if not relay_mgr:
+        return payload
+    return relay_mgr.prepare_for_broadcast(payload, ttl)
+
+
+def _should_process_message(payload: Dict[str, Any]) -> bool:
+    """
+    Check if message should be processed (deduplication check).
+
+    Returns:
+        True if this is a new message that should be processed
+        False if duplicate (already seen)
+    """
+    if not relay_mgr:
+        return True  # No relay manager, process everything
+    return relay_mgr.should_process(payload)
+
+
 def _sync_member_policies(plugin: Plugin) -> None:
     """
     Sync fee policies for all existing members on startup.
@@ -3123,7 +3279,17 @@ def _sync_membership_on_startup(plugin: Plugin) -> None:
 
 
 def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle PROMOTION_REQUEST message from neophyte.
+
+    RELAY: Supports multi-hop relay for non-mesh topologies.
+    """
     if not config or not config.membership_enabled or not membership_mgr:
+        return {"result": "continue"}
+
+    # RELAY: Check deduplication before processing
+    if not _should_process_message(payload):
+        plugin.log(f"cl-hive: PROMOTION_REQUEST duplicate from {peer_id[:16]}..., skipping", level='debug')
         return {"result": "continue"}
 
     if not validate_promotion_request(payload):
@@ -3134,9 +3300,17 @@ def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     request_id = payload["request_id"]
     timestamp = payload["timestamp"]
 
-    if target_pubkey != peer_id:
+    # For direct messages: target must be the sender
+    # For relayed messages: target is the original neophyte, peer_id is the relay node
+    is_relayed = _is_relayed_message(payload)
+    if not is_relayed and target_pubkey != peer_id:
         plugin.log(f"cl-hive: PROMOTION_REQUEST from {peer_id[:16]}... target mismatch", level='warn')
         return {"result": "continue"}
+
+    # RELAY: Forward to other members before processing
+    relay_count = _relay_message(HiveMessageType.PROMOTION_REQUEST, payload, peer_id)
+    if relay_count > 0:
+        plugin.log(f"cl-hive: PROMOTION_REQUEST relayed to {relay_count} members", level='debug')
 
     target_member = database.get_member(target_pubkey)
     if not target_member or target_member.get("tier") != MembershipTier.NEOPHYTE.value:
@@ -3181,18 +3355,37 @@ def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
 
 
 def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle VOUCH message from member endorsing a neophyte.
+
+    RELAY: Supports multi-hop relay for non-mesh topologies.
+    """
     if not config or not config.membership_enabled or not membership_mgr:
+        return {"result": "continue"}
+
+    # RELAY: Check deduplication before processing
+    if not _should_process_message(payload):
+        plugin.log(f"cl-hive: VOUCH duplicate from {peer_id[:16]}..., skipping", level='debug')
         return {"result": "continue"}
 
     if not validate_vouch(payload):
         plugin.log(f"cl-hive: VOUCH from {peer_id[:16]}... invalid payload", level='warn')
         return {"result": "continue"}
 
-    if payload["voucher_pubkey"] != peer_id:
+    # For direct messages: voucher must be the sender
+    # For relayed messages: voucher is the original member, peer_id is the relay node
+    voucher_pubkey = payload["voucher_pubkey"]
+    is_relayed = _is_relayed_message(payload)
+    if not is_relayed and voucher_pubkey != peer_id:
         plugin.log(f"cl-hive: VOUCH from {peer_id[:16]}... voucher mismatch", level='warn')
         return {"result": "continue"}
 
-    voucher = database.get_member(peer_id)
+    # RELAY: Forward to other members before processing
+    relay_count = _relay_message(HiveMessageType.VOUCH, payload, peer_id)
+    if relay_count > 0:
+        plugin.log(f"cl-hive: VOUCH relayed to {relay_count} members", level='debug')
+
+    voucher = database.get_member(voucher_pubkey)
     if not voucher or voucher.get("tier") not in (MembershipTier.MEMBER.value,):
         return {"result": "continue"}
 
@@ -4728,28 +4921,44 @@ def handle_fee_intelligence_snapshot(peer_id: str, payload: Dict, plugin: Plugin
 
     This is the preferred method for receiving fee intelligence - one message
     contains observations for all peers instead of N individual messages.
+
+    RELAY: Supports multi-hop relay for non-mesh topologies.
     """
     if not fee_intel_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT from non-member {peer_id[:16]}...", level='debug')
+    # RELAY: Check deduplication before processing
+    if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # Get the actual sender (may differ from peer_id for relayed messages)
+    reporter_id = payload.get("reporter_id", peer_id)
+    is_relayed = _is_relayed_message(payload)
+
+    # Verify original sender is a hive member and not banned
+    sender = database.get_member(reporter_id)
+    if not sender or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT from non-member {reporter_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # RELAY: Forward to other members
+    relay_count = _relay_message(HiveMessageType.FEE_INTELLIGENCE_SNAPSHOT, payload, peer_id)
+    if relay_count > 0:
+        plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT relayed to {relay_count} members", level='debug')
+
     # Delegate to fee intelligence manager
-    result = fee_intel_mgr.handle_fee_intelligence_snapshot(peer_id, payload, safe_plugin.rpc)
+    result = fee_intel_mgr.handle_fee_intelligence_snapshot(reporter_id, payload, safe_plugin.rpc)
 
     if result.get("success"):
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored fee intelligence snapshot from {peer_id[:16]}... "
+            f"cl-hive: Stored fee intelligence snapshot from {reporter_id[:16]}...{relay_info} "
             f"with {result.get('peers_stored', 0)} peers",
             level='debug'
         )
     elif result.get("error"):
         plugin.log(
-            f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT rejected from {peer_id[:16]}...: {result.get('error')}",
+            f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT rejected from {reporter_id[:16]}...: {result.get('error')}",
             level='debug'
         )
 
@@ -4761,28 +4970,44 @@ def handle_health_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     Handle HEALTH_REPORT message from a hive member.
 
     Used for NNLB (No Node Left Behind) coordination.
+
+    RELAY: Supports multi-hop relay for non-mesh topologies.
     """
     if not fee_intel_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: HEALTH_REPORT from non-member {peer_id[:16]}...", level='debug')
+    # RELAY: Check deduplication before processing
+    if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # Get the actual sender (may differ from peer_id for relayed messages)
+    reporter_id = payload.get("reporter_id", peer_id)
+    is_relayed = _is_relayed_message(payload)
+
+    # Verify original sender is a hive member and not banned
+    sender = database.get_member(reporter_id)
+    if not sender or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: HEALTH_REPORT from non-member {reporter_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # RELAY: Forward to other members
+    relay_count = _relay_message(HiveMessageType.HEALTH_REPORT, payload, peer_id)
+    if relay_count > 0:
+        plugin.log(f"cl-hive: HEALTH_REPORT relayed to {relay_count} members", level='debug')
+
     # Delegate to fee intelligence manager
-    result = fee_intel_mgr.handle_health_report(peer_id, payload, safe_plugin.rpc)
+    result = fee_intel_mgr.handle_health_report(reporter_id, payload, safe_plugin.rpc)
 
     if result.get("success"):
         tier = result.get("tier", "unknown")
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored health report from {peer_id[:16]}... (tier={tier})",
+            f"cl-hive: Stored health report from {reporter_id[:16]}...{relay_info} (tier={tier})",
             level='debug'
         )
     elif result.get("error"):
         plugin.log(
-            f"cl-hive: HEALTH_REPORT rejected from {peer_id[:16]}...: {result.get('error')}",
+            f"cl-hive: HEALTH_REPORT rejected from {reporter_id[:16]}...: {result.get('error')}",
             level='debug'
         )
 
@@ -4794,27 +5019,43 @@ def handle_liquidity_need(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     Handle LIQUIDITY_NEED message from a hive member.
 
     Used for cooperative rebalancing coordination.
+
+    RELAY: Supports multi-hop relay for non-mesh topologies.
     """
     if not liquidity_coord or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: LIQUIDITY_NEED from non-member {peer_id[:16]}...", level='debug')
+    # RELAY: Check deduplication before processing
+    if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # Get the actual sender (may differ from peer_id for relayed messages)
+    reporter_id = payload.get("reporter_id", peer_id)
+    is_relayed = _is_relayed_message(payload)
+
+    # Verify original sender is a hive member and not banned
+    sender = database.get_member(reporter_id)
+    if not sender or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: LIQUIDITY_NEED from non-member {reporter_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # RELAY: Forward to other members
+    relay_count = _relay_message(HiveMessageType.LIQUIDITY_NEED, payload, peer_id)
+    if relay_count > 0:
+        plugin.log(f"cl-hive: LIQUIDITY_NEED relayed to {relay_count} members", level='debug')
+
     # Delegate to liquidity coordinator
-    result = liquidity_coord.handle_liquidity_need(peer_id, payload, safe_plugin.rpc)
+    result = liquidity_coord.handle_liquidity_need(reporter_id, payload, safe_plugin.rpc)
 
     if result.get("success"):
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored liquidity need from {peer_id[:16]}...",
+            f"cl-hive: Stored liquidity need from {reporter_id[:16]}...{relay_info}",
             level='debug'
         )
     elif result.get("error"):
         plugin.log(
-            f"cl-hive: LIQUIDITY_NEED rejected from {peer_id[:16]}...: {result.get('error')}",
+            f"cl-hive: LIQUIDITY_NEED rejected from {reporter_id[:16]}...: {result.get('error')}",
             level='debug'
         )
 
@@ -4827,28 +5068,44 @@ def handle_liquidity_snapshot(peer_id: str, payload: Dict, plugin: Plugin) -> Di
 
     This is the preferred method for receiving liquidity needs - one message
     contains multiple needs instead of N individual messages.
+
+    RELAY: Supports multi-hop relay for non-mesh topologies.
     """
     if not liquidity_coord or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: LIQUIDITY_SNAPSHOT from non-member {peer_id[:16]}...", level='debug')
+    # RELAY: Check deduplication before processing
+    if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # Get the actual sender (may differ from peer_id for relayed messages)
+    reporter_id = payload.get("reporter_id", peer_id)
+    is_relayed = _is_relayed_message(payload)
+
+    # Verify original sender is a hive member and not banned
+    sender = database.get_member(reporter_id)
+    if not sender or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: LIQUIDITY_SNAPSHOT from non-member {reporter_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # RELAY: Forward to other members
+    relay_count = _relay_message(HiveMessageType.LIQUIDITY_SNAPSHOT, payload, peer_id)
+    if relay_count > 0:
+        plugin.log(f"cl-hive: LIQUIDITY_SNAPSHOT relayed to {relay_count} members", level='debug')
+
     # Delegate to liquidity coordinator
-    result = liquidity_coord.handle_liquidity_snapshot(peer_id, payload, safe_plugin.rpc)
+    result = liquidity_coord.handle_liquidity_snapshot(reporter_id, payload, safe_plugin.rpc)
 
     if result.get("success"):
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored liquidity snapshot from {peer_id[:16]}... "
+            f"cl-hive: Stored liquidity snapshot from {reporter_id[:16]}...{relay_info} "
             f"with {result.get('needs_stored', 0)} needs",
             level='debug'
         )
     elif result.get("error"):
         plugin.log(
-            f"cl-hive: LIQUIDITY_SNAPSHOT rejected from {peer_id[:16]}...: {result.get('error')}",
+            f"cl-hive: LIQUIDITY_SNAPSHOT rejected from {reporter_id[:16]}...: {result.get('error')}",
             level='debug'
         )
 
@@ -10877,9 +11134,13 @@ def hive_vouch(plugin: Plugin, peer_id: str):
             break
 
     if not pending_request:
-        return {"error": "no_pending_promotion_request", "peer_id": peer_id}
-
-    request_id = pending_request["request_id"]
+        # Auto-create promotion request if member is vouching
+        # This allows members to initiate promotion without neophyte requesting
+        request_id = f"member_initiated_{int(time.time())}"
+        database.add_promotion_request(peer_id, request_id, status="pending")
+        plugin.log(f"cl-hive: Auto-created promotion request for {peer_id[:16]}... (member-initiated vouch)")
+    else:
+        request_id = pending_request["request_id"]
 
     # Check if we already vouched
     existing_vouches = database.get_promotion_vouches(peer_id, request_id)
