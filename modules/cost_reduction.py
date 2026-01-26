@@ -1678,14 +1678,12 @@ class CostReductionManager:
                 # us -> from_peer -> ??? -> to_peer -> us
                 # The intermediate node must have channels to both from_peer and to_peer
 
-                # Get hive members
-                try:
-                    members_result = rpc.call("hive-members")
-                    members = members_result.get('members', [])
-                except Exception:
-                    return {"error": "Failed to get hive members. Is cl-hive plugin loaded?"}
+                # Get hive members directly from database (avoid RPC deadlock)
+                if not self.database:
+                    return {"error": "Database not available"}
 
-                member_ids = {m['peer_id'] for m in members}
+                members = self.database.get_all_members()
+                member_ids = {m['peer_id'] for m in members if m.get('peer_id')}
 
                 # Check if from_peer and to_peer are both hive members
                 if from_peer not in member_ids:
