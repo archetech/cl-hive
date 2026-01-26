@@ -137,7 +137,8 @@ backup_hsm_secret() {
     mkdir -p "$hsm_dir"
 
     # Copy hsm_secret from container
-    docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/hsm_secret" "$hsm_dir/hsm_secret"
+    # CLN puts hsm_secret in the network subdirectory within LIGHTNING_DIR
+    docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/$NETWORK/hsm_secret" "$hsm_dir/hsm_secret"
 
     # Fix ownership (docker cp creates files as root)
     sudo chown "$USER:$USER" "$hsm_dir/hsm_secret"
