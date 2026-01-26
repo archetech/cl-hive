@@ -20,6 +20,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from . import network_metrics
+
 # =============================================================================
 # CONSTANTS
 # =============================================================================
@@ -60,6 +62,12 @@ AUTO_TRIGGER_MAX_PCT_OF_CAPACITY = 0.10     # Max 10% of total capacity per acti
 EXCHANGE_PRIORITY_BONUS = 1.5               # 50% bonus for exchange channels
 BRIDGE_PRIORITY_BONUS = 1.3                 # 30% bonus for bridge positions
 UNDERSERVED_PRIORITY_BONUS = 1.2            # 20% bonus for underserved targets
+
+# Centrality-aware targeting (Use Case 4)
+CENTRALITY_IMPROVEMENT_BONUS = 1.25         # 25% bonus for centrality improvements
+LOW_CENTRALITY_MEMBER_BONUS = 1.15          # 15% bonus when member has low centrality
+LOW_CENTRALITY_THRESHOLD = 0.3              # Members below this are "low centrality"
+MIN_CENTRALITY_IMPROVEMENT = 0.05           # Minimum improvement to apply bonus
 
 # Fleet coordination
 MAX_MEMBERS_PER_TARGET = 2                  # Max 2 members per target (healthy redundancy)
@@ -163,10 +171,15 @@ class PositionRecommendation:
     # Current state
     current_fleet_channels: int = 0
 
+    # Centrality impact (Use Case 4)
+    member_current_centrality: float = 0.0
+    estimated_centrality_improvement: float = 0.0
+    improves_network_position: bool = False
+
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "target_peer_id": self.target_peer_id,
             "target_alias": self.target_alias,
             "recommended_member": self.recommended_member,
@@ -183,6 +196,12 @@ class PositionRecommendation:
             "current_fleet_channels": self.current_fleet_channels,
             "timestamp": self.timestamp
         }
+        # Include centrality info if there's a network position improvement
+        if self.improves_network_position:
+            result["member_current_centrality"] = round(self.member_current_centrality, 3)
+            result["estimated_centrality_improvement"] = round(self.estimated_centrality_improvement, 3)
+            result["improves_network_position"] = True
+        return result
 
 
 @dataclass
@@ -610,6 +629,65 @@ class FleetPositioningStrategy:
 
         return count
 
+    def _get_member_centrality(self, member_id: str) -> float:
+        """Get hive centrality for a member."""
+        calculator = network_metrics.get_calculator()
+        if not calculator:
+            return 0.5  # Default to middle value
+
+        metrics = calculator.get_member_metrics(member_id)
+        if not metrics:
+            return 0.5
+
+        return metrics.hive_centrality
+
+    def _estimate_centrality_improvement(
+        self,
+        member_id: str,
+        target_peer_id: str
+    ) -> float:
+        """
+        Estimate how much opening a channel to target would improve member's centrality.
+
+        Higher values indicate the target would provide better network position.
+        """
+        calculator = network_metrics.get_calculator()
+        if not calculator:
+            return 0.0
+
+        # Get current member metrics
+        member_metrics = calculator.get_member_metrics(member_id)
+        if not member_metrics:
+            return 0.0
+
+        current_centrality = member_metrics.hive_centrality
+        hive_peer_count = member_metrics.hive_peer_count
+
+        # Check if target is a hive member (internal channel)
+        topology = calculator._get_topology_snapshot()
+        if not topology:
+            return 0.0
+
+        is_hive_target = target_peer_id in topology.member_topologies
+
+        if is_hive_target:
+            # Opening to hive member improves internal connectivity
+            # Improvement is inversely proportional to current hive connections
+            if hive_peer_count == 0:
+                # First hive connection is a big improvement
+                return 0.3
+            elif hive_peer_count == 1:
+                # Second hive connection still significant
+                return 0.15
+            else:
+                # Diminishing returns
+                return max(0.02, 0.1 / hive_peer_count)
+        else:
+            # Opening to external target - check if it improves bridge position
+            # (bridge bonus if target is well-connected externally)
+            # This is a heuristic - real bridge detection would need network graph
+            return 0.02  # Minimal centrality boost for external targets
+
     def _select_best_member_for_target(self, target_peer_id: str) -> Optional[str]:
         """
         Select the best fleet member to open a channel to target.
@@ -619,6 +697,9 @@ class FleetPositioningStrategy:
         - Has available on-chain funds
         - Has capacity for another channel
         - Complements existing positions
+        - Considers hive centrality (Use Case 4):
+          - Members with lower centrality get priority for strategic targets
+          - Targets that improve centrality get higher scores
         """
         members = self._get_fleet_members()
         if not members:
@@ -651,7 +732,29 @@ class FleetPositioningStrategy:
             elif channel_count > 50:
                 score -= 0.2
 
-            candidates.append((member_id, score))
+            # Use Case 4: Centrality-aware scoring
+            member_centrality = self._get_member_centrality(member_id)
+
+            # Bonus for members with low centrality (they need connections more)
+            if member_centrality < LOW_CENTRALITY_THRESHOLD:
+                score *= LOW_CENTRALITY_MEMBER_BONUS
+                self._log(
+                    f"Member {member_id[:16]}... has low centrality ({member_centrality:.2f}), "
+                    f"applying {LOW_CENTRALITY_MEMBER_BONUS}x bonus",
+                    level="debug"
+                )
+
+            # Bonus if this target would significantly improve centrality
+            centrality_improvement = self._estimate_centrality_improvement(member_id, target_peer_id)
+            if centrality_improvement >= MIN_CENTRALITY_IMPROVEMENT:
+                score *= CENTRALITY_IMPROVEMENT_BONUS
+                self._log(
+                    f"Target {target_peer_id[:16]}... would improve {member_id[:16]}...'s "
+                    f"centrality by ~{centrality_improvement:.2f}",
+                    level="debug"
+                )
+
+            candidates.append((member_id, score, member_centrality, centrality_improvement))
 
         if not candidates:
             return None
@@ -659,6 +762,64 @@ class FleetPositioningStrategy:
         # Return highest scoring candidate
         candidates.sort(key=lambda x: x[1], reverse=True)
         return candidates[0][0]
+
+    def _select_best_member_with_metrics(
+        self,
+        target_peer_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Select best member and return selection metrics for recommendations.
+
+        Returns:
+            Dict with member_id, centrality, and improvement estimate
+        """
+        members = self._get_fleet_members()
+        if not members:
+            return None
+
+        candidates = []
+
+        for member_id in members:
+            if not self.state_manager:
+                continue
+
+            state = self.state_manager.get_peer_state(member_id)
+            if not state:
+                continue
+
+            topology = set(getattr(state, 'topology', []) or [])
+
+            if target_peer_id in topology:
+                continue
+
+            score = 1.0
+            channel_count = len(topology)
+            if channel_count < 20:
+                score += 0.2
+            elif channel_count > 50:
+                score -= 0.2
+
+            member_centrality = self._get_member_centrality(member_id)
+            centrality_improvement = self._estimate_centrality_improvement(member_id, target_peer_id)
+
+            if member_centrality < LOW_CENTRALITY_THRESHOLD:
+                score *= LOW_CENTRALITY_MEMBER_BONUS
+
+            if centrality_improvement >= MIN_CENTRALITY_IMPROVEMENT:
+                score *= CENTRALITY_IMPROVEMENT_BONUS
+
+            candidates.append({
+                "member_id": member_id,
+                "score": score,
+                "centrality": member_centrality,
+                "centrality_improvement": centrality_improvement
+            })
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates[0]
 
     def recommend_next_open(
         self,
@@ -772,6 +933,11 @@ class FleetPositioningStrategy:
         """
         Get top positioning recommendations for the fleet.
 
+        Now includes hive centrality analysis (Use Case 4):
+        - Selects members who would benefit most from new connections
+        - Estimates centrality improvement from target connection
+        - Applies bonuses for network position improvements
+
         Args:
             count: Number of recommendations to return
 
@@ -801,10 +967,14 @@ class FleetPositioningStrategy:
             if fleet_channels >= MAX_MEMBERS_PER_TARGET:
                 continue
 
-            # Select member
-            recommended_member = self._select_best_member_for_target(target)
-            if not recommended_member:
+            # Select member with centrality metrics (Use Case 4)
+            member_selection = self._select_best_member_with_metrics(target)
+            if not member_selection:
                 continue
+
+            recommended_member = member_selection["member_id"]
+            member_centrality = member_selection["centrality"]
+            centrality_improvement = member_selection["centrality_improvement"]
 
             # Calculate priority
             priority = corridor.value_score
@@ -818,6 +988,11 @@ class FleetPositioningStrategy:
             if fleet_channels == 0:
                 priority *= UNDERSERVED_PRIORITY_BONUS
 
+            # Use Case 4: Apply centrality improvement bonus
+            improves_network_position = centrality_improvement >= MIN_CENTRALITY_IMPROVEMENT
+            if improves_network_position:
+                priority *= CENTRALITY_IMPROVEMENT_BONUS
+
             # Determine priority tier
             if priority >= 0.5:
                 priority_tier = "critical"
@@ -828,19 +1003,30 @@ class FleetPositioningStrategy:
             else:
                 priority_tier = "low"
 
+            # Build reason with centrality context
+            reason_parts = [f"{corridor.value_tier} value corridor"]
+            if improves_network_position:
+                reason_parts.append(f"improves hive centrality by ~{centrality_improvement:.0%}")
+            if member_centrality < LOW_CENTRALITY_THRESHOLD:
+                reason_parts.append(f"member needs better connectivity")
+
             rec = PositionRecommendation(
                 target_peer_id=target,
                 target_alias=corridor.destination_alias,
                 recommended_member=recommended_member,
                 recommended_capacity_sats=5_000_000,
                 max_fee_rate_ppm=1000,
-                reason=f"{corridor.value_tier} value corridor",
+                reason="; ".join(reason_parts),
                 priority_score=priority,
                 priority_tier=priority_tier,
                 is_exchange=is_exchange,
                 is_underserved=fleet_channels == 0,
                 corridor_value=corridor.value_score,
-                current_fleet_channels=fleet_channels
+                current_fleet_channels=fleet_channels,
+                # Centrality fields (Use Case 4)
+                member_current_centrality=member_centrality,
+                estimated_centrality_improvement=centrality_improvement,
+                improves_network_position=improves_network_position
             )
 
             recommendations.append(rec)
