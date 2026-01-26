@@ -173,11 +173,36 @@ Fair share calculation:
 
 ## Updating Your Node
 
-cl-hive supports **hot updates** - reload the plugin without restarting the node or losing channel state.
+cl-hive supports **hot updates** - reload plugins without restarting the node or losing channel state.
 
-### Hot Update (Recommended)
+### Hot Update Script (Recommended)
 
-Pull latest code and reload the plugin without downtime:
+Use the built-in hot upgrade script:
+
+```bash
+cd cl-hive/docker/scripts
+
+# Check for updates (dry run)
+./hot-upgrade.sh --check
+
+# Upgrade both cl-hive and cl-revenue-ops
+./hot-upgrade.sh
+
+# Upgrade only cl-hive
+./hot-upgrade.sh hive
+
+# Upgrade only cl-revenue-ops
+./hot-upgrade.sh revenue
+```
+
+The script will:
+1. Check for available updates
+2. Pull the latest code
+3. Restart only the upgraded plugins (no node downtime)
+
+### Manual Hot Update
+
+If you prefer manual control:
 
 ```bash
 # Pull changes inside the container
@@ -188,31 +213,16 @@ docker exec cl-hive-node lightning-cli plugin stop /opt/cl-hive/cl-hive.py
 docker exec cl-hive-node lightning-cli plugin start /opt/cl-hive/cl-hive.py
 ```
 
-Verify the plugin loaded:
-
-```bash
-docker exec cl-hive-node lightning-cli plugin list | grep hive
-```
-
-### Updating cl-revenue-ops (if installed)
-
-```bash
-docker exec cl-hive-node bash -c "cd /opt/cl-revenue-ops && git pull"
-docker exec cl-hive-node lightning-cli plugin stop /opt/cl-revenue-ops/cl-revenue-ops.py
-docker exec cl-hive-node lightning-cli plugin start /opt/cl-revenue-ops/cl-revenue-ops.py
-```
-
-### One-Liner Hot Update
-
-```bash
-docker exec cl-hive-node bash -c "cd /opt/cl-hive && git pull" && \
-docker exec cl-hive-node lightning-cli plugin stop /opt/cl-hive/cl-hive.py && \
-docker exec cl-hive-node lightning-cli plugin start /opt/cl-hive/cl-hive.py
-```
-
 ### Full Container Rebuild (Major Updates)
 
-For major version updates or dependency changes, rebuild the container:
+For major version updates or dependency changes, use the full upgrade script:
+
+```bash
+cd cl-hive/docker/scripts
+./upgrade.sh
+```
+
+Or manually rebuild:
 
 ```bash
 cd cl-hive/docker
@@ -223,10 +233,16 @@ docker-compose down && docker-compose up -d
 
 ### Rollback
 
-If an update causes issues:
+Use the rollback script:
 
 ```bash
-# Rollback to previous version
+cd cl-hive/docker/scripts
+./rollback.sh
+```
+
+Or manually:
+
+```bash
 docker exec cl-hive-node bash -c "cd /opt/cl-hive && git checkout <previous-commit-hash>"
 docker exec cl-hive-node lightning-cli plugin stop /opt/cl-hive/cl-hive.py
 docker exec cl-hive-node lightning-cli plugin start /opt/cl-hive/cl-hive.py
