@@ -3293,3 +3293,41 @@ def member_connectivity(ctx: HiveContext, member_id: str) -> Dict[str, Any]:
 
     except Exception as e:
         return {"error": f"Failed to get member connectivity: {e}"}
+
+
+def neophyte_rankings(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get all neophytes ranked by their promotion readiness.
+
+    Returns neophytes sorted by a readiness score (0-100) based on:
+    - Probation progress (40%)
+    - Uptime (20%)
+    - Contribution ratio (20%)
+    - Hive centrality (20%)
+
+    Neophytes with high hive centrality may be eligible for fast-track
+    promotion (after 30 days instead of 90 if centrality >= 0.5).
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with ranked list of neophytes and their metrics.
+    """
+    if not ctx.membership_mgr:
+        return {"error": "Membership manager not initialized"}
+
+    try:
+        rankings = ctx.membership_mgr.get_neophyte_rankings()
+        eligible_count = sum(1 for n in rankings if n.get("eligible"))
+        fast_track_count = sum(1 for n in rankings if n.get("fast_track_eligible"))
+
+        return {
+            "neophyte_count": len(rankings),
+            "eligible_for_promotion": eligible_count,
+            "fast_track_eligible": fast_track_count,
+            "rankings": rankings
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get neophyte rankings: {e}"}

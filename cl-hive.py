@@ -168,6 +168,8 @@ from modules.rpc_commands import (
     fleet_health as rpc_fleet_health,
     connectivity_alerts as rpc_connectivity_alerts,
     member_connectivity as rpc_member_connectivity,
+    # Promotion Criteria
+    neophyte_rankings as rpc_neophyte_rankings,
 )
 
 # Initialize the plugin
@@ -12616,6 +12618,26 @@ def hive_member_connectivity(plugin: Plugin, member_id: str):
         Dict with connectivity details and recommended connections.
     """
     return rpc_member_connectivity(_get_hive_context(), member_id=member_id)
+
+
+@plugin.method("hive-neophyte-rankings")
+def hive_neophyte_rankings(plugin: Plugin):
+    """
+    Get all neophytes ranked by their promotion readiness.
+
+    Returns neophytes sorted by a readiness score (0-100) based on:
+    - Probation progress (40%)
+    - Uptime (20%)
+    - Contribution ratio (20%)
+    - Hive centrality (20%) - higher centrality = stronger commitment
+
+    Neophytes with high hive centrality (>=0.5) may be eligible for
+    fast-track promotion after 30 days instead of the full 90-day period.
+
+    Returns:
+        Dict with ranked neophytes and their metrics.
+    """
+    return rpc_neophyte_rankings(_get_hive_context())
 
 
 # =============================================================================

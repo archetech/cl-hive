@@ -196,6 +196,10 @@ class MembershipManager:
         3. Contribution ratio >= min_contribution_ratio (1.0 default)
         4. Unique peers >= min_unique_peers (1 default)
 
+        Fast-track promotion (optional):
+        If hive_centrality >= 0.5 (well-connected to fleet), probation can be
+        waived after minimum 30 days if all other criteria are met.
+
         No vouching required - purely meritocratic.
         """
         reasons: List[str] = []
@@ -209,8 +213,24 @@ class MembershipManager:
             reasons.append("not_neophyte")
             return {"eligible": False, "reasons": reasons}
 
-        # Check probation period
-        if not self.is_probation_complete(peer_id):
+        # Get hive centrality metrics
+        hive_metrics = self._get_hive_centrality_metrics(peer_id)
+        hive_centrality = hive_metrics.get("hive_centrality", 0.0)
+        hive_peer_count = hive_metrics.get("hive_peer_count", 0)
+
+        # Check for fast-track eligibility (high connectivity)
+        fast_track_eligible = False
+        fast_track_min_days = 30
+        if hive_centrality >= 0.5:
+            joined_at = member.get("joined_at")
+            if joined_at:
+                days_as_member = (int(time.time()) - joined_at) / (24 * 3600)
+                if days_as_member >= fast_track_min_days:
+                    fast_track_eligible = True
+
+        # Check probation period (can be bypassed with fast-track)
+        probation_complete = self.is_probation_complete(peer_id)
+        if not probation_complete and not fast_track_eligible:
             reasons.append("probation_incomplete")
 
         # Check uptime (use config value)
@@ -238,6 +258,14 @@ class MembershipManager:
             "uptime_pct": uptime,
             "contribution_ratio": ratio,
             "unique_peers": unique_peers,
+            "hive_centrality": round(hive_centrality, 3),
+            "hive_peer_count": hive_peer_count,
+            "fast_track": {
+                "eligible": fast_track_eligible,
+                "reason": "high_hive_centrality" if fast_track_eligible else None,
+                "min_days": fast_track_min_days,
+                "min_centrality": 0.5
+            },
             "thresholds": {
                 "min_uptime_pct": min_uptime,
                 "min_contribution_ratio": min_ratio,
@@ -245,6 +273,95 @@ class MembershipManager:
                 "probation_days": self.config.probation_days
             }
         }
+
+    def _get_hive_centrality_metrics(self, peer_id: str) -> Dict[str, Any]:
+        """
+        Get hive centrality metrics for a peer.
+
+        Uses the shared network metrics calculator if available.
+        """
+        calculator = self.metrics_calculator or network_metrics.get_calculator()
+        if calculator:
+            metrics = calculator.get_member_metrics(peer_id)
+            if metrics:
+                return {
+                    "hive_centrality": metrics.hive_centrality,
+                    "hive_peer_count": metrics.hive_peer_count,
+                    "hive_reachability": metrics.hive_reachability,
+                    "rebalance_hub_score": metrics.rebalance_hub_score
+                }
+
+        # Fallback: no metrics available
+        return {
+            "hive_centrality": 0.0,
+            "hive_peer_count": 0,
+            "hive_reachability": 0.0,
+            "rebalance_hub_score": 0.0
+        }
+
+    def get_neophyte_rankings(self) -> List[Dict[str, Any]]:
+        """
+        Get all neophytes ranked by their promotion readiness.
+
+        Useful for identifying which neophytes are closest to promotion
+        and which ones are demonstrating high commitment via connectivity.
+
+        Returns:
+            List of neophytes with their metrics, sorted by readiness score.
+        """
+        neophytes = []
+
+        for member in self.db.get_all_members():
+            if member.get("tier") != MembershipTier.NEOPHYTE.value:
+                continue
+
+            peer_id = member["peer_id"]
+            evaluation = self.evaluate_promotion(peer_id)
+
+            # Calculate a readiness score (0-100)
+            score = 0
+
+            # Probation progress (0-40 points)
+            joined_at = member.get("joined_at", int(time.time()))
+            days_elapsed = (int(time.time()) - joined_at) / (24 * 3600)
+            probation_days = self.config.probation_days
+            probation_progress = min(days_elapsed / probation_days, 1.0)
+            score += probation_progress * 40
+
+            # Uptime (0-20 points)
+            uptime = evaluation.get("uptime_pct", 0)
+            min_uptime = evaluation.get("thresholds", {}).get("min_uptime_pct", 95)
+            uptime_score = min(uptime / min_uptime, 1.0) if min_uptime > 0 else 0
+            score += uptime_score * 20
+
+            # Contribution (0-20 points)
+            ratio = evaluation.get("contribution_ratio", 0)
+            min_ratio = evaluation.get("thresholds", {}).get("min_contribution_ratio", 1.0)
+            contrib_score = min(ratio / min_ratio, 1.0) if min_ratio > 0 else 0
+            score += contrib_score * 20
+
+            # Hive connectivity bonus (0-20 points)
+            hive_centrality = evaluation.get("hive_centrality", 0)
+            score += hive_centrality * 20
+
+            neophytes.append({
+                "peer_id": peer_id,
+                "peer_id_short": peer_id[:16] + "...",
+                "readiness_score": round(score, 1),
+                "eligible": evaluation.get("eligible", False),
+                "fast_track_eligible": evaluation.get("fast_track", {}).get("eligible", False),
+                "days_as_neophyte": round(days_elapsed, 1),
+                "uptime_pct": evaluation.get("uptime_pct", 0),
+                "contribution_ratio": evaluation.get("contribution_ratio", 0),
+                "hive_centrality": hive_centrality,
+                "hive_peer_count": evaluation.get("hive_peer_count", 0),
+                "blocking_reasons": evaluation.get("reasons", [])
+            })
+
+        # Sort by readiness score (highest first)
+        neophytes.sort(key=lambda x: x["readiness_score"], reverse=True)
+
+        return neophytes
 
     def get_active_members(self) -> List[str]:
         now = int(time.time())

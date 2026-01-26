@@ -2923,6 +2923,39 @@ Returns alerts sorted by severity:
                 },
                 "required": ["node", "member_id"]
             }
+        ),
+        # Promotion Criteria Tools
+        Tool(
+            name="hive_neophyte_rankings",
+            description="""Get all neophytes ranked by promotion readiness.
+
+Ranks neophytes by a readiness score (0-100) based on:
+- Probation progress (40%)
+- Uptime (20%)
+- Contribution ratio (20%)
+- Hive centrality (20%) - demonstrates commitment to fleet
+
+**Fast-track eligibility:**
+Neophytes with hive_centrality >= 0.5 can be promoted after 30 days
+instead of the full 90-day probation (if all other criteria met).
+
+**Shows for each neophyte:**
+- readiness_score: 0-100 overall score
+- eligible: Ready for auto-promotion
+- fast_track_eligible: Can skip remaining probation
+- blocking_reasons: What's preventing promotion
+
+**Use for:** Identifying neophytes close to promotion, recognizing commitment.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query from"
+                    }
+                },
+                "required": ["node"]
+            }
         )
     ]
 
@@ -3200,6 +3233,9 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_connectivity_alerts(arguments)
         elif name == "hive_member_connectivity":
             result = await handle_member_connectivity(arguments)
+        # Promotion Criteria
+        elif name == "hive_neophyte_rankings":
+            result = await handle_neophyte_rankings(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -7391,6 +7427,62 @@ async def handle_member_connectivity(args: Dict) -> Dict:
         notes.append("Connectivity is below fleet average - improvement recommended.")
 
     result["ai_note"] = " ".join(notes)
+
+    return result
+
+
+async def handle_neophyte_rankings(args: Dict) -> Dict:
+    """Get all neophytes ranked by promotion readiness."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        result = await node.call("hive-neophyte-rankings", {})
+    except Exception as e:
+        return {"error": f"Failed to get neophyte rankings: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Add AI-friendly analysis
+    neophyte_count = result.get("neophyte_count", 0)
+    eligible = result.get("eligible_for_promotion", 0)
+    fast_track = result.get("fast_track_eligible", 0)
+    rankings = result.get("rankings", [])
+
+    if neophyte_count == 0:
+        result["ai_note"] = "No neophytes in the fleet. All members are fully promoted."
+    elif eligible > 0:
+        top = rankings[0] if rankings else {}
+        result["ai_note"] = (
+            f"{eligible} neophyte(s) eligible for promotion! "
+            f"Top candidate: {top.get('peer_id_short', '?')} "
+            f"(readiness: {top.get('readiness_score', 0)}/100). "
+            "Consider running evaluate_promotion to confirm eligibility."
+        )
+    elif fast_track > 0:
+        result["ai_note"] = (
+            f"{fast_track} neophyte(s) eligible for fast-track promotion "
+            "due to high hive centrality (>=0.5). "
+            "They've demonstrated commitment by connecting to fleet members."
+        )
+    else:
+        # Find the top neophyte and what's blocking them
+        if rankings:
+            top = rankings[0]
+            blockers = top.get("blocking_reasons", [])
+            days = top.get("days_as_neophyte", 0)
+            result["ai_note"] = (
+                f"{neophyte_count} neophyte(s), none yet eligible. "
+                f"Top candidate ({top.get('peer_id_short', '?')}) at {top.get('readiness_score', 0)}/100 "
+                f"after {days:.0f} days. "
+                f"Blocking: {', '.join(blockers[:2]) if blockers else 'time remaining'}."
+            )
+        else:
+            result["ai_note"] = f"{neophyte_count} neophyte(s), none yet eligible for promotion."
 
     return result
 
