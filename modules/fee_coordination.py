@@ -18,6 +18,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from . import network_metrics
+
 # =============================================================================
 # CONSTANTS
 # =============================================================================
@@ -88,6 +90,18 @@ SALIENT_VELOCITY_CHANGE_PCT = 0.10   # 10% velocity change to be salient
 # Routing stats salience
 SALIENT_SUCCESS_RATE_CHANGE = 0.10   # 10% success rate change to be salient
 SALIENT_LATENCY_CHANGE_MS = 100      # 100ms latency change to be salient
+
+# =============================================================================
+# CENTRALITY-BASED FEE ADJUSTMENT (Use Case 8)
+# =============================================================================
+# High-centrality members can charge premium fees (better positioned)
+# Low-centrality members may discount to attract traffic
+
+CENTRALITY_FEE_ADJUSTMENT_ENABLED = True    # Config: hive-centrality-fee-enabled
+CENTRALITY_FEE_HIGH_THRESHOLD = 0.7         # Above this = premium positioning
+CENTRALITY_FEE_LOW_THRESHOLD = 0.3          # Below this = discount positioning
+CENTRALITY_FEE_MAX_PREMIUM_PCT = 0.15       # +15% max for high centrality
+CENTRALITY_FEE_MAX_DISCOUNT_PCT = 0.10      # -10% max for low centrality
 
 
 def is_fee_change_salient(
@@ -324,6 +338,8 @@ class FeeRecommendation:
     stigmergic_influence: float = 0.0
     defensive_multiplier: float = 1.0
     time_adjustment_pct: float = 0.0    # Phase 7.4: Time-based adjustment
+    centrality_adjustment_pct: float = 0.0  # Use Case 8: Centrality-based adjustment
+    our_hive_centrality: float = 0.0       # Current node's centrality
 
     # Salience detection (noise filtering)
     current_fee_ppm: int = 0            # Current fee for comparison
@@ -335,7 +351,7 @@ class FeeRecommendation:
     reason: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "channel_id": self.channel_id,
             "peer_id": self.peer_id,
             "current_fee_ppm": self.current_fee_ppm,
@@ -353,6 +369,11 @@ class FeeRecommendation:
             "confidence": round(self.confidence, 2),
             "reason": self.reason
         }
+        # Include centrality info if adjustment was applied
+        if self.centrality_adjustment_pct != 0.0:
+            result["centrality_adjustment_pct"] = round(self.centrality_adjustment_pct * 100, 1)
+            result["our_hive_centrality"] = round(self.our_hive_centrality, 3)
+        return result
 
 
 # =============================================================================
@@ -2037,6 +2058,50 @@ class FeeCoordinationManager:
         self._fee_change_times[channel_id] = time.time()
         self._log(f"Recorded fee change for {channel_id}")
 
+    def _get_centrality_fee_adjustment(self) -> Tuple[float, float]:
+        """
+        Calculate fee adjustment based on our node's hive centrality.
+
+        Returns:
+            Tuple of (adjustment_pct, our_centrality)
+            - adjustment_pct: positive = premium, negative = discount
+            - our_centrality: current centrality score
+        """
+        if not CENTRALITY_FEE_ADJUSTMENT_ENABLED:
+            return 0.0, 0.0
+
+        if not self.our_pubkey:
+            return 0.0, 0.0
+
+        calculator = network_metrics.get_calculator()
+        if not calculator:
+            return 0.0, 0.0
+
+        metrics = calculator.get_member_metrics(self.our_pubkey)
+        if not metrics:
+            return 0.0, 0.0
+
+        centrality = metrics.hive_centrality
+
+        # High centrality = premium (can charge more)
+        if centrality >= CENTRALITY_FEE_HIGH_THRESHOLD:
+            # Scale from 0 to max premium based on how far above threshold
+            excess = centrality - CENTRALITY_FEE_HIGH_THRESHOLD
+            max_excess = 1.0 - CENTRALITY_FEE_HIGH_THRESHOLD
+            adjustment = CENTRALITY_FEE_MAX_PREMIUM_PCT * (excess / max_excess) if max_excess > 0 else 0
+            return adjustment, centrality
+
+        # Low centrality = discount (attract traffic)
+        if centrality <= CENTRALITY_FEE_LOW_THRESHOLD:
+            # Scale from 0 to max discount based on how far below threshold
+            deficit = CENTRALITY_FEE_LOW_THRESHOLD - centrality
+            max_deficit = CENTRALITY_FEE_LOW_THRESHOLD
+            adjustment = -CENTRALITY_FEE_MAX_DISCOUNT_PCT * (deficit / max_deficit) if max_deficit > 0 else 0
+            return adjustment, centrality
+
+        # Middle range = no adjustment
+        return 0.0, centrality
+
     def get_fee_recommendation(
         self,
         channel_id: str,
@@ -2044,7 +2109,8 @@ class FeeCoordinationManager:
         current_fee: int,
         local_balance_pct: float,
         source_hint: str = None,
-        destination_hint: str = None
+        destination_hint: str = None,
+        use_centrality_adjustment: bool = True
     ) -> FeeRecommendation:
         """
         Get coordinated fee recommendation for a channel.
@@ -2054,6 +2120,8 @@ class FeeCoordinationManager:
         2. Pheromone-based adaptive suggestion
         3. Stigmergic markers from fleet
         4. Defensive adjustments
+        5. Time-based adjustment (Phase 7.4)
+        6. Centrality-based adjustment (Use Case 8)
         """
         # Start with current fee
         recommended_fee = current_fee
@@ -2062,6 +2130,8 @@ class FeeCoordinationManager:
         ceiling_applied = False
         stigmergic_influence = 0.0
         defensive_multiplier = 1.0
+        centrality_adjustment_pct = 0.0
+        our_hive_centrality = 0.0
         reasons = []
 
         # 1. Check corridor assignment
@@ -2113,7 +2183,18 @@ class FeeCoordinationManager:
                 time_adjustment_pct = time_adj.adjustment_pct
                 reasons.append(f"time_{time_adj.adjustment_type}")
 
-        # 6. Apply floor and ceiling
+        # 6. Apply centrality-based adjustment (Use Case 8)
+        if use_centrality_adjustment:
+            centrality_adjustment_pct, our_hive_centrality = self._get_centrality_fee_adjustment()
+            if centrality_adjustment_pct != 0.0:
+                adjustment = int(recommended_fee * centrality_adjustment_pct)
+                recommended_fee += adjustment
+                if centrality_adjustment_pct > 0:
+                    reasons.append(f"centrality_premium_{centrality_adjustment_pct*100:.1f}%")
+                else:
+                    reasons.append(f"centrality_discount_{abs(centrality_adjustment_pct)*100:.1f}%")
+
+        # 7. Apply floor and ceiling
         if recommended_fee < FLEET_FEE_FLOOR_PPM:
             recommended_fee = FLEET_FEE_FLOOR_PPM
             floor_applied = True
@@ -2130,9 +2211,12 @@ class FeeCoordinationManager:
             confidence += 0.2
         if stigmergic_influence > 0:
             confidence += stigmergic_influence * 0.2
+        # Centrality boost to confidence (Use Case 8)
+        if our_hive_centrality >= CENTRALITY_FEE_HIGH_THRESHOLD:
+            confidence += 0.1
         confidence = min(0.95, confidence)
 
-        # 7. Check salience (is this change worth making?)
+        # 8. Check salience (is this change worth making?)
         is_salient, salience_reason = is_fee_change_salient(
             current_fee=current_fee,
             new_fee=recommended_fee,
@@ -2156,6 +2240,8 @@ class FeeCoordinationManager:
             stigmergic_influence=stigmergic_influence,
             defensive_multiplier=defensive_multiplier,
             time_adjustment_pct=time_adjustment_pct,
+            centrality_adjustment_pct=centrality_adjustment_pct,
+            our_hive_centrality=our_hive_centrality,
             is_salient=is_salient,
             salience_reason=salience_reason,
             confidence=confidence,
