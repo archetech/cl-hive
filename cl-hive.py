@@ -5366,18 +5366,29 @@ def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not routing_map or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: ROUTE_PROBE from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned (supports relay)
+    is_relayed = _is_relayed_message(payload)
+    if is_relayed:
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        if not sender or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: ROUTE_PROBE from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Delegate to routing map
     result = routing_map.handle_route_probe(peer_id, payload, safe_plugin.rpc)
 
     if result.get("success"):
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored route probe from {peer_id[:16]}...",
+            f"cl-hive: Stored route probe from {peer_id[:16]}...{relay_info}",
             level='debug'
         )
     elif result.get("error"):
@@ -5385,6 +5396,9 @@ def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             f"cl-hive: ROUTE_PROBE rejected from {peer_id[:16]}...: {result.get('error')}",
             level='debug'
         )
+
+    # Relay to other members
+    _relay_message(HiveMessageType.ROUTE_PROBE, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5399,18 +5413,29 @@ def handle_route_probe_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     if not routing_map or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: ROUTE_PROBE_BATCH from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned (supports relay)
+    is_relayed = _is_relayed_message(payload)
+    if is_relayed:
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        if not sender or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: ROUTE_PROBE_BATCH from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Delegate to routing map
     result = routing_map.handle_route_probe_batch(peer_id, payload, safe_plugin.rpc)
 
     if result.get("success"):
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored route probe batch from {peer_id[:16]}... "
+            f"cl-hive: Stored route probe batch from {peer_id[:16]}...{relay_info} "
             f"with {result.get('probes_stored', 0)} probes",
             level='debug'
         )
@@ -5419,6 +5444,9 @@ def handle_route_probe_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
             f"cl-hive: ROUTE_PROBE_BATCH rejected from {peer_id[:16]}...: {result.get('error')}",
             level='debug'
         )
+
+    # Relay to other members
+    _relay_message(HiveMessageType.ROUTE_PROBE_BATCH, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5433,18 +5461,29 @@ def handle_peer_reputation_snapshot(peer_id: str, payload: Dict, plugin: Plugin)
     if not peer_reputation_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: PEER_REPUTATION_SNAPSHOT from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned (supports relay)
+    is_relayed = _is_relayed_message(payload)
+    if is_relayed:
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        if not sender or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: PEER_REPUTATION_SNAPSHOT from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Delegate to peer reputation manager
     result = peer_reputation_mgr.handle_peer_reputation_snapshot(peer_id, payload, safe_plugin.rpc)
 
     if result.get("success"):
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored peer reputation snapshot from {peer_id[:16]}... "
+            f"cl-hive: Stored peer reputation snapshot from {peer_id[:16]}...{relay_info} "
             f"with {result.get('peers_stored', 0)} peers",
             level='debug'
         )
@@ -5453,6 +5492,9 @@ def handle_peer_reputation_snapshot(peer_id: str, payload: Dict, plugin: Plugin)
             f"cl-hive: PEER_REPUTATION_SNAPSHOT rejected from {peer_id[:16]}...: {result.get('error')}",
             level='debug'
         )
+
+    # Relay to other members
+    _relay_message(HiveMessageType.PEER_REPUTATION_SNAPSHOT, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5468,11 +5510,21 @@ def handle_stigmergic_marker_batch(peer_id: str, payload: Dict, plugin: Plugin) 
     if not fee_coordination_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned (supports relay)
+    is_relayed = _is_relayed_message(payload)
+    if is_relayed:
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        if not sender or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Validate payload
     from modules.protocol import validate_stigmergic_marker_batch, get_stigmergic_marker_batch_signing_payload
@@ -5480,10 +5532,16 @@ def handle_stigmergic_marker_batch(peer_id: str, payload: Dict, plugin: Plugin) 
         plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH validation failed from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify signature
+    # Verify signature - reporter_id may differ from peer_id when relayed
     reporter_id = payload.get("reporter_id", "")
-    if reporter_id != peer_id:
+    if not is_relayed and reporter_id != peer_id:
         plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify reporter is a member
+    reporter = database.get_member(reporter_id)
+    if not reporter or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH from non-member reporter {reporter_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     try:
@@ -5505,8 +5563,8 @@ def handle_stigmergic_marker_batch(peer_id: str, payload: Dict, plugin: Plugin) 
 
     for marker_data in markers:
         try:
-            # Add depositor field (the sender of the batch)
-            marker_data["depositor"] = peer_id
+            # Add depositor field (the original reporter)
+            marker_data["depositor"] = reporter_id
 
             # Use the existing receive_marker_from_gossip method
             result = fee_coordination_mgr.stigmergic_coord.receive_marker_from_gossip(marker_data)
@@ -5517,10 +5575,14 @@ def handle_stigmergic_marker_batch(peer_id: str, payload: Dict, plugin: Plugin) 
             continue
 
     if markers_stored > 0:
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored {markers_stored} stigmergic markers from {peer_id[:16]}...",
+            f"cl-hive: Stored {markers_stored} stigmergic markers from {reporter_id[:16]}...{relay_info}",
             level='debug'
         )
+
+    # Relay to other members
+    _relay_message(HiveMessageType.STIGMERGIC_MARKER_BATCH, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5536,11 +5598,21 @@ def handle_pheromone_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not fee_coordination_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: PHEROMONE_BATCH from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned (supports relay)
+    is_relayed = _is_relayed_message(payload)
+    if is_relayed:
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        if not sender or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: PHEROMONE_BATCH from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Validate payload
     from modules.protocol import validate_pheromone_batch, get_pheromone_batch_signing_payload
@@ -5548,10 +5620,16 @@ def handle_pheromone_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: PHEROMONE_BATCH validation failed from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify signature
+    # Verify signature - reporter_id may differ from peer_id when relayed
     reporter_id = payload.get("reporter_id", "")
-    if reporter_id != peer_id:
+    if not is_relayed and reporter_id != peer_id:
         plugin.log(f"cl-hive: PHEROMONE_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify reporter is a member
+    reporter = database.get_member(reporter_id)
+    if not reporter or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: PHEROMONE_BATCH from non-member reporter {reporter_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     try:
@@ -5577,7 +5655,7 @@ def handle_pheromone_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         try:
             # Use the receive_pheromone_from_gossip method
             result = fee_coordination_mgr.adaptive_controller.receive_pheromone_from_gossip(
-                reporter_id=peer_id,
+                reporter_id=reporter_id,
                 pheromone_data=pheromone_data,
                 weighting_factor=PHEROMONE_WEIGHTING_FACTOR
             )
@@ -5588,10 +5666,14 @@ def handle_pheromone_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             continue
 
     if pheromones_stored > 0:
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored {pheromones_stored} pheromones from {peer_id[:16]}...",
+            f"cl-hive: Stored {pheromones_stored} pheromones from {reporter_id[:16]}...{relay_info}",
             level='debug'
         )
+
+    # Relay to other members
+    _relay_message(HiveMessageType.PHEROMONE_BATCH, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5607,11 +5689,21 @@ def handle_yield_metrics_batch(peer_id: str, payload: Dict, plugin: Plugin) -> D
     if not yield_metrics_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: YIELD_METRICS_BATCH from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned (supports relay)
+    is_relayed = _is_relayed_message(payload)
+    if is_relayed:
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        if not sender or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: YIELD_METRICS_BATCH from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Validate payload
     from modules.protocol import validate_yield_metrics_batch, get_yield_metrics_batch_signing_payload
@@ -5619,10 +5711,16 @@ def handle_yield_metrics_batch(peer_id: str, payload: Dict, plugin: Plugin) -> D
         plugin.log(f"cl-hive: YIELD_METRICS_BATCH validation failed from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify signature
+    # Verify signature - reporter_id may differ from peer_id when relayed
     reporter_id = payload.get("reporter_id", "")
-    if reporter_id != peer_id:
+    if not is_relayed and reporter_id != peer_id:
         plugin.log(f"cl-hive: YIELD_METRICS_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify reporter is a member
+    reporter = database.get_member(reporter_id)
+    if not reporter or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: YIELD_METRICS_BATCH from non-member reporter {reporter_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     try:
@@ -5645,7 +5743,7 @@ def handle_yield_metrics_batch(peer_id: str, payload: Dict, plugin: Plugin) -> D
     for metric_data in metrics:
         try:
             result = yield_metrics_mgr.receive_yield_metrics_from_fleet(
-                reporter_id=peer_id,
+                reporter_id=reporter_id,
                 metrics_data=metric_data
             )
             if result:
@@ -5655,10 +5753,14 @@ def handle_yield_metrics_batch(peer_id: str, payload: Dict, plugin: Plugin) -> D
             continue
 
     if metrics_stored > 0:
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored {metrics_stored} yield metrics from {peer_id[:16]}...",
+            f"cl-hive: Stored {metrics_stored} yield metrics from {reporter_id[:16]}...{relay_info}",
             level='debug'
         )
+
+    # Relay to other members
+    _relay_message(HiveMessageType.YIELD_METRICS_BATCH, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5673,11 +5775,21 @@ def handle_circular_flow_alert(peer_id: str, payload: Dict, plugin: Plugin) -> D
     if not cost_reduction_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: CIRCULAR_FLOW_ALERT from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned (supports relay)
+    is_relayed = _is_relayed_message(payload)
+    if is_relayed:
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        if not sender or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: CIRCULAR_FLOW_ALERT from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Validate payload
     from modules.protocol import validate_circular_flow_alert, get_circular_flow_alert_signing_payload
@@ -5685,10 +5797,16 @@ def handle_circular_flow_alert(peer_id: str, payload: Dict, plugin: Plugin) -> D
         plugin.log(f"cl-hive: CIRCULAR_FLOW_ALERT validation failed from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify signature
+    # Verify signature - reporter_id may differ from peer_id when relayed
     reporter_id = payload.get("reporter_id", "")
-    if reporter_id != peer_id:
+    if not is_relayed and reporter_id != peer_id:
         plugin.log(f"cl-hive: CIRCULAR_FLOW_ALERT reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify reporter is a member
+    reporter = database.get_member(reporter_id)
+    if not reporter or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: CIRCULAR_FLOW_ALERT from non-member reporter {reporter_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     try:
@@ -5707,19 +5825,23 @@ def handle_circular_flow_alert(peer_id: str, payload: Dict, plugin: Plugin) -> D
     # Store the circular flow alert
     try:
         result = cost_reduction_mgr.circular_detector.receive_circular_flow_alert(
-            reporter_id=peer_id,
+            reporter_id=reporter_id,
             alert_data=payload
         )
         if result:
             members = payload.get("members_involved", [])
             cost = payload.get("total_cost_sats", 0)
+            relay_info = " (relayed)" if is_relayed else ""
             plugin.log(
-                f"cl-hive: Received circular flow alert from {peer_id[:16]}... "
+                f"cl-hive: Received circular flow alert from {reporter_id[:16]}...{relay_info} "
                 f"({len(members)} members, {cost} sats wasted)",
                 level='info'
             )
     except Exception as e:
         plugin.log(f"cl-hive: Error storing circular flow alert: {e}", level='debug')
+
+    # Relay to other members
+    _relay_message(HiveMessageType.CIRCULAR_FLOW_ALERT, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5734,11 +5856,21 @@ def handle_temporal_pattern_batch(peer_id: str, payload: Dict, plugin: Plugin) -
     if not anticipatory_liquidity_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned (supports relay)
+    is_relayed = _is_relayed_message(payload)
+    if is_relayed:
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        if not sender or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Validate payload
     from modules.protocol import validate_temporal_pattern_batch, get_temporal_pattern_batch_signing_payload
@@ -5746,10 +5878,16 @@ def handle_temporal_pattern_batch(peer_id: str, payload: Dict, plugin: Plugin) -
         plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH validation failed from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify signature
+    # Verify signature - reporter_id may differ from peer_id when relayed
     reporter_id = payload.get("reporter_id", "")
-    if reporter_id != peer_id:
+    if not is_relayed and reporter_id != peer_id:
         plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify reporter is a member
+    reporter = database.get_member(reporter_id)
+    if not reporter or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH from non-member reporter {reporter_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     try:
@@ -5772,7 +5910,7 @@ def handle_temporal_pattern_batch(peer_id: str, payload: Dict, plugin: Plugin) -
     for pattern_data in patterns:
         try:
             result = anticipatory_liquidity_mgr.receive_pattern_from_fleet(
-                reporter_id=peer_id,
+                reporter_id=reporter_id,
                 pattern_data=pattern_data
             )
             if result:
@@ -5782,10 +5920,14 @@ def handle_temporal_pattern_batch(peer_id: str, payload: Dict, plugin: Plugin) -
             continue
 
     if patterns_stored > 0:
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored {patterns_stored} temporal patterns from {peer_id[:16]}...",
+            f"cl-hive: Stored {patterns_stored} temporal patterns from {reporter_id[:16]}...{relay_info}",
             level='debug'
         )
+
+    # Relay to other members
+    _relay_message(HiveMessageType.TEMPORAL_PATTERN_BATCH, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5805,11 +5947,21 @@ def handle_corridor_value_batch(peer_id: str, payload: Dict, plugin: Plugin) -> 
     if not strategic_positioning_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: CORRIDOR_VALUE_BATCH from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned (supports relay)
+    is_relayed = _is_relayed_message(payload)
+    if is_relayed:
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        if not sender or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: CORRIDOR_VALUE_BATCH from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Validate payload
     from modules.protocol import validate_corridor_value_batch, get_corridor_value_batch_signing_payload
@@ -5817,10 +5969,16 @@ def handle_corridor_value_batch(peer_id: str, payload: Dict, plugin: Plugin) -> 
         plugin.log(f"cl-hive: CORRIDOR_VALUE_BATCH validation failed from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify signature
+    # Verify signature - reporter_id may differ from peer_id when relayed
     reporter_id = payload.get("reporter_id", "")
-    if reporter_id != peer_id:
+    if not is_relayed and reporter_id != peer_id:
         plugin.log(f"cl-hive: CORRIDOR_VALUE_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify reporter is a member
+    reporter = database.get_member(reporter_id)
+    if not reporter or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: CORRIDOR_VALUE_BATCH from non-member reporter {reporter_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     try:
@@ -5843,7 +6001,7 @@ def handle_corridor_value_batch(peer_id: str, payload: Dict, plugin: Plugin) -> 
     for corridor_data in corridors:
         try:
             result = strategic_positioning_mgr.receive_corridor_from_fleet(
-                reporter_id=peer_id,
+                reporter_id=reporter_id,
                 corridor_data=corridor_data
             )
             if result:
@@ -5853,10 +6011,14 @@ def handle_corridor_value_batch(peer_id: str, payload: Dict, plugin: Plugin) -> 
             continue
 
     if corridors_stored > 0:
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored {corridors_stored} corridor values from {peer_id[:16]}...",
+            f"cl-hive: Stored {corridors_stored} corridor values from {reporter_id[:16]}...{relay_info}",
             level='debug'
         )
+
+    # Relay to other members
+    _relay_message(HiveMessageType.CORRIDOR_VALUE_BATCH, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5870,11 +6032,21 @@ def handle_positioning_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> 
     if not strategic_positioning_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: POSITIONING_PROPOSAL from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned (supports relay)
+    is_relayed = _is_relayed_message(payload)
+    if is_relayed:
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        if not sender or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: POSITIONING_PROPOSAL from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Validate payload
     from modules.protocol import validate_positioning_proposal, get_positioning_proposal_signing_payload
@@ -5882,10 +6054,16 @@ def handle_positioning_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> 
         plugin.log(f"cl-hive: POSITIONING_PROPOSAL validation failed from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify signature
+    # Verify signature - reporter_id may differ from peer_id when relayed
     reporter_id = payload.get("reporter_id", "")
-    if reporter_id != peer_id:
+    if not is_relayed and reporter_id != peer_id:
         plugin.log(f"cl-hive: POSITIONING_PROPOSAL reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify reporter is a member
+    reporter = database.get_member(reporter_id)
+    if not reporter or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: POSITIONING_PROPOSAL from non-member reporter {reporter_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     try:
@@ -5904,17 +6082,21 @@ def handle_positioning_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> 
     # Store the positioning proposal
     try:
         result = strategic_positioning_mgr.receive_positioning_proposal_from_fleet(
-            reporter_id=peer_id,
+            reporter_id=reporter_id,
             proposal_data=payload
         )
         if result:
             target = payload.get("target_pubkey", "")[:16]
+            relay_info = " (relayed)" if is_relayed else ""
             plugin.log(
-                f"cl-hive: Stored positioning proposal from {peer_id[:16]}... targeting {target}...",
+                f"cl-hive: Stored positioning proposal from {reporter_id[:16]}...{relay_info} targeting {target}...",
                 level='debug'
             )
     except Exception as e:
         plugin.log(f"cl-hive: Error storing positioning proposal: {e}", level='debug')
+
+    # Relay to other members
+    _relay_message(HiveMessageType.POSITIONING_PROPOSAL, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5929,11 +6111,21 @@ def handle_physarum_recommendation(peer_id: str, payload: Dict, plugin: Plugin) 
     if not strategic_positioning_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: PHYSARUM_RECOMMENDATION from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned (supports relay)
+    is_relayed = _is_relayed_message(payload)
+    if is_relayed:
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        if not sender or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: PHYSARUM_RECOMMENDATION from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Validate payload
     from modules.protocol import validate_physarum_recommendation, get_physarum_recommendation_signing_payload
@@ -5941,10 +6133,16 @@ def handle_physarum_recommendation(peer_id: str, payload: Dict, plugin: Plugin) 
         plugin.log(f"cl-hive: PHYSARUM_RECOMMENDATION validation failed from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify signature
+    # Verify signature - reporter_id may differ from peer_id when relayed
     reporter_id = payload.get("reporter_id", "")
-    if reporter_id != peer_id:
+    if not is_relayed and reporter_id != peer_id:
         plugin.log(f"cl-hive: PHYSARUM_RECOMMENDATION reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify reporter is a member
+    reporter = database.get_member(reporter_id)
+    if not reporter or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: PHYSARUM_RECOMMENDATION from non-member reporter {reporter_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     try:
@@ -5963,18 +6161,22 @@ def handle_physarum_recommendation(peer_id: str, payload: Dict, plugin: Plugin) 
     # Store the Physarum recommendation
     try:
         result = strategic_positioning_mgr.receive_physarum_recommendation_from_fleet(
-            reporter_id=peer_id,
+            reporter_id=reporter_id,
             recommendation_data=payload
         )
         if result:
             action = payload.get("action", "unknown")
             peer_short = payload.get("peer_id", "")[:16]
+            relay_info = " (relayed)" if is_relayed else ""
             plugin.log(
-                f"cl-hive: Stored Physarum {action} recommendation from {peer_id[:16]}... for peer {peer_short}...",
+                f"cl-hive: Stored Physarum {action} recommendation from {reporter_id[:16]}...{relay_info} for peer {peer_short}...",
                 level='debug'
             )
     except Exception as e:
         plugin.log(f"cl-hive: Error storing Physarum recommendation: {e}", level='debug')
+
+    # Relay to other members
+    _relay_message(HiveMessageType.PHYSARUM_RECOMMENDATION, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -5989,11 +6191,21 @@ def handle_coverage_analysis_batch(peer_id: str, payload: Dict, plugin: Plugin) 
     if not rationalization_mgr or not database:
         return {"result": "continue"}
 
-    # Verify sender is a hive member and not banned
-    sender = database.get_member(peer_id)
-    if not sender or database.is_banned(peer_id):
-        plugin.log(f"cl-hive: COVERAGE_ANALYSIS_BATCH from non-member {peer_id[:16]}...", level='debug')
+    # Deduplication check
+    if not _should_process_message(payload):
         return {"result": "continue"}
+
+    # Verify sender is a hive member and not banned (supports relay)
+    is_relayed = _is_relayed_message(payload)
+    if is_relayed:
+        relay_member = database.get_member(peer_id)
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+            return {"result": "continue"}
+    else:
+        sender = database.get_member(peer_id)
+        if not sender or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: COVERAGE_ANALYSIS_BATCH from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Validate payload
     from modules.protocol import validate_coverage_analysis_batch, get_coverage_analysis_batch_signing_payload
@@ -6001,10 +6213,16 @@ def handle_coverage_analysis_batch(peer_id: str, payload: Dict, plugin: Plugin) 
         plugin.log(f"cl-hive: COVERAGE_ANALYSIS_BATCH validation failed from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Verify signature
+    # Verify signature - reporter_id may differ from peer_id when relayed
     reporter_id = payload.get("reporter_id", "")
-    if reporter_id != peer_id:
+    if not is_relayed and reporter_id != peer_id:
         plugin.log(f"cl-hive: COVERAGE_ANALYSIS_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Verify reporter is a member
+    reporter = database.get_member(reporter_id)
+    if not reporter or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: COVERAGE_ANALYSIS_BATCH from non-member reporter {reporter_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     try:
@@ -6027,7 +6245,7 @@ def handle_coverage_analysis_batch(peer_id: str, payload: Dict, plugin: Plugin) 
     for coverage_data in coverage_entries:
         try:
             result = rationalization_mgr.receive_coverage_from_fleet(
-                reporter_id=peer_id,
+                reporter_id=reporter_id,
                 coverage_data=coverage_data
             )
             if result:
@@ -6037,10 +6255,14 @@ def handle_coverage_analysis_batch(peer_id: str, payload: Dict, plugin: Plugin) 
             continue
 
     if entries_stored > 0:
+        relay_info = " (relayed)" if is_relayed else ""
         plugin.log(
-            f"cl-hive: Stored {entries_stored} coverage entries from {peer_id[:16]}...",
+            f"cl-hive: Stored {entries_stored} coverage entries from {reporter_id[:16]}...{relay_info}",
             level='debug'
         )
+
+    # Relay to other members
+    _relay_message(HiveMessageType.COVERAGE_ANALYSIS_BATCH, payload, peer_id)
 
     return {"result": "continue"}
 
