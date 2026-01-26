@@ -137,8 +137,7 @@ backup_hsm_secret() {
     mkdir -p "$hsm_dir"
 
     # Copy hsm_secret from container
-    # CLN creates network subdir inside LIGHTNING_DIR, so path is $NETWORK/$NETWORK
-    docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/$NETWORK/hsm_secret" "$hsm_dir/hsm_secret"
+    docker cp "$CONTAINER_NAME:/data/lightning/$NETWORK/hsm_secret" "$hsm_dir/hsm_secret"
 
     # Fix ownership (docker cp creates files as root)
     sudo chown "$USER:$USER" "$hsm_dir/hsm_secret"
@@ -376,7 +375,7 @@ Options:
     --help          Show this help message
 
 Environment Variables:
-    BACKUP_LOCATION      Backup destination (default: /backups)
+    BACKUP_LOCATION      Backup destination (default: ./backups)
     BACKUP_RETENTION     Days to keep backups (default: 30)
     BACKUP_ENCRYPTION    Enable GPG encryption (default: true)
     GPG_KEY_ID           GPG key ID for encryption
