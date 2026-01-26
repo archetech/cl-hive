@@ -22,9 +22,15 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from . import network_metrics
+
 # =============================================================================
 # CONSTANTS
 # =============================================================================
+
+# Connectivity impact thresholds
+CONNECTIVITY_CRITICAL_DROP = 0.3   # >30% drop in centrality = critical
+CONNECTIVITY_WARNING_DROP = 0.15   # >15% drop = warning, reduce confidence
 
 # Ownership thresholds
 OWNERSHIP_DOMINANT_RATIO = 0.6      # Member with >60% markers owns the route
@@ -126,10 +132,16 @@ class CloseRecommendation:
     # Estimated impact
     freed_capital_sats: int = 0
 
+    # Connectivity impact (Use Case 3)
+    connectivity_impact: str = "none"  # "none", "low", "warning", "critical"
+    current_hive_centrality: float = 0.0
+    projected_hive_centrality: float = 0.0
+    connectivity_warning: Optional[str] = None
+
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "member_id": self.member_id,
             "peer_id": self.peer_id,
             "channel_id": self.channel_id,
@@ -145,8 +157,16 @@ class CloseRecommendation:
             "confidence": round(self.confidence, 2),
             "urgency": self.urgency,
             "freed_capital_sats": self.freed_capital_sats,
+            "connectivity_impact": self.connectivity_impact,
             "timestamp": self.timestamp
         }
+        # Only include connectivity details if there's an impact
+        if self.connectivity_impact != "none":
+            result["current_hive_centrality"] = round(self.current_hive_centrality, 3)
+            result["projected_hive_centrality"] = round(self.projected_hive_centrality, 3)
+            if self.connectivity_warning:
+                result["connectivity_warning"] = self.connectivity_warning
+        return result
 
 
 @dataclass
@@ -496,30 +516,122 @@ class ChannelRationalizer:
 
         return None
 
+    def _assess_connectivity_impact(
+        self,
+        member_id: str,
+        peer_id: str
+    ) -> Dict[str, Any]:
+        """
+        Assess the connectivity impact of closing a member's channel to a peer.
+
+        Returns impact assessment including:
+        - current_centrality: Current hive centrality
+        - projected_centrality: Estimated centrality after closing channel
+        - impact_level: "none", "low", "warning", "critical"
+        - warning: Optional warning message
+        """
+        calculator = network_metrics.get_calculator()
+        if not calculator:
+            return {"impact_level": "none", "warning": None}
+
+        # Get current metrics
+        metrics = calculator.get_member_metrics(member_id)
+        if not metrics:
+            return {"impact_level": "none", "warning": None}
+
+        current_centrality = metrics.hive_centrality
+        hive_peer_count = metrics.hive_peer_count
+
+        # Check if the peer being closed is a hive member
+        topology = calculator._get_topology_snapshot()
+        if not topology:
+            return {
+                "impact_level": "none",
+                "current_centrality": current_centrality,
+                "projected_centrality": current_centrality,
+                "warning": None
+            }
+
+        # Check if this peer is a hive member
+        is_hive_peer = peer_id in topology.member_topologies
+
+        if not is_hive_peer:
+            # Closing external channel doesn't affect hive centrality significantly
+            return {
+                "impact_level": "none",
+                "current_centrality": current_centrality,
+                "projected_centrality": current_centrality,
+                "warning": None
+            }
+
+        # Estimate impact of losing this hive connection
+        # Simple heuristic: centrality drop proportional to 1 / (hive_peer_count)
+        if hive_peer_count <= 1:
+            # Closing only hive connection = critical
+            projected_centrality = 0.0
+            impact_level = "critical"
+            warning = "CRITICAL: This is the member's only hive connection!"
+        elif hive_peer_count == 2:
+            # Losing 1 of 2 connections
+            projected_centrality = current_centrality * 0.5
+            centrality_drop = current_centrality - projected_centrality
+            if centrality_drop / max(current_centrality, 0.01) > CONNECTIVITY_CRITICAL_DROP:
+                impact_level = "critical"
+                warning = "Closing would significantly reduce hive connectivity"
+            else:
+                impact_level = "warning"
+                warning = "Member would have only 1 hive connection remaining"
+        else:
+            # Estimate proportional drop
+            drop_factor = 1.0 / hive_peer_count
+            projected_centrality = current_centrality * (1 - drop_factor)
+            centrality_drop_pct = (current_centrality - projected_centrality) / max(current_centrality, 0.01)
+
+            if centrality_drop_pct > CONNECTIVITY_CRITICAL_DROP:
+                impact_level = "critical"
+                warning = f"Closing would drop hive centrality by {centrality_drop_pct:.0%}"
+            elif centrality_drop_pct > CONNECTIVITY_WARNING_DROP:
+                impact_level = "warning"
+                warning = f"Closing would reduce hive centrality by {centrality_drop_pct:.0%}"
+            else:
+                impact_level = "low"
+                warning = None
+
+        return {
+            "impact_level": impact_level,
+            "current_centrality": current_centrality,
+            "projected_centrality": projected_centrality,
+            "warning": warning
+        }
+
     def _should_recommend_close(
         self,
         coverage: PeerCoverage,
         member_id: str
-    ) -> Tuple[bool, str, float, str]:
+    ) -> Tuple[bool, str, float, str, Dict]:
         """
         Determine if we should recommend closing member's channel to this peer.
 
+        Considers both routing performance and connectivity impact.
+
         Returns:
-            (should_close, reason, confidence, urgency)
+            (should_close, reason, confidence, urgency, connectivity_impact)
         """
+        empty_impact = {"impact_level": "none"}
+
         # Skip if this member is the owner
         if member_id == coverage.owner_member:
-            return False, "", 0.0, "none"
+            return False, "", 0.0, "none", empty_impact
 
         # Skip if no clear owner
         if not coverage.owner_member:
-            return False, "no_clear_owner", 0.0, "none"
+            return False, "no_clear_owner", 0.0, "none", empty_impact
 
         # Check cooldown
         cooldown_key = f"{member_id}:{coverage.peer_id}"
         last_rec = self._recent_recommendations.get(cooldown_key, 0)
         if time.time() - last_rec < CLOSE_RECOMMENDATION_COOLDOWN_HOURS * 3600:
-            return False, "cooldown", 0.0, "none"
+            return False, "cooldown", 0.0, "none", empty_impact
 
         # Get member's marker strength
         member_strength = coverage.member_marker_strength.get(member_id, 0)
@@ -535,6 +647,19 @@ class ChannelRationalizer:
         if performance_ratio < UNDERPERFORMER_MARKER_RATIO:
             # Member has <10% of owner's routing activity
 
+            # Assess connectivity impact before recommending close
+            connectivity_impact = self._assess_connectivity_impact(member_id, coverage.peer_id)
+            impact_level = connectivity_impact.get("impact_level", "none")
+
+            # Block critical connectivity impacts
+            if impact_level == "critical":
+                self._log(
+                    f"Blocked close recommendation for {member_id[:16]}... -> {coverage.peer_id[:16]}...: "
+                    f"critical connectivity impact",
+                    level="info"
+                )
+                return False, "critical_connectivity_impact", 0.0, "none", connectivity_impact
+
             # Determine urgency based on redundancy level and performance
             if coverage.redundancy_count > 3 and performance_ratio < 0.05:
                 urgency = "high"
@@ -546,14 +671,19 @@ class ChannelRationalizer:
                 urgency = "low"
                 confidence = min(0.7, coverage.ownership_confidence * 0.8)
 
+            # Reduce confidence for warning-level connectivity impacts
+            if impact_level == "warning":
+                confidence = confidence * 0.7  # Reduce confidence by 30%
+                urgency = "low" if urgency != "high" else "medium"  # Reduce urgency
+
             reason = (
                 f"Underperforming: {performance_ratio:.1%} of owner's routing activity; "
                 f"{coverage.redundancy_count} members serve this peer"
             )
 
-            return True, reason, confidence, urgency
+            return True, reason, confidence, urgency, connectivity_impact
 
-        return False, "", 0.0, "none"
+        return False, "", 0.0, "none", empty_impact
 
     def generate_close_recommendations(self) -> List[CloseRecommendation]:
         """
@@ -574,7 +704,7 @@ class ChannelRationalizer:
 
             # Check each non-owner member
             for member_id in coverage.members_with_channels:
-                should_close, reason, confidence, urgency = self._should_recommend_close(
+                should_close, reason, confidence, urgency, connectivity_impact = self._should_recommend_close(
                     coverage, member_id
                 )
 
@@ -584,7 +714,7 @@ class ChannelRationalizer:
                 # Get channel info
                 channel_info = self._get_channel_info(member_id, coverage.peer_id)
 
-                # Create recommendation
+                # Create recommendation with connectivity impact
                 rec = CloseRecommendation(
                     member_id=member_id,
                     peer_id=coverage.peer_id,
@@ -603,7 +733,12 @@ class ChannelRationalizer:
                     reason=reason,
                     confidence=confidence,
                     urgency=urgency,
-                    freed_capital_sats=channel_info.get("capacity_sats", 0) if channel_info else 0
+                    freed_capital_sats=channel_info.get("capacity_sats", 0) if channel_info else 0,
+                    # Connectivity impact (Use Case 3)
+                    connectivity_impact=connectivity_impact.get("impact_level", "none"),
+                    current_hive_centrality=connectivity_impact.get("current_centrality", 0.0),
+                    projected_hive_centrality=connectivity_impact.get("projected_centrality", 0.0),
+                    connectivity_warning=connectivity_impact.get("warning")
                 )
 
                 recommendations.append(rec)

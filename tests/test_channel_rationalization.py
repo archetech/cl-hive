@@ -491,7 +491,7 @@ class TestChannelRationalizer:
             member_marker_strength={member: 10.0}
         )
 
-        should_close, reason, conf, urg = rationalizer._should_recommend_close(
+        should_close, reason, conf, urg, connectivity_impact = rationalizer._should_recommend_close(
             coverage, member
         )
 
@@ -518,7 +518,7 @@ class TestChannelRationalizer:
             is_over_redundant=False
         )
 
-        should_close, reason, conf, urg = rationalizer._should_recommend_close(
+        should_close, reason, conf, urg, connectivity_impact = rationalizer._should_recommend_close(
             coverage, underperformer
         )
 
