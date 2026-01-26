@@ -164,6 +164,10 @@ from modules.rpc_commands import (
     network_metrics as rpc_network_metrics,
     rebalance_hubs as rpc_rebalance_hubs,
     rebalance_path as rpc_rebalance_path,
+    # Fleet Health Monitoring
+    fleet_health as rpc_fleet_health,
+    connectivity_alerts as rpc_connectivity_alerts,
+    member_connectivity as rpc_member_connectivity,
 )
 
 # Initialize the plugin
@@ -12559,6 +12563,59 @@ def hive_rebalance_path(plugin: Plugin, source_member: str, dest_member: str,
         dest_member=dest_member,
         max_hops=max_hops
     )
+
+
+# =============================================================================
+# FLEET HEALTH MONITORING COMMANDS
+# =============================================================================
+
+@plugin.method("hive-fleet-health")
+def hive_fleet_health(plugin: Plugin):
+    """
+    Get overall fleet connectivity health metrics.
+
+    Returns aggregated metrics showing how well-connected the fleet is
+    internally, including health score (0-100) and letter grade.
+
+    Returns:
+        Dict with fleet health metrics including avg centrality,
+        reachability, hub count, and health grade.
+    """
+    return rpc_fleet_health(_get_hive_context())
+
+
+@plugin.method("hive-connectivity-alerts")
+def hive_connectivity_alerts(plugin: Plugin):
+    """
+    Check for fleet connectivity issues that need attention.
+
+    Returns alerts for:
+    - Disconnected members (no hive channels)
+    - Isolated members (low reachability)
+    - Low hub availability
+    - Low centrality members
+
+    Returns:
+        Dict with alerts sorted by severity (critical, warning, info).
+    """
+    return rpc_connectivity_alerts(_get_hive_context())
+
+
+@plugin.method("hive-member-connectivity")
+def hive_member_connectivity(plugin: Plugin, member_id: str):
+    """
+    Get detailed connectivity report for a specific member.
+
+    Shows how well-connected the member is within the fleet,
+    comparison to fleet average, and recommendations for improvement.
+
+    Args:
+        member_id: Member's public key
+
+    Returns:
+        Dict with connectivity details and recommended connections.
+    """
+    return rpc_member_connectivity(_get_hive_context(), member_id=member_id)
 
 
 # =============================================================================

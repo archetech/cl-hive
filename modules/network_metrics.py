@@ -604,6 +604,259 @@ class NetworkMetricsCalculator:
 
         return "; ".join(parts)
 
+    # =========================================================================
+    # FLEET HEALTH MONITORING
+    # =========================================================================
+
+    def get_fleet_health(self) -> Dict[str, Any]:
+        """
+        Get overall fleet connectivity health metrics.
+
+        Returns aggregated metrics showing how well-connected the fleet is
+        internally. Used for monitoring and alerting.
+
+        Returns:
+            Dict with fleet health metrics including:
+            - member_count: Total members analyzed
+            - avg_hive_centrality: Average internal connectivity (0-1)
+            - avg_hive_reachability: Average fleet reachability (0-1)
+            - fully_connected_count: Members with 100% reachability
+            - isolated_count: Members with <50% reachability
+            - hub_count: Members suitable as rebalance hubs
+            - health_score: Overall health score (0-100)
+            - health_grade: Letter grade (A-F)
+        """
+        all_metrics = self.get_all_metrics()
+
+        if not all_metrics:
+            return {
+                "member_count": 0,
+                "health_score": 0,
+                "health_grade": "F",
+                "error": "No members found"
+            }
+
+        members = list(all_metrics.values())
+        member_count = len(members)
+
+        # Calculate averages
+        avg_centrality = sum(m.hive_centrality for m in members) / member_count
+        avg_reachability = sum(m.hive_reachability for m in members) / member_count
+        avg_hub_score = sum(m.rebalance_hub_score for m in members) / member_count
+
+        # Count categories
+        fully_connected = sum(1 for m in members if m.hive_reachability >= 0.99)
+        isolated = sum(1 for m in members if m.hive_reachability < 0.5)
+        hubs = sum(1 for m in members if m.rebalance_hub_score >= 0.5)
+
+        # Members with no hive connections
+        disconnected = sum(1 for m in members if m.hive_peer_count == 0)
+
+        # Calculate health score (0-100)
+        # Weighted: 40% avg centrality, 40% avg reachability, 20% hub availability
+        health_score = (
+            avg_centrality * 40 +
+            avg_reachability * 40 +
+            (hubs / max(member_count, 1)) * 20
+        )
+
+        # Penalize for isolated/disconnected members
+        if isolated > 0:
+            health_score -= (isolated / member_count) * 20
+        if disconnected > 0:
+            health_score -= (disconnected / member_count) * 30
+
+        health_score = max(0, min(100, health_score))
+
+        # Assign grade
+        if health_score >= 90:
+            grade = "A"
+        elif health_score >= 80:
+            grade = "B"
+        elif health_score >= 70:
+            grade = "C"
+        elif health_score >= 60:
+            grade = "D"
+        else:
+            grade = "F"
+
+        return {
+            "member_count": member_count,
+            "avg_hive_centrality": round(avg_centrality, 3),
+            "avg_hive_reachability": round(avg_reachability, 3),
+            "avg_hub_score": round(avg_hub_score, 3),
+            "fully_connected_count": fully_connected,
+            "isolated_count": isolated,
+            "disconnected_count": disconnected,
+            "hub_count": hubs,
+            "health_score": round(health_score, 1),
+            "health_grade": grade,
+            "calculated_at": int(time.time())
+        }
+
+    def check_connectivity_alerts(self) -> List[Dict[str, Any]]:
+        """
+        Check for fleet connectivity issues that need attention.
+
+        Returns a list of alerts for:
+        - Isolated members (reachability < 50%)
+        - Disconnected members (no hive connections)
+        - Low hub availability (< 2 good hubs)
+        - Declining centrality (if historical data available)
+
+        Returns:
+            List of alert dicts with severity, member_id, message
+        """
+        alerts = []
+        all_metrics = self.get_all_metrics()
+
+        if not all_metrics:
+            return [{
+                "severity": "warning",
+                "alert_type": "no_data",
+                "message": "No fleet members found for connectivity analysis"
+            }]
+
+        members = list(all_metrics.values())
+        member_count = len(members)
+
+        # Check for disconnected members (critical)
+        for m in members:
+            if m.hive_peer_count == 0:
+                alerts.append({
+                    "severity": "critical",
+                    "alert_type": "disconnected",
+                    "member_id": m.member_id,
+                    "member_id_short": m.member_id[:16] + "...",
+                    "message": f"Member has no channels to other fleet members",
+                    "recommendation": "Open channel to a high-centrality hub"
+                })
+
+        # Check for isolated members (warning)
+        for m in members:
+            if m.hive_peer_count > 0 and m.hive_reachability < 0.5:
+                alerts.append({
+                    "severity": "warning",
+                    "alert_type": "isolated",
+                    "member_id": m.member_id,
+                    "member_id_short": m.member_id[:16] + "...",
+                    "hive_reachability": round(m.hive_reachability, 2),
+                    "message": f"Member can only reach {m.hive_reachability:.0%} of fleet",
+                    "recommendation": "Open additional channels to improve connectivity"
+                })
+
+        # Check hub availability
+        hubs = [m for m in members if m.rebalance_hub_score >= 0.5]
+        if len(hubs) < 2 and member_count >= 3:
+            alerts.append({
+                "severity": "warning",
+                "alert_type": "low_hub_availability",
+                "hub_count": len(hubs),
+                "member_count": member_count,
+                "message": f"Only {len(hubs)} rebalance hub(s) available for {member_count} members",
+                "recommendation": "Encourage members to open more internal channels"
+            })
+
+        # Check for members with very low centrality
+        for m in members:
+            if m.hive_centrality < 0.2 and m.hive_peer_count > 0:
+                alerts.append({
+                    "severity": "info",
+                    "alert_type": "low_centrality",
+                    "member_id": m.member_id,
+                    "member_id_short": m.member_id[:16] + "...",
+                    "hive_centrality": round(m.hive_centrality, 3),
+                    "message": f"Member has low fleet centrality ({m.hive_centrality:.1%})",
+                    "recommendation": "Consider opening channel to this member to improve their connectivity"
+                })
+
+        # Sort by severity
+        severity_order = {"critical": 0, "warning": 1, "info": 2}
+        alerts.sort(key=lambda a: severity_order.get(a.get("severity", "info"), 3))
+
+        return alerts
+
+    def get_member_connectivity_report(self, member_id: str) -> Dict[str, Any]:
+        """
+        Get detailed connectivity report for a specific member.
+
+        Shows how well-connected this member is within the fleet and
+        recommendations for improvement.
+
+        Args:
+            member_id: Member's public key
+
+        Returns:
+            Dict with connectivity details and recommendations
+        """
+        metrics = self.get_member_metrics(member_id)
+        if not metrics:
+            return {"error": f"No metrics found for member {member_id[:16]}..."}
+
+        all_metrics = self.get_all_metrics()
+        fleet_health = self.get_fleet_health()
+
+        # Find members this node is NOT connected to
+        topology = self._get_topology_snapshot()
+        if not topology:
+            return {"error": "Could not get fleet topology"}
+
+        member_topology = topology.member_topologies.get(member_id, set())
+        all_members = set(all_metrics.keys())
+        not_connected_to = all_members - member_topology - {member_id}
+
+        # Find best connection targets (highest centrality nodes we're not connected to)
+        connection_targets = []
+        for target_id in not_connected_to:
+            target_metrics = all_metrics.get(target_id)
+            if target_metrics:
+                connection_targets.append({
+                    "member_id": target_id,
+                    "member_id_short": target_id[:16] + "...",
+                    "hive_centrality": target_metrics.hive_centrality,
+                    "rebalance_hub_score": target_metrics.rebalance_hub_score,
+                    "reason": "high_centrality" if target_metrics.hive_centrality > 0.5 else "fleet_member"
+                })
+
+        # Sort by centrality
+        connection_targets.sort(key=lambda x: x["hive_centrality"], reverse=True)
+
+        # Determine status
+        if metrics.hive_peer_count == 0:
+            status = "disconnected"
+            status_message = "No channels to fleet members - urgent action needed"
+        elif metrics.hive_reachability < 0.5:
+            status = "isolated"
+            status_message = "Limited fleet connectivity - improvement recommended"
+        elif metrics.hive_reachability < 0.8:
+            status = "partial"
+            status_message = "Good connectivity but room for improvement"
+        else:
+            status = "well_connected"
+            status_message = "Excellent fleet connectivity"
+
+        return {
+            "member_id": member_id,
+            "member_id_short": member_id[:16] + "...",
+            "status": status,
+            "status_message": status_message,
+            "metrics": metrics.to_dict(),
+            "fleet_comparison": {
+                "your_centrality": metrics.hive_centrality,
+                "fleet_avg_centrality": fleet_health.get("avg_hive_centrality", 0),
+                "your_reachability": metrics.hive_reachability,
+                "fleet_avg_reachability": fleet_health.get("avg_hive_reachability", 0),
+                "above_average": metrics.hive_centrality > fleet_health.get("avg_hive_centrality", 0)
+            },
+            "connections": {
+                "connected_to": metrics.hive_peer_count,
+                "not_connected_to": len(not_connected_to),
+                "total_fleet_members": len(all_members)
+            },
+            "recommended_connections": connection_targets[:3],
+            "calculated_at": int(time.time())
+        }
+
 
 # =============================================================================
 # MODULE-LEVEL SINGLETON

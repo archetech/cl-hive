@@ -3203,3 +3203,93 @@ def rebalance_path(
 
     except Exception as e:
         return {"error": f"Failed to find rebalance path: {e}"}
+
+
+def fleet_health(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get overall fleet connectivity health metrics.
+
+    Returns aggregated metrics showing how well-connected the fleet is
+    internally. Includes health score (0-100) and letter grade.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with fleet health metrics.
+    """
+    from . import network_metrics as nm
+
+    calculator = nm.get_calculator()
+    if not calculator:
+        return {"error": "Network metrics calculator not initialized"}
+
+    try:
+        return calculator.get_fleet_health()
+
+    except Exception as e:
+        return {"error": f"Failed to get fleet health: {e}"}
+
+
+def connectivity_alerts(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Check for fleet connectivity issues that need attention.
+
+    Returns alerts for isolated members, disconnected members,
+    low hub availability, and other connectivity problems.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with list of alerts sorted by severity.
+    """
+    from . import network_metrics as nm
+
+    calculator = nm.get_calculator()
+    if not calculator:
+        return {"error": "Network metrics calculator not initialized"}
+
+    try:
+        alerts = calculator.check_connectivity_alerts()
+        critical = sum(1 for a in alerts if a.get("severity") == "critical")
+        warnings = sum(1 for a in alerts if a.get("severity") == "warning")
+        info = sum(1 for a in alerts if a.get("severity") == "info")
+
+        return {
+            "alert_count": len(alerts),
+            "critical_count": critical,
+            "warning_count": warnings,
+            "info_count": info,
+            "alerts": alerts
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to check connectivity: {e}"}
+
+
+def member_connectivity(ctx: HiveContext, member_id: str) -> Dict[str, Any]:
+    """
+    Get detailed connectivity report for a specific member.
+
+    Shows how well-connected this member is within the fleet,
+    comparison to fleet average, and recommendations for improvement.
+
+    Args:
+        ctx: HiveContext
+        member_id: Member's public key
+
+    Returns:
+        Dict with connectivity details and recommendations.
+    """
+    from . import network_metrics as nm
+
+    calculator = nm.get_calculator()
+    if not calculator:
+        return {"error": "Network metrics calculator not initialized"}
+
+    try:
+        return calculator.get_member_connectivity_report(member_id)
+
+    except Exception as e:
+        return {"error": f"Failed to get member connectivity: {e}"}

@@ -2849,6 +2849,80 @@ intermediary nodes when direct path isn't available.
                 },
                 "required": ["node", "source_member", "dest_member"]
             }
+        ),
+        # Fleet Health Monitoring Tools
+        Tool(
+            name="hive_fleet_health",
+            description="""Get overall fleet connectivity health metrics.
+
+Returns aggregated metrics showing how well-connected the fleet is internally.
+
+**Shows:**
+- avg_hive_centrality: Average internal connectivity (0-1)
+- avg_hive_reachability: Average fleet reachability (0-1)
+- hub_count: Members suitable as rebalance hubs
+- isolated_count: Members with limited connectivity
+- health_score: Overall health (0-100)
+- health_grade: Letter grade A-F
+
+**Use for:** Monitoring fleet health, identifying connectivity issues early.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query from"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_connectivity_alerts",
+            description="""Check for fleet connectivity issues that need attention.
+
+Returns alerts sorted by severity:
+- **critical**: Disconnected members (no hive channels)
+- **warning**: Isolated members (<50% reachability), low hub availability
+- **info**: Low centrality members
+
+**Use for:** Proactive monitoring, identifying members needing help connecting.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query from"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_member_connectivity",
+            description="""Get detailed connectivity report for a specific member.
+
+**Shows:**
+- Connection status (well_connected, partial, isolated, disconnected)
+- Metrics vs fleet average
+- List of members not connected to
+- Top 3 recommended connections (highest centrality targets)
+
+**Use for:** Helping specific members improve their fleet connectivity.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query from"
+                    },
+                    "member_id": {
+                        "type": "string",
+                        "description": "Member pubkey to analyze"
+                    }
+                },
+                "required": ["node", "member_id"]
+            }
         )
     ]
 
@@ -3119,6 +3193,13 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_rebalance_hubs(arguments)
         elif name == "hive_rebalance_path":
             result = await handle_rebalance_path(arguments)
+        # Fleet Health Monitoring
+        elif name == "hive_fleet_health":
+            result = await handle_fleet_health(arguments)
+        elif name == "hive_connectivity_alerts":
+            result = await handle_connectivity_alerts(arguments)
+        elif name == "hive_member_connectivity":
+            result = await handle_member_connectivity(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -7164,6 +7245,152 @@ async def handle_rebalance_path(args: Dict) -> Dict:
             "Members may not be connected through the internal hive network. "
             "Consider opening channels between these members or through shared hubs."
         )
+
+    return result
+
+
+# =============================================================================
+# Fleet Health Monitoring Handlers
+# =============================================================================
+
+async def handle_fleet_health(args: Dict) -> Dict:
+    """Get overall fleet connectivity health metrics."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        result = await node.call("hive-fleet-health", {})
+    except Exception as e:
+        return {"error": f"Failed to get fleet health: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Add AI-friendly analysis
+    grade = result.get("health_grade", "?")
+    score = result.get("health_score", 0)
+    isolated = result.get("isolated_count", 0)
+    disconnected = result.get("disconnected_count", 0)
+    hubs = result.get("hub_count", 0)
+    members = result.get("member_count", 0)
+
+    if grade in ("A", "B"):
+        status = "healthy"
+    elif grade == "C":
+        status = "acceptable"
+    else:
+        status = "needs attention"
+
+    notes = [f"Fleet connectivity is {status} (Grade {grade}, Score {score}/100)."]
+
+    if disconnected > 0:
+        notes.append(f"CRITICAL: {disconnected} member(s) have no hive channels!")
+    if isolated > 0:
+        notes.append(f"WARNING: {isolated} member(s) have limited fleet reachability.")
+    if hubs < 2 and members >= 3:
+        notes.append(f"Low hub availability ({hubs} hubs for {members} members).")
+
+    result["ai_note"] = " ".join(notes)
+
+    return result
+
+
+async def handle_connectivity_alerts(args: Dict) -> Dict:
+    """Check for fleet connectivity issues that need attention."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        result = await node.call("hive-connectivity-alerts", {})
+    except Exception as e:
+        return {"error": f"Failed to check connectivity: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Add AI-friendly analysis
+    critical = result.get("critical_count", 0)
+    warnings = result.get("warning_count", 0)
+    info = result.get("info_count", 0)
+    total = result.get("alert_count", 0)
+
+    if total == 0:
+        result["ai_note"] = "No connectivity issues detected. Fleet is well-connected."
+    elif critical > 0:
+        result["ai_note"] = (
+            f"URGENT: {critical} critical alert(s)! "
+            "Disconnected members need immediate attention. "
+            "Review alerts and help them establish hive channels."
+        )
+    elif warnings > 0:
+        result["ai_note"] = (
+            f"{warnings} warning(s) found. "
+            "Some members have limited connectivity. "
+            "Consider helping them open additional hive channels."
+        )
+    else:
+        result["ai_note"] = (
+            f"{info} informational alert(s). "
+            "Minor connectivity improvements possible but not urgent."
+        )
+
+    return result
+
+
+async def handle_member_connectivity(args: Dict) -> Dict:
+    """Get detailed connectivity report for a specific member."""
+    node_name = args.get("node")
+    member_id = args.get("member_id")
+
+    if not member_id:
+        return {"error": "member_id is required"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        result = await node.call("hive-member-connectivity", {
+            "member_id": member_id
+        })
+    except Exception as e:
+        return {"error": f"Failed to get member connectivity: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Add AI-friendly analysis
+    status = result.get("status", "unknown")
+    status_msg = result.get("status_message", "")
+    connections = result.get("connections", {})
+    recommendations = result.get("recommended_connections", [])
+    comparison = result.get("fleet_comparison", {})
+
+    notes = [f"Status: {status_msg}"]
+
+    connected_to = connections.get("connected_to", 0)
+    not_connected = connections.get("not_connected_to", 0)
+    total = connections.get("total_fleet_members", 0)
+
+    if not_connected > 0 and recommendations:
+        rec_names = [r.get("member_id_short", "?") for r in recommendations[:2]]
+        notes.append(
+            f"Connected to {connected_to}/{total} members. "
+            f"Recommended connections: {', '.join(rec_names)}"
+        )
+
+    if comparison.get("above_average"):
+        notes.append("Connectivity is above fleet average.")
+    else:
+        notes.append("Connectivity is below fleet average - improvement recommended.")
+
+    result["ai_note"] = " ".join(notes)
 
     return result
 
