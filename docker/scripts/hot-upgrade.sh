@@ -59,36 +59,83 @@ get_remote_version() {
 upgrade_cl_hive() {
     log_step "Checking cl-hive for updates..."
 
-    cd "$PROJECT_ROOT"
+    # Check if cl-hive has a git repo inside the container
+    local container_has_git=false
+    if docker exec "$CONTAINER_NAME" test -d /opt/cl-hive/.git 2>/dev/null; then
+        container_has_git=true
+    fi
 
-    local current=$(get_git_version .)
-    local remote=$(get_remote_version .)
+    # Check if mounted from host by comparing versions
+    local host_version=$(get_git_version "$PROJECT_ROOT")
+    local container_version=$(docker exec "$CONTAINER_NAME" git -C /opt/cl-hive rev-parse --short HEAD 2>/dev/null || echo "none")
+    local is_mounted=false
+    if [ "$host_version" == "$container_version" ] && [ "$host_version" != "unknown" ]; then
+        is_mounted=true
+    fi
 
-    echo "  Current: $current"
-    echo "  Remote:  $remote"
+    if [ "$container_has_git" == "true" ]; then
+        if [ "$is_mounted" == "true" ]; then
+            # Mounted from host - pull on host
+            log_info "cl-hive is mounted from host"
+            cd "$PROJECT_ROOT"
 
-    if [ "$current" == "$remote" ]; then
-        log_info "cl-hive is up to date"
+            local current=$(get_git_version .)
+            local remote=$(get_remote_version .)
+
+            echo "  Current: $current"
+            echo "  Remote:  $remote"
+
+            if [ "$current" == "$remote" ]; then
+                log_info "cl-hive is up to date"
+                return 0
+            fi
+
+            if [ "$CHECK_ONLY" == "true" ]; then
+                log_warn "Update available: $current -> $remote"
+                return 1
+            fi
+
+            log_info "Pulling latest cl-hive on host..."
+            if ! git diff --quiet 2>/dev/null; then
+                log_warn "Stashing local changes..."
+                git stash
+            fi
+            git pull origin main
+            log_info "cl-hive upgraded: $current -> $(get_git_version .)"
+            return 1
+        else
+            # Git repo inside container - pull inside container
+            log_info "cl-hive is a git repo inside container"
+            local current=$(docker exec "$CONTAINER_NAME" git -C /opt/cl-hive rev-parse --short HEAD 2>/dev/null || echo "unknown")
+            docker exec "$CONTAINER_NAME" git -C /opt/cl-hive fetch --quiet 2>/dev/null || true
+            local remote=$(docker exec "$CONTAINER_NAME" git -C /opt/cl-hive rev-parse --short origin/main 2>/dev/null || echo "unknown")
+
+            echo "  Current: $current"
+            echo "  Remote:  $remote"
+
+            if [ "$current" == "$remote" ]; then
+                log_info "cl-hive is up to date"
+                return 0
+            fi
+
+            if [ "$CHECK_ONLY" == "true" ]; then
+                log_warn "Update available: $current -> $remote"
+                return 1
+            fi
+
+            log_info "Pulling latest cl-hive inside container..."
+            docker exec "$CONTAINER_NAME" git -C /opt/cl-hive pull origin main
+            log_info "cl-hive upgraded: $current -> $(docker exec "$CONTAINER_NAME" git -C /opt/cl-hive rev-parse --short HEAD)"
+            return 1
+        fi
+    else
+        # No git repo - baked into image
+        log_warn "cl-hive is baked into image (not a git repo)"
+        log_info "To enable hot upgrades, either:"
+        echo "    1. Mount from host: -v /path/to/cl-hive:/opt/cl-hive:ro"
+        echo "    2. Or rebuild the Docker image"
         return 0
     fi
-
-    if [ "$CHECK_ONLY" == "true" ]; then
-        log_warn "Update available: $current -> $remote"
-        return 1
-    fi
-
-    log_info "Pulling latest cl-hive..."
-    
-    # Stash local changes if any
-    if ! git diff --quiet 2>/dev/null; then
-        log_warn "Stashing local changes..."
-        git stash
-    fi
-
-    git pull origin main
-    
-    log_info "cl-hive upgraded: $current -> $(get_git_version .)"
-    return 1  # Signal upgrade was performed
 }
 
 upgrade_cl_revenue_ops() {
