@@ -7,9 +7,10 @@
 #
 # Usage:
 #   ./hot-upgrade.sh              # Upgrade both plugins
-#   ./hot-upgrade.sh hive         # Upgrade only cl-hive  
+#   ./hot-upgrade.sh hive         # Upgrade only cl-hive
 #   ./hot-upgrade.sh revenue      # Upgrade only cl-revenue-ops
 #   ./hot-upgrade.sh --check      # Check for updates without applying
+#   ./hot-upgrade.sh --restart    # Just restart plugins (no git pull)
 #
 # Prerequisites:
 #   - cl-hive must be mounted from host (default in docker-compose.yml)
@@ -230,15 +231,19 @@ Components:
 
 Options:
     --check, -c     Check for updates without applying
+    --restart, -r   Just restart plugins (skip git pull)
     --help, -h      Show this help
 
 Examples:
-    ./hot-upgrade.sh              # Upgrade all plugins
+    ./hot-upgrade.sh              # Upgrade and restart all plugins
     ./hot-upgrade.sh --check      # Check what updates are available
-    ./hot-upgrade.sh hive         # Upgrade only cl-hive
+    ./hot-upgrade.sh hive         # Upgrade and restart cl-hive only
+    ./hot-upgrade.sh --restart    # Just restart plugins (no git)
 
-Note: cl-hive is mounted from host by default. For cl-revenue-ops hot
-upgrades, add this to docker-compose.yml volumes:
+Note: Plugins are ALWAYS restarted after upgrade, even if already up to date.
+This ensures the running plugin matches the code on disk.
+
+For cl-revenue-ops hot upgrades from git, add to docker-compose.yml volumes:
     - /path/to/cl_revenue_ops:/opt/cl-revenue-ops:ro
 EOF
 }
@@ -247,6 +252,7 @@ main() {
     local upgrade_hive=true
     local upgrade_revenue=true
     CHECK_ONLY=false
+    RESTART_ONLY=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -261,6 +267,10 @@ main() {
                 ;;
             --check|-c)
                 CHECK_ONLY=true
+                shift
+                ;;
+            --restart|-r)
+                RESTART_ONLY=true
                 shift
                 ;;
             --help|-h)
@@ -283,6 +293,9 @@ main() {
     if [ "$CHECK_ONLY" == "true" ]; then
         echo -e "${YELLOW}                    [CHECK MODE]                                     ${NC}"
     fi
+    if [ "$RESTART_ONLY" == "true" ]; then
+        echo -e "${YELLOW}                    [RESTART ONLY]                                   ${NC}"
+    fi
 
     check_container
     show_versions
@@ -290,15 +303,21 @@ main() {
     local hive_upgraded=false
     local revenue_upgraded=false
 
-    if [ "$upgrade_hive" == "true" ]; then
-        if ! upgrade_cl_hive; then
-            hive_upgraded=true
+    # In restart-only mode, skip git operations
+    if [ "$RESTART_ONLY" == "true" ]; then
+        hive_upgraded="$upgrade_hive"
+        revenue_upgraded="$upgrade_revenue"
+    else
+        if [ "$upgrade_hive" == "true" ]; then
+            if ! upgrade_cl_hive; then
+                hive_upgraded=true
+            fi
         fi
-    fi
 
-    if [ "$upgrade_revenue" == "true" ]; then
-        if ! upgrade_cl_revenue_ops; then
-            revenue_upgraded=true
+        if [ "$upgrade_revenue" == "true" ]; then
+            if ! upgrade_cl_revenue_ops; then
+                revenue_upgraded=true
+            fi
         fi
     fi
 
@@ -308,16 +327,32 @@ main() {
         exit 0
     fi
 
-    if [ "$hive_upgraded" == "true" ] || [ "$revenue_upgraded" == "true" ]; then
+    # Always restart requested plugins - even if "up to date", the plugin
+    # may not have been restarted since the last pull
+    local should_restart_hive=false
+    local should_restart_revenue=false
+
+    if [ "$upgrade_hive" == "true" ]; then
+        should_restart_hive=true
+    fi
+    if [ "$upgrade_revenue" == "true" ]; then
+        should_restart_revenue=true
+    fi
+
+    if [ "$should_restart_hive" == "true" ] || [ "$should_restart_revenue" == "true" ]; then
         # Prefer plugin restart over lightningd restart (faster, no channel downtime)
-        restart_plugins "$hive_upgraded" "$revenue_upgraded"
+        restart_plugins "$should_restart_hive" "$should_restart_revenue"
         echo ""
         show_versions
         echo ""
-        log_info "Hot upgrade complete!"
+        if [ "$hive_upgraded" == "true" ] || [ "$revenue_upgraded" == "true" ]; then
+            log_info "Hot upgrade complete!"
+        else
+            log_info "Plugins restarted (already up to date)"
+        fi
     else
         echo ""
-        log_info "Everything is up to date"
+        log_info "Nothing to do"
     fi
 }
 
