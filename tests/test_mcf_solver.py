@@ -90,12 +90,13 @@ class MockStateManager:
     def get_all_peer_states(self):
         return list(self.peer_states.values())
 
-    def set_peer_state(self, peer_id, capacity=0, topology=None, capabilities=None):
+    def set_peer_state(self, peer_id, capacity=0, topology=None, capabilities=None, last_update=None):
         state = MagicMock()
         state.peer_id = peer_id
         state.capacity_sats = capacity
         state.topology = topology or []
         state.capabilities = capabilities if capabilities is not None else ["mcf"]
+        state.last_update = last_update if last_update is not None else int(time.time())
         self.peer_states[peer_id] = state
 
     def set_mcf_capable(self, peer_id, capable=True):
@@ -104,6 +105,16 @@ class MockStateManager:
             self.peer_states[peer_id].capabilities = ["mcf"] if capable else []
         else:
             self.set_peer_state(peer_id, capabilities=["mcf"] if capable else [])
+
+    def set_peer_stale(self, peer_id, stale=True):
+        """Mark a peer as stale (offline) for testing failover."""
+        from modules.mcf_solver import MAX_GOSSIP_AGE_FOR_MCF
+        if peer_id in self.peer_states:
+            if stale:
+                # Set last_update to be older than MAX_GOSSIP_AGE_FOR_MCF
+                self.peer_states[peer_id].last_update = int(time.time()) - MAX_GOSSIP_AGE_FOR_MCF - 100
+            else:
+                self.peer_states[peer_id].last_update = int(time.time())
 
 
 class MockLiquidityCoordinator:
@@ -650,6 +661,51 @@ class TestMCFCoordinator:
 
         # Should skip "a" (not MCF-capable) and elect "b"
         assert elected == "02" + "b" * 64
+
+    def test_elect_coordinator_failover_on_stale(self):
+        """Test that election fails over when coordinator goes stale/offline."""
+        plugin = MockPlugin()
+        database = MockDatabase()
+        state_manager = MockStateManager()
+        liquidity_coordinator = MockLiquidityCoordinator()
+
+        # Add members - all MCF-capable initially
+        database.members = [
+            {"peer_id": "02" + "a" * 64},  # Lowest, MCF-capable, will go stale
+            {"peer_id": "02" + "b" * 64},  # MCF-capable
+            {"peer_id": "02" + "c" * 64},  # MCF-capable
+        ]
+
+        # All are MCF-capable with fresh gossip
+        state_manager.set_mcf_capable("02" + "a" * 64, True)
+        state_manager.set_mcf_capable("02" + "b" * 64, True)
+        state_manager.set_mcf_capable("02" + "c" * 64, True)
+
+        coordinator = MCFCoordinator(
+            plugin=plugin,
+            database=database,
+            state_manager=state_manager,
+            liquidity_coordinator=liquidity_coordinator,
+            our_pubkey="02" + "d" * 64
+        )
+
+        # Initially "a" should be elected (lowest MCF-capable)
+        elected = coordinator.elect_coordinator()
+        assert elected == "02" + "a" * 64
+
+        # Now "a" goes offline (stale gossip)
+        state_manager.set_peer_stale("02" + "a" * 64, True)
+
+        # Should fail over to "b" (next lowest MCF-capable with fresh gossip)
+        elected = coordinator.elect_coordinator()
+        assert elected == "02" + "b" * 64
+
+        # "a" comes back online (fresh gossip)
+        state_manager.set_peer_stale("02" + "a" * 64, False)
+
+        # Should go back to "a"
+        elected = coordinator.elect_coordinator()
+        assert elected == "02" + "a" * 64
 
     def test_is_coordinator(self):
         """Test is_coordinator check."""

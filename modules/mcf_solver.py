@@ -1053,7 +1053,10 @@ class MCFCoordinator:
         """
         Elect coordinator using lexicographic lowest pubkey among MCF-capable members.
 
-        Only considers members that have advertised MCF capability via gossip.
+        Only considers members that:
+        1. Have advertised MCF capability via gossip
+        2. Have fresh gossip (not stale/offline)
+
         Falls back to our own node if no MCF-capable members found.
 
         Returns:
@@ -1069,8 +1072,11 @@ class MCFCoordinator:
         if self.our_pubkey not in member_ids:
             member_ids.append(self.our_pubkey)
 
-        # Filter to only MCF-capable members
+        # Filter to only MCF-capable members with fresh gossip
+        now = time.time()
         mcf_capable_ids = []
+        stale_count = 0
+
         for member_id in member_ids:
             if member_id == self.our_pubkey:
                 # We have MCF capability (running this code proves it)
@@ -1079,6 +1085,14 @@ class MCFCoordinator:
                 # Check peer's advertised capabilities from gossip
                 peer_state = self.state_manager.get_peer_state(member_id)
                 if peer_state:
+                    # Check if gossip is fresh enough (not stale/offline)
+                    last_update = getattr(peer_state, 'last_update', 0)
+                    state_age = now - last_update
+                    if state_age > MAX_GOSSIP_AGE_FOR_MCF:
+                        # Peer gossip is stale - likely offline, exclude from election
+                        stale_count += 1
+                        continue
+
                     capabilities = getattr(peer_state, 'capabilities', [])
                     if 'mcf' in capabilities:
                         mcf_capable_ids.append(member_id)
@@ -1093,10 +1107,10 @@ class MCFCoordinator:
         # Lexicographic lowest among MCF-capable members wins
         elected = min(mcf_capable_ids)
 
-        if len(mcf_capable_ids) < len(member_ids):
+        if len(mcf_capable_ids) < len(member_ids) or stale_count > 0:
             self._log(
                 f"MCF coordinator election: {len(mcf_capable_ids)}/{len(member_ids)} "
-                f"members are MCF-capable, elected {elected[:16]}...",
+                f"members are MCF-capable ({stale_count} stale), elected {elected[:16]}...",
                 level="debug"
             )
 
