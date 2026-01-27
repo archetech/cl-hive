@@ -13653,6 +13653,95 @@ def hive_internal_competition(plugin: Plugin):
     return rpc_internal_competition(_get_hive_context())
 
 
+@plugin.method("hive-report-kalman-velocity")
+def hive_report_kalman_velocity(
+    plugin: Plugin,
+    channel_id: str,
+    peer_id: str,
+    velocity_pct_per_hour: float,
+    uncertainty: float,
+    flow_ratio: float,
+    confidence: float,
+    is_regime_change: bool = False
+):
+    """
+    Report Kalman-estimated velocity from cl-revenue-ops.
+
+    Fleet members share their Kalman filter velocity estimates for
+    coordinated anticipatory liquidity predictions.
+
+    Args:
+        channel_id: Channel SCID
+        peer_id: Peer pubkey
+        velocity_pct_per_hour: Kalman velocity estimate (% change per hour)
+        uncertainty: Standard deviation of velocity estimate
+        flow_ratio: Current flow ratio estimate (-1 to 1)
+        confidence: Observation confidence (0.0-1.0)
+        is_regime_change: True if regime change detected
+
+    Returns:
+        Dict with status and acknowledgement
+    """
+    ctx = _get_hive_context()
+    if not ctx.anticipatory_manager:
+        return {"error": "Anticipatory liquidity manager not initialized"}
+
+    try:
+        # Get reporter ID from our own node
+        reporter_id = ctx.our_id or ""
+
+        success = ctx.anticipatory_manager.receive_kalman_velocity(
+            reporter_id=reporter_id,
+            channel_id=channel_id,
+            peer_id=peer_id,
+            velocity_pct_per_hour=velocity_pct_per_hour,
+            uncertainty=uncertainty,
+            flow_ratio=flow_ratio,
+            confidence=confidence,
+            is_regime_change=is_regime_change
+        )
+
+        return {
+            "status": "ok" if success else "failed",
+            "channel_id": channel_id,
+            "velocity_pct_per_hour": velocity_pct_per_hour,
+            "acknowledged": success
+        }
+    except Exception as e:
+        return {"error": f"Failed to receive Kalman velocity: {e}"}
+
+
+@plugin.method("hive-query-kalman-velocity")
+def hive_query_kalman_velocity(plugin: Plugin, channel_id: str):
+    """
+    Query aggregated Kalman velocity for a channel.
+
+    Returns consensus velocity from all fleet members who have
+    reported Kalman estimates for this channel.
+
+    Args:
+        channel_id: Channel SCID to query
+
+    Returns:
+        Dict with consensus Kalman velocity data
+    """
+    ctx = _get_hive_context()
+    if not ctx.anticipatory_manager:
+        return {"error": "Anticipatory liquidity manager not initialized"}
+
+    try:
+        result = ctx.anticipatory_manager.query_kalman_velocity(channel_id)
+        if not result:
+            return {
+                "status": "no_data",
+                "channel_id": channel_id,
+                "message": "No Kalman velocity data available for this channel"
+            }
+        return result
+    except Exception as e:
+        return {"error": f"Failed to query Kalman velocity: {e}"}
+
+
 # =============================================================================
 # PHASE 2 FEE COORDINATION RPC METHODS
 # =============================================================================

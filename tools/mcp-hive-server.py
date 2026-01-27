@@ -2062,6 +2062,40 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
             }
         ),
         # =======================================================================
+        # Kalman Velocity Integration Tools
+        # =======================================================================
+        Tool(
+            name="kalman_velocity_query",
+            description="""Query Kalman-estimated velocity for a channel.
+
+**What it provides:**
+- Consensus velocity estimate from fleet members running Kalman filters
+- Uncertainty bounds for confidence weighting
+- Flow ratio and regime change detection
+
+**Why use Kalman instead of simple averages:**
+- Kalman filters provide optimal state estimation
+- Tracks both ratio AND velocity as a state vector
+- Adapts faster to regime changes than EMA
+- Proper uncertainty quantification
+
+**When to use:** Before rebalancing decisions or fee changes to understand the true velocity trend.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel ID to query velocity for"
+                    }
+                },
+                "required": ["node", "channel_id"]
+            }
+        ),
+        # =======================================================================
         # Phase 2: Fee Coordination Tools
         # =======================================================================
         Tool(
@@ -3174,6 +3208,9 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_critical_velocity(arguments)
         elif name == "internal_competition":
             result = await handle_internal_competition(arguments)
+        # Kalman Velocity Integration tools
+        elif name == "kalman_velocity_query":
+            result = await handle_kalman_velocity_query(arguments)
         # Phase 2: Fee Coordination tools
         elif name == "coord_fee_recommendation":
             result = await handle_fee_recommendation(arguments)
@@ -6360,6 +6397,27 @@ async def handle_internal_competition(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("hive-internal-competition", {})
+
+
+# =============================================================================
+# Kalman Velocity Integration Handlers
+# =============================================================================
+
+async def handle_kalman_velocity_query(args: Dict) -> Dict:
+    """Query Kalman-estimated velocity for a channel."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if not channel_id:
+        return {"error": "channel_id is required"}
+
+    return await node.call("hive-query-kalman-velocity", {
+        "channel_id": channel_id
+    })
 
 
 # =============================================================================

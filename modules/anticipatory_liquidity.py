@@ -39,6 +39,12 @@ MIN_PATTERN_SAMPLES = 10              # Minimum observations for confidence
 PATTERN_CONFIDENCE_THRESHOLD = 0.60   # Minimum confidence to act on pattern
 PATTERN_STRENGTH_THRESHOLD = 1.3      # 30% above average = significant pattern
 
+# Kalman velocity integration settings
+KALMAN_VELOCITY_TTL_SECONDS = 3600    # Kalman data valid for 1 hour
+KALMAN_MIN_CONFIDENCE = 0.3           # Minimum confidence to use Kalman data
+KALMAN_MIN_REPORTERS = 1              # Minimum reporters for consensus
+KALMAN_UNCERTAINTY_SCALING = 1.5      # Scale factor for uncertainty in confidence
+
 # Prediction settings
 PREDICTION_HORIZONS = [6, 12, 24]     # Hours to look ahead
 DEFAULT_PREDICTION_HOURS = 12         # Default prediction window
@@ -235,6 +241,51 @@ class HourlyFlowSample:
     timestamp: int
 
 
+@dataclass
+class KalmanVelocityReport:
+    """
+    Kalman-estimated velocity report from a fleet member.
+
+    Contains the Kalman filter's optimal state estimate which is superior
+    to simple net flow calculations because it:
+    - Tracks both ratio and velocity as a state vector
+    - Provides proper uncertainty quantification
+    - Adapts to regime changes faster than EMA
+    - Weights observations by confidence
+    """
+    channel_id: str
+    peer_id: str
+    reporter_id: str                 # Fleet member who reported
+    velocity_pct_per_hour: float     # Kalman velocity estimate
+    uncertainty: float               # Standard deviation of estimate
+    flow_ratio: float                # Current flow ratio estimate
+    confidence: float                # Observation confidence
+    is_regime_change: bool           # Regime change detected
+    timestamp: int = 0
+
+    def __post_init__(self):
+        if self.timestamp == 0:
+            self.timestamp = int(time.time())
+
+    def is_stale(self, ttl_seconds: int = KALMAN_VELOCITY_TTL_SECONDS) -> bool:
+        """Check if this report is too old to use."""
+        return (int(time.time()) - self.timestamp) > ttl_seconds
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "channel_id": self.channel_id,
+            "peer_id": self.peer_id,
+            "reporter_id": self.reporter_id[:16] + "..." if len(self.reporter_id) > 16 else self.reporter_id,
+            "velocity_pct_per_hour": round(self.velocity_pct_per_hour, 6),
+            "uncertainty": round(self.uncertainty, 6),
+            "flow_ratio": round(self.flow_ratio, 4),
+            "confidence": round(self.confidence, 3),
+            "is_regime_change": self.is_regime_change,
+            "timestamp": self.timestamp,
+            "age_seconds": int(time.time()) - self.timestamp
+        }
+
+
 # =============================================================================
 # ANTICIPATORY LIQUIDITY MANAGER
 # =============================================================================
@@ -294,6 +345,12 @@ class AnticipatoryLiquidityManager:
         # Cache timestamps
         self._pattern_cache_time: Dict[str, int] = {}
         self._last_analysis_time: int = 0
+
+        # Kalman velocity reports from fleet members
+        # Key: channel_id, Value: List of KalmanVelocityReport from different reporters
+        self._kalman_velocities: Dict[str, List[KalmanVelocityReport]] = defaultdict(list)
+        # Peer-to-channel mapping for queries by peer_id
+        self._peer_to_channels: Dict[str, Set[str]] = defaultdict(set)
 
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
@@ -855,7 +912,34 @@ class AnticipatoryLiquidityManager:
         capacity_sats: int
     ) -> float:
         """
-        Calculate balance velocity (% change per hour) from recent samples.
+        Calculate balance velocity (% change per hour).
+
+        Prefers Kalman-estimated velocity from fleet members when available,
+        falling back to simple net flow calculation from local samples.
+
+        Kalman estimates are superior because they:
+        - Track both ratio and velocity as a state vector
+        - Provide proper uncertainty quantification
+        - Adapt to regime changes faster than simple averaging
+        - Weight observations by confidence
+        """
+        # Try to use Kalman velocity from fleet first
+        kalman_velocity = self._get_kalman_consensus_velocity(channel_id)
+        if kalman_velocity is not None:
+            return kalman_velocity
+
+        # Fall back to simple net flow calculation
+        return self._calculate_simple_velocity(channel_id, capacity_sats)
+
+    def _calculate_simple_velocity(
+        self,
+        channel_id: str,
+        capacity_sats: int
+    ) -> float:
+        """
+        Calculate balance velocity using simple net flow from recent samples.
+
+        This is the fallback when no Kalman data is available.
         """
         samples = self._flow_history.get(channel_id, [])
         if len(samples) < 2 or capacity_sats == 0:
@@ -880,6 +964,61 @@ class AnticipatoryLiquidityManager:
         velocity_pct = flow_per_hour / capacity_sats
 
         return velocity_pct
+
+    def _get_kalman_consensus_velocity(
+        self,
+        channel_id: str
+    ) -> Optional[float]:
+        """
+        Get consensus Kalman velocity estimate from fleet reporters.
+
+        Combines reports from multiple fleet members with uncertainty-weighted
+        averaging, returning None if no valid reports exist.
+
+        Returns:
+            Consensus velocity (% change per hour) or None if unavailable
+        """
+        reports = self._kalman_velocities.get(channel_id, [])
+        if not reports:
+            return None
+
+        # Filter to fresh, confident reports
+        now = int(time.time())
+        valid_reports = [
+            r for r in reports
+            if not r.is_stale() and r.confidence >= KALMAN_MIN_CONFIDENCE
+        ]
+
+        if len(valid_reports) < KALMAN_MIN_REPORTERS:
+            return None
+
+        # Uncertainty-weighted average (inverse variance weighting)
+        total_weight = 0.0
+        weighted_velocity = 0.0
+
+        for report in valid_reports:
+            # Weight by inverse uncertainty (lower uncertainty = higher weight)
+            # Also weight by confidence and recency
+            uncertainty = max(0.001, report.uncertainty)
+            age_hours = (now - report.timestamp) / 3600
+            recency_weight = math.exp(-age_hours / 6)  # Decay over 6 hours
+
+            weight = (report.confidence * recency_weight) / (uncertainty * KALMAN_UNCERTAINTY_SCALING)
+            weighted_velocity += report.velocity_pct_per_hour * weight
+            total_weight += weight
+
+        if total_weight < 0.001:
+            return None
+
+        consensus_velocity = weighted_velocity / total_weight
+
+        self._log(
+            f"Using Kalman consensus velocity for {channel_id[:12]}...: "
+            f"{consensus_velocity:.4%}/hr from {len(valid_reports)} reporters",
+            level="debug"
+        )
+
+        return consensus_velocity
 
     def _calculate_depletion_risk(
         self,
@@ -1430,5 +1569,193 @@ class AnticipatoryLiquidityManager:
 
             if not self._remote_patterns[peer_id]:
                 del self._remote_patterns[peer_id]
+
+        return cleaned
+
+    # =========================================================================
+    # KALMAN VELOCITY INTEGRATION (Phase 14.1)
+    # =========================================================================
+
+    def receive_kalman_velocity(
+        self,
+        reporter_id: str,
+        channel_id: str,
+        peer_id: str,
+        velocity_pct_per_hour: float,
+        uncertainty: float,
+        flow_ratio: float,
+        confidence: float,
+        is_regime_change: bool = False
+    ) -> bool:
+        """
+        Receive Kalman velocity report from a fleet member.
+
+        Fleet members running cl-revenue-ops with Kalman filters share their
+        optimal state estimates for coordinated predictions.
+
+        Args:
+            reporter_id: Fleet member who reported
+            channel_id: Channel SCID
+            peer_id: Peer pubkey (for cross-channel aggregation)
+            velocity_pct_per_hour: Kalman velocity estimate
+            uncertainty: Standard deviation of velocity estimate
+            flow_ratio: Current flow ratio estimate (-1 to 1)
+            confidence: Observation confidence (0.0-1.0)
+            is_regime_change: True if regime change detected
+
+        Returns:
+            True if stored successfully
+        """
+        if not channel_id or not reporter_id:
+            return False
+
+        # Validate inputs
+        if confidence < 0 or confidence > 1:
+            confidence = max(0, min(1, confidence))
+        if uncertainty < 0:
+            uncertainty = abs(uncertainty)
+
+        report = KalmanVelocityReport(
+            channel_id=channel_id,
+            peer_id=peer_id,
+            reporter_id=reporter_id,
+            velocity_pct_per_hour=velocity_pct_per_hour,
+            uncertainty=uncertainty,
+            flow_ratio=flow_ratio,
+            confidence=confidence,
+            is_regime_change=is_regime_change
+        )
+
+        # Update or add report from this reporter
+        reports = self._kalman_velocities[channel_id]
+        updated = False
+        for i, existing in enumerate(reports):
+            if existing.reporter_id == reporter_id:
+                reports[i] = report
+                updated = True
+                break
+
+        if not updated:
+            reports.append(report)
+
+        # Limit reports per channel (keep most recent 10)
+        if len(reports) > 10:
+            reports.sort(key=lambda r: r.timestamp, reverse=True)
+            self._kalman_velocities[channel_id] = reports[:10]
+
+        # Update peer-to-channel mapping
+        if peer_id:
+            self._peer_to_channels[peer_id].add(channel_id)
+
+        self._log(
+            f"Received Kalman velocity for {channel_id[:12]}... from {reporter_id[:12]}...: "
+            f"v={velocity_pct_per_hour:.4%}/hr, u={uncertainty:.4f}",
+            level="debug"
+        )
+
+        return True
+
+    def query_kalman_velocity(
+        self,
+        channel_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query aggregated Kalman velocity for a channel.
+
+        Returns consensus velocity from all fleet reporters with
+        uncertainty-weighted averaging.
+
+        Args:
+            channel_id: Channel SCID
+
+        Returns:
+            Aggregated Kalman velocity data or None
+        """
+        reports = self._kalman_velocities.get(channel_id, [])
+        if not reports:
+            return None
+
+        # Filter to valid reports
+        valid_reports = [r for r in reports if not r.is_stale()]
+        if not valid_reports:
+            return None
+
+        # Calculate consensus
+        consensus_velocity = self._get_kalman_consensus_velocity(channel_id)
+
+        # Calculate aggregate uncertainty (combined variance)
+        if len(valid_reports) == 1:
+            aggregate_uncertainty = valid_reports[0].uncertainty
+        else:
+            # Combined variance from multiple independent estimates
+            inv_var_sum = sum(1.0 / max(0.001, r.uncertainty ** 2) for r in valid_reports)
+            aggregate_uncertainty = 1.0 / math.sqrt(inv_var_sum) if inv_var_sum > 0 else 0.1
+
+        # Average flow ratio
+        avg_flow_ratio = sum(r.flow_ratio for r in valid_reports) / len(valid_reports)
+        avg_confidence = sum(r.confidence for r in valid_reports) / len(valid_reports)
+
+        # Check for regime change consensus
+        regime_change_count = sum(1 for r in valid_reports if r.is_regime_change)
+        is_consensus_regime_change = regime_change_count > len(valid_reports) / 2
+
+        # Determine if we have consensus (multiple reporters agreeing)
+        is_consensus = len(valid_reports) >= 2
+
+        return {
+            "status": "ok",
+            "channel_id": channel_id,
+            "velocity_pct_per_hour": consensus_velocity or 0.0,
+            "uncertainty": round(aggregate_uncertainty, 6),
+            "flow_ratio": round(avg_flow_ratio, 4),
+            "confidence": round(avg_confidence, 3),
+            "reporters": len(valid_reports),
+            "is_consensus": is_consensus,
+            "is_regime_change": is_consensus_regime_change,
+            "last_update": max(r.timestamp for r in valid_reports),
+            "reports": [r.to_dict() for r in valid_reports[:5]]  # Limit for response size
+        }
+
+    def get_kalman_velocity_status(self) -> Dict[str, Any]:
+        """Get status of Kalman velocity integration."""
+        now = int(time.time())
+        total_reports = sum(len(r) for r in self._kalman_velocities.values())
+        fresh_reports = sum(
+            sum(1 for r in reports if not r.is_stale())
+            for reports in self._kalman_velocities.values()
+        )
+
+        channels_with_data = len(self._kalman_velocities)
+        channels_with_consensus = sum(
+            1 for channel_id in self._kalman_velocities
+            if self._get_kalman_consensus_velocity(channel_id) is not None
+        )
+
+        return {
+            "kalman_integration_active": True,
+            "total_reports": total_reports,
+            "fresh_reports": fresh_reports,
+            "channels_with_data": channels_with_data,
+            "channels_with_consensus": channels_with_consensus,
+            "unique_peers": len(self._peer_to_channels),
+            "ttl_seconds": KALMAN_VELOCITY_TTL_SECONDS,
+            "min_confidence": KALMAN_MIN_CONFIDENCE,
+            "min_reporters": KALMAN_MIN_REPORTERS
+        }
+
+    def cleanup_stale_kalman_data(self) -> int:
+        """Remove stale Kalman velocity reports."""
+        cleaned = 0
+
+        for channel_id in list(self._kalman_velocities.keys()):
+            before = len(self._kalman_velocities[channel_id])
+            self._kalman_velocities[channel_id] = [
+                r for r in self._kalman_velocities[channel_id]
+                if not r.is_stale()
+            ]
+            cleaned += before - len(self._kalman_velocities[channel_id])
+
+            if not self._kalman_velocities[channel_id]:
+                del self._kalman_velocities[channel_id]
 
         return cleaned
