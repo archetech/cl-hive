@@ -3204,6 +3204,155 @@ instead of the full 90-day probation (if all other criteria met).
                 },
                 "required": ["node"]
             }
+        ),
+        # MCF (Min-Cost Max-Flow) Optimization tools (Phase 15)
+        Tool(
+            name="hive_mcf_status",
+            description="""Get MCF (Min-Cost Max-Flow) optimizer status.
+
+The MCF optimizer computes globally optimal rebalance assignments for the fleet.
+Shows circuit breaker state, health metrics, and current solution status.
+
+**Returns:**
+- enabled: Whether MCF optimization is active
+- is_coordinator: Whether this node is the current MCF coordinator
+- coordinator_id: Current coordinator's pubkey
+- circuit_breaker_state: CLOSED (healthy), OPEN (failing), HALF_OPEN (recovering)
+- health_metrics: Solution staleness, success/failure counts
+- last_solution: Timestamp and stats from most recent optimization
+- pending_assignments: Number of assignments waiting to be executed""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_mcf_solve",
+            description="""Trigger MCF optimization cycle manually.
+
+Runs the Min-Cost Max-Flow solver to compute optimal fleet-wide rebalancing.
+Only effective when called on the current coordinator node.
+
+**Returns:**
+- solution: Computed optimal assignments
+- total_flow: Total sats being rebalanced
+- total_cost: Expected cost in sats
+- assignments_count: Number of member assignments
+- network_stats: Nodes and edges in optimization network
+
+**Note:** Solution is automatically broadcast to fleet members.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (should be coordinator)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_mcf_assignments",
+            description="""Get pending MCF assignments for a node.
+
+Shows rebalance assignments computed by fleet-wide MCF optimization.
+Each assignment specifies source channel, destination channel, amount,
+expected cost, and execution priority.
+
+**Assignment lifecycle:**
+- pending: Waiting to be claimed
+- executing: Currently being processed
+- completed: Successfully executed
+- failed: Execution failed
+- expired: Assignment timed out
+
+**Returns:**
+- pending: Assignments waiting for execution
+- executing: Currently processing
+- completed_recent: Recently completed (last 24h)
+- failed_recent: Recently failed (last 24h)""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_mcf_optimized_path",
+            description="""Get MCF-optimized rebalance path between channels.
+
+Uses the latest MCF solution if available and valid, otherwise falls back to BFS.
+Returns the optimal path for rebalancing liquidity between two channels.
+
+**Returns:**
+- path: List of pubkeys forming the route
+- source: "mcf" or "bfs" indicating which algorithm found the path
+- cost_estimate_ppm: Expected routing cost
+- hops: Number of hops in the path""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query"
+                    },
+                    "source_channel": {
+                        "type": "string",
+                        "description": "Source channel SCID (e.g., 933128x1345x0)"
+                    },
+                    "dest_channel": {
+                        "type": "string",
+                        "description": "Destination channel SCID"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Amount to rebalance in satoshis"
+                    }
+                },
+                "required": ["node", "source_channel", "dest_channel", "amount_sats"]
+            }
+        ),
+        Tool(
+            name="hive_mcf_health",
+            description="""Get detailed MCF health and circuit breaker metrics.
+
+Provides comprehensive view of MCF optimizer health including:
+- Circuit breaker state and transition history
+- Solution staleness tracking
+- Assignment success/failure rates
+- Recovery status after failures
+
+**Circuit Breaker States:**
+- CLOSED: Normal operation, MCF running
+- OPEN: Too many failures, MCF disabled temporarily
+- HALF_OPEN: Testing recovery with limited operations
+
+**Health Assessment:**
+- healthy: All systems nominal
+- degraded: Some issues but operational
+- unhealthy: Circuit breaker open, MCF disabled""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query"
+                    }
+                },
+                "required": ["node"]
+            }
         )
     ]
 
@@ -3504,6 +3653,17 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
         # Promotion Criteria
         elif name == "hive_neophyte_rankings":
             result = await handle_neophyte_rankings(arguments)
+        # MCF (Min-Cost Max-Flow) Optimization tools (Phase 15)
+        elif name == "hive_mcf_status":
+            result = await handle_mcf_status(arguments)
+        elif name == "hive_mcf_solve":
+            result = await handle_mcf_solve(arguments)
+        elif name == "hive_mcf_assignments":
+            result = await handle_mcf_assignments(arguments)
+        elif name == "hive_mcf_optimized_path":
+            result = await handle_mcf_optimized_path(arguments)
+        elif name == "hive_mcf_health":
+            result = await handle_mcf_health(arguments)
         else:
             result = {"error": f"Unknown tool: {name}"}
 
@@ -7902,6 +8062,262 @@ async def handle_neophyte_rankings(args: Dict) -> Dict:
             result["ai_note"] = f"{neophyte_count} neophyte(s), none yet eligible for promotion."
 
     return result
+
+
+# =============================================================================
+# MCF (Min-Cost Max-Flow) Optimization Handlers (Phase 15)
+# =============================================================================
+
+async def handle_mcf_status(args: Dict) -> Dict:
+    """Get MCF optimizer status."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        result = await node.call("hive-mcf-status", {})
+    except Exception as e:
+        return {"error": f"Failed to get MCF status: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Add AI-friendly analysis
+    enabled = result.get("enabled", False)
+    is_coord = result.get("is_coordinator", False)
+    cb_state = result.get("circuit_breaker_state", "unknown")
+    pending = result.get("pending_assignments", 0)
+    last_solution = result.get("last_solution_timestamp", 0)
+
+    if not enabled:
+        result["ai_note"] = "MCF optimization is disabled. Fleet using BFS fallback for rebalancing."
+    elif cb_state == "open":
+        result["ai_note"] = (
+            "Circuit breaker OPEN - MCF temporarily disabled due to failures. "
+            "Will attempt recovery after cooldown period. BFS fallback active."
+        )
+    elif cb_state == "half_open":
+        result["ai_note"] = (
+            "Circuit breaker HALF_OPEN - MCF testing recovery with limited operations."
+        )
+    elif is_coord:
+        result["ai_note"] = (
+            f"This node is MCF coordinator. "
+            f"{pending} pending assignment(s). "
+            f"Circuit breaker healthy (CLOSED)."
+        )
+    else:
+        coord_short = result.get("coordinator_id", "")[:16]
+        result["ai_note"] = (
+            f"MCF active. Coordinator: {coord_short}... "
+            f"{pending} pending assignment(s) for this node."
+        )
+
+    return result
+
+
+async def handle_mcf_solve(args: Dict) -> Dict:
+    """Trigger MCF optimization cycle."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        result = await node.call("hive-mcf-solve", {})
+    except Exception as e:
+        return {"error": f"Failed to run MCF solve: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Add AI-friendly analysis
+    if result.get("solution"):
+        sol = result["solution"]
+        total_flow = sol.get("total_flow", 0)
+        total_cost = sol.get("total_cost", 0)
+        assignments = sol.get("assignments_count", 0)
+        cost_ppm = (total_cost * 1_000_000 // total_flow) if total_flow > 0 else 0
+
+        result["ai_note"] = (
+            f"MCF solution computed: {assignments} assignment(s), "
+            f"{total_flow:,} sats total flow, "
+            f"{total_cost:,} sats cost ({cost_ppm} ppm effective). "
+            "Solution broadcast to fleet."
+        )
+    elif result.get("skipped"):
+        result["ai_note"] = f"MCF solve skipped: {result.get('reason', 'unknown reason')}"
+    else:
+        result["ai_note"] = "MCF solve completed but no solution generated."
+
+    return result
+
+
+async def handle_mcf_assignments(args: Dict) -> Dict:
+    """Get pending MCF assignments."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        result = await node.call("hive-mcf-assignments", {})
+    except Exception as e:
+        return {"error": f"Failed to get MCF assignments: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Add AI-friendly analysis
+    pending = result.get("pending", [])
+    executing = result.get("executing", [])
+    completed = result.get("completed_recent", [])
+    failed = result.get("failed_recent", [])
+
+    pending_count = len(pending)
+    executing_count = len(executing)
+    completed_count = len(completed)
+    failed_count = len(failed)
+
+    if pending_count == 0 and executing_count == 0:
+        if completed_count > 0 or failed_count > 0:
+            success_rate = completed_count * 100 // (completed_count + failed_count) if (completed_count + failed_count) > 0 else 0
+            result["ai_note"] = (
+                f"No active assignments. Recent: {completed_count} completed, "
+                f"{failed_count} failed ({success_rate}% success rate)."
+            )
+        else:
+            result["ai_note"] = "No MCF assignments (pending or recent). Awaiting next optimization cycle."
+    else:
+        total_pending_sats = sum(a.get("amount_sats", 0) for a in pending)
+        result["ai_note"] = (
+            f"{pending_count} pending ({total_pending_sats:,} sats), "
+            f"{executing_count} executing. "
+            f"Recent: {completed_count} completed, {failed_count} failed."
+        )
+
+    return result
+
+
+async def handle_mcf_optimized_path(args: Dict) -> Dict:
+    """Get MCF-optimized rebalance path."""
+    node_name = args.get("node")
+    source_channel = args.get("source_channel")
+    dest_channel = args.get("dest_channel")
+    amount_sats = args.get("amount_sats")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if not source_channel or not dest_channel or not amount_sats:
+        return {"error": "Required: source_channel, dest_channel, amount_sats"}
+
+    try:
+        result = await node.call("hive-mcf-optimized-path", {
+            "source_channel": source_channel,
+            "dest_channel": dest_channel,
+            "amount_sats": amount_sats
+        })
+    except Exception as e:
+        return {"error": f"Failed to get MCF path: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Add AI-friendly analysis
+    path = result.get("path", [])
+    source = result.get("source", "unknown")
+    cost_ppm = result.get("cost_estimate_ppm", 0)
+    hops = len(path) - 1 if path else 0
+
+    if path:
+        result["ai_note"] = (
+            f"Path found via {source.upper()}: {hops} hop(s), ~{cost_ppm} ppm cost. "
+            f"Route: {' -> '.join([p[:8] + '...' for p in path])}"
+        )
+    else:
+        result["ai_note"] = "No path found between specified channels."
+
+    return result
+
+
+async def handle_mcf_health(args: Dict) -> Dict:
+    """Get detailed MCF health metrics."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        # Get MCF status which includes health metrics
+        result = await node.call("hive-mcf-status", {})
+    except Exception as e:
+        return {"error": f"Failed to get MCF health: {e}"}
+
+    if "error" in result:
+        return result
+
+    # Extract and format health-specific information
+    health_result = {
+        "enabled": result.get("enabled", False),
+        "circuit_breaker": {
+            "state": result.get("circuit_breaker_state", "unknown"),
+            "failure_count": result.get("failure_count", 0),
+            "success_count": result.get("success_count", 0),
+            "last_failure": result.get("last_failure_time"),
+            "last_failure_reason": result.get("last_failure_reason")
+        },
+        "health_metrics": result.get("health_metrics", {}),
+        "solution_staleness": result.get("solution_staleness", {}),
+        "is_healthy": result.get("is_healthy", True)
+    }
+
+    # Compute overall health assessment
+    cb_state = health_result["circuit_breaker"]["state"]
+    is_healthy = health_result.get("is_healthy", True)
+    failure_count = health_result["circuit_breaker"]["failure_count"]
+
+    if cb_state == "open":
+        health_result["health_assessment"] = "unhealthy"
+        health_result["ai_note"] = (
+            f"MCF UNHEALTHY: Circuit breaker OPEN after {failure_count} failures. "
+            f"Last failure: {health_result['circuit_breaker'].get('last_failure_reason', 'unknown')}. "
+            "MCF disabled, using BFS fallback. Will attempt recovery after cooldown."
+        )
+    elif cb_state == "half_open":
+        health_result["health_assessment"] = "recovering"
+        health_result["ai_note"] = (
+            "MCF RECOVERING: Circuit breaker testing limited operations. "
+            "If next attempts succeed, will return to normal. "
+            "If they fail, will revert to OPEN state."
+        )
+    elif not is_healthy:
+        health_result["health_assessment"] = "degraded"
+        staleness = result.get("solution_staleness", {})
+        stale_cycles = staleness.get("consecutive_stale_cycles", 0)
+        health_result["ai_note"] = (
+            f"MCF DEGRADED: {stale_cycles} consecutive stale cycles. "
+            "Solutions may be outdated. Check gossip freshness and coordinator connectivity."
+        )
+    else:
+        health_result["health_assessment"] = "healthy"
+        metrics = health_result.get("health_metrics", {})
+        success = metrics.get("successful_assignments", 0)
+        failed = metrics.get("failed_assignments", 0)
+        total = success + failed
+        rate = (success * 100 // total) if total > 0 else 100
+        health_result["ai_note"] = (
+            f"MCF HEALTHY: Circuit breaker CLOSED, {rate}% assignment success rate "
+            f"({success}/{total} assignments)."
+        )
+
+    return health_result
 
 
 # =============================================================================

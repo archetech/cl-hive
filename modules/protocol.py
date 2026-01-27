@@ -139,6 +139,12 @@ class HiveMessageType(IntEnum):
     COVERAGE_ANALYSIS_BATCH = 32869 # Peer coverage and ownership analysis
     CLOSE_PROPOSAL = 32871         # Channel close recommendation for redundancy
 
+    # Phase 15: Min-Cost Max-Flow (MCF) Rebalance Optimization
+    MCF_NEEDS_BATCH = 32873        # Batch of rebalance needs for MCF optimization
+    MCF_SOLUTION_BROADCAST = 32875 # Computed MCF solution from coordinator
+    MCF_ASSIGNMENT_ACK = 32877     # Acknowledge receipt of MCF assignment
+    MCF_COMPLETION_REPORT = 32879  # Report completion of MCF assignment
+
 
 # =============================================================================
 # PHASE 5 VALIDATION CONSTANTS
@@ -406,6 +412,19 @@ MIN_COVERAGE_OWNERSHIP_CONFIDENCE = 0.5         # Minimum confidence to share ow
 MIN_OWNERSHIP_CONFIDENCE = MIN_COVERAGE_OWNERSHIP_CONFIDENCE  # Alias
 CLOSE_PROPOSAL_RATE_LIMIT = (5, 86400)          # 5 close proposals per day
 MAX_CLOSE_PROPOSALS_PER_CYCLE = 5               # Alias for broadcast function
+
+# MCF (Min-Cost Max-Flow) optimization constants (Phase 15)
+MCF_NEEDS_BATCH_RATE_LIMIT = (2, 3600)          # 2 batches per hour per sender
+MCF_SOLUTION_BROADCAST_RATE_LIMIT = (6, 3600)   # 6 solutions per hour (every 10 min)
+MCF_ASSIGNMENT_ACK_RATE_LIMIT = (30, 3600)      # 30 acks per hour
+MCF_COMPLETION_REPORT_RATE_LIMIT = (30, 3600)   # 30 completions per hour
+MAX_MCF_NEEDS_IN_BATCH = 100                    # Maximum needs in one batch
+MAX_MCF_ASSIGNMENTS_IN_SOLUTION = 200           # Maximum assignments in solution
+MCF_SOLUTION_MAX_AGE = 1200                     # 20 minutes max solution age
+MCF_MIN_AMOUNT_SATS = 10000                     # Minimum amount for MCF assignment
+MCF_MAX_AMOUNT_SATS = 100_000_000_000           # 1000 BTC max per assignment
+VALID_MCF_NEED_TYPES = {'inbound', 'outbound'}  # Valid need types
+VALID_MCF_URGENCY_LEVELS = {'critical', 'high', 'medium', 'low'}
 
 # Route probe constants
 MAX_PATH_LENGTH = 20                        # Maximum hops in a path
@@ -5355,3 +5374,395 @@ def create_close_proposal(
         return None
 
     return serialize(HiveMessageType.CLOSE_PROPOSAL, payload)
+
+
+# =============================================================================
+# PHASE 15: MCF (MIN-COST MAX-FLOW) MESSAGE FUNCTIONS
+# =============================================================================
+
+def validate_mcf_needs_batch(payload: Dict[str, Any]) -> bool:
+    """
+    Validate an MCF_NEEDS_BATCH message payload.
+
+    Args:
+        payload: Message payload dict
+
+    Returns:
+        True if valid
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    reporter_id = payload.get("reporter_id")
+    if not isinstance(reporter_id, str) or len(reporter_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, int) or timestamp <= 0:
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str):
+        return False
+
+    needs = payload.get("needs")
+    if not isinstance(needs, list) or len(needs) > MAX_MCF_NEEDS_IN_BATCH:
+        return False
+
+    for need in needs:
+        if not isinstance(need, dict):
+            return False
+
+        need_type = need.get("need_type")
+        if need_type not in VALID_MCF_NEED_TYPES:
+            return False
+
+        amount_sats = need.get("amount_sats")
+        if not isinstance(amount_sats, int) or amount_sats < MCF_MIN_AMOUNT_SATS:
+            return False
+        if amount_sats > MCF_MAX_AMOUNT_SATS:
+            return False
+
+        urgency = need.get("urgency", "medium")
+        if urgency not in VALID_MCF_URGENCY_LEVELS:
+            return False
+
+    return True
+
+
+def validate_mcf_solution_broadcast(payload: Dict[str, Any]) -> bool:
+    """
+    Validate an MCF_SOLUTION_BROADCAST message payload.
+
+    Args:
+        payload: Message payload dict
+
+    Returns:
+        True if valid
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    coordinator_id = payload.get("coordinator_id")
+    if not isinstance(coordinator_id, str) or len(coordinator_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, int) or timestamp <= 0:
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str):
+        return False
+
+    assignments = payload.get("assignments")
+    if not isinstance(assignments, list) or len(assignments) > MAX_MCF_ASSIGNMENTS_IN_SOLUTION:
+        return False
+
+    total_flow_sats = payload.get("total_flow_sats", 0)
+    if not isinstance(total_flow_sats, int) or total_flow_sats < 0:
+        return False
+
+    total_cost_sats = payload.get("total_cost_sats", 0)
+    if not isinstance(total_cost_sats, int) or total_cost_sats < 0:
+        return False
+
+    return True
+
+
+def validate_mcf_assignment_ack(payload: Dict[str, Any]) -> bool:
+    """
+    Validate an MCF_ASSIGNMENT_ACK message payload.
+
+    Args:
+        payload: Message payload dict
+
+    Returns:
+        True if valid
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    member_id = payload.get("member_id")
+    if not isinstance(member_id, str) or len(member_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, int) or timestamp <= 0:
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str):
+        return False
+
+    solution_timestamp = payload.get("solution_timestamp")
+    if not isinstance(solution_timestamp, int):
+        return False
+
+    assignment_count = payload.get("assignment_count")
+    if not isinstance(assignment_count, int) or assignment_count < 0:
+        return False
+
+    return True
+
+
+def validate_mcf_completion_report(payload: Dict[str, Any]) -> bool:
+    """
+    Validate an MCF_COMPLETION_REPORT message payload.
+
+    Args:
+        payload: Message payload dict
+
+    Returns:
+        True if valid
+    """
+    if not isinstance(payload, dict):
+        return False
+
+    member_id = payload.get("member_id")
+    if not isinstance(member_id, str) or len(member_id) > MAX_PEER_ID_LEN:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, int) or timestamp <= 0:
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str):
+        return False
+
+    assignment_id = payload.get("assignment_id")
+    if not isinstance(assignment_id, str):
+        return False
+
+    success = payload.get("success")
+    if not isinstance(success, bool):
+        return False
+
+    actual_amount_sats = payload.get("actual_amount_sats", 0)
+    if not isinstance(actual_amount_sats, int) or actual_amount_sats < 0:
+        return False
+
+    actual_cost_sats = payload.get("actual_cost_sats", 0)
+    if not isinstance(actual_cost_sats, int) or actual_cost_sats < 0:
+        return False
+
+    return True
+
+
+def get_mcf_needs_batch_signing_payload(payload: Dict[str, Any]) -> str:
+    """Get signing payload for MCF_NEEDS_BATCH message."""
+    reporter_id = payload.get("reporter_id", "")
+    timestamp = payload.get("timestamp", 0)
+    needs = payload.get("needs", [])
+    needs_hash = hashlib.sha256(json.dumps(needs, sort_keys=True).encode()).hexdigest()[:16]
+    return f"mcf_needs_batch:{reporter_id}:{timestamp}:{needs_hash}"
+
+
+def get_mcf_solution_signing_payload(payload: Dict[str, Any]) -> str:
+    """Get signing payload for MCF_SOLUTION_BROADCAST message."""
+    coordinator_id = payload.get("coordinator_id", "")
+    timestamp = payload.get("timestamp", 0)
+    total_flow = payload.get("total_flow_sats", 0)
+    total_cost = payload.get("total_cost_sats", 0)
+    assignments = payload.get("assignments", [])
+    assign_hash = hashlib.sha256(json.dumps(assignments, sort_keys=True).encode()).hexdigest()[:16]
+    return f"mcf_solution:{coordinator_id}:{timestamp}:{total_flow}:{total_cost}:{assign_hash}"
+
+
+def get_mcf_assignment_ack_signing_payload(payload: Dict[str, Any]) -> str:
+    """Get signing payload for MCF_ASSIGNMENT_ACK message."""
+    member_id = payload.get("member_id", "")
+    timestamp = payload.get("timestamp", 0)
+    solution_timestamp = payload.get("solution_timestamp", 0)
+    assignment_count = payload.get("assignment_count", 0)
+    return f"mcf_ack:{member_id}:{timestamp}:{solution_timestamp}:{assignment_count}"
+
+
+def get_mcf_completion_signing_payload(payload: Dict[str, Any]) -> str:
+    """Get signing payload for MCF_COMPLETION_REPORT message."""
+    member_id = payload.get("member_id", "")
+    timestamp = payload.get("timestamp", 0)
+    assignment_id = payload.get("assignment_id", "")
+    success = "1" if payload.get("success", False) else "0"
+    amount = payload.get("actual_amount_sats", 0)
+    return f"mcf_complete:{member_id}:{timestamp}:{assignment_id}:{success}:{amount}"
+
+
+def create_mcf_needs_batch(
+    needs: List[Dict[str, Any]],
+    rpc: Any,
+    our_pubkey: str
+) -> Optional[bytes]:
+    """
+    Create an MCF_NEEDS_BATCH message.
+
+    Args:
+        needs: List of rebalance needs (need_type, target_peer, amount_sats, urgency)
+        rpc: RPC interface for signing
+        our_pubkey: Our pubkey
+
+    Returns:
+        Serialized message or None on error
+    """
+    timestamp = int(time.time())
+
+    # Enforce bounds
+    if len(needs) > MAX_MCF_NEEDS_IN_BATCH:
+        needs = needs[:MAX_MCF_NEEDS_IN_BATCH]
+
+    payload = {
+        "reporter_id": our_pubkey,
+        "timestamp": timestamp,
+        "signature": "",
+        "needs": needs,
+    }
+
+    try:
+        signing_payload = get_mcf_needs_batch_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.MCF_NEEDS_BATCH, payload)
+
+
+def create_mcf_solution_broadcast(
+    assignments: List[Dict[str, Any]],
+    total_flow_sats: int,
+    total_cost_sats: int,
+    unmet_demand_sats: int,
+    iterations: int,
+    rpc: Any,
+    our_pubkey: str
+) -> Optional[bytes]:
+    """
+    Create an MCF_SOLUTION_BROADCAST message.
+
+    Args:
+        assignments: List of rebalance assignments
+        total_flow_sats: Total flow achieved
+        total_cost_sats: Total cost
+        unmet_demand_sats: Demand that couldn't be met
+        iterations: Solver iterations
+        rpc: RPC interface for signing
+        our_pubkey: Our pubkey (coordinator)
+
+    Returns:
+        Serialized message or None on error
+    """
+    timestamp = int(time.time())
+
+    # Enforce bounds
+    if len(assignments) > MAX_MCF_ASSIGNMENTS_IN_SOLUTION:
+        assignments = assignments[:MAX_MCF_ASSIGNMENTS_IN_SOLUTION]
+
+    payload = {
+        "coordinator_id": our_pubkey,
+        "timestamp": timestamp,
+        "signature": "",
+        "assignments": assignments,
+        "total_flow_sats": total_flow_sats,
+        "total_cost_sats": total_cost_sats,
+        "unmet_demand_sats": unmet_demand_sats,
+        "iterations": iterations,
+    }
+
+    try:
+        signing_payload = get_mcf_solution_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.MCF_SOLUTION_BROADCAST, payload)
+
+
+def create_mcf_assignment_ack(
+    solution_timestamp: int,
+    assignment_count: int,
+    rpc: Any,
+    our_pubkey: str
+) -> Optional[bytes]:
+    """
+    Create an MCF_ASSIGNMENT_ACK message.
+
+    Args:
+        solution_timestamp: Timestamp of the solution being acknowledged
+        assignment_count: Number of assignments received for us
+        rpc: RPC interface for signing
+        our_pubkey: Our pubkey
+
+    Returns:
+        Serialized message or None on error
+    """
+    timestamp = int(time.time())
+
+    payload = {
+        "member_id": our_pubkey,
+        "timestamp": timestamp,
+        "signature": "",
+        "solution_timestamp": solution_timestamp,
+        "assignment_count": assignment_count,
+    }
+
+    try:
+        signing_payload = get_mcf_assignment_ack_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.MCF_ASSIGNMENT_ACK, payload)
+
+
+def create_mcf_completion_report(
+    assignment_id: str,
+    success: bool,
+    actual_amount_sats: int,
+    actual_cost_sats: int,
+    error_message: str,
+    rpc: Any,
+    our_pubkey: str
+) -> Optional[bytes]:
+    """
+    Create an MCF_COMPLETION_REPORT message.
+
+    Args:
+        assignment_id: ID of the completed assignment
+        success: Whether the assignment succeeded
+        actual_amount_sats: Actual amount rebalanced
+        actual_cost_sats: Actual cost paid
+        error_message: Error message if failed
+        rpc: RPC interface for signing
+        our_pubkey: Our pubkey
+
+    Returns:
+        Serialized message or None on error
+    """
+    timestamp = int(time.time())
+
+    payload = {
+        "member_id": our_pubkey,
+        "timestamp": timestamp,
+        "signature": "",
+        "assignment_id": assignment_id,
+        "success": success,
+        "actual_amount_sats": actual_amount_sats,
+        "actual_cost_sats": actual_cost_sats,
+        "error_message": error_message[:500] if error_message else "",
+    }
+
+    try:
+        signing_payload = get_mcf_completion_signing_payload(payload)
+        sign_result = rpc.signmessage(signing_payload)
+        signature = sign_result.get("signature", sign_result.get("zbase", ""))
+        payload["signature"] = signature
+    except Exception:
+        return None
+
+    return serialize(HiveMessageType.MCF_COMPLETION_REPORT, payload)

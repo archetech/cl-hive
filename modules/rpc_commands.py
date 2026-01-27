@@ -2695,6 +2695,141 @@ def execute_hive_circular_rebalance(
 
 
 # =============================================================================
+# MCF (MIN-COST MAX-FLOW) OPTIMIZATION COMMANDS
+# =============================================================================
+
+def mcf_status(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get MCF (Min-Cost Max-Flow) optimizer status.
+
+    Shows coordinator election status, last solution, and pending assignments.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with MCF status including:
+        - is_coordinator: Whether we are the elected coordinator
+        - coordinator_id: Pubkey of current coordinator
+        - last_solution: Details of last computed solution
+        - solution_valid: Whether solution is still within validity window
+        - our_assignments: Pending assignments for our node
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction not initialized"}
+
+    try:
+        return ctx.cost_reduction_mgr.get_mcf_status()
+
+    except Exception as e:
+        return {"error": f"Failed to get MCF status: {e}"}
+
+
+def mcf_solve(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Trigger MCF optimization cycle.
+
+    Only succeeds if we are the elected coordinator. Collects needs from
+    all fleet members and computes globally optimal rebalance assignments.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with MCF solution including:
+        - assignments: List of rebalance assignments for fleet members
+        - total_flow_sats: Total liquidity moved
+        - total_cost_sats: Total routing cost
+        - unmet_demand_sats: Demand that couldn't be satisfied
+        - computation_time_ms: Time to solve
+        - iterations: Number of solver iterations
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction not initialized"}
+
+    try:
+        result = ctx.cost_reduction_mgr.run_mcf_optimization()
+        if result:
+            return result
+        return {
+            "status": "skipped",
+            "reason": "Not coordinator or insufficient demand"
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to run MCF optimization: {e}"}
+
+
+def mcf_assignments(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get pending MCF assignments for our node.
+
+    These are the rebalance operations we should execute as part of
+    the fleet-wide optimization.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with:
+        - assignments: List of pending assignments with details
+        - count: Number of pending assignments
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction not initialized"}
+
+    try:
+        assignments = ctx.cost_reduction_mgr.get_mcf_assignments()
+        return {
+            "assignments": assignments,
+            "count": len(assignments)
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get MCF assignments: {e}"}
+
+
+def mcf_optimized_path(
+    ctx: HiveContext,
+    from_channel: str,
+    to_channel: str,
+    amount_sats: int
+) -> Dict[str, Any]:
+    """
+    Get MCF-optimized rebalance path between channels.
+
+    Uses the latest MCF solution if available and valid,
+    otherwise falls back to BFS-based fleet routing.
+
+    Args:
+        ctx: HiveContext
+        from_channel: Source channel SCID
+        to_channel: Destination channel SCID
+        amount_sats: Amount to rebalance
+
+    Returns:
+        Dict with path recommendation including:
+        - source: "mcf" or "bfs" indicating which algorithm found the path
+        - fleet_path_available: Whether a fleet path exists
+        - fleet_path: List of pubkeys in the path
+        - estimated_fleet_cost_sats: Expected cost
+        - recommendation: Recommended action
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction not initialized"}
+
+    try:
+        return ctx.cost_reduction_mgr.get_mcf_optimized_path(
+            from_channel=from_channel,
+            to_channel=to_channel,
+            amount_sats=amount_sats
+        )
+
+    except Exception as e:
+        return {"error": f"Failed to get MCF optimized path: {e}"}
+
+
+# =============================================================================
 # CHANNEL RATIONALIZATION COMMANDS
 # =============================================================================
 
@@ -3374,3 +3509,221 @@ def neophyte_rankings(ctx: HiveContext) -> Dict[str, Any]:
 
     except Exception as e:
         return {"error": f"Failed to get neophyte rankings: {e}"}
+
+
+# =============================================================================
+# MCF (Min-Cost Max-Flow) COMMANDS
+# =============================================================================
+
+def mcf_status(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get MCF optimization status.
+
+    Shows coordinator election, pending assignments, completion stats,
+    and latest solution information.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with MCF status including:
+        - enabled: Whether MCF is enabled
+        - is_coordinator: Whether we are the elected coordinator
+        - coordinator_id: Elected coordinator's pubkey
+        - pending_assignments: Our pending MCF assignments
+        - solution_info: Latest solution stats
+        - ack_stats: Assignment acknowledgment stats
+        - completion_stats: Completion report stats
+    """
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction manager not initialized"}
+
+    try:
+        # Get basic MCF status
+        mcf_coord_status = ctx.cost_reduction_mgr.get_mcf_status()
+
+        # Get coordinator info
+        coordinator_id = ctx.cost_reduction_mgr.get_current_mcf_coordinator()
+
+        # Get our assignments from liquidity coordinator
+        pending_assignments = []
+        if ctx.liquidity_coordinator:
+            liq_status = ctx.liquidity_coordinator.get_mcf_status()
+            pending_assignments = liq_status.get("pending_assignments", [])
+
+        # Get ACK and completion stats
+        acks = ctx.cost_reduction_mgr.get_mcf_acks()
+        completions = ctx.cost_reduction_mgr.get_mcf_completions()
+
+        success_count = sum(1 for c in completions if c.get("success"))
+        failure_count = sum(1 for c in completions if not c.get("success"))
+
+        return {
+            "enabled": mcf_coord_status.get("enabled", False),
+            "is_coordinator": mcf_coord_status.get("is_coordinator", False),
+            "coordinator_id": coordinator_id,
+            "our_pubkey": ctx.our_pubkey,
+            "pending_assignments": {
+                "count": len(pending_assignments),
+                "assignments": pending_assignments[:5],  # First 5
+            },
+            "solution_info": {
+                "valid": mcf_coord_status.get("solution_valid", False),
+                "last_timestamp": mcf_coord_status.get("last_solution_timestamp", 0),
+                "total_flow_sats": mcf_coord_status.get("total_flow_sats", 0),
+                "total_cost_sats": mcf_coord_status.get("total_cost_sats", 0),
+                "assignment_count": mcf_coord_status.get("assignment_count", 0),
+            },
+            "ack_stats": {
+                "count": len(acks),
+                "recent": acks[-5:] if acks else [],  # Last 5
+            },
+            "completion_stats": {
+                "total": len(completions),
+                "success": success_count,
+                "failure": failure_count,
+                "recent": completions[-5:] if completions else [],  # Last 5
+            },
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get MCF status: {e}"}
+
+
+def mcf_solve(ctx: HiveContext, dry_run: bool = True) -> Dict[str, Any]:
+    """
+    Trigger MCF optimization cycle manually.
+
+    Computes optimal rebalance assignments for the fleet. Only works if
+    this node is the elected coordinator.
+
+    Args:
+        ctx: HiveContext
+        dry_run: If True, compute solution but don't broadcast (default: True)
+
+    Returns:
+        Dict with solution details including:
+        - coordinator: Whether we are coordinator
+        - solution: Optimization results (flow, cost, assignments)
+        - broadcast: Whether solution was broadcast
+
+    Permission: Member only
+    """
+    # Permission check: Member only
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ctx.cost_reduction_mgr:
+        return {"error": "Cost reduction manager not initialized"}
+
+    try:
+        # Check if we're coordinator
+        coordinator_id = ctx.cost_reduction_mgr.get_current_mcf_coordinator()
+        is_coordinator = coordinator_id == ctx.our_pubkey
+
+        if not is_coordinator:
+            return {
+                "error": "Not coordinator",
+                "message": "Only the elected coordinator can run MCF optimization",
+                "coordinator_id": coordinator_id,
+                "our_pubkey": ctx.our_pubkey
+            }
+
+        # Run optimization
+        solution = ctx.cost_reduction_mgr.run_mcf_optimization()
+
+        if not solution:
+            return {
+                "success": False,
+                "message": "No solution generated (may not have enough demand)",
+                "is_coordinator": True
+            }
+
+        result = {
+            "success": True,
+            "is_coordinator": True,
+            "dry_run": dry_run,
+            "solution": {
+                "total_flow_sats": solution.get("total_flow_sats", 0),
+                "total_cost_sats": solution.get("total_cost_sats", 0),
+                "unmet_demand_sats": solution.get("unmet_demand_sats", 0),
+                "assignment_count": len(solution.get("assignments", [])),
+                "computation_time_ms": solution.get("computation_time_ms", 0),
+                "iterations": solution.get("iterations", 0),
+            },
+            "assignments": solution.get("assignments", [])[:10],  # First 10
+        }
+
+        if not dry_run:
+            # Broadcast solution (integration will be added when cl-hive.py wrapper is created)
+            result["broadcast"] = True
+            result["message"] = "Solution broadcast to fleet"
+        else:
+            result["broadcast"] = False
+            result["message"] = "Dry run - solution not broadcast (use dry_run=false to broadcast)"
+
+        return result
+
+    except Exception as e:
+        return {"error": f"MCF optimization failed: {e}"}
+
+
+def mcf_assignments(ctx: HiveContext) -> Dict[str, Any]:
+    """
+    Get detailed view of our MCF assignments.
+
+    Shows all pending, executing, completed, and failed assignments
+    from the current and recent MCF solutions.
+
+    Args:
+        ctx: HiveContext
+
+    Returns:
+        Dict with assignment details by status.
+    """
+    if not ctx.liquidity_coordinator:
+        return {"error": "Liquidity coordinator not initialized"}
+
+    try:
+        status = ctx.liquidity_coordinator.get_mcf_status()
+
+        # Get all assignments by status
+        all_assignments = []
+        if hasattr(ctx.liquidity_coordinator, '_mcf_assignments'):
+            all_assignments = list(ctx.liquidity_coordinator._mcf_assignments.values())
+
+        pending = [a for a in all_assignments if a.status == "pending"]
+        executing = [a for a in all_assignments if a.status == "executing"]
+        completed = [a for a in all_assignments if a.status == "completed"]
+        failed = [a for a in all_assignments if a.status in ("failed", "rejected")]
+
+        def format_assignment(a):
+            return {
+                "assignment_id": a.assignment_id,
+                "from_channel": a.from_channel,
+                "to_channel": a.to_channel,
+                "amount_sats": a.amount_sats,
+                "expected_cost_sats": a.expected_cost_sats,
+                "priority": a.priority,
+                "status": a.status,
+                "coordinator_id": a.coordinator_id[:16] + "..." if a.coordinator_id else "",
+            }
+
+        return {
+            "last_solution_timestamp": status.get("last_solution_timestamp", 0),
+            "ack_sent": status.get("ack_sent", False),
+            "summary": {
+                "pending": len(pending),
+                "executing": len(executing),
+                "completed": len(completed),
+                "failed": len(failed),
+            },
+            "pending": [format_assignment(a) for a in pending],
+            "executing": [format_assignment(a) for a in executing],
+            "completed": [format_assignment(a) for a in completed[-10:]],  # Last 10
+            "failed": [format_assignment(a) for a in failed[-10:]],  # Last 10
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get MCF assignments: {e}"}

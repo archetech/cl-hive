@@ -34,6 +34,9 @@ from .protocol import (
     LIQUIDITY_NEED_RATE_LIMIT,
     LIQUIDITY_SNAPSHOT_RATE_LIMIT,
     MAX_NEEDS_IN_SNAPSHOT,
+    # MCF message functions (Phase 15)
+    create_mcf_assignment_ack,
+    create_mcf_completion_report,
 )
 
 
@@ -55,6 +58,8 @@ REASON_NNLB_ASSIST = "nnlb_assist"
 
 # Limits
 MAX_PENDING_NEEDS = 100  # Max liquidity needs to track
+MAX_MCF_ASSIGNMENTS = 50  # Max MCF assignments to track
+MCF_ASSIGNMENT_TTL = 3600  # 1 hour TTL for assignments
 
 
 @dataclass
@@ -72,6 +77,50 @@ class LiquidityNeed:
     can_provide_outbound: int
     timestamp: int
     signature: str
+
+
+@dataclass
+class MCFAssignment:
+    """
+    MCF rebalance assignment received from coordinator.
+
+    Represents an action we should execute as part of the fleet-wide
+    optimization computed by the MCF solver.
+    """
+    assignment_id: str          # Unique ID for tracking
+    solution_timestamp: int     # Which solution this belongs to
+    coordinator_id: str         # Who computed the solution
+    from_channel: str           # Source channel SCID
+    to_channel: str             # Destination channel SCID
+    amount_sats: int            # Amount to rebalance
+    expected_cost_sats: int     # Expected routing cost
+    path: List[str]             # Routing path (pubkeys)
+    priority: int               # Execution order (lower = sooner)
+    via_fleet: bool             # True if routed through hive
+    received_at: int            # When we received this
+    status: str = "pending"     # pending, executing, completed, failed, rejected
+    actual_amount_sats: int = 0
+    actual_cost_sats: int = 0
+    error_message: str = ""
+    completed_at: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "assignment_id": self.assignment_id,
+            "solution_timestamp": self.solution_timestamp,
+            "coordinator_id": self.coordinator_id[:16] + "..." if self.coordinator_id else "",
+            "from_channel": self.from_channel,
+            "to_channel": self.to_channel,
+            "amount_sats": self.amount_sats,
+            "expected_cost_sats": self.expected_cost_sats,
+            "path": self.path,
+            "priority": self.priority,
+            "via_fleet": self.via_fleet,
+            "status": self.status,
+            "actual_amount_sats": self.actual_amount_sats,
+            "actual_cost_sats": self.actual_cost_sats,
+            "error_message": self.error_message,
+        }
 
 
 class LiquidityCoordinator:
@@ -118,6 +167,15 @@ class LiquidityCoordinator:
         # Rate limiting
         self._need_rate: Dict[str, List[float]] = defaultdict(list)
         self._snapshot_rate: Dict[str, List[float]] = defaultdict(list)
+
+        # MCF assignment tracking (Phase 15)
+        self._mcf_assignments: Dict[str, MCFAssignment] = {}  # assignment_id -> assignment
+        self._last_mcf_solution_timestamp: int = 0
+        self._mcf_ack_sent: bool = False  # Track if we've ACKed current solution
+
+        # Remote MCF needs (received from fleet members, coordinator only)
+        self._remote_mcf_needs: Dict[str, Dict[str, Any]] = {}  # reporter_id -> need
+        self._max_remote_needs = 500  # Bound cache size
 
     def _check_rate_limit(
         self,
@@ -1249,3 +1307,396 @@ class LiquidityCoordinator:
             "recommendation": "Implement coordinated fee strategy to eliminate undercutting",
             "competitions": competitions[:10]  # Top 10 for display
         }
+
+    # =========================================================================
+    # MCF (MIN-COST MAX-FLOW) INTEGRATION (Phase 15)
+    # =========================================================================
+
+    def get_all_liquidity_needs_for_mcf(self) -> List[Dict[str, Any]]:
+        """
+        Get all liquidity needs in MCF-compatible format.
+
+        Combines our own needs with fleet needs for the MCF solver.
+        Used by MCFCoordinator to build the optimization network.
+
+        Returns:
+            List of needs formatted for MCF solver with:
+            - member_id: Who has the need
+            - need_type: 'inbound' or 'outbound'
+            - target_peer: Target peer pubkey
+            - amount_sats: Amount needed
+            - urgency: Priority level
+            - max_fee_ppm: Maximum acceptable fee
+        """
+        mcf_needs = []
+
+        # Add needs from _liquidity_needs (received via gossip)
+        for need in self._liquidity_needs.values():
+            # Skip stale needs (older than 30 minutes)
+            if time.time() - need.timestamp > 1800:
+                continue
+
+            mcf_needs.append({
+                "member_id": need.reporter_id,
+                "need_type": need.need_type,
+                "target_peer": need.target_peer_id,
+                "amount_sats": need.amount_sats,
+                "urgency": need.urgency,
+                "max_fee_ppm": need.max_fee_ppm,
+                "channel_id": "",  # Not always known from gossip
+            })
+
+        # Add our own needs (if we have fresh data)
+        try:
+            if self.plugin and self.plugin.rpc:
+                funds = self.plugin.rpc.listfunds()
+                our_needs = self.assess_our_liquidity_needs(funds)
+
+                for need in our_needs:
+                    mcf_needs.append({
+                        "member_id": self.our_pubkey,
+                        "need_type": need["need_type"],
+                        "target_peer": need["target_peer_id"],
+                        "amount_sats": need["amount_sats"],
+                        "urgency": need["urgency"],
+                        "max_fee_ppm": 1000,  # Default max fee
+                        "channel_id": "",
+                    })
+        except Exception as e:
+            self._log(f"Error assessing our needs for MCF: {e}", "debug")
+
+        # Add remote MCF needs (received from other fleet members)
+        for reporter_id, need in self._remote_mcf_needs.items():
+            # Skip stale needs (older than 30 minutes)
+            received_at = need.get("received_at", 0)
+            if time.time() - received_at > 1800:
+                continue
+
+            mcf_needs.append({
+                "member_id": need.get("reporter_id", reporter_id),
+                "need_type": need.get("need_type", "inbound"),
+                "target_peer": need.get("target_peer", ""),
+                "amount_sats": need.get("amount_sats", 0),
+                "urgency": need.get("urgency", "medium"),
+                "max_fee_ppm": need.get("max_fee_ppm", 1000),
+                "channel_id": need.get("channel_id", ""),
+            })
+
+        return mcf_needs
+
+    def store_remote_mcf_need(self, need: Dict[str, Any]) -> bool:
+        """
+        Store a remote MCF need received from another fleet member.
+
+        Called by the coordinator when receiving MCF_NEEDS_BATCH messages.
+
+        Args:
+            need: Need dict containing reporter_id, need_type, target_peer, etc.
+
+        Returns:
+            True if stored successfully
+        """
+        reporter_id = need.get("reporter_id", "")
+        if not reporter_id:
+            return False
+
+        # Validate basic structure
+        need_type = need.get("need_type", "")
+        if need_type not in ("inbound", "outbound"):
+            return False
+
+        amount_sats = need.get("amount_sats", 0)
+        if amount_sats <= 0:
+            return False
+
+        # Store by reporter_id (latest need per member)
+        self._remote_mcf_needs[reporter_id] = {
+            "reporter_id": reporter_id,
+            "need_type": need_type,
+            "target_peer": need.get("target_peer", ""),
+            "amount_sats": amount_sats,
+            "urgency": need.get("urgency", "medium"),
+            "max_fee_ppm": need.get("max_fee_ppm", 1000),
+            "channel_id": need.get("channel_id", ""),
+            "received_at": need.get("received_at", int(time.time())),
+        }
+
+        # Enforce size limit
+        if len(self._remote_mcf_needs) > self._max_remote_needs:
+            # Remove oldest entries
+            sorted_needs = sorted(
+                self._remote_mcf_needs.items(),
+                key=lambda x: x[1].get("received_at", 0)
+            )
+            for k, _ in sorted_needs[:100]:
+                del self._remote_mcf_needs[k]
+
+        return True
+
+    def get_remote_mcf_needs_count(self) -> int:
+        """Get count of stored remote MCF needs."""
+        return len(self._remote_mcf_needs)
+
+    def clear_stale_remote_needs(self, max_age_seconds: int = 1800) -> int:
+        """
+        Clear remote MCF needs older than max_age_seconds.
+
+        Args:
+            max_age_seconds: Maximum age in seconds (default 30 minutes)
+
+        Returns:
+            Number of needs removed
+        """
+        now = time.time()
+        stale_keys = [
+            k for k, v in self._remote_mcf_needs.items()
+            if now - v.get("received_at", 0) > max_age_seconds
+        ]
+        for k in stale_keys:
+            del self._remote_mcf_needs[k]
+        return len(stale_keys)
+
+    def receive_mcf_assignment(
+        self,
+        assignment_data: Dict[str, Any],
+        solution_timestamp: int,
+        coordinator_id: str
+    ) -> bool:
+        """
+        Receive and store an MCF assignment from the coordinator.
+
+        Called when we receive an MCF_SOLUTION_BROADCAST with assignments for us.
+
+        Args:
+            assignment_data: Assignment dict from solution
+            solution_timestamp: Timestamp of the MCF solution
+            coordinator_id: Pubkey of the coordinator
+
+        Returns:
+            True if assignment was accepted
+        """
+        # Generate assignment ID
+        assignment_id = f"mcf_{solution_timestamp}_{assignment_data.get('priority', 0)}"
+
+        # Check for duplicate
+        if assignment_id in self._mcf_assignments:
+            return False
+
+        # Validate basic fields
+        amount_sats = assignment_data.get("amount_sats", 0)
+        if amount_sats <= 0:
+            return False
+
+        # Create assignment
+        assignment = MCFAssignment(
+            assignment_id=assignment_id,
+            solution_timestamp=solution_timestamp,
+            coordinator_id=coordinator_id,
+            from_channel=assignment_data.get("from_channel", ""),
+            to_channel=assignment_data.get("to_channel", ""),
+            amount_sats=amount_sats,
+            expected_cost_sats=assignment_data.get("expected_cost_sats", 0),
+            path=assignment_data.get("path", []),
+            priority=assignment_data.get("priority", 0),
+            via_fleet=assignment_data.get("via_fleet", True),
+            received_at=int(time.time()),
+            status="pending",
+        )
+
+        # Enforce limits
+        if len(self._mcf_assignments) >= MAX_MCF_ASSIGNMENTS:
+            self._cleanup_old_mcf_assignments()
+
+        self._mcf_assignments[assignment_id] = assignment
+        self._last_mcf_solution_timestamp = solution_timestamp
+        self._mcf_ack_sent = False
+
+        self._log(
+            f"Received MCF assignment {assignment_id}: "
+            f"{amount_sats} sats, priority={assignment.priority}",
+            "info"
+        )
+
+        return True
+
+    def get_pending_mcf_assignments(self) -> List[MCFAssignment]:
+        """
+        Get pending MCF assignments sorted by priority.
+
+        Returns:
+            List of pending assignments (status='pending'), sorted by priority
+        """
+        self._cleanup_old_mcf_assignments()
+
+        pending = [
+            a for a in self._mcf_assignments.values()
+            if a.status == "pending"
+        ]
+
+        return sorted(pending, key=lambda a: a.priority)
+
+    def get_mcf_assignment(self, assignment_id: str) -> Optional[MCFAssignment]:
+        """Get a specific MCF assignment by ID."""
+        return self._mcf_assignments.get(assignment_id)
+
+    def update_mcf_assignment_status(
+        self,
+        assignment_id: str,
+        status: str,
+        actual_amount_sats: int = 0,
+        actual_cost_sats: int = 0,
+        error_message: str = ""
+    ) -> bool:
+        """
+        Update the status of an MCF assignment.
+
+        Args:
+            assignment_id: Assignment to update
+            status: New status (executing, completed, failed, rejected)
+            actual_amount_sats: Actual amount rebalanced (for completed)
+            actual_cost_sats: Actual cost paid (for completed)
+            error_message: Error message (for failed)
+
+        Returns:
+            True if assignment was found and updated
+        """
+        assignment = self._mcf_assignments.get(assignment_id)
+        if not assignment:
+            return False
+
+        assignment.status = status
+        assignment.actual_amount_sats = actual_amount_sats
+        assignment.actual_cost_sats = actual_cost_sats
+        assignment.error_message = error_message
+
+        if status in ("completed", "failed", "rejected"):
+            assignment.completed_at = int(time.time())
+
+        self._log(
+            f"MCF assignment {assignment_id} status updated to {status}",
+            "info"
+        )
+
+        return True
+
+    def create_mcf_ack_message(self) -> Optional[bytes]:
+        """
+        Create MCF_ASSIGNMENT_ACK message for current solution.
+
+        Returns:
+            Serialized message or None if no pending solution
+        """
+        if self._mcf_ack_sent:
+            return None
+
+        if not self._last_mcf_solution_timestamp:
+            return None
+
+        pending = self.get_pending_mcf_assignments()
+        assignment_count = len(pending)
+
+        try:
+            msg = create_mcf_assignment_ack(
+                solution_timestamp=self._last_mcf_solution_timestamp,
+                assignment_count=assignment_count,
+                rpc=self.plugin.rpc,
+                our_pubkey=self.our_pubkey
+            )
+            if msg:
+                self._mcf_ack_sent = True
+            return msg
+        except Exception as e:
+            self._log(f"Error creating MCF ACK: {e}", "warn")
+            return None
+
+    def create_mcf_completion_message(
+        self,
+        assignment_id: str
+    ) -> Optional[bytes]:
+        """
+        Create MCF_COMPLETION_REPORT message for a completed assignment.
+
+        Args:
+            assignment_id: Assignment that was completed
+
+        Returns:
+            Serialized message or None on error
+        """
+        assignment = self._mcf_assignments.get(assignment_id)
+        if not assignment:
+            return None
+
+        if assignment.status not in ("completed", "failed", "rejected"):
+            return None
+
+        try:
+            return create_mcf_completion_report(
+                assignment_id=assignment_id,
+                success=(assignment.status == "completed"),
+                actual_amount_sats=assignment.actual_amount_sats,
+                actual_cost_sats=assignment.actual_cost_sats,
+                error_message=assignment.error_message,
+                rpc=self.plugin.rpc,
+                our_pubkey=self.our_pubkey
+            )
+        except Exception as e:
+            self._log(f"Error creating MCF completion report: {e}", "warn")
+            return None
+
+    def get_mcf_status(self) -> Dict[str, Any]:
+        """
+        Get MCF assignment status for this node.
+
+        Returns:
+            Dict with assignment counts and details
+        """
+        self._cleanup_old_mcf_assignments()
+
+        all_assignments = list(self._mcf_assignments.values())
+        pending = [a for a in all_assignments if a.status == "pending"]
+        executing = [a for a in all_assignments if a.status == "executing"]
+        completed = [a for a in all_assignments if a.status == "completed"]
+        failed = [a for a in all_assignments if a.status in ("failed", "rejected")]
+
+        return {
+            "last_solution_timestamp": self._last_mcf_solution_timestamp,
+            "ack_sent": self._mcf_ack_sent,
+            "assignment_counts": {
+                "total": len(all_assignments),
+                "pending": len(pending),
+                "executing": len(executing),
+                "completed": len(completed),
+                "failed": len(failed),
+            },
+            "pending_assignments": [a.to_dict() for a in pending[:10]],
+            "total_pending_amount_sats": sum(a.amount_sats for a in pending),
+        }
+
+    def _cleanup_old_mcf_assignments(self) -> None:
+        """Remove old/expired MCF assignments."""
+        now = time.time()
+        expired = []
+
+        for assignment_id, assignment in self._mcf_assignments.items():
+            age = now - assignment.received_at
+
+            # Remove completed/failed assignments older than 1 hour
+            if assignment.status in ("completed", "failed", "rejected"):
+                if age > MCF_ASSIGNMENT_TTL:
+                    expired.append(assignment_id)
+
+            # Remove pending assignments older than solution TTL (20 min)
+            elif assignment.status == "pending":
+                if age > 1200:  # MAX_SOLUTION_AGE
+                    expired.append(assignment_id)
+
+        for assignment_id in expired:
+            del self._mcf_assignments[assignment_id]
+
+        if expired:
+            self._log(f"Cleaned up {len(expired)} old MCF assignments", "debug")
+
+    def _log(self, message: str, level: str = "debug") -> None:
+        """Log a message if plugin is available."""
+        if self.plugin:
+            self.plugin.log(f"LIQUIDITY_COORD: {message}", level=level)

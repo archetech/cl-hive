@@ -20,6 +20,16 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 
 from . import network_metrics
+from .mcf_solver import (
+    MCFCoordinator,
+    MCFNetworkBuilder,
+    SSPSolver,
+    RebalanceNeed,
+    RebalanceAssignment,
+    MCFSolution,
+    MIN_MCF_DEMAND,
+    MAX_SOLUTION_AGE,
+)
 
 
 # =============================================================================
@@ -1341,6 +1351,7 @@ class CostReductionManager:
     - Predictive rebalancing
     - Fleet rebalance routing
     - Circular flow detection
+    - MCF (Min-Cost Max-Flow) optimization (Phase 15)
     """
 
     def __init__(
@@ -1364,6 +1375,7 @@ class CostReductionManager:
         self.plugin = plugin
         self.database = database
         self.state_manager = state_manager
+        self.liquidity_coordinator = liquidity_coordinator
 
         # Initialize components
         self.predictive_rebalancer = PredictiveRebalancer(
@@ -1383,6 +1395,10 @@ class CostReductionManager:
             state_manager=state_manager
         )
 
+        # MCF coordinator (initialized when pubkey is set)
+        self._mcf_coordinator: Optional[MCFCoordinator] = None
+        self._mcf_enabled: bool = True  # Can be disabled via config
+
         self._our_pubkey: Optional[str] = None
 
     def set_our_pubkey(self, pubkey: str) -> None:
@@ -1390,6 +1406,16 @@ class CostReductionManager:
         self._our_pubkey = pubkey
         self.predictive_rebalancer.set_our_pubkey(pubkey)
         self.fleet_router.set_our_pubkey(pubkey)
+
+        # Initialize MCF coordinator
+        if self.database and self.state_manager:
+            self._mcf_coordinator = MCFCoordinator(
+                plugin=self.plugin,
+                database=self.database,
+                state_manager=self.state_manager,
+                liquidity_coordinator=self.liquidity_coordinator,
+                our_pubkey=pubkey
+            )
 
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
@@ -1591,19 +1617,261 @@ class CostReductionManager:
         """
         circular_status = self.circular_detector.get_circular_flow_status()
 
+        # Get MCF status if available
+        mcf_status = None
+        if self._mcf_coordinator and self._mcf_enabled:
+            mcf_status = self._mcf_coordinator.get_status()
+
         return {
             "predictive_rebalancing_enabled": True,
             "fleet_routing_enabled": True,
             "circular_flow_detection_enabled": True,
+            "mcf_optimization_enabled": self._mcf_enabled and self._mcf_coordinator is not None,
             "circular_flow_status": circular_status,
+            "mcf_status": mcf_status,
             "constants": {
                 "depletion_risk_threshold": DEPLETION_RISK_THRESHOLD,
                 "saturation_risk_threshold": SATURATION_RISK_THRESHOLD,
                 "preemptive_max_fee_ppm": PREEMPTIVE_MAX_FEE_PPM,
                 "urgent_max_fee_ppm": URGENT_MAX_FEE_PPM,
-                "fleet_path_savings_threshold": FLEET_PATH_SAVINGS_THRESHOLD
+                "fleet_path_savings_threshold": FLEET_PATH_SAVINGS_THRESHOLD,
+                "mcf_min_demand_sats": MIN_MCF_DEMAND,
+                "mcf_max_solution_age_seconds": MAX_SOLUTION_AGE
             }
         }
+
+    # =========================================================================
+    # MCF (MIN-COST MAX-FLOW) OPTIMIZATION (Phase 15)
+    # =========================================================================
+
+    def run_mcf_optimization(self) -> Optional[Dict[str, Any]]:
+        """
+        Run MCF optimization cycle.
+
+        Only runs if we are the coordinator. Returns solution if successful.
+
+        Returns:
+            MCF solution dict or None
+        """
+        if not self._mcf_enabled or not self._mcf_coordinator:
+            return None
+
+        solution = self._mcf_coordinator.run_optimization_cycle()
+        if solution:
+            return solution.to_dict()
+        return None
+
+    def get_mcf_status(self) -> Dict[str, Any]:
+        """
+        Get MCF coordinator status.
+
+        Returns:
+            Status dict with coordinator info, solution, and assignments
+        """
+        if not self._mcf_coordinator:
+            return {
+                "enabled": False,
+                "reason": "MCF coordinator not initialized"
+            }
+
+        if not self._mcf_enabled:
+            return {
+                "enabled": False,
+                "reason": "MCF optimization disabled"
+            }
+
+        return self._mcf_coordinator.get_status()
+
+    def get_mcf_assignments(self) -> List[Dict[str, Any]]:
+        """
+        Get our pending MCF assignments.
+
+        Returns:
+            List of assignment dicts
+        """
+        if not self._mcf_coordinator:
+            return []
+
+        assignments = self._mcf_coordinator.get_our_assignments()
+        return [a.to_dict() for a in assignments]
+
+    def receive_mcf_solution(self, solution_data: Dict[str, Any]) -> bool:
+        """
+        Receive and validate an MCF solution from the coordinator.
+
+        Args:
+            solution_data: Serialized MCF solution
+
+        Returns:
+            True if accepted
+        """
+        if not self._mcf_coordinator:
+            return False
+
+        return self._mcf_coordinator.receive_solution(solution_data)
+
+    def set_mcf_enabled(self, enabled: bool) -> None:
+        """Enable or disable MCF optimization."""
+        self._mcf_enabled = enabled
+        self._log(f"MCF optimization {'enabled' if enabled else 'disabled'}")
+
+    def get_mcf_optimized_path(
+        self,
+        from_channel: str,
+        to_channel: str,
+        amount_sats: int
+    ) -> Dict[str, Any]:
+        """
+        Get rebalance path using MCF optimization when available.
+
+        Falls back to BFS-based fleet routing if MCF is not available.
+
+        Args:
+            from_channel: Source channel SCID
+            to_channel: Destination channel SCID
+            amount_sats: Amount to rebalance
+
+        Returns:
+            Path recommendation dict
+        """
+        # Try MCF-based path first
+        if self._mcf_enabled and self._mcf_coordinator:
+            mcf_status = self._mcf_coordinator.get_status()
+            if mcf_status.get("solution_valid"):
+                # Check if there's an assignment that matches
+                assignments = self._mcf_coordinator.get_our_assignments()
+                for assignment in assignments:
+                    if (assignment.from_channel == from_channel and
+                        assignment.amount_sats >= amount_sats):
+                        return {
+                            "source": "mcf",
+                            "fleet_path_available": True,
+                            "fleet_path": assignment.path,
+                            "estimated_fleet_cost_sats": assignment.expected_cost_sats,
+                            "via_fleet": assignment.via_fleet,
+                            "assignment": assignment.to_dict(),
+                            "recommendation": "use_mcf_assignment"
+                        }
+
+        # Fall back to BFS-based routing
+        bfs_result = self.fleet_router.get_best_rebalance_path(
+            from_channel=from_channel,
+            to_channel=to_channel,
+            amount_sats=amount_sats
+        )
+        bfs_result["source"] = "bfs"
+        return bfs_result
+
+    def get_current_mcf_coordinator(self) -> Optional[str]:
+        """
+        Get the pubkey of the current MCF coordinator.
+
+        Returns:
+            Coordinator pubkey or None if MCF not available
+        """
+        if not self._mcf_coordinator:
+            return None
+        return self._mcf_coordinator.elect_coordinator()
+
+    def record_mcf_ack(
+        self,
+        member_id: str,
+        solution_timestamp: int,
+        assignment_count: int
+    ) -> None:
+        """
+        Record an MCF assignment acknowledgment from a member.
+
+        Only tracks if we are the coordinator.
+
+        Args:
+            member_id: Pubkey of the member sending ACK
+            solution_timestamp: Timestamp of the solution being acknowledged
+            assignment_count: Number of assignments the member accepted
+        """
+        if not self._mcf_coordinator:
+            return
+
+        # Track ACK for monitoring
+        ack_key = f"{member_id}:{solution_timestamp}"
+        if not hasattr(self, "_mcf_acks"):
+            self._mcf_acks: Dict[str, Dict[str, Any]] = {}
+
+        self._mcf_acks[ack_key] = {
+            "member_id": member_id,
+            "solution_timestamp": solution_timestamp,
+            "assignment_count": assignment_count,
+            "received_at": int(time.time())
+        }
+
+        # Limit cache size
+        if len(self._mcf_acks) > 500:
+            # Remove oldest entries
+            sorted_acks = sorted(
+                self._mcf_acks.items(),
+                key=lambda x: x[1].get("received_at", 0)
+            )
+            for k, _ in sorted_acks[:100]:
+                del self._mcf_acks[k]
+
+        self._log(f"Recorded MCF ACK from {member_id[:16]}... for solution {solution_timestamp}")
+
+    def record_mcf_completion(
+        self,
+        member_id: str,
+        assignment_id: str,
+        success: bool,
+        actual_amount_sats: int,
+        actual_cost_sats: int,
+        failure_reason: str = ""
+    ) -> None:
+        """
+        Record the outcome of an MCF assignment execution.
+
+        Args:
+            member_id: Pubkey of the member reporting
+            assignment_id: ID of the completed assignment
+            success: Whether execution succeeded
+            actual_amount_sats: Actual amount rebalanced
+            actual_cost_sats: Actual cost incurred
+            failure_reason: Reason for failure if not successful
+        """
+        if not hasattr(self, "_mcf_completions"):
+            self._mcf_completions: Dict[str, Dict[str, Any]] = {}
+
+        self._mcf_completions[assignment_id] = {
+            "member_id": member_id,
+            "assignment_id": assignment_id,
+            "success": success,
+            "actual_amount_sats": actual_amount_sats,
+            "actual_cost_sats": actual_cost_sats,
+            "failure_reason": failure_reason,
+            "completed_at": int(time.time())
+        }
+
+        # Limit cache size
+        if len(self._mcf_completions) > 1000:
+            sorted_completions = sorted(
+                self._mcf_completions.items(),
+                key=lambda x: x[1].get("completed_at", 0)
+            )
+            for k, _ in sorted_completions[:200]:
+                del self._mcf_completions[k]
+
+        status = "succeeded" if success else f"failed: {failure_reason}"
+        self._log(f"MCF assignment {assignment_id[:20]}... {status} ({actual_amount_sats} sats)")
+
+    def get_mcf_acks(self) -> List[Dict[str, Any]]:
+        """Get all recorded MCF acknowledgments."""
+        if not hasattr(self, "_mcf_acks"):
+            return []
+        return list(self._mcf_acks.values())
+
+    def get_mcf_completions(self) -> List[Dict[str, Any]]:
+        """Get all recorded MCF completion reports."""
+        if not hasattr(self, "_mcf_completions"):
+            return []
+        return list(self._mcf_completions.values())
 
     def execute_hive_circular_rebalance(
         self,

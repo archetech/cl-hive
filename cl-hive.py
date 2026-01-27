@@ -63,6 +63,12 @@ from modules.protocol import (
     get_peer_available_signing_payload, compute_states_hash,
     # Settlement offer broadcast
     create_settlement_offer, get_settlement_offer_signing_payload,
+    # MCF (Min-Cost Max-Flow) optimization
+    validate_mcf_needs_batch, validate_mcf_solution_broadcast,
+    validate_mcf_assignment_ack, validate_mcf_completion_report,
+    get_mcf_needs_batch_signing_payload, get_mcf_solution_signing_payload,
+    get_mcf_assignment_ack_signing_payload, get_mcf_completion_signing_payload,
+    create_mcf_needs_batch,
 )
 from modules.handshake import HandshakeManager, Ticket, CHALLENGE_TTL_SECONDS
 from modules.state_manager import StateManager, HivePeerState
@@ -147,6 +153,11 @@ from modules.rpc_commands import (
     circular_flow_status as rpc_circular_flow_status,
     cost_reduction_status as rpc_cost_reduction_status,
     execute_hive_circular_rebalance as rpc_execute_hive_circular_rebalance,
+    # Phase 15 - MCF Optimization
+    mcf_status as rpc_mcf_status,
+    mcf_solve as rpc_mcf_solve,
+    mcf_assignments as rpc_mcf_assignments,
+    mcf_optimized_path as rpc_mcf_optimized_path,
     # Channel Rationalization
     coverage_analysis as rpc_coverage_analysis,
     close_recommendations as rpc_close_recommendations,
@@ -1419,6 +1430,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     cost_reduction_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Cost reduction manager initialized (Phase 3)")
 
+    # Start MCF optimization background thread (Phase 15)
+    mcf_thread = threading.Thread(
+        target=mcf_optimization_loop,
+        name="cl-hive-mcf-optimization",
+        daemon=True
+    )
+    mcf_thread.start()
+    plugin.log("cl-hive: MCF optimization thread started (Phase 15)")
+
     # Initialize Rationalization Manager (Channel Rationalization)
     global rationalization_mgr
     rationalization_mgr = RationalizationManager(
@@ -1746,6 +1766,15 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             return handle_splice_signed(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.SPLICE_ABORT:
             return handle_splice_abort(peer_id, msg_payload, plugin)
+        # Phase 15: MCF (Min-Cost Max-Flow) Optimization
+        elif msg_type == HiveMessageType.MCF_NEEDS_BATCH:
+            return handle_mcf_needs_batch(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.MCF_SOLUTION_BROADCAST:
+            return handle_mcf_solution_broadcast(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.MCF_ASSIGNMENT_ACK:
+            return handle_mcf_assignment_ack(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.MCF_COMPLETION_REPORT:
+            return handle_mcf_completion_report(peer_id, msg_payload, plugin)
         else:
             # Known but unimplemented message type
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
@@ -7062,6 +7091,387 @@ def handle_splice_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     return {"result": "continue"}
 
 
+# =============================================================================
+# MCF (Min-Cost Max-Flow) MESSAGE HANDLERS
+# =============================================================================
+
+
+def handle_mcf_needs_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle MCF_NEEDS_BATCH message from fleet members.
+
+    Fleet members broadcast their liquidity needs to the coordinator.
+    The coordinator collects these needs to build the MCF optimization network.
+    """
+    if not database or not cost_reduction_mgr:
+        return {"result": "continue"}
+
+    # Validate payload structure
+    if not validate_mcf_needs_batch(payload):
+        plugin.log(
+            f"cl-hive: Invalid MCF_NEEDS_BATCH from {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    reporter_id = payload.get("reporter_id", "")
+    timestamp = payload.get("timestamp", 0)
+    signature = payload.get("signature", "")
+    needs = payload.get("needs", [])
+
+    # Identity binding: peer_id must match claimed reporter
+    if peer_id != reporter_id:
+        plugin.log(
+            f"cl-hive: MCF_NEEDS_BATCH identity mismatch: {peer_id[:16]} != {reporter_id[:16]}",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # Verify sender is a hive member
+    sender = database.get_member(peer_id)
+    if not sender:
+        plugin.log(
+            f"cl-hive: MCF_NEEDS_BATCH from non-member {peer_id[:16]}...",
+            level='debug'
+        )
+        return {"result": "continue"}
+
+    # Verify signature
+    signing_payload = get_mcf_needs_batch_signing_payload(payload)
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != reporter_id:
+            plugin.log(
+                f"cl-hive: MCF_NEEDS_BATCH signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: MCF needs batch signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # Only the coordinator needs to process needs
+    coordinator_id = cost_reduction_mgr.get_current_mcf_coordinator()
+    if coordinator_id != our_pubkey:
+        # Not coordinator, ignore (but don't log - this is expected)
+        return {"result": "continue"}
+
+    # Store needs for MCF optimization
+    stored_count = 0
+    for need in needs:
+        # Add reporter_id to each need
+        need["reporter_id"] = reporter_id
+        need["received_at"] = int(time.time())
+        if liquidity_coord:
+            # Store via liquidity coordinator
+            liquidity_coord.store_remote_mcf_need(need)
+            stored_count += 1
+
+    if stored_count > 0:
+        plugin.log(
+            f"cl-hive: Received {stored_count} MCF need(s) from {reporter_id[:16]}...",
+            level='debug'
+        )
+
+    return {"result": "continue"}
+
+
+def handle_mcf_solution_broadcast(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle MCF_SOLUTION_BROADCAST message from coordinator.
+
+    The coordinator broadcasts a complete MCF solution containing assignments
+    for all fleet members. Each member extracts their own assignments and
+    stores them for execution.
+    """
+    if not database or not liquidity_coord:
+        return {"result": "continue"}
+
+    # Validate payload structure
+    if not validate_mcf_solution_broadcast(payload):
+        plugin.log(
+            f"cl-hive: Invalid MCF_SOLUTION_BROADCAST from {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    coordinator_id = payload.get("coordinator_id", "")
+    timestamp = payload.get("timestamp", 0)
+    signature = payload.get("signature", "")
+    assignments = payload.get("assignments", [])
+
+    # Identity binding: peer_id must match claimed coordinator
+    if peer_id != coordinator_id:
+        plugin.log(
+            f"cl-hive: MCF_SOLUTION_BROADCAST identity mismatch: {peer_id[:16]} != {coordinator_id[:16]}",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # Verify sender is a hive member
+    sender = database.get_member(peer_id)
+    if not sender:
+        plugin.log(
+            f"cl-hive: MCF_SOLUTION_BROADCAST from non-member {peer_id[:16]}...",
+            level='debug'
+        )
+        return {"result": "continue"}
+
+    # Verify signature
+    signing_payload = get_mcf_solution_signing_payload(payload)
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != coordinator_id:
+            plugin.log(
+                f"cl-hive: MCF_SOLUTION_BROADCAST signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: MCF signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # Extract our assignments
+    our_id = our_pubkey
+    our_assignments = [a for a in assignments if a.get("member_id") == our_id]
+
+    if not our_assignments:
+        plugin.log(
+            f"cl-hive: MCF solution received with no assignments for us (total: {len(assignments)})",
+            level='debug'
+        )
+        return {"result": "continue"}
+
+    # Store each assignment
+    accepted_count = 0
+    for assignment_data in our_assignments:
+        if liquidity_coord.receive_mcf_assignment(assignment_data, timestamp, coordinator_id):
+            accepted_count += 1
+
+    if accepted_count > 0:
+        plugin.log(
+            f"cl-hive: Received {accepted_count} MCF assignment(s) from coordinator {coordinator_id[:16]}...",
+            level='info'
+        )
+        # Send ACK back to coordinator
+        _send_mcf_ack(coordinator_id, timestamp, accepted_count)
+
+    return {"result": "continue"}
+
+
+def handle_mcf_assignment_ack(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle MCF_ASSIGNMENT_ACK message (coordinator receives from members).
+
+    Members send this ACK after receiving their MCF assignments to confirm
+    they will attempt to execute them.
+    """
+    if not database or not cost_reduction_mgr:
+        return {"result": "continue"}
+
+    # Validate payload structure
+    if not validate_mcf_assignment_ack(payload):
+        plugin.log(
+            f"cl-hive: Invalid MCF_ASSIGNMENT_ACK from {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    member_id = payload.get("member_id", "")
+    timestamp = payload.get("timestamp", 0)
+    solution_timestamp = payload.get("solution_timestamp", 0)
+    assignment_count = payload.get("assignment_count", 0)
+    signature = payload.get("signature", "")
+
+    # Identity binding
+    if peer_id != member_id:
+        plugin.log(
+            f"cl-hive: MCF_ASSIGNMENT_ACK identity mismatch: {peer_id[:16]} != {member_id[:16]}",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # Verify sender is a hive member
+    sender = database.get_member(peer_id)
+    if not sender:
+        return {"result": "continue"}
+
+    # Verify signature
+    signing_payload = get_mcf_assignment_ack_signing_payload(payload)
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != member_id:
+            plugin.log(
+                f"cl-hive: MCF_ASSIGNMENT_ACK signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: MCF ACK signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # Only process if we are the coordinator
+    if our_pubkey != cost_reduction_mgr.get_current_mcf_coordinator():
+        return {"result": "continue"}
+
+    # Record the ACK
+    cost_reduction_mgr.record_mcf_ack(member_id, solution_timestamp, assignment_count)
+
+    plugin.log(
+        f"cl-hive: MCF ACK from {member_id[:16]}... ({assignment_count} assignments)",
+        level='debug'
+    )
+
+    return {"result": "continue"}
+
+
+def handle_mcf_completion_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle MCF_COMPLETION_REPORT message (member reports assignment outcome).
+
+    After executing (or failing to execute) an MCF assignment, members report
+    the outcome so the coordinator can track fleet-wide rebalancing progress.
+    """
+    if not database or not cost_reduction_mgr:
+        return {"result": "continue"}
+
+    # Validate payload structure
+    if not validate_mcf_completion_report(payload):
+        plugin.log(
+            f"cl-hive: Invalid MCF_COMPLETION_REPORT from {peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    member_id = payload.get("member_id", "")
+    timestamp = payload.get("timestamp", 0)
+    assignment_id = payload.get("assignment_id", "")
+    success = payload.get("success", False)
+    actual_amount = payload.get("actual_amount_sats", 0)
+    actual_cost = payload.get("actual_cost_sats", 0)
+    failure_reason = payload.get("failure_reason", "")
+    signature = payload.get("signature", "")
+
+    # Identity binding
+    if peer_id != member_id:
+        plugin.log(
+            f"cl-hive: MCF_COMPLETION_REPORT identity mismatch",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    # Verify sender is a hive member
+    sender = database.get_member(peer_id)
+    if not sender:
+        return {"result": "continue"}
+
+    # Verify signature
+    signing_payload = get_mcf_completion_signing_payload(payload)
+    try:
+        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != member_id:
+            plugin.log(
+                f"cl-hive: MCF_COMPLETION_REPORT signature invalid from {peer_id[:16]}...",
+                level='warn'
+            )
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: MCF completion signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # Record completion (both coordinator and other members can track this)
+    cost_reduction_mgr.record_mcf_completion(
+        member_id=member_id,
+        assignment_id=assignment_id,
+        success=success,
+        actual_amount_sats=actual_amount,
+        actual_cost_sats=actual_cost,
+        failure_reason=failure_reason
+    )
+
+    if success:
+        plugin.log(
+            f"cl-hive: MCF assignment {assignment_id[:20]} completed by {member_id[:16]}...: "
+            f"{actual_amount} sats, cost {actual_cost} sats",
+            level='info'
+        )
+    else:
+        plugin.log(
+            f"cl-hive: MCF assignment {assignment_id[:20]} failed by {member_id[:16]}...: {failure_reason}",
+            level='info'
+        )
+
+    return {"result": "continue"}
+
+
+def _send_mcf_ack(coordinator_id: str, solution_timestamp: int, assignment_count: int) -> bool:
+    """
+    Send MCF_ASSIGNMENT_ACK to the coordinator.
+
+    Args:
+        coordinator_id: Coordinator's pubkey
+        solution_timestamp: Timestamp of the solution we're acknowledging
+        assignment_count: Number of assignments we accepted
+
+    Returns:
+        True if sent successfully
+    """
+    if not liquidity_coord or not safe_plugin:
+        return False
+
+    ack_msg = liquidity_coord.create_mcf_ack_message(
+        our_pubkey,
+        solution_timestamp,
+        assignment_count,
+        safe_plugin.rpc
+    )
+
+    if not ack_msg:
+        return False
+
+    try:
+        safe_plugin.rpc.sendcustommsg(coordinator_id, ack_msg.hex())
+        return True
+    except Exception as e:
+        safe_plugin.log(f"cl-hive: Failed to send MCF ACK: {e}", level='debug')
+        return False
+
+
+def _broadcast_mcf_completion(assignment_id: str, success: bool,
+                              actual_amount_sats: int, actual_cost_sats: int,
+                              failure_reason: str = "") -> int:
+    """
+    Broadcast MCF_COMPLETION_REPORT to all hive members.
+
+    Args:
+        assignment_id: ID of the completed assignment
+        success: Whether execution succeeded
+        actual_amount_sats: Actual amount rebalanced
+        actual_cost_sats: Actual cost incurred
+        failure_reason: Reason for failure if not successful
+
+    Returns:
+        Number of members the message was sent to
+    """
+    if not liquidity_coord or not safe_plugin:
+        return 0
+
+    completion_msg = liquidity_coord.create_mcf_completion_message(
+        our_pubkey,
+        assignment_id,
+        success,
+        actual_amount_sats,
+        actual_cost_sats,
+        failure_reason,
+        safe_plugin.rpc
+    )
+
+    if not completion_msg:
+        return 0
+
+    return _broadcast_to_members(completion_msg)
+
+
 def _broadcast_settlement_offer(peer_id: str, bolt12_offer: str) -> int:
     """
     Broadcast a settlement offer to all hive members.
@@ -8124,6 +8534,310 @@ def gossip_loop():
 
         # Wait for next cycle (5 minutes default)
         shutdown_event.wait(DEFAULT_HEARTBEAT_INTERVAL)
+
+
+# =============================================================================
+# PHASE 15: MCF OPTIMIZATION BACKGROUND LOOP
+# =============================================================================
+
+def mcf_optimization_loop():
+    """
+    Background thread for MCF (Min-Cost Max-Flow) optimization.
+
+    Runs periodically to:
+    1. Check if we're the elected coordinator
+    2. Run MCF optimization cycle if coordinator
+    3. Broadcast solution to fleet
+    4. Process our assignments from latest solution
+
+    Cycle interval: 10 minutes (MCF_CYCLE_INTERVAL)
+    """
+    from modules.mcf_solver import MCF_CYCLE_INTERVAL, MAX_SOLUTION_AGE
+
+    # Wait for initialization
+    shutdown_event.wait(60)
+
+    while not shutdown_event.is_set():
+        try:
+            if not cost_reduction_mgr or not safe_plugin or not database or not our_pubkey:
+                shutdown_event.wait(60)
+                continue
+
+            if not cost_reduction_mgr._mcf_enabled:
+                # MCF disabled, just wait
+                shutdown_event.wait(MCF_CYCLE_INTERVAL)
+                continue
+
+            mcf_coord = cost_reduction_mgr._mcf_coordinator
+            if not mcf_coord:
+                shutdown_event.wait(MCF_CYCLE_INTERVAL)
+                continue
+
+            # Step 1: Check if we're coordinator
+            if mcf_coord.is_coordinator():
+                # Step 2: Run optimization cycle
+                solution = mcf_coord.run_optimization_cycle()
+
+                if solution and solution.assignments:
+                    # Step 3: Broadcast solution to fleet
+                    _broadcast_mcf_solution(solution)
+            else:
+                # Not coordinator - broadcast our needs to the coordinator
+                _broadcast_mcf_needs()
+
+            # Step 4: Check for assignments from received solution
+            _process_mcf_assignments()
+
+        except Exception as e:
+            if safe_plugin:
+                safe_plugin.log(f"cl-hive: MCF optimization loop error: {e}", level='warn')
+
+        # Wait for next cycle (10 minutes)
+        shutdown_event.wait(MCF_CYCLE_INTERVAL)
+
+
+def _broadcast_mcf_solution(solution):
+    """
+    Broadcast MCF solution to all fleet members.
+
+    Args:
+        solution: MCFSolution to broadcast
+    """
+    from modules.protocol import create_mcf_solution_broadcast
+
+    if not safe_plugin or not database or not our_pubkey:
+        return
+
+    try:
+        # Create signed solution broadcast message
+        assignments_data = [a.to_dict() for a in solution.assignments]
+
+        msg = create_mcf_solution_broadcast(
+            assignments=assignments_data,
+            total_flow_sats=solution.total_flow_sats,
+            total_cost_sats=solution.total_cost_sats,
+            unmet_demand_sats=solution.unmet_demand_sats,
+            iterations=solution.iterations,
+            rpc=safe_plugin.rpc,
+            our_pubkey=our_pubkey
+        )
+
+        if not msg:
+            safe_plugin.log("cl-hive: Failed to create MCF solution message", level='warn')
+            return
+
+        # Broadcast to all members
+        members = database.get_all_members()
+        broadcast_count = 0
+
+        for member in members:
+            peer_id = member.get("peer_id")
+            if not peer_id or peer_id == our_pubkey:
+                continue
+
+            try:
+                safe_plugin.rpc.sendcustommsg(
+                    node_id=peer_id,
+                    msg=msg.hex()
+                )
+                broadcast_count += 1
+            except Exception as e:
+                safe_plugin.log(
+                    f"cl-hive: Failed to send MCF solution to {peer_id[:16]}...: {e}",
+                    level='debug'
+                )
+
+        if broadcast_count > 0:
+            safe_plugin.log(
+                f"cl-hive: MCF solution broadcast to {broadcast_count} members "
+                f"(flow={solution.total_flow_sats}sats, assignments={len(solution.assignments)})",
+                level='info'
+            )
+
+    except Exception as e:
+        safe_plugin.log(f"cl-hive: MCF solution broadcast error: {e}", level='warn')
+
+
+def _broadcast_mcf_needs():
+    """
+    Broadcast our liquidity needs to the MCF coordinator.
+
+    Non-coordinator members call this to share their needs
+    with the coordinator for inclusion in MCF optimization.
+    """
+    if not safe_plugin or not liquidity_coord or not cost_reduction_mgr or not our_pubkey:
+        return
+
+    try:
+        # Get coordinator
+        coordinator_id = cost_reduction_mgr.get_current_mcf_coordinator()
+        if not coordinator_id or coordinator_id == our_pubkey:
+            # We are coordinator or no coordinator
+            return
+
+        # Get our needs
+        needs = liquidity_coord.get_all_liquidity_needs_for_mcf()
+
+        # Filter to just our own needs
+        our_needs = [n for n in needs if n.get("member_id") == our_pubkey]
+
+        if not our_needs:
+            # No needs to broadcast
+            return
+
+        # Format needs for protocol
+        needs_for_batch = []
+        for need in our_needs:
+            needs_for_batch.append({
+                "need_type": need.get("need_type", "inbound"),
+                "target_peer": need.get("target_peer", ""),
+                "amount_sats": need.get("amount_sats", 0),
+                "urgency": need.get("urgency", "medium"),
+                "max_fee_ppm": need.get("max_fee_ppm", 1000),
+            })
+
+        # Create signed needs batch message
+        msg = create_mcf_needs_batch(
+            needs=needs_for_batch,
+            rpc=safe_plugin.rpc,
+            our_pubkey=our_pubkey
+        )
+
+        if not msg:
+            safe_plugin.log("cl-hive: Failed to create MCF needs batch", level='debug')
+            return
+
+        # Send to coordinator
+        try:
+            safe_plugin.rpc.sendcustommsg(
+                node_id=coordinator_id,
+                msg=msg.hex()
+            )
+            safe_plugin.log(
+                f"cl-hive: Sent {len(needs_for_batch)} MCF need(s) to coordinator",
+                level='debug'
+            )
+        except Exception as e:
+            safe_plugin.log(
+                f"cl-hive: Failed to send MCF needs to coordinator: {e}",
+                level='debug'
+            )
+
+    except Exception as e:
+        safe_plugin.log(f"cl-hive: MCF needs broadcast error: {e}", level='debug')
+
+
+def _process_mcf_assignments():
+    """
+    Process pending MCF assignments for our node.
+
+    Manages the lifecycle of MCF assignments:
+    1. Sends ACK to coordinator when new assignments received
+    2. Monitors assignment progress (pending -> executing -> completed/failed)
+    3. Cleans up stale assignments
+
+    Actual execution is triggered by cl-revenue-ops via:
+    - hive-mcf-assignments: Query pending assignments
+    - hive-claim-mcf-assignment: Claim assignment for execution
+    - hive-report-mcf-completion: Report execution outcome
+    """
+    if not liquidity_coord or not cost_reduction_mgr:
+        return
+
+    try:
+        # Get all assignments
+        status = liquidity_coord.get_mcf_status()
+        counts = status.get("assignment_counts", {})
+
+        pending_count = counts.get("pending", 0)
+        executing_count = counts.get("executing", 0)
+        completed_count = counts.get("completed", 0)
+        failed_count = counts.get("failed", 0)
+
+        # Send ACK if we have pending assignments and haven't ACKed yet
+        if pending_count > 0 and not status.get("ack_sent", False):
+            pending = liquidity_coord.get_pending_mcf_assignments()
+            if pending:
+                solution_timestamp = pending[0].solution_timestamp
+                ack_msg = liquidity_coord.create_mcf_ack_message(
+                    our_pubkey,
+                    solution_timestamp,
+                    pending_count,
+                    safe_plugin.rpc
+                )
+                if ack_msg:
+                    _broadcast_mcf_ack(ack_msg)
+
+        # Log status periodically (only if there's activity)
+        if pending_count > 0 or executing_count > 0:
+            safe_plugin.log(
+                f"cl-hive: MCF assignments - pending={pending_count}, "
+                f"executing={executing_count}, completed={completed_count}, "
+                f"failed={failed_count}",
+                level='debug'
+            )
+
+        # Check for stuck assignments (executing for too long)
+        _check_stuck_mcf_assignments()
+
+    except Exception as e:
+        safe_plugin.log(f"cl-hive: MCF assignment processing error: {e}", level='debug')
+
+
+def _check_stuck_mcf_assignments():
+    """Check for and handle assignments stuck in 'executing' state."""
+    if not liquidity_coord:
+        return
+
+    # Get assignments in executing state
+    if not hasattr(liquidity_coord, '_mcf_assignments'):
+        return
+
+    now = int(time.time())
+    max_execution_time = 1800  # 30 minutes max for execution
+
+    stuck_assignments = []
+    for assignment in liquidity_coord._mcf_assignments.values():
+        if assignment.status == "executing":
+            # Check if executing for too long
+            age = now - assignment.received_at
+            if age > max_execution_time:
+                stuck_assignments.append(assignment)
+
+    # Mark stuck assignments as failed
+    for assignment in stuck_assignments:
+        liquidity_coord.update_mcf_assignment_status(
+            assignment.assignment_id,
+            "failed",
+            error_message="execution_timeout"
+        )
+        safe_plugin.log(
+            f"cl-hive: MCF assignment {assignment.assignment_id[:20]}... timed out",
+            level='warn'
+        )
+
+
+def _broadcast_mcf_ack(ack_msg: bytes):
+    """Broadcast MCF assignment ACK to coordinator."""
+    if not cost_reduction_mgr or not cost_reduction_mgr._mcf_coordinator:
+        return
+
+    coordinator_id = cost_reduction_mgr._mcf_coordinator.elect_coordinator()
+
+    if coordinator_id == our_pubkey:
+        return  # We're coordinator, no need to ACK ourselves
+
+    try:
+        safe_plugin.rpc.sendcustommsg(
+            node_id=coordinator_id,
+            msg=ack_msg.hex()
+        )
+        safe_plugin.log(
+            f"cl-hive: MCF ACK sent to coordinator {coordinator_id[:16]}...",
+            level='debug'
+        )
+    except Exception as e:
+        safe_plugin.log(f"cl-hive: Failed to send MCF ACK: {e}", level='debug')
 
 
 def _broadcast_our_fee_intelligence():
@@ -14265,6 +14979,239 @@ def hive_execute_circular_rebalance(
         via_members=via_members,
         dry_run=dry_run
     )
+
+
+# =============================================================================
+# MCF (MIN-COST MAX-FLOW) OPTIMIZATION RPC METHODS
+# =============================================================================
+
+@plugin.method("hive-mcf-status")
+def hive_mcf_status(plugin: Plugin):
+    """
+    Get MCF (Min-Cost Max-Flow) optimizer status.
+
+    The MCF optimizer computes globally optimal rebalance assignments for
+    the entire fleet, minimizing total routing costs while satisfying
+    liquidity needs.
+
+    Returns:
+        Dict with MCF status including:
+        - is_coordinator: Whether we are the elected coordinator
+        - coordinator_id: Pubkey of current coordinator
+        - last_solution: Details of last computed solution
+        - solution_valid: Whether solution is still within validity window
+        - our_assignments: Pending assignments for our node
+    """
+    return rpc_mcf_status(_get_hive_context())
+
+
+@plugin.method("hive-mcf-solve")
+def hive_mcf_solve(plugin: Plugin):
+    """
+    Trigger MCF optimization cycle.
+
+    Only succeeds if we are the elected coordinator. Collects liquidity
+    needs from all fleet members and computes globally optimal rebalance
+    assignments using the Successive Shortest Paths algorithm.
+
+    The solution prefers zero-fee hive internal channels and prevents
+    circular flows at the planning stage.
+
+    Returns:
+        Dict with MCF solution including:
+        - assignments: List of rebalance assignments for fleet members
+        - total_flow_sats: Total liquidity moved
+        - total_cost_sats: Total routing cost
+        - unmet_demand_sats: Demand that couldn't be satisfied
+        - computation_time_ms: Time to solve
+        - iterations: Number of solver iterations
+
+    Example:
+        lightning-cli hive-mcf-solve
+    """
+    return rpc_mcf_solve(_get_hive_context())
+
+
+@plugin.method("hive-mcf-assignments")
+def hive_mcf_assignments(plugin: Plugin):
+    """
+    Get pending MCF assignments for our node.
+
+    These are the rebalance operations we should execute as part of
+    the fleet-wide optimization computed by the MCF solver.
+
+    Returns:
+        Dict with:
+        - assignments: List of pending assignments with from_channel,
+          to_channel, amount_sats, expected_cost_sats, priority
+        - count: Number of pending assignments
+    """
+    return rpc_mcf_assignments(_get_hive_context())
+
+
+@plugin.method("hive-mcf-optimized-path")
+def hive_mcf_optimized_path(
+    plugin: Plugin,
+    from_channel: str,
+    to_channel: str,
+    amount_sats: int
+):
+    """
+    Get MCF-optimized rebalance path between channels.
+
+    Uses the latest MCF solution if available and valid,
+    otherwise falls back to BFS-based fleet routing.
+
+    Args:
+        from_channel: Source channel SCID
+        to_channel: Destination channel SCID
+        amount_sats: Amount to rebalance
+
+    Returns:
+        Dict with path recommendation including:
+        - source: "mcf" or "bfs" indicating which algorithm found the path
+        - fleet_path_available: Whether a fleet path exists
+        - fleet_path: List of pubkeys in the path
+        - estimated_fleet_cost_sats: Expected cost
+        - recommendation: Recommended action
+
+    Example:
+        lightning-cli hive-mcf-optimized-path 933128x1345x0 933882x99x0 100000
+    """
+    return rpc_mcf_optimized_path(
+        _get_hive_context(),
+        from_channel=from_channel,
+        to_channel=to_channel,
+        amount_sats=amount_sats
+    )
+
+
+@plugin.method("hive-report-mcf-completion")
+def hive_report_mcf_completion(
+    plugin: Plugin,
+    assignment_id: str,
+    success: bool,
+    actual_amount_sats: int = 0,
+    actual_cost_sats: int = 0,
+    failure_reason: str = ""
+):
+    """
+    Report completion of an MCF assignment.
+
+    After executing (or failing) an MCF-assigned rebalance, report
+    the outcome so the coordinator can track fleet-wide progress.
+
+    Args:
+        assignment_id: ID of the completed assignment
+        success: Whether rebalance succeeded
+        actual_amount_sats: Actual amount rebalanced
+        actual_cost_sats: Actual routing cost
+        failure_reason: Reason for failure if not successful
+
+    Returns:
+        Dict with success status
+    """
+    if not liquidity_coord:
+        return {"success": False, "error": "Liquidity coordinator not initialized"}
+
+    try:
+        # Update local assignment status
+        updated = liquidity_coord.update_mcf_assignment_status(
+            assignment_id=assignment_id,
+            status="completed" if success else "failed",
+            actual_amount_sats=actual_amount_sats,
+            actual_cost_sats=actual_cost_sats,
+            error_message=failure_reason
+        )
+
+        if not updated:
+            return {
+                "success": False,
+                "error": f"Assignment {assignment_id} not found"
+            }
+
+        # Broadcast completion to fleet
+        broadcast_count = _broadcast_mcf_completion(
+            assignment_id=assignment_id,
+            success=success,
+            actual_amount_sats=actual_amount_sats,
+            actual_cost_sats=actual_cost_sats,
+            failure_reason=failure_reason
+        )
+
+        return {
+            "success": True,
+            "assignment_id": assignment_id,
+            "status": "completed" if success else "failed",
+            "broadcast_count": broadcast_count
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@plugin.method("hive-claim-mcf-assignment")
+def hive_claim_mcf_assignment(plugin: Plugin, assignment_id: str = None):
+    """
+    Claim an MCF assignment for execution.
+
+    Marks an assignment as "executing" to prevent double execution.
+    If no assignment_id provided, claims the highest priority pending.
+
+    Args:
+        assignment_id: Specific assignment to claim, or None for next pending
+
+    Returns:
+        Dict with claimed assignment details
+    """
+    if not liquidity_coord:
+        return {"success": False, "error": "Liquidity coordinator not initialized"}
+
+    try:
+        # Get pending assignments
+        pending = liquidity_coord.get_pending_mcf_assignments()
+
+        if not pending:
+            return {"success": False, "error": "No pending assignments"}
+
+        # Find assignment to claim
+        to_claim = None
+        if assignment_id:
+            for a in pending:
+                if a.assignment_id == assignment_id:
+                    to_claim = a
+                    break
+            if not to_claim:
+                return {"success": False, "error": f"Assignment {assignment_id} not found or not pending"}
+        else:
+            # Claim highest priority (lowest number)
+            to_claim = min(pending, key=lambda a: a.priority)
+
+        # Mark as executing
+        updated = liquidity_coord.update_mcf_assignment_status(
+            assignment_id=to_claim.assignment_id,
+            status="executing"
+        )
+
+        if not updated:
+            return {"success": False, "error": "Failed to claim assignment"}
+
+        return {
+            "success": True,
+            "assignment": {
+                "assignment_id": to_claim.assignment_id,
+                "from_channel": to_claim.from_channel,
+                "to_channel": to_claim.to_channel,
+                "amount_sats": to_claim.amount_sats,
+                "expected_cost_sats": to_claim.expected_cost_sats,
+                "priority": to_claim.priority,
+                "path": to_claim.path,
+                "via_fleet": to_claim.via_fleet,
+            }
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # =============================================================================
