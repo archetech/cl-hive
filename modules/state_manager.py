@@ -317,6 +317,8 @@ class StateManager:
             budget_available_sats=gossip_data.get('budget_available_sats', 0),
             budget_reserved_until=gossip_data.get('budget_reserved_until', 0),
             budget_last_update=gossip_data.get('budget_last_update', 0),
+            # Capabilities (MCF support, etc. - backward compatible, defaults to empty)
+            capabilities=gossip_data.get('capabilities', []),
         )
         
         # Update in-memory cache
