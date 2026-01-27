@@ -163,18 +163,20 @@ For operators who want more automation, there's an Autonomous mode with strict s
 
 Open channels to one or more of our fleet members:
 
-**hive-nexus-01** (Virginia, USA)
+**cyber-hornet-1**
+```
+03796a3c5b18080db99b0b880e2e326db9f5eb6bf3d7394b924f633da3eae31412@ch36z4vnycie5y4aibq7ve226reqheow7ltyy5kaulsh2yypz56aqsid.onion:9736
+```
+
+**Hive-Nexus-01**
 ```
 0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3@45.76.234.192:9735
 ```
 
-**hive-nexus-02** (Virginia, USA)
+**Hive-Nexus-02**
 ```
 03fe48e8a64f14fa0aa7d9d16500754b3b906c729acfb867c00423fd4b0b9b56c2@45.76.234.192:9736
 ```
-
-**cyber-hornet-1**
-[View on Amboss](https://amboss.space/node/03796a3c5b18080db99b0b880e2e326db9f5eb6bf3d7394b924f633da3eae31412)
 
 ### Step 2: Install the Plugins
 
