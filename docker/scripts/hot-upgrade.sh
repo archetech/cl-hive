@@ -2,8 +2,8 @@
 # =============================================================================
 # cl-hive Hot Upgrade Script
 # =============================================================================
-# Upgrades plugins WITHOUT rebuilding the Docker image by pulling latest
-# changes and restarting lightningd.
+# Upgrades plugins by pulling latest code on HOST and restarting in container.
+# Requires plugins to be mounted from host (default in docker-compose.yml).
 #
 # Usage:
 #   ./hot-upgrade.sh              # Upgrade both plugins
@@ -12,9 +12,10 @@
 #   ./hot-upgrade.sh --check      # Check for updates without applying
 #   ./hot-upgrade.sh --restart    # Just restart plugins (no git pull)
 #
-# Prerequisites:
-#   - cl-hive must be mounted from host (default in docker-compose.yml)
-#   - For cl-revenue-ops hot upgrades, add volume mount to compose file
+# Required directory structure:
+#   parent/
+#     cl-hive/           <- this repo (mounted to /opt/cl-hive)
+#     cl_revenue_ops/    <- revenue ops repo (mounted to /opt/cl-revenue-ops)
 # =============================================================================
 
 set -e
@@ -22,6 +23,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCKER_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECT_ROOT="$(dirname "$DOCKER_DIR")"
+REVENUE_OPS_ROOT="$(dirname "$PROJECT_ROOT")/cl_revenue_ops"
 CONTAINER_NAME="${CONTAINER_NAME:-cl-hive-node}"
 NETWORK="${NETWORK:-bitcoin}"
 
@@ -47,7 +49,7 @@ check_container() {
 
 get_git_version() {
     local repo="$1"
-    git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo "unknown"
+    git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo "not-found"
 }
 
 get_remote_version() {
@@ -56,108 +58,59 @@ get_remote_version() {
     git -C "$repo" rev-parse --short origin/main 2>/dev/null || echo "unknown"
 }
 
-upgrade_cl_hive() {
-    log_step "Checking cl-hive for updates..."
+check_mount() {
+    local name="$1"
+    local host_path="$2"
+    local container_path="$3"
 
-    # Check if cl-hive has a git repo inside the container
-    local container_has_git=false
-    if docker exec "$CONTAINER_NAME" test -d /opt/cl-hive/.git 2>/dev/null; then
-        container_has_git=true
+    # Check host repo exists
+    if [ ! -d "$host_path/.git" ]; then
+        log_error "$name not found at: $host_path"
+        echo ""
+        echo "Please clone the repo:"
+        echo "  git clone https://github.com/lightning-goats/$name.git $host_path"
+        return 1
     fi
 
-    # Check if mounted from host by comparing versions
-    local host_version=$(get_git_version "$PROJECT_ROOT")
-    local container_version=$(docker exec "$CONTAINER_NAME" git -C /opt/cl-hive rev-parse --short HEAD 2>/dev/null || echo "none")
-    local is_mounted=false
-    if [ "$host_version" == "$container_version" ] && [ "$host_version" != "unknown" ]; then
-        is_mounted=true
+    # Check if mounted by comparing a file
+    local host_version=$(get_git_version "$host_path")
+    local container_version=$(docker exec "$CONTAINER_NAME" cat "$container_path/.git/HEAD" 2>/dev/null | head -1 || echo "not-mounted")
+
+    if [[ "$container_version" == "not-mounted" ]] || [[ "$container_version" != *"ref:"* && "$container_version" != "$host_version"* ]]; then
+        log_error "$name is not mounted from host"
+        echo ""
+        echo "Add to docker-compose.yml or docker-compose.override.yml:"
+        echo "  volumes:"
+        echo "    - $host_path:$container_path:ro"
+        echo ""
+        echo "Then run: docker-compose up -d"
+        return 1
     fi
 
-    if [ "$container_has_git" == "true" ]; then
-        if [ "$is_mounted" == "true" ]; then
-            # Mounted from host - pull on host
-            log_info "cl-hive is mounted from host"
-            cd "$PROJECT_ROOT"
-
-            local current=$(get_git_version .)
-            local remote=$(get_remote_version .)
-
-            echo "  Current: $current"
-            echo "  Remote:  $remote"
-
-            if [ "$current" == "$remote" ]; then
-                log_info "cl-hive is up to date"
-                return 0
-            fi
-
-            if [ "$CHECK_ONLY" == "true" ]; then
-                log_warn "Update available: $current -> $remote"
-                return 1
-            fi
-
-            log_info "Pulling latest cl-hive on host..."
-            if ! git diff --quiet 2>/dev/null; then
-                log_warn "Stashing local changes..."
-                git stash
-            fi
-            git pull origin main
-            log_info "cl-hive upgraded: $current -> $(get_git_version .)"
-            return 1
-        else
-            # Git repo inside container - pull inside container
-            log_info "cl-hive is a git repo inside container"
-            local current=$(docker exec "$CONTAINER_NAME" git -C /opt/cl-hive rev-parse --short HEAD 2>/dev/null || echo "unknown")
-            docker exec "$CONTAINER_NAME" git -C /opt/cl-hive fetch --quiet 2>/dev/null || true
-            local remote=$(docker exec "$CONTAINER_NAME" git -C /opt/cl-hive rev-parse --short origin/main 2>/dev/null || echo "unknown")
-
-            echo "  Current: $current"
-            echo "  Remote:  $remote"
-
-            if [ "$current" == "$remote" ]; then
-                log_info "cl-hive is up to date"
-                return 0
-            fi
-
-            if [ "$CHECK_ONLY" == "true" ]; then
-                log_warn "Update available: $current -> $remote"
-                return 1
-            fi
-
-            log_info "Pulling latest cl-hive inside container..."
-            docker exec "$CONTAINER_NAME" git -C /opt/cl-hive pull origin main
-            log_info "cl-hive upgraded: $current -> $(docker exec "$CONTAINER_NAME" git -C /opt/cl-hive rev-parse --short HEAD)"
-            return 1
-        fi
-    else
-        # No git repo - baked into image
-        log_warn "cl-hive is baked into image (not a git repo)"
-        log_info "To enable hot upgrades, either:"
-        echo "    1. Mount from host: -v /path/to/cl-hive:/opt/cl-hive:ro"
-        echo "    2. Or rebuild the Docker image"
-        return 0
-    fi
+    return 0
 }
 
-upgrade_cl_revenue_ops() {
-    log_step "Checking cl-revenue-ops for updates..."
+upgrade_repo() {
+    local name="$1"
+    local repo_path="$2"
 
-    # Check if git is available in container
-    if ! docker exec "$CONTAINER_NAME" test -d /opt/cl-revenue-ops/.git 2>/dev/null; then
-        log_warn "cl-revenue-ops is baked into image (not a git repo)"
-        log_info "To enable hot upgrades, add to docker-compose.yml volumes:"
-        echo "    - /path/to/cl_revenue_ops:/opt/cl-revenue-ops:ro"
+    log_step "Checking $name for updates..."
+
+    if [ ! -d "$repo_path/.git" ]; then
+        log_warn "$name repo not found at $repo_path"
         return 0
     fi
 
-    local current=$(docker exec "$CONTAINER_NAME" git -C /opt/cl-revenue-ops rev-parse --short HEAD 2>/dev/null || echo "unknown")
-    docker exec "$CONTAINER_NAME" git -C /opt/cl-revenue-ops fetch --quiet 2>/dev/null || true
-    local remote=$(docker exec "$CONTAINER_NAME" git -C /opt/cl-revenue-ops rev-parse --short origin/main 2>/dev/null || echo "unknown")
+    cd "$repo_path"
+
+    local current=$(get_git_version .)
+    local remote=$(get_remote_version .)
 
     echo "  Current: $current"
     echo "  Remote:  $remote"
 
     if [ "$current" == "$remote" ]; then
-        log_info "cl-revenue-ops is up to date"
+        log_info "$name is up to date"
         return 0
     fi
 
@@ -166,11 +119,18 @@ upgrade_cl_revenue_ops() {
         return 1
     fi
 
-    log_info "Pulling latest cl-revenue-ops..."
-    docker exec "$CONTAINER_NAME" git -C /opt/cl-revenue-ops pull origin main
+    log_info "Pulling latest $name..."
 
-    log_info "cl-revenue-ops upgraded: $current -> $(docker exec "$CONTAINER_NAME" git -C /opt/cl-revenue-ops rev-parse --short HEAD)"
-    return 1
+    # Stash local changes if any
+    if ! git diff --quiet 2>/dev/null; then
+        log_warn "Stashing local changes..."
+        git stash
+    fi
+
+    git pull origin main
+
+    log_info "$name upgraded: $current -> $(get_git_version .)"
+    return 1  # Signal upgrade was performed
 }
 
 restart_plugin() {
@@ -181,15 +141,15 @@ restart_plugin() {
 
     # Try to stop the plugin gracefully
     local stop_output
-    stop_output=$(docker exec "$CONTAINER_NAME" lightning-cli --lightning-dir="/data/lightning/$NETWORK" plugin stop "$plugin_path" 2>&1)
-    if [ $? -eq 0 ]; then
+    stop_output=$(docker exec "$CONTAINER_NAME" lightning-cli --lightning-dir="/data/lightning/$NETWORK" plugin stop "$plugin_path" 2>&1) || true
+    if [[ "$stop_output" == *"Successfully"* ]]; then
         log_info "Stopped $plugin_name"
         sleep 1
     else
-        log_warn "Failed to stop $plugin_name (may not be running)"
+        log_warn "Could not stop $plugin_name (may not be running)"
     fi
 
-    # Start the plugin (show errors for debugging)
+    # Start the plugin
     local start_output
     start_output=$(docker exec "$CONTAINER_NAME" lightning-cli --lightning-dir="/data/lightning/$NETWORK" plugin start "$plugin_path" 2>&1)
     local start_result=$?
@@ -198,78 +158,19 @@ restart_plugin() {
         log_info "Started $plugin_name"
         return 0
     else
-        log_error "Failed to start $plugin_name"
+        log_error "Failed to start $plugin_name:"
         echo "$start_output" | head -20
         return 1
     fi
 }
 
-restart_plugins() {
-    local hive_upgraded="$1"
-    local revenue_upgraded="$2"
-
-    log_step "Restarting upgraded plugins..."
-
-    local restart_failed=false
-
-    # Restart plugins individually (faster, no channel downtime)
-    if [ "$hive_upgraded" == "true" ]; then
-        if ! restart_plugin "/opt/cl-hive/cl-hive.py" "cl-hive"; then
-            restart_failed=true
-        fi
-    fi
-
-    if [ "$revenue_upgraded" == "true" ]; then
-        if ! restart_plugin "/opt/cl-revenue-ops/cl-revenue-ops.py" "cl-revenue-ops"; then
-            restart_failed=true
-        fi
-    fi
-
-    if [ "$restart_failed" == "true" ]; then
-        log_warn "Plugin restart failed, falling back to lightningd restart..."
-        restart_lightningd
-    else
-        log_info "Plugin restart complete"
-    fi
-}
-
-restart_lightningd() {
-    log_step "Restarting lightningd to load updated plugins..."
-
-    # Graceful restart via supervisorctl
-    docker exec "$CONTAINER_NAME" supervisorctl restart lightningd
-
-    log_info "Waiting for node to become healthy..."
-
-    local retries=30
-    while [ $retries -gt 0 ]; do
-        if docker exec "$CONTAINER_NAME" lightning-cli --lightning-dir="/data/lightning/$NETWORK" getinfo >/dev/null 2>&1; then
-            log_info "Node is healthy"
-            return 0
-        fi
-        echo -n "."
-        sleep 2
-        retries=$((retries - 1))
-    done
-    echo ""
-
-    log_error "Node did not become healthy after restart"
-    log_warn "Check logs: docker logs $CONTAINER_NAME"
-    return 1
-}
-
 show_versions() {
     echo ""
-    echo "Current versions:"
+    echo "Current versions (on host):"
     echo -n "  cl-hive:        "
     get_git_version "$PROJECT_ROOT"
-    
     echo -n "  cl-revenue-ops: "
-    if docker exec "$CONTAINER_NAME" test -d /opt/cl-revenue-ops/.git 2>/dev/null; then
-        docker exec "$CONTAINER_NAME" git -C /opt/cl-revenue-ops rev-parse --short HEAD 2>/dev/null || echo "unknown"
-    else
-        echo "baked (use full upgrade.sh to update)"
-    fi
+    get_git_version "$REVENUE_OPS_ROOT"
 }
 
 print_usage() {
@@ -277,6 +178,7 @@ print_usage() {
 Usage: hot-upgrade.sh [OPTION] [COMPONENT]
 
 Hot upgrade plugins without rebuilding the Docker image.
+Pulls latest code on HOST, then restarts plugins in container.
 
 Components:
     hive        Upgrade only cl-hive
@@ -294,11 +196,9 @@ Examples:
     ./hot-upgrade.sh hive         # Upgrade and restart cl-hive only
     ./hot-upgrade.sh --restart    # Just restart plugins (no git)
 
-Note: Plugins are ALWAYS restarted after upgrade, even if already up to date.
-This ensures the running plugin matches the code on disk.
-
-For cl-revenue-ops hot upgrades from git, add to docker-compose.yml volumes:
-    - /path/to/cl_revenue_ops:/opt/cl-revenue-ops:ro
+Required setup:
+    Both repos must be cloned on host and mounted into container.
+    See docker-compose.yml for the default configuration.
 EOF
 }
 
@@ -352,24 +252,41 @@ main() {
     fi
 
     check_container
+
+    # Verify mounts
+    local mounts_ok=true
+    if [ "$upgrade_hive" == "true" ]; then
+        if ! check_mount "cl-hive" "$PROJECT_ROOT" "/opt/cl-hive"; then
+            mounts_ok=false
+        fi
+    fi
+    if [ "$upgrade_revenue" == "true" ]; then
+        if ! check_mount "cl_revenue_ops" "$REVENUE_OPS_ROOT" "/opt/cl-revenue-ops"; then
+            mounts_ok=false
+        fi
+    fi
+
+    if [ "$mounts_ok" == "false" ]; then
+        echo ""
+        log_error "Mount check failed. Fix the issues above and retry."
+        exit 1
+    fi
+
     show_versions
 
     local hive_upgraded=false
     local revenue_upgraded=false
 
     # In restart-only mode, skip git operations
-    if [ "$RESTART_ONLY" == "true" ]; then
-        hive_upgraded="$upgrade_hive"
-        revenue_upgraded="$upgrade_revenue"
-    else
+    if [ "$RESTART_ONLY" != "true" ]; then
         if [ "$upgrade_hive" == "true" ]; then
-            if ! upgrade_cl_hive; then
+            if ! upgrade_repo "cl-hive" "$PROJECT_ROOT"; then
                 hive_upgraded=true
             fi
         fi
 
         if [ "$upgrade_revenue" == "true" ]; then
-            if ! upgrade_cl_revenue_ops; then
+            if ! upgrade_repo "cl_revenue_ops" "$REVENUE_OPS_ROOT"; then
                 revenue_upgraded=true
             fi
         fi
@@ -381,32 +298,36 @@ main() {
         exit 0
     fi
 
-    # Always restart requested plugins - even if "up to date", the plugin
-    # may not have been restarted since the last pull
-    local should_restart_hive=false
-    local should_restart_revenue=false
+    # Restart plugins
+    log_step "Restarting plugins..."
+
+    local restart_failed=false
 
     if [ "$upgrade_hive" == "true" ]; then
-        should_restart_hive=true
-    fi
-    if [ "$upgrade_revenue" == "true" ]; then
-        should_restart_revenue=true
+        if ! restart_plugin "/opt/cl-hive/cl-hive.py" "cl-hive"; then
+            restart_failed=true
+        fi
     fi
 
-    if [ "$should_restart_hive" == "true" ] || [ "$should_restart_revenue" == "true" ]; then
-        # Prefer plugin restart over lightningd restart (faster, no channel downtime)
-        restart_plugins "$should_restart_hive" "$should_restart_revenue"
-        echo ""
-        show_versions
-        echo ""
-        if [ "$hive_upgraded" == "true" ] || [ "$revenue_upgraded" == "true" ]; then
-            log_info "Hot upgrade complete!"
-        else
-            log_info "Plugins restarted (already up to date)"
+    if [ "$upgrade_revenue" == "true" ]; then
+        if ! restart_plugin "/opt/cl-revenue-ops/cl-revenue-ops.py" "cl-revenue-ops"; then
+            restart_failed=true
         fi
+    fi
+
+    echo ""
+    show_versions
+    echo ""
+
+    if [ "$restart_failed" == "true" ]; then
+        log_error "Some plugins failed to restart. Check errors above."
+        exit 1
+    fi
+
+    if [ "$hive_upgraded" == "true" ] || [ "$revenue_upgraded" == "true" ]; then
+        log_info "Hot upgrade complete!"
     else
-        echo ""
-        log_info "Nothing to do"
+        log_info "Plugins restarted successfully"
     fi
 }
 
