@@ -1123,6 +1123,90 @@ which channels have strong fee signals.""",
             }
         ),
         Tool(
+            name="revenue_portfolio",
+            description="""Analyze channel portfolio using Mean-Variance (Markowitz) optimization.
+
+Treats channels as assets in a portfolio to optimize liquidity allocation for maximum risk-adjusted returns.
+
+Returns:
+- summary: Portfolio Sharpe ratio, diversification ratio, improvement potential
+- optimal_allocations: Target liquidity % per channel
+- recommendations: Prioritized rebalance actions
+- hedging_opportunities: Negatively correlated channel pairs (natural hedges)
+- concentration_risks: Highly correlated pairs (undiversified risk)
+
+Use risk_aversion: 0.5=aggressive, 1.0=balanced, 2.0=conservative""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "risk_aversion": {
+                        "type": "number",
+                        "description": "Risk aversion (0.5=aggressive, 1.0=balanced, 2.0=conservative)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_portfolio_summary",
+            description="Get lightweight portfolio summary: Sharpe ratio, diversification, improvement potential.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_portfolio_rebalance",
+            description="""Get portfolio-optimized rebalance recommendations.
+
+Prioritizes rebalances that improve portfolio efficiency (Sharpe ratio) over individual channel balance.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "max_recommendations": {
+                        "type": "integer",
+                        "description": "Maximum recommendations to return (default: 5)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_portfolio_correlations",
+            description="""Get channel correlation analysis to identify hedging opportunities and concentration risks.
+
+Hedging opportunities: Negatively correlated channels that naturally balance each other.
+Concentration risks: Highly correlated channels that move together (undiversified).""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "min_correlation": {
+                        "type": "number",
+                        "description": "Minimum |correlation| to include (default: 0.3)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
             name="revenue_policy",
             description="""Manage peer-level fee and rebalance policies. Actions: list, get, set, delete.
 
@@ -3214,6 +3298,14 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
             result = await handle_revenue_profitability(arguments)
         elif name == "revenue_dashboard":
             result = await handle_revenue_dashboard(arguments)
+        elif name == "revenue_portfolio":
+            result = await handle_revenue_portfolio(arguments)
+        elif name == "revenue_portfolio_summary":
+            result = await handle_revenue_portfolio_summary(arguments)
+        elif name == "revenue_portfolio_rebalance":
+            result = await handle_revenue_portfolio_rebalance(arguments)
+        elif name == "revenue_portfolio_correlations":
+            result = await handle_revenue_portfolio_correlations(arguments)
         elif name == "revenue_policy":
             result = await handle_revenue_policy(arguments)
         elif name == "revenue_set_fee":
@@ -5030,6 +5122,57 @@ async def handle_revenue_dashboard(args: Dict) -> Dict:
     dashboard["pnl_summary"] = pnl
 
     return dashboard
+
+
+async def handle_revenue_portfolio(args: Dict) -> Dict:
+    """Full portfolio analysis using Mean-Variance optimization."""
+    node_name = args.get("node")
+    risk_aversion = args.get("risk_aversion", 1.0)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-portfolio", {"risk_aversion": risk_aversion})
+
+
+async def handle_revenue_portfolio_summary(args: Dict) -> Dict:
+    """Get lightweight portfolio summary metrics."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-portfolio-summary", {})
+
+
+async def handle_revenue_portfolio_rebalance(args: Dict) -> Dict:
+    """Get portfolio-optimized rebalance recommendations."""
+    node_name = args.get("node")
+    max_recommendations = args.get("max_recommendations", 5)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-portfolio-rebalance", {
+        "max_recommendations": max_recommendations
+    })
+
+
+async def handle_revenue_portfolio_correlations(args: Dict) -> Dict:
+    """Get channel correlation analysis."""
+    node_name = args.get("node")
+    min_correlation = args.get("min_correlation", 0.3)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-portfolio-correlations", {
+        "min_correlation": min_correlation
+    })
 
 
 async def handle_revenue_policy(args: Dict) -> Dict:
