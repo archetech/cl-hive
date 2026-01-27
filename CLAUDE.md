@@ -54,6 +54,9 @@ Core Lightning
 | `contribution.py` | Forwarding stats and anti-leech detection |
 | `planner.py` | Topology optimization - saturation analysis, expansion election, feerate gate |
 | `splice_manager.py` | Coordinated splice operations between hive members (Phase 11) |
+| `mcf_solver.py` | Min-Cost Max-Flow solver for global fleet rebalance optimization |
+| `liquidity_coordinator.py` | Liquidity needs aggregation and rebalance assignment distribution |
+| `cost_reduction.py` | Fleet rebalance routing with MCF/BFS fallback |
 | `config.py` | Hot-reloadable configuration with snapshot pattern |
 | `database.py` | SQLite with WAL mode, thread-local connections |
 

@@ -44,6 +44,9 @@ Health monitoring and liquidity needs detection across the fleet.
 ### Coordinated Splicing (Phase 11)
 Automated splice operations between hive members with full PSBT exchange workflow. Resize channels without closing them - splice-in to add capacity, splice-out to remove.
 
+### Min-Cost Max-Flow Optimization (MCF)
+Global fleet-wide rebalancing optimization using Successive Shortest Paths algorithm. Automatically prefers zero-fee hive internal channels, prevents circular flows, and coordinates simultaneous rebalances across the fleet with version-aware coordinator election.
+
 ### VPN Transport Support
 Optional WireGuard VPN integration for secure fleet communication.
 
@@ -208,6 +211,16 @@ lightningd --plugin=/path/to/cl-hive/cl-hive.py
 | `hive-vpn-add-peer <pubkey> <addr>` | Add a VPN peer mapping |
 | `hive-vpn-remove-peer <pubkey>` | Remove a VPN peer mapping |
 
+### MCF Optimization
+
+| Command | Description |
+|---------|-------------|
+| `hive-mcf-status` | View MCF solver state and coordinator election |
+| `hive-mcf-solve` | Trigger manual MCF optimization cycle |
+| `hive-mcf-assignments` | View pending/completed rebalance assignments |
+| `hive-mcf-path <from> <to> <amount>` | Get optimized routing path |
+| `hive-mcf-health` | View MCF solver health metrics |
+
 ### Bridge & Debug
 
 | Command | Description |
@@ -300,14 +313,15 @@ See [MCP Server Documentation](docs/MCP_SERVER.md) for setup instructions.
 
 | Document | Description |
 |----------|-------------|
+| [Joining the Hive](docs/JOINING_THE_HIVE.md) | How to join an existing hive |
 | [MCP Server](docs/MCP_SERVER.md) | Claude Code integration guide |
-| [CLAUDE.md](CLAUDE.md) | Developer guidance for Claude Code |
-| [Phase 6 Plan](docs/planning/PHASE6_PLAN.md) | Topology optimization specification |
-| [Threat Model](docs/security/THREAT_MODEL.md) | Security threat analysis |
+| [AI Advisor Setup](docs/AI_ADVISOR_SETUP.md) | AI-assisted fleet management |
 | [Cooperative Fee Coordination](docs/design/cooperative-fee-coordination.md) | Fee coordination design |
 | [VPN Transport](docs/design/VPN_HIVE_TRANSPORT.md) | VPN transport design |
+| [Liquidity Integration](docs/design/LIQUIDITY_INTEGRATION.md) | cl-revenue-ops integration |
+| [Architecture](docs/ARCHITECTURE.md) | Complete protocol specification |
 | [Docker Deployment](docker/README.md) | Docker deployment guide |
-| [Polar Testing](docs/testing/polar.md) | Testing with Polar |
+| [Threat Model](docs/security/THREAT_MODEL.md) | Security threat analysis |
 
 ## Testing
 
