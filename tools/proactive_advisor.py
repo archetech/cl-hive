@@ -589,7 +589,7 @@ class ProactiveAdvisor:
         """
         Comprehensive node state analysis with full intelligence gathering.
 
-        Gathers data from all available intelligence systems:
+        Gathers data from all available intelligence systems concurrently:
         - Core: node_info, channels, dashboard, profitability
         - Fleet coordination: defense_status, internal_competition, fee_coordination
         - Predictive: anticipatory_predictions, critical_velocity
@@ -597,189 +597,65 @@ class ProactiveAdvisor:
         - Cost reduction: rebalance_recommendations, circular_flow_status
         - Collective warnings: ban_candidates
         """
-        # Gather data (some may fail, that's ok)
-        results = {}
+        # Define all data sources to gather concurrently
+        calls = {
+            # Core data
+            "node_info": ("hive_node_info", {"node": node_name}),
+            "channels": ("hive_channels", {"node": node_name}),
+            "dashboard": ("revenue_dashboard", {"node": node_name, "window_days": 30}),
+            "profitability": ("revenue_profitability", {"node": node_name}),
+            "context": ("advisor_get_context_brief", {"days": 7}),
+            "velocities": ("advisor_get_velocities", {"hours_threshold": 24}),
+            # Fleet coordination intelligence
+            "defense_status": ("defense_status", {"node": node_name}),
+            "internal_competition": ("internal_competition", {"node": node_name}),
+            "fee_coordination": ("fee_coordination_status", {"node": node_name}),
+            "pheromone_levels": ("pheromone_levels", {"node": node_name}),
+            "stigmergic_markers": ("stigmergic_markers", {"node": node_name}),
+            "routing_intelligence": ("hive_routing_intelligence_status", {"node": node_name}),
+            # Predictive intelligence
+            "anticipatory": ("anticipatory_predictions", {
+                "node": node_name, "min_risk": 0.3, "hours_ahead": 24
+            }),
+            "critical_velocity": ("critical_velocity", {"node": node_name, "threshold_hours": 24}),
+            # Strategic positioning
+            "positioning": ("positioning_summary", {"node": node_name}),
+            "yield_summary": ("yield_summary", {"node": node_name}),
+            "flow_recommendations": ("flow_recommendations", {"node": node_name}),
+            # Cost reduction
+            "rebalance_recommendations": ("rebalance_recommendations", {"node": node_name}),
+            "circular_flows": ("circular_flow_status", {"node": node_name}),
+            # Collective warnings
+            "ban_candidates": ("ban_candidates", {"node": node_name}),
+            # Channel rationalization
+            "rationalization": ("rationalization_summary", {"node": node_name}),
+            "close_recommendations": ("close_recommendations", {"node": node_name, "our_node_only": True}),
+            # Competitor analysis
+            "competitor_analysis": ("competitor_analysis", {"node": node_name, "top_n": 10}),
+            # Hive membership
+            "hive_members": ("hive_members", {"node": node_name}),
+        }
 
-        # ==== CORE DATA ====
-        try:
-            results["node_info"] = await self.mcp.call(
-                "hive_node_info", {"node": node_name}
-            )
-        except Exception:
-            results["node_info"] = {}
+        PER_CALL_TIMEOUT = 15  # seconds per individual call
 
-        try:
-            results["channels"] = await self.mcp.call(
-                "hive_channels", {"node": node_name}
-            )
-        except Exception:
-            results["channels"] = {}
+        async def safe_call(key: str, method: str, params: Dict) -> tuple:
+            try:
+                result = await asyncio.wait_for(
+                    self.mcp.call(method, params),
+                    timeout=PER_CALL_TIMEOUT
+                )
+                return (key, result)
+            except asyncio.TimeoutError:
+                logger.debug(f"  Timeout on {method} for {node_name}")
+                return (key, {})
+            except Exception:
+                return (key, {})
 
-        try:
-            results["dashboard"] = await self.mcp.call(
-                "revenue_dashboard", {"node": node_name, "window_days": 30}
-            )
-        except Exception:
-            results["dashboard"] = {}
-
-        try:
-            results["profitability"] = await self.mcp.call(
-                "revenue_profitability", {"node": node_name}
-            )
-        except Exception:
-            results["profitability"] = {}
-
-        try:
-            results["context"] = await self.mcp.call(
-                "advisor_get_context_brief", {"days": 7}
-            )
-        except Exception:
-            results["context"] = {}
-
-        try:
-            results["velocities"] = await self.mcp.call(
-                "advisor_get_velocities", {"hours_threshold": 24}
-            )
-        except Exception:
-            results["velocities"] = {}
-
-        # ==== FLEET COORDINATION INTELLIGENCE (Phase 2) ====
-        try:
-            results["defense_status"] = await self.mcp.call(
-                "defense_status", {"node": node_name}
-            )
-        except Exception:
-            results["defense_status"] = {}
-
-        try:
-            results["internal_competition"] = await self.mcp.call(
-                "internal_competition", {"node": node_name}
-            )
-        except Exception:
-            results["internal_competition"] = {}
-
-        try:
-            results["fee_coordination"] = await self.mcp.call(
-                "fee_coordination_status", {"node": node_name}
-            )
-        except Exception:
-            results["fee_coordination"] = {}
-
-        try:
-            results["pheromone_levels"] = await self.mcp.call(
-                "pheromone_levels", {"node": node_name}
-            )
-        except Exception:
-            results["pheromone_levels"] = {}
-
-        try:
-            results["stigmergic_markers"] = await self.mcp.call(
-                "stigmergic_markers", {"node": node_name}
-            )
-        except Exception:
-            results["stigmergic_markers"] = {}
-
-        try:
-            results["routing_intelligence"] = await self.mcp.call(
-                "hive_routing_intelligence_status", {"node": node_name}
-            )
-        except Exception:
-            results["routing_intelligence"] = {}
-
-        # ==== PREDICTIVE INTELLIGENCE (Phase 7.1) ====
-        try:
-            results["anticipatory"] = await self.mcp.call(
-                "anticipatory_predictions", {
-                    "node": node_name,
-                    "min_risk": 0.3,
-                    "hours_ahead": 24
-                }
-            )
-        except Exception:
-            results["anticipatory"] = {}
-
-        try:
-            results["critical_velocity"] = await self.mcp.call(
-                "critical_velocity", {"node": node_name, "threshold_hours": 24}
-            )
-        except Exception:
-            results["critical_velocity"] = {}
-
-        # ==== STRATEGIC POSITIONING (Phase 4) ====
-        try:
-            results["positioning"] = await self.mcp.call(
-                "positioning_summary", {"node": node_name}
-            )
-        except Exception:
-            results["positioning"] = {}
-
-        try:
-            results["yield_summary"] = await self.mcp.call(
-                "yield_summary", {"node": node_name}
-            )
-        except Exception:
-            results["yield_summary"] = {}
-
-        try:
-            results["flow_recommendations"] = await self.mcp.call(
-                "flow_recommendations", {"node": node_name}
-            )
-        except Exception:
-            results["flow_recommendations"] = {}
-
-        # ==== COST REDUCTION (Phase 3) ====
-        try:
-            results["rebalance_recommendations"] = await self.mcp.call(
-                "rebalance_recommendations", {"node": node_name}
-            )
-        except Exception:
-            results["rebalance_recommendations"] = {}
-
-        try:
-            results["circular_flows"] = await self.mcp.call(
-                "circular_flow_status", {"node": node_name}
-            )
-        except Exception:
-            results["circular_flows"] = {}
-
-        # ==== COLLECTIVE WARNINGS ====
-        try:
-            results["ban_candidates"] = await self.mcp.call(
-                "ban_candidates", {"node": node_name}
-            )
-        except Exception:
-            results["ban_candidates"] = {}
-
-        # ==== CHANNEL RATIONALIZATION ====
-        try:
-            results["rationalization"] = await self.mcp.call(
-                "rationalization_summary", {"node": node_name}
-            )
-        except Exception:
-            results["rationalization"] = {}
-
-        try:
-            results["close_recommendations"] = await self.mcp.call(
-                "close_recommendations", {"node": node_name, "our_node_only": True}
-            )
-        except Exception:
-            results["close_recommendations"] = {}
-
-        # ==== COMPETITOR ANALYSIS ====
-        try:
-            results["competitor_analysis"] = await self.mcp.call(
-                "competitor_analysis", {"node": node_name, "top_n": 10}
-            )
-        except Exception:
-            results["competitor_analysis"] = {}
-
-        # ==== HIVE MEMBERSHIP (for new member detection) ====
-        try:
-            results["hive_members"] = await self.mcp.call(
-                "hive_members", {"node": node_name}
-            )
-        except Exception:
-            results["hive_members"] = {}
+        # Run all calls concurrently
+        gathered = await asyncio.gather(
+            *[safe_call(k, method, params) for k, (method, params) in calls.items()]
+        )
+        results = dict(gathered)
 
         # Calculate summary metrics
         channels = results.get("channels", {}).get("channels", [])
