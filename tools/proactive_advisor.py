@@ -990,9 +990,23 @@ class ProactiveAdvisor:
         if not opp.channel_id:
             return False
 
-        # Get current fee
-        current_state = opp.current_state
+        # Get current fee from current_state or fetch it
+        current_state = opp.current_state or {}
         current_fee = current_state.get("fee_ppm", 0)
+
+        # If fee not in current_state, fetch from revenue-ops
+        if current_fee == 0:
+            try:
+                channels = await self.mcp.call(
+                    "hive_channels",
+                    {"node": node_name}
+                )
+                for ch in channels.get("channels", []):
+                    if ch.get("channel_id") == opp.channel_id or ch.get("scid") == opp.channel_id:
+                        current_fee = ch.get("fee_ppm", 0)
+                        break
+            except Exception:
+                pass
 
         if current_fee == 0:
             return False
