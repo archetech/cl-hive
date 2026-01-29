@@ -83,7 +83,7 @@ class MockYieldMetrics:
         self.critical_channels = []
         self.predictions = {}
 
-    def get_critical_velocity_channels(self, hours_threshold=24):
+    def get_critical_velocity_channels(self, threshold_hours=24):
         return self.critical_channels
 
     def predict_channel_state(self, channel_id, hours=12):
