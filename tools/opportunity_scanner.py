@@ -109,7 +109,7 @@ SAFETY_CONSTRAINTS = {
     "rebalances_per_cycle": 5,           # Max 5 rebalances per 3h
 
     # Confidence requirements
-    "min_confidence_auto_execute": 0.8,
+    "min_confidence_auto_execute": 0.55,  # Lowered from 0.8 (Issue #45)
     "min_confidence_for_queue": 0.5,
 }
 
