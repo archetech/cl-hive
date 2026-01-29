@@ -15,6 +15,7 @@ Author: Lightning Goats Team
 
 import hashlib
 import json
+import threading
 import time
 from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -163,18 +164,19 @@ class HivePeerState:
 class StateManager:
     """
     Manages the local view of Hive fleet state (the "HiveMap").
-    
+
     Responsibilities:
     - Cache peer state received via GOSSIP
     - Calculate deterministic fleet hash for anti-entropy
     - Detect state divergence and trigger FULL_SYNC
     - Persist state to database
-    
+
     Thread Safety:
     - All database operations use thread-local connections
-    - State hash calculation is read-only (safe for concurrent access)
+    - _local_state dict protected by _lock for thread-safe access
+    - State hash calculation acquires lock for consistent snapshot
     """
-    
+
     def __init__(self, database, plugin=None):
         """
         Initialize the StateManager.
@@ -185,6 +187,7 @@ class StateManager:
         """
         self.db = database
         self.plugin = plugin
+        self._lock = threading.Lock()  # Protects _local_state access
         self._local_state: Dict[str, HivePeerState] = {}
         self._last_hash: str = ""
         self._last_hash_time: int = 0
@@ -246,24 +249,26 @@ class StateManager:
         try:
             states = self.db.get_all_hive_states()
             loaded = 0
-            for state_data in states:
-                peer_id = state_data.get('peer_id')
-                if not peer_id:
-                    continue
 
-                # Create HivePeerState from DB data
-                peer_state = HivePeerState(
-                    peer_id=peer_id,
-                    capacity_sats=state_data.get('capacity_sats', 0),
-                    available_sats=state_data.get('available_sats', 0),
-                    fee_policy=state_data.get('fee_policy', {}),
-                    topology=state_data.get('topology', []),
-                    version=state_data.get('version', 0),
-                    last_update=state_data.get('last_gossip', 0),
-                    state_hash=state_data.get('state_hash', ""),
-                )
-                self._local_state[peer_id] = peer_state
-                loaded += 1
+            with self._lock:
+                for state_data in states:
+                    peer_id = state_data.get('peer_id')
+                    if not peer_id:
+                        continue
+
+                    # Create HivePeerState from DB data
+                    peer_state = HivePeerState(
+                        peer_id=peer_id,
+                        capacity_sats=state_data.get('capacity_sats', 0),
+                        available_sats=state_data.get('available_sats', 0),
+                        fee_policy=state_data.get('fee_policy', {}),
+                        topology=state_data.get('topology', []),
+                        version=state_data.get('version', 0),
+                        last_update=state_data.get('last_gossip', 0),
+                        state_hash=state_data.get('state_hash', ""),
+                    )
+                    self._local_state[peer_id] = peer_state
+                    loaded += 1
 
             if loaded > 0:
                 self._log(f"Loaded {loaded} peer states from database")
@@ -279,14 +284,14 @@ class StateManager:
     def update_peer_state(self, peer_id: str, gossip_data: Dict[str, Any]) -> bool:
         """
         Update local cache with received gossip data.
-        
+
         Only updates if the incoming version is newer than what we have.
         Persists to database after update.
-        
+
         Args:
             peer_id: The peer's public key
             gossip_data: Dict containing state fields from GOSSIP message
-            
+
         Returns:
             True if state was updated, False if rejected (stale)
         """
@@ -297,37 +302,38 @@ class StateManager:
             return False
 
         remote_version = gossip_data.get('version', 0)
-        
-        # Check if we have existing state
-        existing = self._local_state.get(peer_id)
-        if existing and existing.version >= remote_version:
-            self._log(f"Rejected stale gossip from {peer_id[:16]}... "
-                     f"(local v{existing.version} >= remote v{remote_version})")
-            return False
-        
-        # Create new state entry
-        now = int(time.time())
-        new_state = HivePeerState(
-            peer_id=peer_id,
-            capacity_sats=gossip_data.get('capacity_sats', 0),
-            available_sats=gossip_data.get('available_sats', 0),
-            fee_policy=gossip_data.get('fee_policy', {}),
-            topology=gossip_data.get('topology', []),
-            version=remote_version,
-            last_update=gossip_data.get('timestamp', now),
-            state_hash=gossip_data.get('state_hash', ""),
-            # Budget fields (Phase 8 - backward compatible, defaults to 0)
-            budget_available_sats=gossip_data.get('budget_available_sats', 0),
-            budget_reserved_until=gossip_data.get('budget_reserved_until', 0),
-            budget_last_update=gossip_data.get('budget_last_update', 0),
-            # Capabilities (MCF support, etc. - backward compatible, defaults to empty)
-            capabilities=gossip_data.get('capabilities', []),
-        )
-        
-        # Update in-memory cache
-        self._local_state[peer_id] = new_state
 
-        # Persist to database with the remote version
+        with self._lock:
+            # Check if we have existing state
+            existing = self._local_state.get(peer_id)
+            if existing and existing.version >= remote_version:
+                self._log(f"Rejected stale gossip from {peer_id[:16]}... "
+                         f"(local v{existing.version} >= remote v{remote_version})")
+                return False
+
+            # Create new state entry
+            now = int(time.time())
+            new_state = HivePeerState(
+                peer_id=peer_id,
+                capacity_sats=gossip_data.get('capacity_sats', 0),
+                available_sats=gossip_data.get('available_sats', 0),
+                fee_policy=gossip_data.get('fee_policy', {}),
+                topology=gossip_data.get('topology', []),
+                version=remote_version,
+                last_update=gossip_data.get('timestamp', now),
+                state_hash=gossip_data.get('state_hash', ""),
+                # Budget fields (Phase 8 - backward compatible, defaults to 0)
+                budget_available_sats=gossip_data.get('budget_available_sats', 0),
+                budget_reserved_until=gossip_data.get('budget_reserved_until', 0),
+                budget_last_update=gossip_data.get('budget_last_update', 0),
+                # Capabilities (MCF support, etc. - backward compatible, defaults to empty)
+                capabilities=gossip_data.get('capabilities', []),
+            )
+
+            # Update in-memory cache
+            self._local_state[peer_id] = new_state
+
+        # Persist to database outside lock (DB has its own thread-local connections)
         self.db.update_hive_state(
             peer_id=peer_id,
             capacity_sats=new_state.capacity_sats,
@@ -364,44 +370,45 @@ class StateManager:
         """
         now = int(time.time())
 
-        # Basic validation
+        # Basic validation (before lock)
         if not peer_id or fees_earned_sats < 0 or forward_count < 0:
             return False
         if rebalance_costs_sats < 0:
             rebalance_costs_sats = 0
 
-        # Get or create peer state
-        existing = self._local_state.get(peer_id)
+        with self._lock:
+            # Get or create peer state
+            existing = self._local_state.get(peer_id)
 
-        if existing:
-            # Only update if this report is newer
-            if existing.fees_last_report >= period_end:
-                self._log(f"Rejected stale fee report from {peer_id[:16]}...")
-                return False
+            if existing:
+                # Only update if this report is newer
+                if existing.fees_last_report >= period_end:
+                    self._log(f"Rejected stale fee report from {peer_id[:16]}...")
+                    return False
 
-            # Update fee fields while preserving other state
-            existing.fees_earned_sats = fees_earned_sats
-            existing.fees_forward_count = forward_count
-            existing.fees_period_start = period_start
-            existing.fees_last_report = period_end
-            existing.fees_costs_sats = rebalance_costs_sats
-        else:
-            # Create minimal state entry with just fee data
-            new_state = HivePeerState(
-                peer_id=peer_id,
-                capacity_sats=0,
-                available_sats=0,
-                fee_policy={},
-                topology=[],
-                version=0,
-                last_update=now,
-                fees_earned_sats=fees_earned_sats,
-                fees_forward_count=forward_count,
-                fees_period_start=period_start,
-                fees_last_report=period_end,
-                fees_costs_sats=rebalance_costs_sats
-            )
-            self._local_state[peer_id] = new_state
+                # Update fee fields while preserving other state
+                existing.fees_earned_sats = fees_earned_sats
+                existing.fees_forward_count = forward_count
+                existing.fees_period_start = period_start
+                existing.fees_last_report = period_end
+                existing.fees_costs_sats = rebalance_costs_sats
+            else:
+                # Create minimal state entry with just fee data
+                new_state = HivePeerState(
+                    peer_id=peer_id,
+                    capacity_sats=0,
+                    available_sats=0,
+                    fee_policy={},
+                    topology=[],
+                    version=0,
+                    last_update=now,
+                    fees_earned_sats=fees_earned_sats,
+                    fees_forward_count=forward_count,
+                    fees_period_start=period_start,
+                    fees_last_report=period_end,
+                    fees_costs_sats=rebalance_costs_sats
+                )
+                self._local_state[peer_id] = new_state
 
         self._log(f"Updated fees for {peer_id[:16]}...: {fees_earned_sats} sats, "
                  f"{forward_count} forwards, costs={rebalance_costs_sats}")
@@ -417,23 +424,24 @@ class StateManager:
         Returns:
             Dict with fees_earned_sats, forward_count, period_start, last_report, rebalance_costs_sats
         """
-        state = self._local_state.get(peer_id)
-        if not state:
-            return {
-                "fees_earned_sats": 0,
-                "forward_count": 0,
-                "period_start": 0,
-                "last_report": 0,
-                "rebalance_costs_sats": 0
-            }
+        with self._lock:
+            state = self._local_state.get(peer_id)
+            if not state:
+                return {
+                    "fees_earned_sats": 0,
+                    "forward_count": 0,
+                    "period_start": 0,
+                    "last_report": 0,
+                    "rebalance_costs_sats": 0
+                }
 
-        return {
-            "fees_earned_sats": state.fees_earned_sats,
-            "forward_count": state.fees_forward_count,
-            "period_start": state.fees_period_start,
-            "last_report": state.fees_last_report,
-            "rebalance_costs_sats": state.fees_costs_sats
-        }
+            return {
+                "fees_earned_sats": state.fees_earned_sats,
+                "forward_count": state.fees_forward_count,
+                "period_start": state.fees_period_start,
+                "last_report": state.fees_last_report,
+                "rebalance_costs_sats": state.fees_costs_sats
+            }
 
     def get_all_peer_fees(self) -> Dict[str, Dict[str, int]]:
         """
@@ -442,16 +450,17 @@ class StateManager:
         Returns:
             Dict mapping peer_id to fee data dict
         """
-        result = {}
-        for peer_id, state in self._local_state.items():
-            result[peer_id] = {
-                "fees_earned_sats": state.fees_earned_sats,
-                "forward_count": state.fees_forward_count,
-                "period_start": state.fees_period_start,
-                "last_report": state.fees_last_report,
-                "rebalance_costs_sats": state.fees_costs_sats
-            }
-        return result
+        with self._lock:
+            result = {}
+            for peer_id, state in self._local_state.items():
+                result[peer_id] = {
+                    "fees_earned_sats": state.fees_earned_sats,
+                    "forward_count": state.fees_forward_count,
+                    "period_start": state.fees_period_start,
+                    "last_report": state.fees_last_report,
+                    "rebalance_costs_sats": state.fees_costs_sats
+                }
+            return result
 
     def update_local_state(self, capacity_sats: int, available_sats: int,
                            fee_policy: Dict[str, Any], topology: List[str],
@@ -480,45 +489,46 @@ class StateManager:
             The updated HivePeerState for our node
         """
         now = int(time.time())
-        existing = self._local_state.get(our_pubkey)
 
-        # Check if state has actually changed
-        state_changed = True
-        if existing:
-            # Compare relevant fields (not version, timestamp, or state_hash)
-            state_changed = (
-                existing.capacity_sats != capacity_sats or
-                existing.available_sats != available_sats or
-                existing.fee_policy != fee_policy or
-                set(existing.topology) != set(topology)
+        with self._lock:
+            existing = self._local_state.get(our_pubkey)
+
+            # Check if state has actually changed
+            state_changed = True
+            if existing:
+                # Compare relevant fields (not version, timestamp, or state_hash)
+                state_changed = (
+                    existing.capacity_sats != capacity_sats or
+                    existing.available_sats != available_sats or
+                    existing.fee_policy != fee_policy or
+                    set(existing.topology) != set(topology)
+                )
+
+            # Use forced version from GossipManager if provided (ensures persistence matches gossip)
+            # Otherwise, only increment version if state changed
+            if force_version is not None:
+                new_version = force_version
+            elif state_changed:
+                new_version = (existing.version + 1) if existing else 1
+                self._log(f"State changed for {our_pubkey[:16]}..., incrementing to v{new_version}")
+            else:
+                # No change - keep existing version
+                new_version = existing.version if existing else 1
+
+            our_state = HivePeerState(
+                peer_id=our_pubkey,
+                capacity_sats=capacity_sats,
+                available_sats=available_sats,
+                fee_policy=fee_policy,
+                topology=topology,
+                version=new_version,
+                last_update=now,
+                state_hash=""  # Will be calculated on demand
             )
 
-        # Use forced version from GossipManager if provided (ensures persistence matches gossip)
-        # Otherwise, only increment version if state changed
-        if force_version is not None:
-            new_version = force_version
-        elif state_changed:
-            new_version = (existing.version + 1) if existing else 1
-            self._log(f"State changed for {our_pubkey[:16]}..., incrementing to v{new_version}")
-        else:
-            # No change - keep existing version
-            new_version = existing.version if existing else 1
+            self._local_state[our_pubkey] = our_state
 
-        our_state = HivePeerState(
-            peer_id=our_pubkey,
-            capacity_sats=capacity_sats,
-            available_sats=available_sats,
-            fee_policy=fee_policy,
-            topology=topology,
-            version=new_version,
-            last_update=now,
-            state_hash=""  # Will be calculated on demand
-        )
-
-        self._local_state[our_pubkey] = our_state
-
-        # Persist to database if state changed OR if force_version provided
-        # (force_version means GossipManager wants to ensure version is saved for restart)
+        # Persist to database outside lock (DB has its own thread-local connections)
         if state_changed or force_version is not None:
             self.db.update_hive_state(
                 peer_id=our_pubkey,
@@ -534,11 +544,13 @@ class StateManager:
     
     def get_peer_state(self, peer_id: str) -> Optional[HivePeerState]:
         """Get cached state for a specific peer."""
-        return self._local_state.get(peer_id)
-    
+        with self._lock:
+            return self._local_state.get(peer_id)
+
     def get_all_peer_states(self) -> List[HivePeerState]:
-        """Get all cached peer states."""
-        return list(self._local_state.values())
+        """Get all cached peer states (returns a copy for thread safety)."""
+        with self._lock:
+            return list(self._local_state.values())
 
     def get_fleet_budget_summary(self, min_channel_sats: int = 0,
                                   stale_threshold_sec: int = 600) -> Dict[str, Any]:
@@ -568,25 +580,26 @@ class StateManager:
         stale_count = 0
         budget_ages = []
 
-        for state in self._local_state.values():
-            budget = state.budget_available_sats
-            budget_time = state.budget_last_update
+        with self._lock:
+            for state in self._local_state.values():
+                budget = state.budget_available_sats
+                budget_time = state.budget_last_update
 
-            # Track budget totals
-            if budget > 0:
-                total_available += budget
-                members_with_budget += 1
+                # Track budget totals
+                if budget > 0:
+                    total_available += budget
+                    members_with_budget += 1
 
-            # Check affordability
-            if min_channel_sats > 0 and budget >= min_channel_sats:
-                affordable_members.append(state.peer_id)
+                # Check affordability
+                if min_channel_sats > 0 and budget >= min_channel_sats:
+                    affordable_members.append(state.peer_id)
 
-            # Track staleness
-            if budget_time > 0:
-                age = now - budget_time
-                budget_ages.append(age)
-                if age > stale_threshold_sec:
-                    stale_count += 1
+                # Track staleness
+                if budget_time > 0:
+                    age = now - budget_time
+                    budget_ages.append(age)
+                    if age > stale_threshold_sec:
+                        stale_count += 1
 
         avg_age = sum(budget_ages) / len(budget_ages) if budget_ages else 0
 
@@ -601,10 +614,11 @@ class StateManager:
 
     def remove_peer_state(self, peer_id: str) -> bool:
         """Remove a peer from the state cache (e.g., after ban)."""
-        if peer_id in self._local_state:
-            del self._local_state[peer_id]
-            return True
-        return False
+        with self._lock:
+            if peer_id in self._local_state:
+                del self._local_state[peer_id]
+                return True
+            return False
     
     # =========================================================================
     # STATE HASH CALCULATION
@@ -613,36 +627,37 @@ class StateManager:
     def calculate_fleet_hash(self) -> str:
         """
         Calculate deterministic hash of the entire fleet state.
-        
+
         Algorithm:
             1. Extract minimal tuples: (peer_id, version, timestamp)
             2. Sort by peer_id (lexicographic)
             3. Serialize to JSON with sorted keys, compact separators
             4. SHA256 hash the result
-        
+
         Returns:
             Hex-encoded SHA256 hash of the sorted state array
         """
-        # Extract minimal state tuples
-        state_tuples = [
-            state.to_hash_tuple() 
-            for state in self._local_state.values()
-        ]
-        
-        # Sort by peer_id for determinism
+        with self._lock:
+            # Extract minimal state tuples (snapshot while holding lock)
+            state_tuples = [
+                state.to_hash_tuple()
+                for state in self._local_state.values()
+            ]
+
+        # Sort by peer_id for determinism (can release lock for CPU work)
         state_tuples.sort(key=lambda x: x['peer_id'])
-        
+
         # Serialize to canonical JSON
         json_str = json.dumps(state_tuples, sort_keys=True, separators=(',', ':'))
-        
+
         # Calculate SHA256
         hash_bytes = hashlib.sha256(json_str.encode('utf-8')).digest()
         hash_hex = hash_bytes.hex()
-        
+
         # Cache the result
         self._last_hash = hash_hex
         self._last_hash_time = int(time.time())
-        
+
         return hash_hex
     
     def get_cached_hash(self) -> Tuple[str, int]:
@@ -675,26 +690,28 @@ class StateManager:
     def get_full_state_for_sync(self) -> List[Dict[str, Any]]:
         """
         Get complete state data for FULL_SYNC response.
-        
+
         Returns:
             List of peer state dictionaries
         """
-        return [state.to_dict() for state in self._local_state.values()]
-    
+        with self._lock:
+            return [state.to_dict() for state in self._local_state.values()]
+
     def apply_full_sync(self, remote_states: List[Dict[str, Any]]) -> int:
         """
         Apply a FULL_SYNC payload to update local state.
-        
+
         Merges remote state, preferring higher versions.
-        
+
         Args:
             remote_states: List of peer state dictionaries
-            
+
         Returns:
             Number of states that were updated
         """
         updated_count = 0
-        
+        states_to_persist = []
+
         for state_dict in remote_states:
             peer_id = state_dict.get('peer_id')
             if not peer_id:
@@ -702,28 +719,31 @@ class StateManager:
             if not self._validate_state_entry(state_dict):
                 self._log(f"Rejected invalid FULL_SYNC entry for {peer_id[:16]}...", level="warn")
                 continue
-            
+
             remote_version = state_dict.get('version', 0)
-            local_state = self._local_state.get(peer_id)
-            
-            # Only update if remote is newer
-            if not local_state or local_state.version < remote_version:
-                new_state = HivePeerState.from_dict(state_dict)
-                self._local_state[peer_id] = new_state
 
-                # Persist to database with the remote version
-                self.db.update_hive_state(
-                    peer_id=peer_id,
-                    capacity_sats=new_state.capacity_sats,
-                    available_sats=new_state.available_sats,
-                    fee_policy=new_state.fee_policy,
-                    topology=new_state.topology,
-                    state_hash=new_state.state_hash,
-                    version=remote_version
-                )
+            with self._lock:
+                local_state = self._local_state.get(peer_id)
 
-                updated_count += 1
-        
+                # Only update if remote is newer
+                if not local_state or local_state.version < remote_version:
+                    new_state = HivePeerState.from_dict(state_dict)
+                    self._local_state[peer_id] = new_state
+                    states_to_persist.append((peer_id, new_state, remote_version))
+                    updated_count += 1
+
+        # Persist to database outside lock
+        for peer_id, new_state, remote_version in states_to_persist:
+            self.db.update_hive_state(
+                peer_id=peer_id,
+                capacity_sats=new_state.capacity_sats,
+                available_sats=new_state.available_sats,
+                fee_policy=new_state.fee_policy,
+                topology=new_state.topology,
+                state_hash=new_state.state_hash,
+                version=remote_version
+            )
+
         self._log(f"FULL_SYNC applied: {updated_count} states updated")
         return updated_count
     
@@ -760,27 +780,28 @@ class StateManager:
     def cleanup_stale_states(self, max_age_seconds: int = STALE_STATE_THRESHOLD) -> int:
         """
         Remove states that haven't been updated recently.
-        
+
         Args:
             max_age_seconds: Maximum age before state is considered stale
-            
+
         Returns:
             Number of states removed
         """
         now = int(time.time())
         cutoff = now - max_age_seconds
-        
-        stale_peers = [
-            peer_id for peer_id, state in self._local_state.items()
-            if state.last_update < cutoff
-        ]
-        
-        for peer_id in stale_peers:
-            del self._local_state[peer_id]
-        
+
+        with self._lock:
+            stale_peers = [
+                peer_id for peer_id, state in self._local_state.items()
+                if state.last_update < cutoff
+            ]
+
+            for peer_id in stale_peers:
+                del self._local_state[peer_id]
+
         if stale_peers:
             self._log(f"Cleaned up {len(stale_peers)} stale states")
-        
+
         return len(stale_peers)
     
     # =========================================================================
@@ -790,12 +811,13 @@ class StateManager:
     def get_fleet_stats(self) -> Dict[str, Any]:
         """
         Calculate aggregate statistics for the fleet.
-        
+
         Returns:
             Dict with fleet-wide metrics
         """
-        states = list(self._local_state.values())
-        
+        with self._lock:
+            states = list(self._local_state.values())
+
         if not states:
             return {
                 "peer_count": 0,
@@ -804,15 +826,15 @@ class StateManager:
                 "unique_external_peers": 0,
                 "fleet_hash": ""
             }
-        
+
         total_capacity = sum(s.capacity_sats for s in states)
         total_available = sum(s.available_sats for s in states)
-        
+
         # Deduplicate external peers across fleet
         all_external = set()
         for state in states:
             all_external.update(state.topology)
-        
+
         return {
             "peer_count": len(states),
             "total_capacity_sats": total_capacity,
