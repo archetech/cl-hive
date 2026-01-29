@@ -4842,12 +4842,14 @@ async def handle_routing_intelligence_status(args: Dict) -> Dict:
     failed = result.get("failed_markers", 0)
 
     if pheromone_count == 0 and marker_count == 0:
+        result["status"] = "empty"
         result["ai_summary"] = (
             "No routing intelligence data yet. "
             "Run hive_backfill_routing_intelligence to populate from historical forwards, "
             "or wait for new forwards to accumulate."
         )
     else:
+        result["status"] = "active"
         result["ai_summary"] = (
             f"Routing intelligence active: {pheromone_count} channels with pheromone levels, "
             f"{marker_count} stigmergic markers ({successful} successful, {failed} failed). "
