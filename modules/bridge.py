@@ -620,6 +620,49 @@ class Bridge:
             self._log(f"Failed to get SCID for {peer_id[:16]}...: {e}", level='debug')
             return None
 
+    def verify_hive_channel_zero_fees(self, peer_id: str) -> Tuple[bool, str]:
+        """
+        Verify a hive member channel has zero fees as required.
+
+        Hive channels MUST have 0 ppm fees (both base and proportional) for
+        the zero-cost capital movement guarantee. This method checks the
+        actual channel fees via listchannels.
+
+        Args:
+            peer_id: Hive member's node public key
+
+        Returns:
+            Tuple of (is_valid, reason)
+            - (True, "ok") if fees are zero
+            - (False, "reason") if fees are non-zero or check failed
+        """
+        try:
+            scid = self._get_channel_scid(peer_id)
+            if not scid:
+                return (False, "no_channel")
+
+            # Get our node's fee settings for this channel
+            channels = self.rpc.listchannels(short_channel_id=scid)
+            if not channels or 'channels' not in channels:
+                return (False, "channel_not_found")
+
+            # Find our direction (we need our node's pubkey)
+            our_pubkey = self.rpc.getinfo().get('id', '')
+            for ch in channels.get('channels', []):
+                if ch.get('source') == our_pubkey:
+                    base_fee = ch.get('base_fee_millisatoshi', 0)
+                    fee_ppm = ch.get('fee_per_millionth', 0)
+
+                    if base_fee != 0 or fee_ppm != 0:
+                        return (False, f"non_zero_fees: base={base_fee}msat, ppm={fee_ppm}")
+                    return (True, "ok")
+
+            return (False, "our_direction_not_found")
+
+        except Exception as e:
+            self._log(f"Failed to verify fees for {peer_id[:16]}...: {e}", level='debug')
+            return (False, f"error: {e}")
+
     def _check_daily_rebalance_budget(self, amount_sats: int) -> bool:
         """
         Check if rebalance fits within daily budget.

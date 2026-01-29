@@ -439,7 +439,12 @@ class RateLimiter:
 
     Tracks message rates per sender and rejects messages that exceed
     the configured rate. Uses a sliding window approach.
+
+    Memory bounded: evicts inactive peers when MAX_TRACKED_PEERS exceeded.
     """
+
+    # Maximum peers to track (DoS protection)
+    MAX_TRACKED_PEERS = 1000
 
     def __init__(self, max_per_minute: int = 10, window_seconds: int = 60):
         """
@@ -470,6 +475,18 @@ class RateLimiter:
         with self._lock:
             # Get or create timestamp list for this peer
             if peer_id not in self._timestamps:
+                # Enforce max tracked peers (DoS protection)
+                if len(self._timestamps) >= self.MAX_TRACKED_PEERS:
+                    # Evict peers with no recent activity
+                    inactive = [
+                        pid for pid, ts_list in self._timestamps.items()
+                        if not ts_list or max(ts_list) <= cutoff
+                    ]
+                    for pid in inactive[:100]:  # Evict up to 100 at a time
+                        del self._timestamps[pid]
+                    # If still at limit after eviction, reject new peer
+                    if len(self._timestamps) >= self.MAX_TRACKED_PEERS:
+                        return False
                 self._timestamps[peer_id] = []
 
             # Remove old timestamps outside the window
