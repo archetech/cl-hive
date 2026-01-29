@@ -659,26 +659,18 @@ class ProactiveAdvisor:
 
         # Calculate summary metrics
         channels = results.get("channels", {}).get("channels", [])
-        prof_list = results.get("profitability", {}).get("channels", [])
         dashboard = results.get("dashboard", {})
 
         total_capacity = sum(ch.get("capacity_sats", 0) for ch in channels)
         total_local = sum(ch.get("local_sats", 0) for ch in channels)
         avg_balance_ratio = total_local / total_capacity if total_capacity > 0 else 0.5
 
-        # Profitability analysis
-        underwater_count = sum(
-            1 for p in prof_list
-            if p.get("classification") == "underwater"
-            or p.get("profitability_class") == "underwater"
-        )
-        profitable_count = sum(
-            1 for p in prof_list
-            if p.get("classification") == "profitable"
-            or p.get("profitability_class") == "profitable"
-        )
-
-        total_prof = len(prof_list) if prof_list else 1
+        # Profitability analysis - read from summary directly (Issue #43)
+        prof_data = results.get("profitability", {})
+        prof_summary = prof_data.get("summary", {})
+        underwater_count = prof_summary.get("underwater_count", 0)
+        profitable_count = prof_summary.get("profitable_count", 0)
+        total_prof = prof_summary.get("total_channels", 1)
         underwater_pct = underwater_count / total_prof * 100
         profitable_pct = profitable_count / total_prof * 100
 
