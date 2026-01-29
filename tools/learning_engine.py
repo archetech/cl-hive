@@ -108,7 +108,9 @@ class LearningEngine:
     LEARNING_RATE = 0.1
 
     # Default success rate for new opportunity types
-    DEFAULT_SUCCESS_RATE = 0.5
+    # Optimistic default for untracked opportunity types (Issue #45)
+    # No reason to assume 50% failure when system success is 99%+
+    DEFAULT_SUCCESS_RATE = 0.9
 
     def __init__(self, db):
         """
