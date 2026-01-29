@@ -119,7 +119,14 @@ DAILY_REBALANCE_FEE_BUDGET_SATS = 50_000
 # Conservative thresholds
 MIN_ONCHAIN_RESERVE_SATS = 600_000
 MAX_FEE_CHANGE_PCT = 15  # Max 15% per change (more conservative than 25%)
-MIN_AUTO_EXECUTE_CONFIDENCE = 0.8
+
+# Adaptive auto-execute threshold (Issue #45)
+# - Default conservative threshold for new deployments
+# - Lower threshold unlocked after proven performance
+MIN_AUTO_EXECUTE_CONFIDENCE_DEFAULT = 0.8
+MIN_AUTO_EXECUTE_CONFIDENCE_PROVEN = 0.6
+PROVEN_OUTCOMES_THRESHOLD = 200
+PROVEN_SUCCESS_RATE_THRESHOLD = 0.95
 
 
 # =============================================================================
@@ -903,12 +910,27 @@ class ProactiveAdvisor:
         if self._daily_budget.date != today:
             self._daily_budget = DailyBudget(date=today)
 
+        # Adaptive threshold based on proven performance (Issue #45)
+        learning = self.learning_engine.get_learning_summary()
+        total_outcomes = learning.get("total_outcomes_measured", 0)
+        success_rate = learning.get("overall_success_rate", 0.5)
+
+        if (total_outcomes >= PROVEN_OUTCOMES_THRESHOLD and
+                success_rate >= PROVEN_SUCCESS_RATE_THRESHOLD):
+            confidence_threshold = MIN_AUTO_EXECUTE_CONFIDENCE_PROVEN
+            logger.debug(f"  Using proven threshold {confidence_threshold} "
+                        f"(outcomes={total_outcomes}, success={success_rate:.1%})")
+        else:
+            confidence_threshold = MIN_AUTO_EXECUTE_CONFIDENCE_DEFAULT
+            logger.debug(f"  Using default threshold {confidence_threshold} "
+                        f"(outcomes={total_outcomes}, success={success_rate:.1%})")
+
         # Only consider high-confidence, auto-safe opportunities
         for opp in opportunities:
             if not opp.auto_execute_safe:
                 continue
 
-            if opp.adjusted_confidence < MIN_AUTO_EXECUTE_CONFIDENCE:
+            if opp.adjusted_confidence < confidence_threshold:
                 continue
 
             # Check budget
