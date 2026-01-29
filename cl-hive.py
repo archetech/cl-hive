@@ -7927,13 +7927,18 @@ def fee_intelligence_loop():
                 safe_plugin.log(f"cl-hive: Fee intelligence cleanup error: {e}", level='warn')
 
             # Step 5: Broadcast liquidity needs
+            # NOTE: Small delays (50ms) between broadcasts reduce RPC lock contention
+            # and allow incoming RPC requests (e.g., hive-deposit-marker) to be processed
             _broadcast_liquidity_needs()
+            shutdown_event.wait(0.05)  # Yield to allow other RPC processing
 
             # Step 5a: Broadcast stigmergic markers (Phase 13 - Fleet Learning)
             _broadcast_our_stigmergic_markers()
+            shutdown_event.wait(0.05)
 
             # Step 5b: Broadcast pheromones (Phase 13 - Fleet Learning)
             _broadcast_our_pheromones()
+            shutdown_event.wait(0.05)
 
             # Step 5c: Broadcast yield metrics (Phase 14 - Daily, only once per day)
             # Check if we've already broadcast today
@@ -7944,11 +7949,13 @@ def fee_intelligence_loop():
                 if last_yield_broadcast != today:
                     _broadcast_our_yield_metrics()
                     _broadcast_our_yield_metrics._last_broadcast = today
+                    shutdown_event.wait(0.05)
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Yield metrics broadcast check error: {e}", level='debug')
 
             # Step 5d: Broadcast circular flow alerts (Phase 14 - Event-driven)
             _broadcast_circular_flow_alerts()
+            shutdown_event.wait(0.05)
 
             # Step 5e: Broadcast temporal patterns (Phase 14 - Weekly)
             try:
@@ -7958,6 +7965,7 @@ def fee_intelligence_loop():
                 if last_temporal_broadcast != current_week:
                     _broadcast_our_temporal_patterns()
                     _broadcast_our_temporal_patterns._last_broadcast = current_week
+                    shutdown_event.wait(0.05)
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Temporal patterns broadcast check error: {e}", level='debug')
 
@@ -7969,14 +7977,17 @@ def fee_intelligence_loop():
                 if last_corridor_broadcast != current_week:
                     _broadcast_our_corridor_values()
                     _broadcast_our_corridor_values._last_broadcast = current_week
+                    shutdown_event.wait(0.05)
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Corridor values broadcast check error: {e}", level='debug')
 
             # Step 5g: Broadcast positioning proposals (Phase 14.2 - Event-driven)
             _broadcast_our_positioning_proposals()
+            shutdown_event.wait(0.05)
 
             # Step 5h: Broadcast Physarum recommendations (Phase 14.2 - Event-driven)
             _broadcast_our_physarum_recommendations()
+            shutdown_event.wait(0.05)
 
             # Step 5i: Broadcast coverage analysis (Phase 14.2 - Weekly)
             try:
@@ -7986,11 +7997,13 @@ def fee_intelligence_loop():
                 if last_coverage_broadcast != current_week:
                     _broadcast_our_coverage_analysis()
                     _broadcast_our_coverage_analysis._last_broadcast = current_week
+                    shutdown_event.wait(0.05)
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Coverage analysis broadcast check error: {e}", level='debug')
 
             # Step 5j: Broadcast close proposals (Phase 14.2 - Event-driven)
             _broadcast_our_close_proposals()
+            shutdown_event.wait(0.05)
 
             # Step 6: Cleanup old liquidity needs
             try:
