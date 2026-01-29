@@ -8006,6 +8006,18 @@ def fee_intelligence_loop():
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Route probe cleanup error: {e}", level='warn')
 
+            # Step 8: Cleanup stale peer states (memory management)
+            try:
+                if state_manager:
+                    cleaned_states = state_manager.cleanup_stale_states()
+                    if cleaned_states > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Cleaned up {cleaned_states} stale peer states",
+                            level='debug'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: State cleanup error: {e}", level='warn')
+
             # Step 9: Cleanup old peer reputation (Phase 5 - Advanced Cooperation)
             try:
                 if peer_reputation_mgr:
