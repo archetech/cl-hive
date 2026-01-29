@@ -9112,6 +9112,7 @@ def _broadcast_our_stigmergic_markers():
     try:
         from modules.protocol import (
             create_stigmergic_marker_batch,
+            get_stigmergic_marker_batch_signing_payload,
             MIN_MARKER_STRENGTH,
             MAX_MARKER_AGE_HOURS,
             MAX_MARKERS_IN_BATCH
@@ -9128,11 +9129,28 @@ def _broadcast_our_stigmergic_markers():
         if not shareable_markers:
             return
 
+        # Build payload and sign it
+        timestamp = int(time.time())
+        payload = {
+            "reporter_id": our_pubkey,
+            "timestamp": timestamp,
+            "markers": shareable_markers
+        }
+
+        signing_payload = get_stigmergic_marker_batch_signing_payload(payload)
+        try:
+            sig_result = safe_plugin.rpc.signmessage(signing_payload)
+            signature = sig_result["zbase"]
+        except Exception as e:
+            safe_plugin.log(f"cl-hive: Failed to sign stigmergic marker batch: {e}", level='warn')
+            return
+
         # Create signed batch message
         msg = create_stigmergic_marker_batch(
-            markers=shareable_markers,
-            rpc=safe_plugin.rpc,
-            our_pubkey=our_pubkey
+            reporter_id=our_pubkey,
+            timestamp=timestamp,
+            signature=signature,
+            markers=shareable_markers
         )
 
         if not msg:
