@@ -64,10 +64,12 @@ BRIDGE_PRIORITY_BONUS = 1.3                 # 30% bonus for bridge positions
 UNDERSERVED_PRIORITY_BONUS = 1.2            # 20% bonus for underserved targets
 
 # Centrality-aware targeting (Use Case 4)
+# Hive centrality = (hive_peer_connections) / (fleet_size - 1)
+# Range: 0.0 (isolated) to 1.0 (fully connected to all hive members)
 CENTRALITY_IMPROVEMENT_BONUS = 1.25         # 25% bonus for centrality improvements
 LOW_CENTRALITY_MEMBER_BONUS = 1.15          # 15% bonus when member has low centrality
-LOW_CENTRALITY_THRESHOLD = 0.3              # Members below this are "low centrality"
-MIN_CENTRALITY_IMPROVEMENT = 0.05           # Minimum improvement to apply bonus
+LOW_CENTRALITY_THRESHOLD = 0.3              # Members below 30% connectivity are "low centrality"
+MIN_CENTRALITY_IMPROVEMENT = 0.05           # Minimum improvement (+5%) to apply bonus
 
 # Fleet coordination
 MAX_MEMBERS_PER_TARGET = 2                  # Max 2 members per target (healthy redundancy)
@@ -630,7 +632,29 @@ class FleetPositioningStrategy:
         return count
 
     def _get_member_centrality(self, member_id: str) -> float:
-        """Get hive centrality for a member."""
+        """
+        Get hive centrality for a member.
+
+        Hive centrality is a connectivity ratio measuring internal fleet connectivity:
+            hive_centrality = (hive_peer_connections) / (fleet_size - 1)
+
+        Values:
+            0.0 = No direct connections to other hive members
+            0.5 = Connected to half the fleet
+            1.0 = Connected to all other hive members (fully meshed)
+
+        This is NOT betweenness/closeness/eigenvector centrality from graph theory.
+        It's a simpler metric focused on direct hive connectivity for:
+            - Identifying poorly-connected members needing more hive channels
+            - Selecting rebalance hubs (high centrality = good intermediary)
+            - Prioritizing expansion to improve fleet mesh density
+
+        Args:
+            member_id: Node public key
+
+        Returns:
+            Hive centrality score (0.0 to 1.0), default 0.5 if unknown
+        """
         calculator = network_metrics.get_calculator()
         if not calculator:
             return 0.5  # Default to middle value
@@ -649,7 +673,21 @@ class FleetPositioningStrategy:
         """
         Estimate how much opening a channel to target would improve member's centrality.
 
-        Higher values indicate the target would provide better network position.
+        For hive targets (internal channels):
+            - First hive connection: +0.30 (major improvement)
+            - Second hive connection: +0.15 (significant)
+            - Additional connections: diminishing returns (0.1 / current_count)
+
+        For external targets:
+            - Minimal improvement (+0.02) since they don't affect hive_centrality
+            - External channels improve bridge_score instead (separate metric)
+
+        Args:
+            member_id: Node public key of the member opening channel
+            target_peer_id: Node public key of potential channel target
+
+        Returns:
+            Estimated centrality improvement (0.0 to 0.3)
         """
         calculator = network_metrics.get_calculator()
         if not calculator:

@@ -34,10 +34,15 @@ if TYPE_CHECKING:
 # =============================================================================
 
 # Pattern detection settings
-PATTERN_WINDOW_DAYS = 14              # Days of history to analyze
+PATTERN_WINDOW_DAYS = 14              # Days of history for weekly patterns
 MIN_PATTERN_SAMPLES = 10              # Minimum observations for confidence
 PATTERN_CONFIDENCE_THRESHOLD = 0.60   # Minimum confidence to act on pattern
 PATTERN_STRENGTH_THRESHOLD = 1.3      # 30% above average = significant pattern
+
+# Monthly/market structure pattern settings
+MONTHLY_PATTERN_WINDOW_DAYS = 30      # Days of history for monthly patterns
+MONTHLY_MIN_SAMPLES = 3               # Min samples (1 per occurrence in window)
+MONTHLY_PATTERNS_ENABLED = True       # Enable monthly pattern detection
 
 # Kalman velocity integration settings
 KALMAN_VELOCITY_TTL_SECONDS = 3600    # Kalman data valid for 1 hour
@@ -128,16 +133,23 @@ class TemporalPattern:
 
     Patterns indicate when a channel typically experiences high inbound
     or outbound flow, enabling predictive positioning.
+
+    Pattern types:
+    - Hourly: hour_of_day set, others None (e.g., "mornings are busy")
+    - Weekly: day_of_week set, others None (e.g., "Fridays need rebalancing")
+    - Monthly: day_of_month set, others None (e.g., "end of month settlement")
+    - Combined: multiple fields set (e.g., "Friday mornings")
     """
     channel_id: str
     hour_of_day: int              # 0-23 (None if day pattern)
-    day_of_week: Optional[int]    # 0-6 (Mon-Sun), None if hour-only
     direction: FlowDirection
     intensity: float              # Relative intensity (1.0 = average)
     confidence: float             # Pattern reliability (0.0-1.0)
     samples: int                  # Number of observations
     avg_flow_sats: int            # Average flow in this window
-    detected_at: int = 0         # Timestamp of detection
+    day_of_week: Optional[int] = None    # 0-6 (Mon-Sun), None if hour-only
+    day_of_month: Optional[int] = None   # 1-31, None if not monthly pattern
+    detected_at: int = 0                 # Timestamp of detection
 
     def __post_init__(self):
         if self.detected_at == 0:
@@ -149,6 +161,7 @@ class TemporalPattern:
             "channel_id": self.channel_id,
             "hour_of_day": self.hour_of_day,
             "day_of_week": self.day_of_week,
+            "day_of_month": self.day_of_month,
             "day_name": self._day_name(),
             "direction": self.direction.value,
             "intensity": round(self.intensity, 2),
@@ -704,6 +717,11 @@ class AnticipatoryLiquidityManager:
         combined_patterns = self._detect_combined_patterns(channel_id, samples)
         patterns.extend(combined_patterns)
 
+        # Detect monthly patterns (market structure: end-of-month, difficulty adjustments)
+        if MONTHLY_PATTERNS_ENABLED:
+            monthly_patterns = self._detect_monthly_patterns(channel_id, samples)
+            patterns.extend(monthly_patterns)
+
         # Cache results
         self._pattern_cache[channel_id] = patterns
         self._pattern_cache_time[channel_id] = now
@@ -923,6 +941,155 @@ class AnticipatoryLiquidityManager:
             ))
 
         return patterns
+
+    def _detect_monthly_patterns(
+        self,
+        channel_id: str,
+        samples: List[HourlyFlowSample]
+    ) -> List[TemporalPattern]:
+        """
+        Detect day-of-month patterns (market structure).
+
+        Identifies recurring patterns tied to specific days of the month:
+        - End-of-month settlement (days 28-31, 1-3)
+        - Mid-month activity (days 14-16)
+        - Mining difficulty adjustment cycles (~14 days)
+        - Monthly recurring transfers
+
+        Uses 30-day window for detection.
+        """
+        patterns = []
+
+        # Need at least 30 days of data for monthly patterns
+        if len(samples) < 24 * 30:  # ~30 days of hourly samples
+            return patterns
+
+        # Group by day of month
+        monthly_flows: Dict[int, List[int]] = defaultdict(list)
+        for sample in samples:
+            dt = datetime.fromtimestamp(sample.timestamp)
+            day_of_month = dt.day
+            monthly_flows[day_of_month].append(sample.net_flow_sats)
+
+        # Calculate overall average
+        all_flows = [s.net_flow_sats for s in samples]
+        if not all_flows:
+            return patterns
+
+        overall_avg = sum(abs(f) for f in all_flows) / len(all_flows)
+        if overall_avg == 0:
+            return patterns
+
+        # Find significant monthly patterns
+        for day, flows in monthly_flows.items():
+            if len(flows) < MONTHLY_MIN_SAMPLES:
+                continue
+
+            avg_flow = sum(flows) / len(flows)
+            avg_magnitude = sum(abs(f) for f in flows) / len(flows)
+
+            # Determine direction
+            if avg_flow > 0:
+                direction = FlowDirection.INBOUND
+            elif avg_flow < 0:
+                direction = FlowDirection.OUTBOUND
+            else:
+                direction = FlowDirection.BALANCED
+
+            # Calculate intensity
+            intensity = avg_magnitude / overall_avg if overall_avg > 0 else 1.0
+
+            # Calculate confidence (lower for monthly due to fewer samples)
+            if avg_magnitude > 0:
+                consistency = 1.0 - (
+                    sum(abs(f - avg_flow) for f in flows) /
+                    (len(flows) * avg_magnitude)
+                )
+            else:
+                consistency = 0.0
+
+            # Lower confidence threshold for monthly (fewer samples expected)
+            confidence = min(0.7, max(0.0, consistency * (len(flows) / 5)))
+
+            # Monthly patterns need higher strength threshold
+            if intensity >= PATTERN_STRENGTH_THRESHOLD * 1.2 and confidence >= 0.4:
+                patterns.append(TemporalPattern(
+                    channel_id=channel_id,
+                    hour_of_day=None,
+                    day_of_week=None,
+                    day_of_month=day,
+                    direction=direction,
+                    intensity=intensity,
+                    confidence=confidence,
+                    samples=len(flows),
+                    avg_flow_sats=int(abs(avg_flow))
+                ))
+
+        # Detect end-of-month cluster (days 28-31 + 1-3)
+        eom_cluster = self._detect_end_of_month_pattern(channel_id, monthly_flows, overall_avg)
+        if eom_cluster:
+            patterns.append(eom_cluster)
+
+        return patterns
+
+    def _detect_end_of_month_pattern(
+        self,
+        channel_id: str,
+        monthly_flows: Dict[int, List[int]],
+        overall_avg: float
+    ) -> Optional[TemporalPattern]:
+        """
+        Detect end-of-month settlement pattern.
+
+        Combines days 28-31 and 1-3 to detect settlement patterns that
+        span month boundaries (common in financial settlements).
+        """
+        # Collect EOM flows (days 28-31 and 1-3)
+        eom_flows = []
+        for day in [28, 29, 30, 31, 1, 2, 3]:
+            eom_flows.extend(monthly_flows.get(day, []))
+
+        if len(eom_flows) < MONTHLY_MIN_SAMPLES * 2:
+            return None
+
+        avg_flow = sum(eom_flows) / len(eom_flows)
+        avg_magnitude = sum(abs(f) for f in eom_flows) / len(eom_flows)
+
+        if avg_magnitude == 0 or overall_avg == 0:
+            return None
+
+        intensity = avg_magnitude / overall_avg
+        if intensity < PATTERN_STRENGTH_THRESHOLD * 1.3:
+            return None
+
+        if avg_flow > 0:
+            direction = FlowDirection.INBOUND
+        elif avg_flow < 0:
+            direction = FlowDirection.OUTBOUND
+        else:
+            direction = FlowDirection.BALANCED
+
+        # Confidence based on consistency
+        consistency = 1.0 - (
+            sum(abs(f - avg_flow) for f in eom_flows) /
+            (len(eom_flows) * avg_magnitude)
+        )
+        confidence = min(0.75, max(0.0, consistency * (len(eom_flows) / 10)))
+
+        if confidence < 0.45:
+            return None
+
+        return TemporalPattern(
+            channel_id=channel_id,
+            hour_of_day=None,
+            day_of_week=None,
+            day_of_month=31,  # Use 31 as marker for "end of month cluster"
+            direction=direction,
+            intensity=intensity,
+            confidence=confidence,
+            samples=len(eom_flows),
+            avg_flow_sats=int(abs(avg_flow))
+        )
 
     # =========================================================================
     # INTRA-DAY PATTERN DETECTION (Kalman-Enhanced)
