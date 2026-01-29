@@ -6402,6 +6402,7 @@ def _get_proactive_advisor():
                     "hive_set_fees": "handle_set_fees",
                     "hive_routing_intelligence_status": "handle_routing_intelligence_status",
                     "hive_backfill_routing_intelligence": "handle_backfill_routing_intelligence",
+                    "hive_members": "handle_members",
                 }
 
                 async def call(self, tool_name, params):

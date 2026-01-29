@@ -639,7 +639,7 @@ class ProactiveAdvisor:
             "rationalization": ("rationalization_summary", {"node": node_name}),
             "close_recommendations": ("close_recommendations", {"node": node_name, "our_node_only": True}),
             # Competitor analysis
-            "competitor_analysis": ("competitor_analysis", {"node": node_name, "top_n": 10}),
+            "competitor_analysis": ("revenue_competitor_analysis", {"node": node_name, "top_n": 10}),
             # Hive membership
             "hive_members": ("hive_members", {"node": node_name}),
         }
