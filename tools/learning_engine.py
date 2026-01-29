@@ -216,20 +216,9 @@ class LearningEngine:
         current_state = self._get_current_channel_state(node_name, channel_id)
 
         if not current_state and action_type in ["fee_change", "rebalance"]:
-            # Channel may have been closed - that's an outcome
-            return ActionOutcome(
-                action_id=decision.get("id", 0),
-                action_type=action_type,
-                opportunity_type=decision.get("opportunity_type", "unknown"),
-                channel_id=channel_id,
-                node_name=node_name,
-                decision_confidence=decision.get("confidence", 0.5),
-                predicted_benefit=decision.get("predicted_benefit", 0),
-                actual_benefit=0,
-                success=False,  # Channel closed is generally not success for adjustments
-                outcome_measured_at=int(time.time()),
-                prediction_error=0
-            )
+            # No recent history - skip measurement rather than assume failure (Issue #45)
+            # Missing history != channel closed; could be data gap or slow sync
+            return None
 
         # Calculate outcome based on action type
         if action_type == "fee_change":
@@ -269,14 +258,16 @@ class LearningEngine:
     def _get_current_channel_state(
         self,
         node_name: str,
-        channel_id: str
+        channel_id: str,
+        hours: int = 24
     ) -> Optional[Dict]:
         """Get current state of a channel from database."""
         if not channel_id:
             return None
 
-        # Get most recent history record
-        history = self.db.get_channel_history(node_name, channel_id, hours=1)
+        # Get most recent history record within window
+        # Use longer window (default 24h) to avoid false "channel closed" (Issue #45)
+        history = self.db.get_channel_history(node_name, channel_id, hours=hours)
         if history:
             return history[-1]  # Most recent
         return None
