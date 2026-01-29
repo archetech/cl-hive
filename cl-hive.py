@@ -7724,6 +7724,14 @@ def membership_maintenance_loop():
     MAINTENANCE_INTERVAL = 3600  # seconds
     PRESENCE_WINDOW_SECONDS = 30 * 86400
 
+    # X-01 FIX: Delay first run to let init() complete (avoid RPC lock contention)
+    # The _auto_connect_to_all_members() call uses rpc.connect() which can block
+    # for extended periods, causing RPC lock timeout for startup sync.
+    STARTUP_DELAY_SECONDS = 30
+    if not shutdown_event.wait(STARTUP_DELAY_SECONDS):
+        if safe_plugin:
+            safe_plugin.log("cl-hive: Membership maintenance starting after init delay", level='debug')
+
     while not shutdown_event.is_set():
         try:
             if database:
@@ -7779,7 +7787,14 @@ def planner_loop():
     - Adds random jitter to prevent simultaneous wake-up across swarm
     - Respects shutdown_event for graceful termination
     """
-    # Run first cycle immediately on startup (for testing)
+    # X-01 FIX: Delay first cycle to let init() complete (avoid RPC lock contention)
+    # The listchannels() call in _refresh_network_cache can hold the lock for seconds,
+    # blocking startup sync's signmessage() call.
+    PLANNER_STARTUP_DELAY_SECONDS = 45
+    if not shutdown_event.wait(PLANNER_STARTUP_DELAY_SECONDS):
+        if safe_plugin:
+            safe_plugin.log("cl-hive: Planner starting after init delay", level='debug')
+
     first_run = True
 
     while not shutdown_event.is_set():
