@@ -3940,7 +3940,7 @@ def validate_settlement_propose(payload: Dict[str, Any]) -> bool:
         return False
 
     required = ["proposal_id", "period", "proposer_peer_id", "timestamp",
-                "data_hash", "total_fees_sats", "member_count",
+                "data_hash", "plan_hash", "total_fees_sats", "member_count",
                 "contributions", "signature"]
 
     for field in required:
@@ -3957,6 +3957,8 @@ def validate_settlement_propose(payload: Dict[str, Any]) -> bool:
     if not isinstance(payload["timestamp"], int) or payload["timestamp"] < 0:
         return False
     if not isinstance(payload["data_hash"], str) or len(payload["data_hash"]) != 64:
+        return False
+    if not isinstance(payload["plan_hash"], str) or len(payload["plan_hash"]) != 64:
         return False
     if not isinstance(payload["total_fees_sats"], int) or payload["total_fees_sats"] < 0:
         return False
@@ -3976,9 +3978,20 @@ def validate_settlement_propose(payload: Dict[str, Any]) -> bool:
             return False
         if not _valid_pubkey(contrib.get("peer_id", "")):
             return False
-        if not isinstance(contrib.get("fees_earned", 0), int):
+        fees_earned = contrib.get("fees_earned", 0)
+        if not isinstance(fees_earned, int) or fees_earned < 0:
             return False
-        if not isinstance(contrib.get("capacity", 0), int):
+        rebalance_costs = contrib.get("rebalance_costs", 0)
+        if not isinstance(rebalance_costs, int) or rebalance_costs < 0:
+            return False
+        forward_count = contrib.get("forward_count", 0)
+        if not isinstance(forward_count, int) or forward_count < 0:
+            return False
+        uptime = contrib.get("uptime", 100)
+        if not isinstance(uptime, int) or not (0 <= uptime <= 100):
+            return False
+        capacity = contrib.get("capacity", 0)
+        if not isinstance(capacity, int) or capacity < 0:
             return False
 
     return True
@@ -4046,6 +4059,12 @@ def validate_settlement_executed(payload: Dict[str, Any]) -> bool:
         return False
 
     # Optional fields
+    if "plan_hash" in payload:
+        if not isinstance(payload["plan_hash"], str) or (payload["plan_hash"] and len(payload["plan_hash"]) != 64):
+            return False
+    if "total_sent_sats" in payload:
+        if not isinstance(payload["total_sent_sats"], int) or payload["total_sent_sats"] < 0:
+            return False
     if "payment_hash" in payload:
         if not isinstance(payload["payment_hash"], str):
             return False
@@ -4067,6 +4086,7 @@ def get_settlement_propose_signing_payload(payload: Dict[str, Any]) -> str:
         "period": payload.get("period", ""),
         "proposer_peer_id": payload.get("proposer_peer_id", ""),
         "data_hash": payload.get("data_hash", ""),
+        "plan_hash": payload.get("plan_hash", ""),
         "total_fees_sats": payload.get("total_fees_sats", 0),
         "member_count": payload.get("member_count", 0),
         "timestamp": payload.get("timestamp", 0),
@@ -4098,6 +4118,8 @@ def get_settlement_executed_signing_payload(payload: Dict[str, Any]) -> str:
     signing_fields = {
         "proposal_id": payload.get("proposal_id", ""),
         "executor_peer_id": payload.get("executor_peer_id", ""),
+        "plan_hash": payload.get("plan_hash", ""),
+        "total_sent_sats": payload.get("total_sent_sats", 0),
         "payment_hash": payload.get("payment_hash", ""),
         "amount_paid_sats": payload.get("amount_paid_sats", 0),
         "timestamp": payload.get("timestamp", 0),
@@ -4110,6 +4132,7 @@ def create_settlement_propose(
     period: str,
     proposer_peer_id: str,
     data_hash: str,
+    plan_hash: str,
     total_fees_sats: int,
     member_count: int,
     contributions: List[Dict[str, Any]],
@@ -4141,6 +4164,7 @@ def create_settlement_propose(
         "period": period,
         "proposer_peer_id": proposer_peer_id,
         "data_hash": data_hash,
+        "plan_hash": plan_hash,
         "total_fees_sats": total_fees_sats,
         "member_count": member_count,
         "contributions": contributions,
@@ -4188,6 +4212,8 @@ def create_settlement_executed(
     executor_peer_id: str,
     timestamp: int,
     signature: str,
+    plan_hash: Optional[str] = None,
+    total_sent_sats: Optional[int] = None,
     payment_hash: Optional[str] = None,
     amount_paid_sats: Optional[int] = None
 ) -> bytes:
@@ -4214,6 +4240,10 @@ def create_settlement_executed(
         "timestamp": timestamp,
         "signature": signature
     }
+    if plan_hash is not None:
+        payload["plan_hash"] = plan_hash
+    if total_sent_sats is not None:
+        payload["total_sent_sats"] = total_sent_sats
     if payment_hash is not None:
         payload["payment_hash"] = payment_hash
     if amount_paid_sats is not None:

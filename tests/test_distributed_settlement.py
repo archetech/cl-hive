@@ -256,7 +256,9 @@ class TestProposalCreation:
         assert proposal['period'] == period
         assert proposal['proposer_peer_id'] == our_peer_id
         assert 'data_hash' in proposal
+        assert 'plan_hash' in proposal
         assert len(proposal['data_hash']) == 64
+        assert len(proposal['plan_hash']) == 64
         assert 'contributions' in proposal
         mock_database.add_settlement_proposal.assert_called_once()
 
@@ -310,12 +312,15 @@ class TestVoting:
         contributions = settlement_manager.gather_contributions_from_gossip(
             mock_state_manager, "2024-05"
         )
-        data_hash = settlement_manager.calculate_settlement_hash("2024-05", contributions)
+        plan = settlement_manager.compute_settlement_plan("2024-05", contributions)
+        data_hash = plan["data_hash"]
+        plan_hash = plan["plan_hash"]
 
         proposal = {
             'proposal_id': 'test_proposal_123',
             'period': '2024-05',
             'data_hash': data_hash,
+            'plan_hash': plan_hash,
             'total_fees_sats': 18000,
             'member_count': 3,
         }
@@ -340,6 +345,7 @@ class TestVoting:
             'proposal_id': 'test_proposal_123',
             'period': '2024-05',
             'data_hash': 'wrong_hash_' + 'x' * 54,  # 64 chars
+            'plan_hash': 'y' * 64,
             'total_fees_sats': 18000,
             'member_count': 3,
         }
@@ -433,10 +439,12 @@ class TestProtocolValidation:
             "proposer_peer_id": "02" + "a" * 64,
             "timestamp": int(time.time()),
             "data_hash": "a" * 64,
+            "plan_hash": "b" * 64,
             "total_fees_sats": 10000,
             "member_count": 3,
             "contributions": [
-                {"peer_id": "02" + "a" * 64, "fees_earned": 5000, "capacity": 1000000}
+                {"peer_id": "02" + "a" * 64, "fees_earned": 5000, "rebalance_costs": 0,
+                 "capacity": 1000000, "uptime": 100, "forward_count": 10}
             ],
             "signature": "mock_signature_zbase_1234567890"
         }
@@ -451,6 +459,7 @@ class TestProtocolValidation:
             "proposer_peer_id": "02" + "a" * 64,
             "timestamp": int(time.time()),
             "data_hash": "tooshort",  # Should be 64 chars
+            "plan_hash": "b" * 64,
             "total_fees_sats": 10000,
             "member_count": 3,
             "contributions": [],
@@ -499,6 +508,7 @@ class TestMessageCreation:
             period="2024-05",
             proposer_peer_id="02" + "a" * 64,
             data_hash="a" * 64,
+            plan_hash="b" * 64,
             total_fees_sats=10000,
             member_count=3,
             contributions=[{"peer_id": "02" + "a" * 64, "fees_earned": 5000}],
@@ -538,6 +548,135 @@ class TestMessageCreation:
 
 
 # =============================================================================
+# PAYMENT PLAN + EXECUTION VALIDATION TESTS (Phase 12 v2)
+# =============================================================================
+
+class TestDeterministicPaymentPlan:
+    def test_plan_is_deterministic_and_sums(self, settlement_manager):
+        period = "2024-05"
+        # Four members, only A earns net profit. Equal contribution => A owes, others receive.
+        a = "02" + "a" * 64
+        b = "02" + "b" * 64
+        c = "02" + "c" * 64
+        d = "02" + "d" * 64
+        contributions = [
+            {"peer_id": a, "fees_earned": 1000, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": b, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": c, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": d, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+        ]
+
+        plan1 = settlement_manager.compute_settlement_plan(period, contributions)
+        plan2 = settlement_manager.compute_settlement_plan(period, list(reversed(contributions)))
+
+        assert plan1["data_hash"] == plan2["data_hash"]
+        assert plan1["plan_hash"] == plan2["plan_hash"]
+        assert plan1["expected_sent_sats"][a] == 750
+        assert sum(p["amount_sats"] for p in plan1["payments"]) == 750
+        # Deterministic receiver order tie-breaks by peer_id.
+        assert [p["to_peer"] for p in plan1["payments"]] == [b, c, d]
+
+
+class TestExecuteAssignedPayments:
+    def test_execute_our_settlement_executes_only_assigned_payments(
+        self, settlement_manager, mock_database, mock_rpc
+    ):
+        period = "2024-05"
+        a = "02" + "a" * 64
+        b = "02" + "b" * 64
+        c = "02" + "c" * 64
+        d = "02" + "d" * 64
+        contributions = [
+            {"peer_id": a, "fees_earned": 1000, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": b, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": c, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": d, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+        ]
+        plan = settlement_manager.compute_settlement_plan(period, contributions)
+
+        proposal = {"proposal_id": "p1", "period": period, "plan_hash": plan["plan_hash"]}
+
+        # Offers must exist for each receiver.
+        settlement_manager.get_offer = Mock(side_effect=lambda peer_id: "lno1offer" if peer_id in (b, c, d) else None)
+
+        async def _exec_payment(payment: SettlementPayment) -> SettlementPayment:
+            payment.status = "completed"
+            payment.payment_hash = f"h_{payment.to_peer[-4:]}_{payment.amount_sats}"
+            return payment
+
+        settlement_manager.execute_payment = AsyncMock(side_effect=_exec_payment)
+        mock_database.has_executed_settlement.return_value = False
+
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            exec_result = loop.run_until_complete(
+                settlement_manager.execute_our_settlement(
+                    proposal=proposal,
+                    contributions=contributions,
+                    our_peer_id=a,
+                    rpc=mock_rpc,
+                )
+            )
+        finally:
+            loop.close()
+
+        assert exec_result is not None
+        assert exec_result["total_sent_sats"] == 750
+        assert exec_result["plan_hash"] == plan["plan_hash"]
+        assert settlement_manager.execute_payment.call_count == 3
+
+        # Ensure the DB execution record binds to the plan hash and total.
+        assert mock_database.add_settlement_execution.called
+        kwargs = mock_database.add_settlement_execution.call_args.kwargs
+        assert kwargs["proposal_id"] == "p1"
+        assert kwargs["executor_peer_id"] == a
+        assert kwargs["amount_paid_sats"] == 750
+        assert kwargs["plan_hash"] == plan["plan_hash"]
+
+
+class TestCompletionValidation:
+    def test_completion_requires_matching_expected_totals(self, settlement_manager, mock_database):
+        period = "2024-05"
+        a = "02" + "a" * 64
+        b = "02" + "b" * 64
+        c = "02" + "c" * 64
+        d = "02" + "d" * 64
+        contributions = [
+            {"peer_id": a, "fees_earned": 1000, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": b, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": c, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+            {"peer_id": d, "fees_earned": 0, "rebalance_costs": 0, "capacity": 1, "uptime": 100, "forward_count": 1},
+        ]
+        plan = settlement_manager.compute_settlement_plan(period, contributions)
+        proposal = {
+            "proposal_id": "p1",
+            "period": period,
+            "status": "ready",
+            "member_count": 4,
+            "plan_hash": plan["plan_hash"],
+            "contributions_json": json.dumps(contributions),
+        }
+
+        mock_database.get_settlement_proposal.return_value = proposal
+        mock_database.get_settlement_executions.return_value = [
+            {"executor_peer_id": a, "amount_paid_sats": 750, "plan_hash": plan["plan_hash"]},
+            {"executor_peer_id": b, "amount_paid_sats": 0, "plan_hash": plan["plan_hash"]},
+            {"executor_peer_id": c, "amount_paid_sats": 0, "plan_hash": plan["plan_hash"]},
+            {"executor_peer_id": d, "amount_paid_sats": 0, "plan_hash": plan["plan_hash"]},
+        ]
+
+        ok = settlement_manager.check_and_complete_settlement("p1")
+        assert ok is True
+        mock_database.update_settlement_proposal_status.assert_called_with("p1", "completed")
+        assert mock_database.mark_period_settled.called
+        mark_args = mock_database.mark_period_settled.call_args.args
+        assert mark_args[0] == period
+        assert mark_args[1] == "p1"
+        assert mark_args[2] == 750
+
+
+# =============================================================================
 # SIGNING PAYLOAD TESTS
 # =============================================================================
 
@@ -551,6 +690,7 @@ class TestSigningPayloads:
             "period": "2024-05",
             "proposer_peer_id": "02" + "a" * 64,
             "data_hash": "a" * 64,
+            "plan_hash": "b" * 64,
             "total_fees_sats": 10000,
             "member_count": 3,
             "timestamp": 1234567890,

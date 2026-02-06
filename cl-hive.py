@@ -6695,6 +6695,7 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     proposal_id = payload.get("proposal_id")
     period = payload.get("period")
     data_hash = payload.get("data_hash")
+    plan_hash = payload.get("plan_hash")
     contributions = payload.get("contributions", [])
 
     plugin.log(
@@ -6708,8 +6709,11 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
             period=period,
             proposer_peer_id=proposer_peer_id,
             data_hash=data_hash,
+            plan_hash=plan_hash,
             total_fees_sats=payload.get("total_fees_sats", 0),
             member_count=payload.get("member_count", 0)
+            ,
+            contributions_json=json.dumps(contributions)
         )
 
     # Try to verify and vote
@@ -6889,7 +6893,8 @@ def handle_settlement_executed(peer_id: str, payload: Dict, plugin: Plugin) -> D
 
     proposal_id = payload.get("proposal_id")
     payment_hash = payload.get("payment_hash")
-    amount_paid = payload.get("amount_paid_sats", 0)
+    plan_hash = payload.get("plan_hash")
+    amount_paid = payload.get("total_sent_sats", payload.get("amount_paid_sats", 0)) or 0
 
     # Record the execution
     if database.add_settlement_execution(
@@ -6897,7 +6902,8 @@ def handle_settlement_executed(peer_id: str, payload: Dict, plugin: Plugin) -> D
         executor_peer_id=executor_peer_id,
         signature=signature,
         payment_hash=payment_hash,
-        amount_paid_sats=amount_paid
+        amount_paid_sats=amount_paid,
+        plan_hash=plan_hash,
     ):
         is_relayed = _is_relayed_message(payload)
         relay_info = " (relayed)" if is_relayed else ""
@@ -8227,8 +8233,18 @@ def settlement_loop():
                         )
 
                         if proposal:
-                            # Sign the proposal
-                            signing_payload = get_settlement_propose_signing_payload(proposal)
+                            # Sign the outgoing proposal payload (binds to timestamp).
+                            outgoing = {
+                                "proposal_id": proposal["proposal_id"],
+                                "period": proposal["period"],
+                                "proposer_peer_id": proposal["proposer_peer_id"],
+                                "data_hash": proposal["data_hash"],
+                                "plan_hash": proposal["plan_hash"],
+                                "total_fees_sats": proposal["total_fees_sats"],
+                                "member_count": proposal["member_count"],
+                                "timestamp": proposal["timestamp"],
+                            }
+                            signing_payload = get_settlement_propose_signing_payload(outgoing)
                             try:
                                 sig_result = safe_plugin.rpc.signmessage(signing_payload)
                                 signature = sig_result.get('zbase', '')
@@ -8243,6 +8259,7 @@ def settlement_loop():
                                     period=proposal['period'],
                                     proposer_peer_id=proposal['proposer_peer_id'],
                                     data_hash=proposal['data_hash'],
+                                    plan_hash=proposal['plan_hash'],
                                     total_fees_sats=proposal['total_fees_sats'],
                                     member_count=proposal['member_count'],
                                     contributions=proposal['contributions'],
@@ -8284,6 +8301,7 @@ def settlement_loop():
                     proposal_id = proposal.get('proposal_id')
                     period = proposal.get('period')
                     member_count = proposal.get('member_count', 0)
+                    plan_hash = proposal.get('plan_hash')
 
                     # Check if quorum already reached
                     vote_count = database.count_settlement_ready_votes(proposal_id)
@@ -8310,7 +8328,18 @@ def settlement_loop():
                         continue
 
                     # Sign and create the proposal message
-                    signing_payload = get_settlement_propose_signing_payload(proposal)
+                    rebroadcast_ts = int(time.time())
+                    outgoing = {
+                        "proposal_id": proposal_id,
+                        "period": period,
+                        "proposer_peer_id": proposal.get('proposer_peer_id'),
+                        "data_hash": proposal.get('data_hash'),
+                        "plan_hash": plan_hash or "",
+                        "total_fees_sats": proposal.get('total_fees_sats'),
+                        "member_count": member_count,
+                        "timestamp": rebroadcast_ts,
+                    }
+                    signing_payload = get_settlement_propose_signing_payload(outgoing)
                     try:
                         sig_result = safe_plugin.rpc.signmessage(signing_payload)
                         signature = sig_result.get('zbase', '')
@@ -8324,10 +8353,11 @@ def settlement_loop():
                             period=period,
                             proposer_peer_id=proposal.get('proposer_peer_id'),
                             data_hash=proposal.get('data_hash'),
+                            plan_hash=plan_hash or "",
                             total_fees_sats=proposal.get('total_fees_sats'),
                             member_count=member_count,
                             contributions=contributions,
-                            timestamp=int(time.time()),
+                            timestamp=rebroadcast_ts,
                             signature=signature
                         )
                         sent = _broadcast_to_members(propose_msg)
@@ -8381,10 +8411,14 @@ def settlement_loop():
                     if database.has_executed_settlement(proposal_id, our_pubkey):
                         continue
 
-                    # Get contributions from the proposal (we stored them in state)
-                    contributions = settlement_mgr.gather_contributions_from_gossip(
-                        state_manager, proposal.get('period', '')
-                    )
+                    # Use the proposal's canonical contributions snapshot for execution.
+                    contributions_json = proposal.get("contributions_json")
+                    if not contributions_json:
+                        continue
+                    try:
+                        contributions = json.loads(contributions_json)
+                    except Exception:
+                        continue
 
                     # Execute our settlement (this is async but we run it sync here)
                     import asyncio
@@ -8408,6 +8442,8 @@ def settlement_loop():
                                 executor_peer_id=exec_result['executor_peer_id'],
                                 timestamp=exec_result['timestamp'],
                                 signature=exec_result['signature'],
+                                plan_hash=exec_result.get('plan_hash'),
+                                total_sent_sats=exec_result.get('total_sent_sats'),
                                 payment_hash=exec_result.get('payment_hash'),
                                 amount_paid_sats=exec_result.get('amount_paid_sats')
                             )
