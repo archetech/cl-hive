@@ -984,6 +984,7 @@ class HiveDatabase:
                 expires_at INTEGER NOT NULL,
                 status TEXT DEFAULT 'pending',
                 data_hash TEXT NOT NULL,
+                plan_hash TEXT,
                 total_fees_sats INTEGER NOT NULL,
                 member_count INTEGER NOT NULL
             )
@@ -1007,6 +1008,13 @@ class HiveDatabase:
         try:
             conn.execute(
                 "ALTER TABLE settlement_proposals ADD COLUMN contributions_json TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        # Add plan_hash column for deterministic payment plan binding (Phase 12 v2).
+        try:
+            conn.execute(
+                "ALTER TABLE settlement_proposals ADD COLUMN plan_hash TEXT"
             )
         except sqlite3.OperationalError:
             pass  # Column already exists
@@ -1043,6 +1051,13 @@ class HiveDatabase:
             "CREATE INDEX IF NOT EXISTS idx_settlement_exec_proposal "
             "ON settlement_executions(proposal_id)"
         )
+        # Add plan_hash column for deterministic plan completion validation (Phase 12 v2).
+        try:
+            conn.execute(
+                "ALTER TABLE settlement_executions ADD COLUMN plan_hash TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
         # Settled periods - prevent double settlement (critical!)
         conn.execute("""
@@ -4715,11 +4730,15 @@ class HiveDatabase:
             # ISO week format: 2025-W03
             year, week = period.split("-W")
             # Monday of that week (use ISO week format: %G=ISO year, %V=ISO week, %u=ISO weekday)
-            start = datetime.datetime.strptime(f"{year}-W{week}-1", "%G-W%V-%u")
+            start = datetime.datetime.strptime(f"{year}-W{week}-1", "%G-W%V-%u").replace(
+                tzinfo=datetime.timezone.utc
+            )
             end = start + datetime.timedelta(days=7)
         elif len(period) == 7:
             # Month format: 2025-01
-            start = datetime.datetime.strptime(f"{period}-01", "%Y-%m-%d")
+            start = datetime.datetime.strptime(f"{period}-01", "%Y-%m-%d").replace(
+                tzinfo=datetime.timezone.utc
+            )
             # First of next month
             if start.month == 12:
                 end = start.replace(year=start.year + 1, month=1)
@@ -4727,7 +4746,9 @@ class HiveDatabase:
                 end = start.replace(month=start.month + 1)
         else:
             # Day format: 2025-01-15
-            start = datetime.datetime.strptime(period, "%Y-%m-%d")
+            start = datetime.datetime.strptime(period, "%Y-%m-%d").replace(
+                tzinfo=datetime.timezone.utc
+            )
             end = start + datetime.timedelta(days=1)
 
         return (int(start.timestamp()), int(end.timestamp()))
@@ -5457,7 +5478,7 @@ class HiveDatabase:
         import datetime
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         cutoff_date = now - datetime.timedelta(weeks=keep_periods)
-        cutoff_period = f"{cutoff_date.isocalendar()[0]}-{cutoff_date.isocalendar()[1]:02d}"
+        cutoff_period = f"{cutoff_date.isocalendar()[0]}-W{cutoff_date.isocalendar()[1]:02d}"
 
         result = conn.execute("""
             DELETE FROM fee_reports WHERE period < ?
@@ -5476,6 +5497,7 @@ class HiveDatabase:
         data_hash: str,
         total_fees_sats: int,
         member_count: int,
+        plan_hash: Optional[str] = None,
         expires_in_seconds: int = 86400,  # 24 hours
         contributions_json: Optional[str] = None
     ) -> bool:
@@ -5503,11 +5525,11 @@ class HiveDatabase:
             conn.execute("""
                 INSERT INTO settlement_proposals
                 (proposal_id, period, proposer_peer_id, proposed_at, expires_at,
-                 status, data_hash, total_fees_sats, member_count, last_broadcast_at,
+                 status, data_hash, plan_hash, total_fees_sats, member_count, last_broadcast_at,
                  contributions_json)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
             """, (proposal_id, period, proposer_peer_id, now, expires_at,
-                  data_hash, total_fees_sats, member_count, now, contributions_json))
+                  data_hash, plan_hash, total_fees_sats, member_count, now, contributions_json))
             return True
         except sqlite3.IntegrityError:
             # Period already has a proposal
@@ -5685,7 +5707,8 @@ class HiveDatabase:
         executor_peer_id: str,
         signature: str,
         payment_hash: Optional[str] = None,
-        amount_paid_sats: Optional[int] = None
+        amount_paid_sats: Optional[int] = None,
+        plan_hash: Optional[str] = None,
     ) -> bool:
         """
         Record a settlement execution by a member.
@@ -5707,10 +5730,10 @@ class HiveDatabase:
             conn.execute("""
                 INSERT INTO settlement_executions
                 (proposal_id, executor_peer_id, payment_hash, amount_paid_sats,
-                 executed_at, signature)
-                VALUES (?, ?, ?, ?, ?, ?)
+                 executed_at, signature, plan_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (proposal_id, executor_peer_id, payment_hash, amount_paid_sats,
-                  now, signature))
+                  now, signature, plan_hash))
             return True
         except sqlite3.IntegrityError:
             return False  # Already executed
