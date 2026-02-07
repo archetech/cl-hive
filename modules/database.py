@@ -860,7 +860,8 @@ class HiveDatabase:
                 amount_sats INTEGER NOT NULL,
                 channel_id TEXT,
                 payment_hash TEXT,
-                recorded_at INTEGER NOT NULL
+                recorded_at INTEGER NOT NULL,
+                UNIQUE(payment_hash) ON CONFLICT IGNORE
             )
         """)
         conn.execute(
@@ -870,6 +871,10 @@ class HiveDatabase:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pool_revenue_member "
             "ON pool_revenue(member_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pool_revenue_payment_hash "
+            "ON pool_revenue(payment_hash)"
         )
 
         # Pool distributions - settlement records
@@ -4563,6 +4568,16 @@ class HiveDatabase:
             Row ID of the recorded revenue
         """
         conn = self._get_connection()
+
+        # Deduplicate by payment_hash if provided
+        if payment_hash:
+            existing = conn.execute(
+                "SELECT id FROM pool_revenue WHERE payment_hash = ?",
+                (payment_hash,)
+            ).fetchone()
+            if existing:
+                return existing[0]
+
         cursor = conn.execute("""
             INSERT INTO pool_revenue
             (member_id, amount_sats, channel_id, payment_hash, recorded_at)

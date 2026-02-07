@@ -741,9 +741,9 @@ class SettlementManager:
         if not payers or not receivers:
             return []
 
-        # Sort by absolute balance (largest first)
-        payers.sort(key=lambda x: x.balance)  # Most negative first
-        receivers.sort(key=lambda x: x.balance, reverse=True)  # Most positive first
+        # Sort by absolute balance (largest first), with peer_id tie-breaker for determinism
+        payers.sort(key=lambda x: (x.balance, x.peer_id))  # Most negative first
+        receivers.sort(key=lambda x: (-x.balance, x.peer_id))  # Most positive first
 
         payments = []
         payer_remaining = {p.peer_id: -p.balance for p in payers}  # Amount they owe
@@ -1386,16 +1386,24 @@ class SettlementManager:
             Tuple of (balance_sats, creditor_peer_id or None, min_payment_threshold)
         """
         # Convert to MemberContribution objects
-        member_contributions = [
-            MemberContribution(
-                peer_id=c['peer_id'],
-                capacity_sats=c.get('capacity', 0),
-                forwards_sats=c.get('forward_count', 0) * 100000,  # Estimate
-                fees_earned_sats=c.get('fees_earned', 0),
-                uptime_pct=c.get('uptime', 100),
+        # MUST match compute_settlement_plan() conversion exactly for consistent results
+        member_contributions = []
+        for c in contributions:
+            uptime = c.get("uptime", 100)
+            try:
+                uptime_pct = float(uptime) / 100.0
+            except Exception:
+                uptime_pct = 1.0
+            member_contributions.append(
+                MemberContribution(
+                    peer_id=c['peer_id'],
+                    capacity_sats=int(c.get('capacity', 0)),
+                    forwards_sats=int(c.get('forward_count', 0)),
+                    fees_earned_sats=int(c.get('fees_earned', 0)),
+                    rebalance_costs_sats=int(c.get('rebalance_costs', 0)),
+                    uptime_pct=uptime_pct,
+                )
             )
-            for c in contributions
-        ]
 
         # Calculate fair shares
         results = self.calculate_fair_shares(member_contributions)

@@ -8745,16 +8745,18 @@ def settlement_loop():
                     import asyncio
                     try:
                         loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        exec_result = loop.run_until_complete(
-                            settlement_mgr.execute_our_settlement(
-                                proposal=proposal,
-                                contributions=contributions,
-                                our_peer_id=our_pubkey,
-                                rpc=safe_plugin.rpc
+                        try:
+                            asyncio.set_event_loop(loop)
+                            exec_result = loop.run_until_complete(
+                                settlement_mgr.execute_our_settlement(
+                                    proposal=proposal,
+                                    contributions=contributions,
+                                    our_peer_id=our_pubkey,
+                                    rpc=safe_plugin.rpc
+                                )
                             )
-                        )
-                        loop.close()
+                        finally:
+                            loop.close()
 
                         if exec_result:
                             # Broadcast execution confirmation via reliable delivery

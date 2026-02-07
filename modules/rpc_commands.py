@@ -1745,7 +1745,7 @@ def pool_snapshot(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
         if period is None:
             now = datetime.datetime.now(tz=datetime.timezone.utc)
             year, week, _ = now.isocalendar()
-            period = f"{year}-W{week:02d}"
+            period = f"{year}-{week:02d}"
 
         # Sync uptime from presence data before snapshotting
         # This ensures uptime_pct in hive_members is current
@@ -1801,7 +1801,7 @@ def pool_distribution(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
         if period is None:
             now = datetime.datetime.now(tz=datetime.timezone.utc)
             year, week, _ = now.isocalendar()
-            period = f"{year}-W{week:02d}"
+            period = f"{year}-{week:02d}"
 
         # Get revenue for the period
         revenue_info = ctx.routing_pool.db.get_pool_revenue(period=period)
@@ -1860,7 +1860,7 @@ def pool_settle(ctx: HiveContext, period: str = None, dry_run: bool = True) -> D
             now = datetime.datetime.now(tz=datetime.timezone.utc)
             last_week = now - datetime.timedelta(days=7)
             year, week, _ = last_week.isocalendar()
-            period = f"{year}-W{week:02d}"
+            period = f"{year}-{week:02d}"
 
         if dry_run:
             # Just calculate
