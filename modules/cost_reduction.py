@@ -17,7 +17,7 @@ import time
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from . import network_metrics
 from .mcf_solver import (
@@ -543,10 +543,10 @@ class FleetRebalanceRouter:
 
         # BFS for shortest path
         visited = set()
-        queue = [(m, [m]) for m in start_members]
+        queue = deque([(m, [m]) for m in start_members])
 
         while queue:
-            current, path = queue.pop(0)
+            current, path = queue.popleft()
 
             if current in visited:
                 continue

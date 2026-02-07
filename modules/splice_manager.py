@@ -54,6 +54,9 @@ from .protocol import (
 )
 
 
+MAX_RATE_LIMIT_PEERS = 200
+
+
 class SpliceManager:
     """
     Manages coordinated splice operations between hive members.
@@ -125,6 +128,11 @@ class SpliceManager:
             if sender_id not in tracker:
                 tracker[sender_id] = []
             tracker[sender_id].append(now)
+
+            if len(tracker) > MAX_RATE_LIMIT_PEERS:
+                oldest_peer = min(tracker, key=lambda k: tracker[k][-1] if tracker[k] else 0)
+                if oldest_peer != sender_id:
+                    del tracker[oldest_peer]
 
     def _generate_session_id(self) -> str:
         """Generate a unique session ID."""
@@ -622,6 +630,10 @@ class SpliceManager:
         """
         self._log(f"Received SPLICE_UPDATE from {sender_id[:16]}...")
 
+        if not self._check_rate_limit(sender_id, self._message_rate, SPLICE_MESSAGE_RATE_LIMIT):
+            self._log(f"Rate limited splice update from {sender_id[:16]}...", level="warn")
+            return {"error": "rate_limited"}
+
         # Validate payload
         if not validate_splice_update_payload(payload):
             return {"error": "invalid_payload"}
@@ -633,6 +645,8 @@ class SpliceManager:
         # Verify signature
         if not self._verify_signature(payload, get_splice_update_signing_payload, sender_id, rpc):
             return {"error": "invalid_signature"}
+
+        self._record_message(sender_id, self._message_rate)
 
         session_id = payload.get("session_id")
         peer_psbt = payload.get("psbt")
@@ -711,6 +725,10 @@ class SpliceManager:
         """
         self._log(f"Received SPLICE_SIGNED from {sender_id[:16]}...")
 
+        if not self._check_rate_limit(sender_id, self._message_rate, SPLICE_MESSAGE_RATE_LIMIT):
+            self._log(f"Rate limited splice signed from {sender_id[:16]}...", level="warn")
+            return {"error": "rate_limited"}
+
         # Validate payload
         if not validate_splice_signed_payload(payload):
             return {"error": "invalid_payload"}
@@ -722,6 +740,8 @@ class SpliceManager:
         # Verify signature
         if not self._verify_signature(payload, get_splice_signed_signing_payload, sender_id, rpc):
             return {"error": "invalid_signature"}
+
+        self._record_message(sender_id, self._message_rate)
 
         session_id = payload.get("session_id")
         signed_psbt = payload.get("signed_psbt")
@@ -815,6 +835,10 @@ class SpliceManager:
         """
         self._log(f"Received SPLICE_ABORT from {sender_id[:16]}...")
 
+        if not self._check_rate_limit(sender_id, self._message_rate, SPLICE_MESSAGE_RATE_LIMIT):
+            self._log(f"Rate limited splice abort from {sender_id[:16]}...", level="warn")
+            return {"error": "rate_limited"}
+
         # Validate payload
         if not validate_splice_abort_payload(payload):
             return {"error": "invalid_payload"}
@@ -826,6 +850,8 @@ class SpliceManager:
         # Verify signature
         if not self._verify_signature(payload, get_splice_abort_signing_payload, sender_id, rpc):
             return {"error": "invalid_signature"}
+
+        self._record_message(sender_id, self._message_rate)
 
         session_id = payload.get("session_id")
         reason = payload.get("reason")

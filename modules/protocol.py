@@ -48,6 +48,10 @@ MAX_MESSAGE_BYTES = 65535
 # Maximum peer_id length (hex-encoded pubkey should be 66 chars, allow some margin)
 MAX_PEER_ID_LEN = 128
 
+# Maximum length for freeform string fields
+MAX_REASON_LEN = 512
+MAX_STRING_FIELD_LEN = 1024
+
 # =============================================================================
 # MESSAGE TYPES
 # =============================================================================
@@ -718,6 +722,8 @@ def validate_member_left(payload: Dict[str, Any]) -> bool:
     # reason must be a non-empty string
     if not isinstance(reason, str) or not reason:
         return False
+    if len(reason) > MAX_REASON_LEN:
+        return False
 
     # signature must be present (zbase encoded)
     if not isinstance(signature, str) or not signature:
@@ -727,8 +733,10 @@ def validate_member_left(payload: Dict[str, Any]) -> bool:
 
 
 def _valid_pubkey(pubkey: Any) -> bool:
-    """Check if value is a valid 66-char hex pubkey."""
+    """Check if value is a valid 66-char hex pubkey with 02/03 prefix."""
     if not isinstance(pubkey, str) or len(pubkey) != 66:
+        return False
+    if not (pubkey.startswith('02') or pubkey.startswith('03')):
         return False
     return all(c in "0123456789abcdef" for c in pubkey)
 
@@ -756,7 +764,7 @@ def validate_ban_proposal(payload: Dict[str, Any]) -> bool:
         return False
 
     # reason must be non-empty string
-    if not isinstance(reason, str) or not reason or len(reason) > 500:
+    if not isinstance(reason, str) or not reason or len(reason) > MAX_REASON_LEN:
         return False
 
     # timestamp must be positive integer
@@ -1696,7 +1704,7 @@ def validate_expansion_decline(payload: Dict[str, Any]) -> bool:
         return False
 
     # reason must be a non-empty string
-    if not isinstance(reason, str) or not reason:
+    if not isinstance(reason, str) or not reason or len(reason) > MAX_REASON_LEN:
         return False
 
     # Valid reasons
@@ -3281,6 +3289,8 @@ def validate_task_response_payload(payload: Dict[str, Any]) -> bool:
         reason = payload.get("reason", "")
         if not reason or not isinstance(reason, str):
             return False
+        if len(reason) > MAX_REASON_LEN:
+            return False
 
     # If completed, result should be present
     if payload["status"] == TASK_STATUS_COMPLETED:
@@ -3572,7 +3582,7 @@ def validate_splice_init_response_payload(payload: Dict[str, Any]) -> bool:
     # If rejected, reason should be present
     if not accepted:
         reason = payload.get("reason")
-        if reason is not None and (not isinstance(reason, str) or len(reason) > 200):
+        if reason is not None and (not isinstance(reason, str) or len(reason) > MAX_REASON_LEN):
             return False
 
     # timestamp must be positive integer
@@ -3738,7 +3748,7 @@ def validate_splice_abort_payload(payload: Dict[str, Any]) -> bool:
         return False
 
     # reason must be a string
-    if not isinstance(reason, str) or len(reason) > 500:
+    if not isinstance(reason, str) or len(reason) > MAX_REASON_LEN:
         return False
 
     # timestamp must be positive integer

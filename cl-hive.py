@@ -614,26 +614,25 @@ def _get_hive_context() -> HiveContext:
     Note: Some globals may not be initialized yet if init() hasn't completed.
     """
     # These globals are always defined (may be None before init())
-    _database = database if 'database' in globals() else None
-    _config = config if 'config' in globals() else None
-    _safe_plugin = safe_plugin if 'safe_plugin' in globals() else None
-    _our_pubkey = our_pubkey if 'our_pubkey' in globals() else None
-    _vpn_transport = vpn_transport if 'vpn_transport' in globals() else None
-    _planner = planner if 'planner' in globals() else None
-    _bridge = bridge if 'bridge' in globals() else None
-    _intent_mgr = intent_mgr if 'intent_mgr' in globals() else None
-    _membership_mgr = membership_mgr if 'membership_mgr' in globals() else None
-    # coop_expansion is the global name, not coop_expansion_mgr
-    _coop_expansion = coop_expansion if 'coop_expansion' in globals() else None
-    _contribution_mgr = contribution_mgr if 'contribution_mgr' in globals() else None
-    _routing_pool = routing_pool if 'routing_pool' in globals() else None
-    _yield_metrics_mgr = yield_metrics_mgr if 'yield_metrics_mgr' in globals() else None
-    _liquidity_coord = liquidity_coord if 'liquidity_coord' in globals() else None
-    _fee_coordination_mgr = fee_coordination_mgr if 'fee_coordination_mgr' in globals() else None
-    _cost_reduction_mgr = cost_reduction_mgr if 'cost_reduction_mgr' in globals() else None
-    _rationalization_mgr = rationalization_mgr if 'rationalization_mgr' in globals() else None
-    _strategic_positioning_mgr = strategic_positioning_mgr if 'strategic_positioning_mgr' in globals() else None
-    _anticipatory_liquidity_mgr = anticipatory_liquidity_mgr if 'anticipatory_liquidity_mgr' in globals() else None
+    _database = database if database is not None else None
+    _config = config if config is not None else None
+    _safe_plugin = safe_plugin if safe_plugin is not None else None
+    _our_pubkey = our_pubkey if our_pubkey is not None else None
+    _vpn_transport = vpn_transport if vpn_transport is not None else None
+    _planner = planner if planner is not None else None
+    _bridge = bridge if bridge is not None else None
+    _intent_mgr = intent_mgr if intent_mgr is not None else None
+    _membership_mgr = membership_mgr if membership_mgr is not None else None
+    _coop_expansion = coop_expansion if coop_expansion is not None else None
+    _contribution_mgr = contribution_mgr if contribution_mgr is not None else None
+    _routing_pool = routing_pool if routing_pool is not None else None
+    _yield_metrics_mgr = yield_metrics_mgr if yield_metrics_mgr is not None else None
+    _liquidity_coord = liquidity_coord if liquidity_coord is not None else None
+    _fee_coordination_mgr = fee_coordination_mgr if fee_coordination_mgr is not None else None
+    _cost_reduction_mgr = cost_reduction_mgr if cost_reduction_mgr is not None else None
+    _rationalization_mgr = rationalization_mgr if rationalization_mgr is not None else None
+    _strategic_positioning_mgr = strategic_positioning_mgr if strategic_positioning_mgr is not None else None
+    _anticipatory_liquidity_mgr = anticipatory_liquidity_mgr if anticipatory_liquidity_mgr is not None else None
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -1614,8 +1613,8 @@ def on_peer_connected(peer: dict, plugin: Plugin, **kwargs):
     if not handshake_mgr or not database:
         return {"result": "continue"}
 
-    our_pubkey = handshake_mgr.get_our_pubkey()
-    our_member = database.get_member(our_pubkey)
+    local_pubkey = handshake_mgr.get_our_pubkey()
+    our_member = database.get_member(local_pubkey)
 
     # If we're already a member, no need to autodiscover
     if our_member:
@@ -1630,7 +1629,7 @@ def on_peer_connected(peer: dict, plugin: Plugin, **kwargs):
     # Send HIVE_HELLO to discover if peer is a hive member
     try:
         from modules.protocol import create_hello
-        hello_msg = create_hello(our_pubkey)
+        hello_msg = create_hello(local_pubkey)
 
         safe_plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
@@ -2900,7 +2899,7 @@ def _update_and_broadcast_fees(new_fee_sats: int):
     """
     global _local_fees_earned_sats, _local_fees_forward_count
     global _local_fees_period_start, _local_fees_last_broadcast
-    global _local_fees_last_broadcast_amount
+    global _local_fees_last_broadcast_amount, _local_rebalance_costs_sats
 
     if not our_pubkey or not database or not safe_plugin:
         return
@@ -3698,7 +3697,7 @@ def _sync_member_policies(plugin: Plugin) -> None:
 
         # Determine if this peer should have HIVE strategy
         # Both admin and member tiers get HIVE strategy
-        is_hive_member = tier in (MembershipTier.MEMBER.value,)
+        is_hive_member = tier in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value)
 
         try:
             # Use bypass_rate_limit=True for startup sync
@@ -16105,6 +16104,10 @@ def hive_genesis(plugin: Plugin, hive_id: str = None):
     """
     if not database or not safe_plugin or not handshake_mgr:
         return {"error": "Hive not initialized"}
+
+    existing_members = database.get_all_members()
+    if existing_members:
+        return {"error": "Genesis already performed. Use hive-reset to reinitialize."}
 
     try:
         result = handshake_mgr.genesis(hive_id)
