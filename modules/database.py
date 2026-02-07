@@ -1219,7 +1219,7 @@ class HiveDatabase:
         """Get all Hive members."""
         conn = self._get_connection()
         rows = conn.execute(
-            "SELECT * FROM hive_members ORDER BY tier, joined_at"
+            "SELECT * FROM hive_members ORDER BY tier, joined_at LIMIT 1000"
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1457,7 +1457,7 @@ class HiveDatabase:
     def get_all_hive_states(self) -> List[Dict]:
         """Get cached state for all Hive peers."""
         conn = self._get_connection()
-        rows = conn.execute("SELECT * FROM hive_state").fetchall()
+        rows = conn.execute("SELECT * FROM hive_state LIMIT 1000").fetchall()
         
         results = []
         for row in rows:
@@ -2084,8 +2084,9 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
         rows = conn.execute("""
-            SELECT * FROM hive_bans 
+            SELECT * FROM hive_bans
             WHERE expires_at IS NULL OR expires_at > ?
+            LIMIT 1000
         """, (now,)).fetchall()
         return [dict(row) for row in rows]
     
@@ -3640,6 +3641,7 @@ class HiveDatabase:
             SELECT * FROM fee_intelligence
             WHERE timestamp >= ?
             ORDER BY target_peer_id, timestamp DESC
+            LIMIT 10000
         """, (cutoff,)).fetchall()
         return [dict(row) for row in rows]
 
@@ -3857,7 +3859,7 @@ class HiveDatabase:
         """
         conn = self._get_connection()
         rows = conn.execute("""
-            SELECT * FROM member_health ORDER BY overall_health ASC
+            SELECT * FROM member_health ORDER BY overall_health ASC LIMIT 1000
         """).fetchall()
         results = []
         for row in rows:
@@ -4011,7 +4013,7 @@ class HiveDatabase:
         conn = self._get_connection()
         rows = conn.execute("""
             SELECT * FROM member_liquidity_state
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC LIMIT 1000
         """).fetchall()
 
         results = []
@@ -4114,6 +4116,7 @@ class HiveDatabase:
                     ELSE 4
                 END,
                 timestamp DESC
+            LIMIT 10000
         """, (cutoff,)).fetchall()
         return [dict(row) for row in rows]
 
@@ -4300,6 +4303,7 @@ class HiveDatabase:
             SELECT * FROM route_probes
             WHERE timestamp >= ?
             ORDER BY timestamp DESC
+            LIMIT 10000
         """, (cutoff,)).fetchall()
 
         results = []
@@ -4486,6 +4490,7 @@ class HiveDatabase:
             SELECT * FROM peer_reputation
             WHERE timestamp > ?
             ORDER BY timestamp DESC
+            LIMIT 10000
         """, (cutoff,)).fetchall()
 
         reports = []
@@ -4921,6 +4926,7 @@ class HiveDatabase:
             SELECT * FROM flow_samples
             WHERE timestamp > ?
             ORDER BY timestamp DESC
+            LIMIT 50000
         """, (cutoff,)).fetchall()
 
         return [dict(row) for row in rows]

@@ -354,6 +354,12 @@ class GossipManager:
             self._log(f"Rejected gossip from {sender_id[:16]}...: fee_policy key too long")
             return False
 
+        MAX_FEE_VALUE = 10_000_000
+        for k, v in fee_policy.items():
+            if not isinstance(v, (int, float)) or v < 0 or v > MAX_FEE_VALUE:
+                self._log(f"Rejected gossip from {sender_id[:16]}...: invalid fee_policy value", level="warn")
+                return False
+
         # Track active peer
         with self._lock:
             self._active_peers.add(sender_id)
@@ -488,6 +494,11 @@ class GossipManager:
                 self._log(f"Rate-limited FULL_SYNC from {sender_id[:16]}...", level="warn")
                 return 0
             self._full_sync_times[sender_id] = now
+
+            cutoff = now - FULL_SYNC_COOLDOWN * 2
+            stale_sync_keys = [k for k, t in self._full_sync_times.items() if t < cutoff]
+            for k in stale_sync_keys:
+                del self._full_sync_times[k]
 
         states = payload.get('states', [])
 

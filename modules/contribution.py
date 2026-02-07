@@ -15,6 +15,7 @@ MAX_EVENT_MSAT = 10 ** 14
 LEECH_WARN_RATIO = 0.5
 LEECH_BAN_RATIO = 0.4
 LEECH_WINDOW_DAYS = 7
+MAX_RATE_LIMIT_ENTRIES = 1000
 
 # P5-02: Global daily limit across all peers (anti-Sybil DoS protection)
 MAX_CONTRIB_EVENTS_PER_DAY_TOTAL = 10000
@@ -167,6 +168,12 @@ class ContributionManager:
             self._daily_count += 1
             new_count = count + 1
             self._rate_limits[peer_id] = (window_start, new_count)
+
+            if len(self._rate_limits) > MAX_RATE_LIMIT_ENTRIES:
+                cutoff = now - 3600
+                stale = [k for k, (ws, _) in self._rate_limits.items() if ws < cutoff]
+                for k in stale:
+                    del self._rate_limits[k]
 
         # Persist updated stats (outside lock — non-critical)
         if self.db:
