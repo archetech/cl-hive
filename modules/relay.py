@@ -30,10 +30,10 @@ from enum import Enum
 # =============================================================================
 
 DEFAULT_TTL = 3                    # Maximum hops for relay
-DEDUP_EXPIRY_SECONDS = 300         # 5 minutes - how long to remember seen messages
-CLEANUP_INTERVAL_SECONDS = 60      # How often to clean expired entries
+DEDUP_EXPIRY_SECONDS = 3600        # 1 hour - must cover timestamp freshness windows
+CLEANUP_INTERVAL_SECONDS = 120     # How often to clean expired entries
 MAX_RELAY_PATH_LENGTH = 10         # Maximum nodes in relay path (safety limit)
-MAX_SEEN_MESSAGES = 10000          # Maximum cached message hashes
+MAX_SEEN_MESSAGES = 50000          # Maximum cached message hashes (increased for longer window)
 
 
 # =============================================================================

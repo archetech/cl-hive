@@ -5924,7 +5924,26 @@ def create_mcf_completion_report(
 # PHASE D: MSG_ACK HELPERS
 # =============================================================================
 
-def create_msg_ack(ack_msg_id: str, status: str, sender_id: str) -> bytes:
+def get_msg_ack_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical string to sign for MSG_ACK messages.
+
+    Args:
+        payload: MSG_ACK message payload
+
+    Returns:
+        Canonical string for signmessage()
+    """
+    return (
+        f"MSG_ACK:"
+        f"{payload.get('sender_id', '')}:"
+        f"{payload.get('ack_msg_id', '')}:"
+        f"{payload.get('status', 'ok')}:"
+        f"{payload.get('timestamp', 0)}"
+    )
+
+
+def create_msg_ack(ack_msg_id: str, status: str, sender_id: str, rpc=None) -> bytes:
     """
     Create a MSG_ACK message for reliable delivery acknowledgment.
 
@@ -5932,6 +5951,7 @@ def create_msg_ack(ack_msg_id: str, status: str, sender_id: str) -> bytes:
         ack_msg_id: The _event_id of the message being acknowledged
         status: Ack status - "ok", "invalid", or "retry_later"
         sender_id: Our pubkey (the acknowledging node)
+        rpc: Optional RPC interface for signing (if provided, ACK will be signed)
 
     Returns:
         Serialized MSG_ACK message bytes
@@ -5942,6 +5962,16 @@ def create_msg_ack(ack_msg_id: str, status: str, sender_id: str) -> bytes:
         "sender_id": sender_id,
         "timestamp": int(time.time()),
     }
+
+    # Sign the ACK if rpc is available
+    if rpc:
+        try:
+            signing_message = get_msg_ack_signing_payload(payload)
+            sig_result = rpc.signmessage(signing_message)
+            payload["signature"] = sig_result["zbase"]
+        except Exception:
+            pass  # Best-effort signing
+
     return serialize(HiveMessageType.MSG_ACK, payload)
 
 

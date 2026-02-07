@@ -1871,6 +1871,11 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... but we're not a member", level='debug')
         return {"result": "continue"}
 
+    # SECURITY: Check if peer is banned (prevents ban evasion via rejoin)
+    if database.is_banned(peer_id):
+        plugin.log(f"cl-hive: HELLO from banned peer {peer_id[:16]}..., ignoring", level='warn')
+        return {"result": "continue"}
+
     # Check if peer is already a member
     existing_member = database.get_member(peer_id)
     if existing_member:
@@ -2048,6 +2053,12 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         handshake_mgr.clear_challenge(peer_id)
         return {"result": "continue"}
 
+    # SECURITY: Final ban check before adding member (prevents race with ban during handshake)
+    if database.is_banned(peer_id):
+        plugin.log(f"cl-hive: ATTEST from banned peer {peer_id[:16]}..., rejecting", level='warn')
+        handshake_mgr.clear_challenge(peer_id)
+        return {"result": "continue"}
+
     # Get initial tier from pending challenge (always neophyte for autodiscovery)
     initial_tier = pending.get('initial_tier', 'neophyte')
 
@@ -2220,6 +2231,10 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         )
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check (reject stale replayed messages)
+    if not _check_timestamp_freshness(payload, MAX_GOSSIP_AGE_SECONDS, "GOSSIP"):
+        return {"result": "continue"}
+
     # SECURITY: Verify cryptographic signature
     sender_id = payload.get("sender_id")
     signature = payload.get("signature")
@@ -2306,6 +2321,10 @@ def handle_state_hash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         )
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_STATE_HASH_AGE_SECONDS, "STATE_HASH"):
+        return {"result": "continue"}
+
     # SECURITY: Verify cryptographic signature
     sender_id = payload.get("sender_id")
     signature = payload.get("signature")
@@ -2369,6 +2388,10 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: invalid payload structure",
             level='warn'
         )
+        return {"result": "continue"}
+
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_STATE_HASH_AGE_SECONDS, "FULL_SYNC"):
         return {"result": "continue"}
 
     # SECURITY: Verify cryptographic signature
@@ -3235,6 +3258,10 @@ def handle_intent(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: INTENT from {peer_id[:16]}... initiator mismatch", level='warn')
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check (reject stale replayed intents)
+    if not _check_timestamp_freshness(payload, MAX_INTENT_AGE_SECONDS, "INTENT"):
+        return {"result": "continue"}
+
     if payload.get("intent_type") not in {t.value for t in IntentType}:
         plugin.log(f"cl-hive: INTENT from {peer_id[:16]}... invalid intent_type", level='warn')
         return {"result": "continue"}
@@ -3480,7 +3507,7 @@ def _emit_ack(peer_id: str, msg_id: Optional[str]) -> None:
     if not msg_id or not safe_plugin or not our_pubkey:
         return
     try:
-        ack_msg = create_msg_ack(msg_id, "ok", our_pubkey)
+        ack_msg = create_msg_ack(msg_id, "ok", our_pubkey, rpc=safe_plugin.rpc)
         safe_plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
             "msg": ack_msg.hex()
@@ -3493,6 +3520,26 @@ def handle_msg_ack(peer_id: str, payload: Dict, plugin) -> Dict:
     """Handle incoming MSG_ACK from a peer."""
     if not validate_msg_ack(payload):
         plugin.log(f"cl-hive: MSG_ACK invalid payload from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature if present (backward compat: unsigned ACKs still accepted
+    # from peers that haven't upgraded yet, but sender_id must match peer_id)
+    sender_id = payload.get("sender_id", "")
+    signature = payload.get("signature")
+    if signature and safe_plugin:
+        from modules.protocol import get_msg_ack_signing_payload
+        signing_payload = get_msg_ack_signing_payload(payload)
+        try:
+            verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+            if not verify_result.get("verified") or verify_result.get("pubkey") != sender_id:
+                plugin.log(f"cl-hive: MSG_ACK invalid signature from {peer_id[:16]}...", level='warn')
+                return {"result": "continue"}
+        except Exception as e:
+            plugin.log(f"cl-hive: MSG_ACK signature check failed: {e}", level='debug')
+            return {"result": "continue"}
+    elif sender_id != peer_id:
+        # Unsigned ACK with mismatched sender_id — reject
+        plugin.log(f"cl-hive: MSG_ACK unsigned with mismatched sender from {peer_id[:16]}...", level='warn')
         return {"result": "continue"}
 
     ack_msg_id = payload.get("ack_msg_id")
@@ -3693,6 +3740,43 @@ def _should_process_message(payload: Dict[str, Any]) -> bool:
     if not relay_mgr:
         return True  # No relay manager, process everything
     return relay_mgr.should_process(payload)
+
+
+def _check_timestamp_freshness(payload: Dict[str, Any], max_age: int,
+                                label: str = "message") -> bool:
+    """
+    Check if a message timestamp is fresh enough to process.
+
+    Rejects messages that are too old (replay) or too far in the future (clock skew).
+
+    Args:
+        payload: Message payload containing 'timestamp' field
+        max_age: Maximum allowed age in seconds
+        label: Message type label for logging
+
+    Returns:
+        True if timestamp is acceptable, False if stale/invalid
+    """
+    ts = payload.get("timestamp")
+    if not isinstance(ts, (int, float)) or ts <= 0:
+        return False
+    now = int(time.time())
+    age = now - int(ts)
+    if age > max_age:
+        if safe_plugin:
+            safe_plugin.log(
+                f"cl-hive: {label} rejected: timestamp too old ({age}s > {max_age}s)",
+                level='debug'
+            )
+        return False
+    if age < -MAX_CLOCK_SKEW_SECONDS:
+        if safe_plugin:
+            safe_plugin.log(
+                f"cl-hive: {label} rejected: timestamp {-age}s in the future",
+                level='debug'
+            )
+        return False
+    return True
 
 
 def _sync_member_policies(plugin: Plugin) -> None:
@@ -4187,6 +4271,14 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 # =============================================================================
 # BAN VOTING CONSTANTS
 # =============================================================================
+
+# Message timestamp freshness limits (reject stale replayed messages)
+MAX_GOSSIP_AGE_SECONDS = 3600           # 1 hour for gossip
+MAX_INTENT_AGE_SECONDS = 600            # 10 minutes for intents (time-sensitive)
+MAX_STATE_HASH_AGE_SECONDS = 3600       # 1 hour for state hash / full sync
+MAX_SETTLEMENT_AGE_SECONDS = 86400      # 24 hours for settlement messages
+MAX_INTELLIGENCE_AGE_SECONDS = 7200     # 2 hours for fee/health/liquidity reports
+MAX_CLOCK_SKEW_SECONDS = 300            # 5 minutes future tolerance
 
 # Ban proposal voting period (7 days)
 BAN_PROPOSAL_TTL_SECONDS = 7 * 24 * 3600
@@ -5570,6 +5662,10 @@ def handle_fee_intelligence_snapshot(peer_id: str, payload: Dict, plugin: Plugin
         plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT from non-member {reporter_id[:16]}...", level='debug')
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "FEE_INTELLIGENCE_SNAPSHOT"):
+        return {"result": "continue"}
+
     # RELAY: Forward to other members
     relay_count = _relay_message(HiveMessageType.FEE_INTELLIGENCE_SNAPSHOT, payload, peer_id)
     if relay_count > 0:
@@ -5609,6 +5705,10 @@ def handle_health_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "HEALTH_REPORT"):
+        return {"result": "continue"}
+
     # Get the actual sender (may differ from peer_id for relayed messages)
     reporter_id = payload.get("reporter_id", peer_id)
     is_relayed = _is_relayed_message(payload)
@@ -5617,6 +5717,23 @@ def handle_health_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     sender = database.get_member(reporter_id)
     if not sender or database.is_banned(reporter_id):
         plugin.log(f"cl-hive: HEALTH_REPORT from non-member {reporter_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: HEALTH_REPORT missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_health_report_signing_payload
+    signing_payload = get_health_report_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: HEALTH_REPORT invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: HEALTH_REPORT signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # RELAY: Forward to other members
@@ -5658,6 +5775,10 @@ def handle_liquidity_need(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "LIQUIDITY_NEED"):
+        return {"result": "continue"}
+
     # Get the actual sender (may differ from peer_id for relayed messages)
     reporter_id = payload.get("reporter_id", peer_id)
     is_relayed = _is_relayed_message(payload)
@@ -5666,6 +5787,23 @@ def handle_liquidity_need(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     sender = database.get_member(reporter_id)
     if not sender or database.is_banned(reporter_id):
         plugin.log(f"cl-hive: LIQUIDITY_NEED from non-member {reporter_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: LIQUIDITY_NEED missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_liquidity_need_signing_payload
+    signing_payload = get_liquidity_need_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: LIQUIDITY_NEED invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: LIQUIDITY_NEED signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # RELAY: Forward to other members
@@ -5707,6 +5845,10 @@ def handle_liquidity_snapshot(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "LIQUIDITY_SNAPSHOT"):
+        return {"result": "continue"}
+
     # Get the actual sender (may differ from peer_id for relayed messages)
     reporter_id = payload.get("reporter_id", peer_id)
     is_relayed = _is_relayed_message(payload)
@@ -5715,6 +5857,23 @@ def handle_liquidity_snapshot(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     sender = database.get_member(reporter_id)
     if not sender or database.is_banned(reporter_id):
         plugin.log(f"cl-hive: LIQUIDITY_SNAPSHOT from non-member {reporter_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: LIQUIDITY_SNAPSHOT missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_liquidity_snapshot_signing_payload
+    signing_payload = get_liquidity_snapshot_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: LIQUIDITY_SNAPSHOT invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: LIQUIDITY_SNAPSHOT signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # RELAY: Forward to other members
@@ -5754,6 +5913,10 @@ def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "ROUTE_PROBE"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member and not banned (supports relay)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
@@ -5765,6 +5928,24 @@ def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         if not sender or database.is_banned(peer_id):
             plugin.log(f"cl-hive: ROUTE_PROBE from non-member {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    reporter_id = payload.get("reporter_id", peer_id)
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: ROUTE_PROBE missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_route_probe_signing_payload
+    signing_payload = get_route_probe_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: ROUTE_PROBE invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: ROUTE_PROBE signature check failed: {e}", level='warn')
+        return {"result": "continue"}
 
     # Delegate to routing map
     result = routing_map.handle_route_probe(peer_id, payload, safe_plugin.rpc)
@@ -5801,6 +5982,10 @@ def handle_route_probe_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "ROUTE_PROBE_BATCH"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member and not banned (supports relay)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
@@ -5812,6 +5997,24 @@ def handle_route_probe_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
         if not sender or database.is_banned(peer_id):
             plugin.log(f"cl-hive: ROUTE_PROBE_BATCH from non-member {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    reporter_id = payload.get("reporter_id", peer_id)
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: ROUTE_PROBE_BATCH missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_route_probe_batch_signing_payload
+    signing_payload = get_route_probe_batch_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: ROUTE_PROBE_BATCH invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: ROUTE_PROBE_BATCH signature check failed: {e}", level='warn')
+        return {"result": "continue"}
 
     # Delegate to routing map
     result = routing_map.handle_route_probe_batch(peer_id, payload, safe_plugin.rpc)
@@ -5849,6 +6052,10 @@ def handle_peer_reputation_snapshot(peer_id: str, payload: Dict, plugin: Plugin)
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "PEER_REPUTATION_SNAPSHOT"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member and not banned (supports relay)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
@@ -5860,6 +6067,24 @@ def handle_peer_reputation_snapshot(peer_id: str, payload: Dict, plugin: Plugin)
         if not sender or database.is_banned(peer_id):
             plugin.log(f"cl-hive: PEER_REPUTATION_SNAPSHOT from non-member {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    reporter_id = payload.get("reporter_id", peer_id)
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: PEER_REPUTATION_SNAPSHOT missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_peer_reputation_snapshot_signing_payload
+    signing_payload = get_peer_reputation_snapshot_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: PEER_REPUTATION_SNAPSHOT invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: PEER_REPUTATION_SNAPSHOT signature check failed: {e}", level='warn')
+        return {"result": "continue"}
 
     # Delegate to peer reputation manager
     result = peer_reputation_mgr.handle_peer_reputation_snapshot(peer_id, payload, safe_plugin.rpc)
@@ -6725,6 +6950,10 @@ def handle_settlement_offer(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SETTLEMENT_OFFER"):
+        return {"result": "continue"}
+
     # Extract payload fields
     offer_peer_id = payload.get("peer_id")
     bolt12_offer = payload.get("bolt12_offer")
@@ -6795,6 +7024,10 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Deduplication check
     if not _should_process_message(payload):
+        return {"result": "continue"}
+
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "FEE_REPORT"):
         return {"result": "continue"}
 
     # Validate payload schema
@@ -6937,6 +7170,10 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
         plugin.log(f"cl-hive: SETTLEMENT_PROPOSE invalid schema from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SETTLEMENT_PROPOSE"):
+        return {"result": "continue"}
+
     # Verify proposer (supports relay)
     proposer_peer_id = payload.get("proposer_peer_id")
     if not _validate_relay_sender(peer_id, proposer_peer_id, payload):
@@ -7048,6 +7285,10 @@ def handle_settlement_ready(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SETTLEMENT_READY"):
+        return {"result": "continue"}
+
     # Validate payload schema
     if not validate_settlement_ready(payload):
         plugin.log(f"cl-hive: SETTLEMENT_READY invalid schema from {peer_id[:16]}...", level='debug')
@@ -7157,6 +7398,10 @@ def handle_settlement_executed(peer_id: str, payload: Dict, plugin: Plugin) -> D
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SETTLEMENT_EXECUTED"):
+        return {"result": "continue"}
+
     # Validate payload schema
     if not validate_settlement_executed(payload):
         plugin.log(f"cl-hive: SETTLEMENT_EXECUTED invalid schema from {peer_id[:16]}...", level='debug')
@@ -7254,10 +7499,32 @@ def handle_task_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not task_mgr or not database:
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "TASK_REQUEST"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member and not banned
     sender = database.get_member(peer_id)
     if not sender or database.is_banned(peer_id):
         plugin.log(f"cl-hive: TASK_REQUEST from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    requester_id = payload.get("requester_id", peer_id)
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: TASK_REQUEST missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_task_request_signing_payload
+    signing_payload = get_task_request_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != requester_id:
+            plugin.log(f"cl-hive: TASK_REQUEST invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: TASK_REQUEST signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # Phase C: Persistent idempotency check
@@ -7303,10 +7570,32 @@ def handle_task_response(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not task_mgr or not database:
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "TASK_RESPONSE"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member
     sender = database.get_member(peer_id)
     if not sender:
         plugin.log(f"cl-hive: TASK_RESPONSE from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    responder_id = payload.get("responder_id", peer_id)
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: TASK_RESPONSE missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_task_response_signing_payload
+    signing_payload = get_task_response_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != responder_id:
+            plugin.log(f"cl-hive: TASK_RESPONSE invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: TASK_RESPONSE signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # Phase C: Persistent idempotency check
@@ -7354,10 +7643,32 @@ def handle_splice_init_request(peer_id: str, payload: Dict, plugin: Plugin) -> D
     if not splice_mgr or not database:
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SPLICE_INIT_REQUEST"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member and not banned
     sender = database.get_member(peer_id)
     if not sender or database.is_banned(peer_id):
         plugin.log(f"cl-hive: SPLICE_INIT_REQUEST from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    initiator_id = payload.get("initiator_id", peer_id)
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: SPLICE_INIT_REQUEST missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_splice_init_request_signing_payload
+    signing_payload = get_splice_init_request_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != initiator_id:
+            plugin.log(f"cl-hive: SPLICE_INIT_REQUEST invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: SPLICE_INIT_REQUEST signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # Phase C: Persistent idempotency check
@@ -7395,10 +7706,32 @@ def handle_splice_init_response(peer_id: str, payload: Dict, plugin: Plugin) -> 
     if not splice_mgr or not database:
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SPLICE_INIT_RESPONSE"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member
     sender = database.get_member(peer_id)
     if not sender:
         plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE from non-member {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    responder_id = payload.get("responder_id", peer_id)
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_splice_init_response_signing_payload
+    signing_payload = get_splice_init_response_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != responder_id:
+            plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # Delegate to splice manager
@@ -7429,9 +7762,31 @@ def handle_splice_update(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not splice_mgr or not database:
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SPLICE_UPDATE"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member
     sender = database.get_member(peer_id)
     if not sender:
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    sender_id_field = payload.get("sender_id", peer_id)
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: SPLICE_UPDATE missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_splice_update_signing_payload
+    signing_payload = get_splice_update_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != sender_id_field:
+            plugin.log(f"cl-hive: SPLICE_UPDATE invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: SPLICE_UPDATE signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # Phase C: Persistent idempotency check
@@ -7462,9 +7817,31 @@ def handle_splice_signed(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not splice_mgr or not database:
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SPLICE_SIGNED"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member
     sender = database.get_member(peer_id)
     if not sender:
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    sender_id_field = payload.get("sender_id", peer_id)
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: SPLICE_SIGNED missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_splice_signed_signing_payload
+    signing_payload = get_splice_signed_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != sender_id_field:
+            plugin.log(f"cl-hive: SPLICE_SIGNED invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: SPLICE_SIGNED signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # Phase C: Persistent idempotency check
@@ -7500,9 +7877,31 @@ def handle_splice_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not splice_mgr or not database:
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SPLICE_ABORT"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member
     sender = database.get_member(peer_id)
     if not sender:
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    sender_id_field = payload.get("sender_id", peer_id)
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: SPLICE_ABORT missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_splice_abort_signing_payload
+    signing_payload = get_splice_abort_signing_payload(payload)
+    try:
+        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != sender_id_field:
+            plugin.log(f"cl-hive: SPLICE_ABORT invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: SPLICE_ABORT signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # Phase C: Persistent idempotency check
