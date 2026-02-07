@@ -21,6 +21,7 @@ Author: Lightning Goats Team
 """
 
 import json
+import threading
 import time
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -118,6 +119,7 @@ class DecisionEngine:
         self.plugin = plugin
 
         # Failsafe mode state tracking (budget and rate limits)
+        self._failsafe_lock = threading.Lock()
         self._daily_spend_sats: int = 0
         self._daily_spend_reset_day: int = 0  # Day of year for reset
         self._hourly_actions: List[int] = []  # Timestamps of recent actions
@@ -275,50 +277,51 @@ class DecisionEngine:
             )
             return self._handle_advisor_mode(packet, cfg)
 
-        # Check daily budget
+        # Atomically check budget+rate, execute, and update tracking
         amount_sats = packet.context.get('amount_sats', 0)
         if isinstance(amount_sats, (int, float)) and amount_sats < 0:
             amount_sats = 0
-        if not self._check_budget(amount_sats, cfg):
-            self._log(
-                f"Daily budget exceeded ({self._daily_spend_sats} + {amount_sats} > "
-                f"{cfg.failsafe_budget_per_day}), queueing action",
-                level='warn'
-            )
-            return self._handle_advisor_mode(packet, cfg)
 
-        # Check rate limit
-        if not self._check_rate_limit(cfg):
-            self._log(
-                f"Hourly rate limit exceeded ({len(self._hourly_actions)} >= "
-                f"{cfg.failsafe_actions_per_hour}), queueing action",
-                level='warn'
-            )
-            return self._handle_advisor_mode(packet, cfg)
-
-        # Execute the emergency action
-        executor = self._executors.get(packet.action_type)
-        if executor:
-            try:
-                executor(packet.target, packet.context)
-
-                # Update tracking
-                self._daily_spend_sats += amount_sats
-                self._hourly_actions.append(int(time.time()))
-
-                self._log(f"Emergency action executed (FAILSAFE mode)")
-
-                return DecisionResponse(
-                    result=DecisionResult.APPROVED,
-                    reason="Emergency action executed (FAILSAFE mode)"
+        with self._failsafe_lock:
+            if not self._check_budget(amount_sats, cfg):
+                self._log(
+                    f"Daily budget exceeded ({self._daily_spend_sats} + {amount_sats} > "
+                    f"{cfg.failsafe_budget_per_day}), queueing action",
+                    level='warn'
                 )
-            except Exception as e:
-                self._log(f"Execution failed: {e}, queueing action", level='warn')
                 return self._handle_advisor_mode(packet, cfg)
-        else:
-            # No executor registered - queue for manual handling
-            self._log(f"No executor for {packet.action_type}, queueing action")
-            return self._handle_advisor_mode(packet, cfg)
+
+            if not self._check_rate_limit(cfg):
+                self._log(
+                    f"Hourly rate limit exceeded ({len(self._hourly_actions)} >= "
+                    f"{cfg.failsafe_actions_per_hour}), queueing action",
+                    level='warn'
+                )
+                return self._handle_advisor_mode(packet, cfg)
+
+            # Execute the emergency action
+            executor = self._executors.get(packet.action_type)
+            if executor:
+                try:
+                    executor(packet.target, packet.context)
+
+                    # Update tracking (atomic with checks above)
+                    self._daily_spend_sats += amount_sats
+                    self._hourly_actions.append(int(time.time()))
+
+                    self._log(f"Emergency action executed (FAILSAFE mode)")
+
+                    return DecisionResponse(
+                        result=DecisionResult.APPROVED,
+                        reason="Emergency action executed (FAILSAFE mode)"
+                    )
+                except Exception as e:
+                    self._log(f"Execution failed: {e}, queueing action", level='warn')
+                    return self._handle_advisor_mode(packet, cfg)
+            else:
+                # No executor registered - queue for manual handling
+                self._log(f"No executor for {packet.action_type}, queueing action")
+                return self._handle_advisor_mode(packet, cfg)
 
     def _check_budget(self, amount_sats: int, cfg) -> bool:
         """

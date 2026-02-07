@@ -2022,7 +2022,7 @@ class StrategicPositioningManager:
                     "competition_level": c.competition_level,
                     "competitor_count": c.competitor_count,
                     "margin_estimate_ppm": c.margin_estimate_ppm,
-                    "fleet_coverage": c.fleet_coverage
+                    "fleet_coverage": c.fleet_members_present
                 })
 
         except Exception as e:
@@ -2053,9 +2053,9 @@ class StrategicPositioningManager:
                     "target_peer_id": r.target_peer_id,
                     "recommended_member": r.recommended_member or "",
                     "priority_tier": r.priority_tier,
-                    "target_capacity_sats": r.target_capacity_sats,
+                    "target_capacity_sats": r.recommended_capacity_sats,
                     "reason": r.reason,
-                    "value_score": round(r.value_score, 4),
+                    "value_score": round(r.priority_score, 4),
                     "is_exchange": r.is_exchange,
                     "is_underserved": r.is_underserved
                 })

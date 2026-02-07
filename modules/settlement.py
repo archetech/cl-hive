@@ -509,8 +509,8 @@ class SettlementManager:
             ideals.keys(),
             key=lambda pid: (-(ideals[pid] - floors[pid]), pid)
         )
-        for i in range(max(0, remainder)):
-            floors[frac_order[i % len(frac_order)]] += 1
+        for i in range(max(0, min(remainder, len(frac_order)))):
+            floors[frac_order[i]] += 1
 
         # Step 4: build SettlementResult list
         results: List[SettlementResult] = []

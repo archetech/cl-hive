@@ -599,10 +599,6 @@ class CooperativeExpansionManager:
         Returns:
             True if joined successfully, False if round already exists
         """
-        with self._lock:
-            if round_id in self._rounds:
-                return False  # Already have this round
-
         now = int(time.time())
         round_obj = ExpansionRound(
             round_id=round_id,
@@ -616,6 +612,8 @@ class CooperativeExpansionManager:
         )
 
         with self._lock:
+            if round_id in self._rounds:
+                return False  # Already have this round
             self._rounds[round_id] = round_obj
 
         self._log(
@@ -843,7 +841,7 @@ class CooperativeExpansionManager:
             # Liquidity score (0-1): log scale, caps at 100M sats
             import math
             liquidity_btc = nom.available_liquidity_sats / 100_000_000
-            liquidity_score = min(1.0, 0.3 + 0.7 * math.log10(max(0.01, liquidity_btc)) / 2)
+            liquidity_score = max(0.0, min(1.0, 0.3 + 0.7 * math.log10(max(0.01, liquidity_btc)) / 2))
             score += liquidity_score * self.WEIGHT_LIQUIDITY
             factors['liquidity'] = round(liquidity_score, 3)
 
@@ -873,8 +871,8 @@ class CooperativeExpansionManager:
             factors['total'] = round(score, 3)
             scored.append((nom, score, factors))
 
-        # Sort by score descending
-        scored.sort(key=lambda x: x[1], reverse=True)
+        # Sort by score descending, then nominator_id ascending for determinism
+        scored.sort(key=lambda x: (-x[1], x[0].nominator_id))
 
         # Winner is highest scored
         winner, winner_score, winner_factors = scored[0]
@@ -931,6 +929,14 @@ class CooperativeExpansionManager:
         with self._lock:
             round_obj = self._rounds.get(round_id)
             if round_obj:
+                # Only accept election for rounds in valid pre-election states
+                if round_obj.state in (ExpansionRoundState.COMPLETED,
+                                       ExpansionRoundState.CANCELLED,
+                                       ExpansionRoundState.EXPIRED):
+                    self._log(
+                        f"Round {round_id[:8]}... ignoring election - already {round_obj.state.value}"
+                    )
+                    return {"action": "ignored", "reason": f"round_already_{round_obj.state.value}"}
                 round_obj.state = ExpansionRoundState.COMPLETED
                 round_obj.elected_id = elected_id
                 round_obj.recommended_size_sats = channel_size_sats
@@ -1048,6 +1054,7 @@ class CooperativeExpansionManager:
             round_obj.result = f"fallback_elected with score {next_score:.3f}"
             target_peer_id = round_obj.target_peer_id
             channel_size_sats = round_obj.recommended_size_sats
+            decline_count = round_obj.decline_count
 
         self._log(
             f"Round {round_id[:8]}... fallback elected {next_candidate[:16]}... "
@@ -1063,7 +1070,7 @@ class CooperativeExpansionManager:
             "elected_id": next_candidate,
             "target_peer_id": target_peer_id,
             "channel_size_sats": channel_size_sats,
-            "decline_count": round_obj.decline_count,
+            "decline_count": decline_count,
         }
 
     def complete_round(self, round_id: str, success: bool, result: str = "") -> None:
@@ -1151,6 +1158,11 @@ class CooperativeExpansionManager:
             ]
             for rid in expired_ids:
                 del self._rounds[rid]
+
+        # Prune stale _recent_opens (older than 7 days) and expired _target_cooldowns
+        week_ago = now - 7 * 86400
+        self._recent_opens = {k: v for k, v in self._recent_opens.items() if v > week_ago}
+        self._target_cooldowns = {k: v for k, v in self._target_cooldowns.items() if v > now}
 
         if cleaned > 0:
             self._log(f"Cleaned up {cleaned} expired rounds")

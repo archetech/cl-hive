@@ -1481,7 +1481,9 @@ class LiquidityCoordinator:
             True if assignment was accepted
         """
         # Generate assignment ID
-        assignment_id = f"mcf_{solution_timestamp}_{assignment_data.get('priority', 0)}"
+        from_ch = assignment_data.get("from_channel", "")[-8:]
+        to_ch = assignment_data.get("to_channel", "")[-8:]
+        assignment_id = f"mcf_{solution_timestamp}_{assignment_data.get('priority', 0)}_{from_ch}_{to_ch}"
 
         # Check for duplicate
         if assignment_id in self._mcf_assignments:

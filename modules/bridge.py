@@ -515,14 +515,13 @@ class Bridge:
                 f"RPC call {method} timed out after {RPC_TIMEOUT}s",
                 level='warn'
             )
-            raise TimeoutError(f"RPC call {method} timed out after {RPC_TIMEOUT}s")
+            raise TimeoutError(f"RPC call {method} timed out after {RPC_TIMEOUT}s") from None
         except RpcError as e:
             cb.record_failure()
             self._log(f"RPC call {method} failed: {e}", level='warn')
             raise
-        except TimeoutError as e:
-            cb.record_failure()
-            self._log(f"RPC call {method} timed out: {e}", level='warn')
+        except TimeoutError:
+            # Re-raised from subprocess.TimeoutExpired above (already recorded)
             raise
         except Exception as e:
             cb.record_failure()
