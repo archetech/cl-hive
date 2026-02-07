@@ -222,10 +222,18 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
     if ctx.our_pubkey:
         our_member = ctx.database.get_member(ctx.our_pubkey)
         if our_member:
+            uptime_raw = our_member.get("uptime_pct", 0.0)
+            contribution_ratio = our_member.get("contribution_ratio", 0.0)
+            # Enrich with live contribution ratio if available (Issue #59)
+            if ctx.membership_mgr:
+                contribution_ratio = ctx.membership_mgr.calculate_contribution_ratio(ctx.our_pubkey)
+                uptime_raw = round(uptime_raw * 100, 2)
             our_membership = {
                 "tier": our_member.get("tier"),
                 "joined_at": our_member.get("joined_at"),
                 "pubkey": ctx.our_pubkey,
+                "uptime_pct": uptime_raw,
+                "contribution_ratio": contribution_ratio,
             }
 
     return {
