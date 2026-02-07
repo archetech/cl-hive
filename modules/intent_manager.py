@@ -18,6 +18,7 @@ Tie-Breaker Rule:
 Author: Lightning Goats Team
 """
 
+import threading
 import time
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -178,7 +179,10 @@ class IntentManager:
         
         # Callback registry for intent commit actions
         self._commit_callbacks: Dict[str, Callable] = {}
-        
+
+        # Lock protecting _remote_intents
+        self._remote_lock = threading.Lock()
+
         # Track remote intents for visibility
         self._remote_intents: Dict[str, Intent] = {}
     
@@ -351,22 +355,34 @@ class IntentManager:
         Args:
             intent: Remote intent received from network
         """
+        # Validate timestamp: reject intents too far in the future or too old
+        now = time.time()
+        if intent.timestamp > now + 300:
+            self._log(f"Rejected remote intent from {intent.initiator[:16]}...: "
+                     f"timestamp {int(intent.timestamp)} is too far in the future", level="warn")
+            return
+        if intent.timestamp < now - 86400:
+            self._log(f"Rejected remote intent from {intent.initiator[:16]}...: "
+                     f"timestamp {int(intent.timestamp)} is too old (>24h)", level="warn")
+            return
+
         key = f"{intent.intent_type}:{intent.target}:{intent.initiator}"
 
-        # P3-01: Enforce cache size limit - evict oldest by timestamp before adding
-        if key not in self._remote_intents and len(self._remote_intents) >= MAX_REMOTE_INTENTS:
-            # Find and evict the oldest intent by timestamp
-            oldest_key = None
-            oldest_ts = float('inf')
-            for k, v in self._remote_intents.items():
-                if v.timestamp < oldest_ts:
-                    oldest_ts = v.timestamp
-                    oldest_key = k
-            if oldest_key:
-                del self._remote_intents[oldest_key]
-                self._log(f"Evicted oldest remote intent (cache full at {MAX_REMOTE_INTENTS})", level='debug')
+        with self._remote_lock:
+            # P3-01: Enforce cache size limit - evict oldest by timestamp before adding
+            if key not in self._remote_intents and len(self._remote_intents) >= MAX_REMOTE_INTENTS:
+                # Find and evict the oldest intent by timestamp
+                oldest_key = None
+                oldest_ts = float('inf')
+                for k, v in self._remote_intents.items():
+                    if v.timestamp < oldest_ts:
+                        oldest_ts = v.timestamp
+                        oldest_key = k
+                if oldest_key:
+                    del self._remote_intents[oldest_key]
+                    self._log(f"Evicted oldest remote intent (cache full at {MAX_REMOTE_INTENTS})", level='debug')
 
-        self._remote_intents[key] = intent
+            self._remote_intents[key] = intent
 
         self._log(f"Recorded remote intent from {intent.initiator[:16]}...: "
                  f"{intent.intent_type} -> {intent.target[:16]}...", level='debug')
@@ -374,33 +390,35 @@ class IntentManager:
     def record_remote_abort(self, intent_type: str, target: str, initiator: str) -> None:
         """
         Record that a remote node aborted their intent.
-        
+
         Args:
             intent_type: Type of intent
             target: Target identifier
             initiator: Node that aborted
         """
         key = f"{intent_type}:{target}:{initiator}"
-        if key in self._remote_intents:
-            self._remote_intents[key].status = STATUS_ABORTED
-            self._log(f"Remote intent aborted by {initiator[:16]}...: "
-                     f"{intent_type} -> {target[:16]}...", level='debug')
+        with self._remote_lock:
+            if key in self._remote_intents:
+                self._remote_intents[key].status = STATUS_ABORTED
+        self._log(f"Remote intent aborted by {initiator[:16]}...: "
+                 f"{intent_type} -> {target[:16]}...", level='debug')
     
     def get_remote_intents(self, target: str = None) -> List[Intent]:
         """
         Get tracked remote intents, optionally filtered by target.
-        
+
         Args:
             target: Optional target to filter by
-            
+
         Returns:
             List of remote Intent objects
         """
-        intents = list(self._remote_intents.values())
-        
+        with self._remote_lock:
+            intents = list(self._remote_intents.values())
+
         if target:
             intents = [i for i in intents if i.target == target]
-        
+
         return intents
     
     # =========================================================================
@@ -487,15 +505,16 @@ class IntentManager:
             Number of intents cleaned up
         """
         count = self.db.cleanup_expired_intents()
-        
+
         # Also clean up remote intent cache
         now = int(time.time())
-        stale_keys = [
-            key for key, intent in self._remote_intents.items()
-            if now > intent.expires_at + STALE_INTENT_THRESHOLD
-        ]
-        for key in stale_keys:
-            del self._remote_intents[key]
+        with self._remote_lock:
+            stale_keys = [
+                key for key, intent in self._remote_intents.items()
+                if now > intent.expires_at + STALE_INTENT_THRESHOLD
+            ]
+            for key in stale_keys:
+                del self._remote_intents[key]
         
         if count > 0 or stale_keys:
             self._log(f"Cleaned up {count} DB intents, {len(stale_keys)} cached remote intents")

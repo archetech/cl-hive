@@ -18,6 +18,7 @@ Author: Lightning Goats Team
 """
 
 import math
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -530,6 +531,9 @@ class AnticipatoryLiquidityManager:
         self.plugin = plugin
         self.state_manager = state_manager
         self.our_id = our_id
+
+        # Lock protecting in-memory caches
+        self._lock = threading.Lock()
 
         # In-memory caches
         self._pattern_cache: Dict[str, List[TemporalPattern]] = {}

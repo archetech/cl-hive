@@ -4,6 +4,7 @@ Contribution tracking module for cl-hive.
 Tracks forwarding events for contribution ratio and anti-leech signals.
 """
 
+import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -27,6 +28,7 @@ class ContributionManager:
         self.db = db
         self.plugin = plugin
         self.config = config
+        self._lock = threading.Lock()
         self._channel_map: Dict[str, str] = {}
         self._last_refresh = 0
         self._rate_limits: Dict[str, Tuple[int, int]] = {}
@@ -117,48 +119,61 @@ class ContributionManager:
 
     def _allow_daily_global(self) -> bool:
         """
-        P5-02: Check global daily limit across all peers.
+        P5-02: Check global daily limit across all peers (thread-safe).
 
         Returns False if daily cap exceeded (resets after 24h).
         """
-        now = int(time.time())
-        # Reset counter if 24h have passed
-        if now - self._daily_window_start >= 86400:
-            self._daily_window_start = now
-            self._daily_count = 0
-        if self._daily_count >= MAX_CONTRIB_EVENTS_PER_DAY_TOTAL:
-            return False
-        self._daily_count += 1
+        with self._lock:
+            now = int(time.time())
+            if now - self._daily_window_start >= 86400:
+                self._daily_window_start = now
+                self._daily_count = 0
+            if self._daily_count >= MAX_CONTRIB_EVENTS_PER_DAY_TOTAL:
+                return False
+            self._daily_count += 1
 
-        # Persist updated daily stats
         if self.db:
             try:
                 self.db.save_contribution_daily_stats(
                     self._daily_window_start, self._daily_count
                 )
             except Exception:
-                pass  # Non-critical, don't spam logs
+                pass
         return True
 
     def _allow_record(self, peer_id: str) -> bool:
-        """Check per-peer rate limit and global daily limit."""
-        # P5-02: Check global daily limit first
-        if not self._allow_daily_global():
-            return False
+        """Check per-peer rate limit and global daily limit (thread-safe)."""
+        with self._lock:
+            now = int(time.time())
 
-        now = int(time.time())
-        window_start, count = self._rate_limits.get(peer_id, (now, 0))
-        if now - window_start >= 3600:
-            window_start = now
-            count = 0
-        if count >= MAX_CONTRIB_EVENTS_PER_PEER_PER_HOUR:
-            return False
-        new_count = count + 1
-        self._rate_limits[peer_id] = (window_start, new_count)
+            # Reset daily counter if 24h have passed
+            if now - self._daily_window_start >= 86400:
+                self._daily_window_start = now
+                self._daily_count = 0
 
-        # Persist updated rate limit
+            # Check global daily limit
+            if self._daily_count >= MAX_CONTRIB_EVENTS_PER_DAY_TOTAL:
+                return False
+
+            # Check per-peer rate limit BEFORE incrementing daily counter
+            window_start, count = self._rate_limits.get(peer_id, (now, 0))
+            if now - window_start >= 3600:
+                window_start = now
+                count = 0
+            if count >= MAX_CONTRIB_EVENTS_PER_PEER_PER_HOUR:
+                return False
+
+            # Both limits passed — now increment both counters
+            self._daily_count += 1
+            new_count = count + 1
+            self._rate_limits[peer_id] = (window_start, new_count)
+
+        # Persist updated stats (outside lock — non-critical)
         if self.db:
             try:
+                self.db.save_contribution_daily_stats(
+                    self._daily_window_start, self._daily_count
+                )
                 self.db.save_contribution_rate_limit(peer_id, window_start, new_count)
             except Exception:
                 pass  # Non-critical, don't spam logs

@@ -543,9 +543,19 @@ def serialize(msg_type: HiveMessageType, payload: Dict[str, Any]) -> bytes:
     
     # JSON encode
     json_bytes = json.dumps(envelope, separators=(',', ':')).encode('utf-8')
-    
+
     # Prepend magic
-    return HIVE_MAGIC + json_bytes
+    result = HIVE_MAGIC + json_bytes
+
+    # Size check: reject messages exceeding wire limit
+    if len(result) > MAX_MESSAGE_BYTES:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"serialize: message too large ({len(result)} bytes > {MAX_MESSAGE_BYTES}), dropping"
+        )
+        return None
+
+    return result
 
 
 def deserialize(data: bytes) -> Tuple[Optional[HiveMessageType], Optional[Dict[str, Any]]]:

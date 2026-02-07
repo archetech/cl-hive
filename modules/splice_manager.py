@@ -15,6 +15,7 @@ Author: Lightning Goats Team
 
 import json
 import secrets
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -85,6 +86,9 @@ class SpliceManager:
         self.splice_coord = splice_coordinator
         self.our_pubkey = our_pubkey
 
+        # Lock protecting rate-limit trackers
+        self._lock = threading.Lock()
+
         # Rate limiting trackers
         self._init_rate: Dict[str, List[int]] = {}
         self._message_rate: Dict[str, List[int]] = {}
@@ -100,25 +104,27 @@ class SpliceManager:
         tracker: Dict[str, List[int]],
         limit: tuple
     ) -> bool:
-        """Check if sender is within rate limit."""
+        """Check if sender is within rate limit (thread-safe)."""
         max_count, window_seconds = limit
         now = int(time.time())
         cutoff = now - window_seconds
 
-        if sender_id not in tracker:
-            tracker[sender_id] = []
+        with self._lock:
+            if sender_id not in tracker:
+                tracker[sender_id] = []
 
-        # Remove old entries
-        tracker[sender_id] = [t for t in tracker[sender_id] if t > cutoff]
+            # Remove old entries
+            tracker[sender_id] = [t for t in tracker[sender_id] if t > cutoff]
 
-        return len(tracker[sender_id]) < max_count
+            return len(tracker[sender_id]) < max_count
 
     def _record_message(self, sender_id: str, tracker: Dict[str, List[int]]):
-        """Record a message for rate limiting."""
+        """Record a message for rate limiting (thread-safe)."""
         now = int(time.time())
-        if sender_id not in tracker:
-            tracker[sender_id] = []
-        tracker[sender_id].append(now)
+        with self._lock:
+            if sender_id not in tracker:
+                tracker[sender_id] = []
+            tracker[sender_id].append(now)
 
     def _generate_session_id(self) -> str:
         """Generate a unique session ID."""
@@ -236,6 +242,9 @@ class SpliceManager:
                 "error": "channel_mismatch",
                 "message": f"Channel ID mismatch: {channel_id} not found (scid={short_channel_id})"
             }
+
+        # Normalize channel_id to full format for consistent DB lookups
+        channel_id = full_channel_id
 
         # Check for active splice on this channel
         existing = self.db.get_active_splice_for_channel(channel_id)

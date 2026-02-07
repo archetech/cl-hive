@@ -181,4 +181,3 @@ Acceptance:
    - recommended safety env vars (`HIVE_ALLOW_INSECURE_TLS`, `HIVE_ALLOW_INSECURE_HTTP`)
    - expected timeout behavior
 2. Add `tools/README.md` describing the tool stack and how to run tests.
-

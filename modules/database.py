@@ -122,7 +122,10 @@ class HiveDatabase:
             yield conn
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass  # Don't mask the original exception
             raise
 
     def initialize(self):
@@ -1804,11 +1807,11 @@ class HiveDatabase:
         """Update ban proposal status (pending, approved, rejected, expired)."""
         conn = self._get_connection()
         try:
-            conn.execute("""
+            cursor = conn.execute("""
                 UPDATE ban_proposals SET status = ? WHERE proposal_id = ?
             """, (status, proposal_id))
             conn.commit()
-            return conn.total_changes > 0
+            return cursor.rowcount > 0
         except Exception:
             return False
 
@@ -1848,13 +1851,13 @@ class HiveDatabase:
     def cleanup_expired_ban_proposals(self, now: int) -> int:
         """Mark expired ban proposals and return count."""
         conn = self._get_connection()
-        conn.execute("""
+        cursor = conn.execute("""
             UPDATE ban_proposals
             SET status = 'expired'
             WHERE status = 'pending' AND expires_at < ?
         """, (now,))
         conn.commit()
-        return conn.total_changes
+        return cursor.rowcount
 
     # =========================================================================
     # PEER PRESENCE
