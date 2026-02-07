@@ -49,6 +49,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import ssl
 import sys
 import threading
@@ -97,7 +98,29 @@ HIVE_ALLOW_INSECURE_TLS = os.environ.get("HIVE_ALLOW_INSECURE_TLS", "false").low
 # Allow cleartext REST to non-local hosts (not recommended)
 HIVE_ALLOW_INSECURE_HTTP = os.environ.get("HIVE_ALLOW_INSECURE_HTTP", "false").lower() == "true"
 # Normalize tool responses (wrap in ok/data or ok/error)
-HIVE_NORMALIZE_RESPONSES = os.environ.get("HIVE_NORMALIZE_RESPONSES", "false").lower() == "true"
+HIVE_NORMALIZE_RESPONSES = os.environ.get("HIVE_NORMALIZE_RESPONSES", "true").lower() == "true"
+
+# Configurable timeouts
+HIVE_HTTP_TIMEOUT = float(os.environ.get("HIVE_HTTP_TIMEOUT", "30"))
+HIVE_DOCKER_TIMEOUT = float(os.environ.get("HIVE_DOCKER_TIMEOUT", "30"))
+
+# Optional RPC method allowlist (path to JSON file with list of allowed methods)
+HIVE_ALLOWED_METHODS_FILE = os.environ.get("HIVE_ALLOWED_METHODS")
+_allowed_methods: Optional[set] = None
+
+
+def _check_method_allowed(method: str) -> bool:
+    """Check if an RPC method is allowed by the optional allowlist."""
+    global _allowed_methods
+    if _allowed_methods is None:
+        if not HIVE_ALLOWED_METHODS_FILE:
+            return True  # No allowlist = allow all
+        try:
+            with open(HIVE_ALLOWED_METHODS_FILE) as f:
+                _allowed_methods = set(json.load(f))
+        except Exception:
+            return True
+    return method in _allowed_methods
 
 
 def load_strategy(name: str) -> str:
@@ -116,16 +139,26 @@ def load_strategy(name: str) -> str:
     if not STRATEGY_DIR:
         logger.debug(f"Strategy dir not set; skipping strategy load for {name}")
         return ""
+    # Reject names with path traversal characters
+    if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        logger.warning(f"Strategy name rejected (invalid chars): {name!r}")
+        return ""
     path = os.path.join(STRATEGY_DIR, f"{name}.md")
+    # Resolve and enforce directory boundary
+    resolved = os.path.realpath(path)
+    strategy_root = os.path.realpath(STRATEGY_DIR)
+    if not resolved.startswith(strategy_root + os.sep) and resolved != strategy_root:
+        logger.warning(f"Strategy path escaped directory: {name!r}")
+        return ""
     try:
-        with open(path, 'r') as f:
+        with open(resolved, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read().strip()
             if len(content) > STRATEGY_MAX_CHARS:
                 content = content[:STRATEGY_MAX_CHARS].rstrip() + "\n\n[truncated]"
             logger.debug(f"Loaded strategy prompt: {name}")
             return "\n\n" + content
     except FileNotFoundError:
-        logger.debug(f"Strategy file not found: {path}")
+        logger.debug(f"Strategy file not found: {resolved}")
         return ""
     except Exception as e:
         logger.warning(f"Error loading strategy {name}: {e}")
@@ -220,11 +253,12 @@ class NodeConnection:
                 )
             verify = False
 
+        # SECURITY: Never log self.rune or request headers containing it
         self.client = httpx.AsyncClient(
             base_url=self.rest_url,
             headers={"Rune": self.rune},
             verify=verify,
-            timeout=30.0
+            timeout=HIVE_HTTP_TIMEOUT
         )
         logger.info(f"Connected to {self.name} at {self.rest_url}")
 
@@ -235,6 +269,9 @@ class NodeConnection:
 
     async def call(self, method: str, params: Dict = None) -> Dict:
         """Call a CLN RPC method via REST or docker exec."""
+        if not _check_method_allowed(method):
+            return {"error": f"Method '{method}' not in allowlist"}
+
         # Docker exec mode (for Polar)
         if self.docker_container:
             return await self._call_docker(method, params)
@@ -264,8 +301,6 @@ class NodeConnection:
 
     async def _call_docker(self, method: str, params: Dict = None) -> Dict:
         """Call CLN via docker exec (for Polar testing)."""
-        import subprocess
-
         # Build command
         cmd = [
             "docker", "exec", self.docker_container,
@@ -288,16 +323,22 @@ class NodeConnection:
                     cmd.append(f"{key}={json.dumps(value)}")
 
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            if result.returncode != 0:
-                return {"error": result.stderr.strip()}
-            return json.loads(result.stdout) if result.stdout.strip() else {}
-        except subprocess.TimeoutExpired:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=HIVE_DOCKER_TIMEOUT
+            )
+            if proc.returncode != 0:
+                return {"error": stderr.decode().strip()[:500]}
+            return json.loads(stdout.decode()) if stdout.strip() else {}
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
             return {"error": "Command timed out"}
         except json.JSONDecodeError as e:
             return {"error": f"Invalid JSON response: {e}"}
@@ -310,6 +351,8 @@ class HiveFleet:
 
     def __init__(self):
         self.nodes: Dict[str, NodeConnection] = {}
+        self._node_semaphores: Dict[str, asyncio.Semaphore] = {}
+        self._max_concurrent_per_node = 5
 
     def load_config(self, config_path: str):
         """Load node configuration from JSON file.
@@ -363,6 +406,7 @@ class HiveFleet:
                     ca_cert=node_config.get("ca_cert")
                 )
             self.nodes[node.name] = node
+            self._node_semaphores[node.name] = asyncio.Semaphore(self._max_concurrent_per_node)
 
         logger.info(f"Loaded {len(self.nodes)} nodes from config (global_mode={global_mode})")
 
@@ -386,8 +430,13 @@ class HiveFleet:
     async def call_all(self, method: str, params: Dict = None, timeout: float = 30.0) -> Dict[str, Any]:
         """Call an RPC method on all nodes in parallel."""
         async def call_with_timeout(name: str, node: NodeConnection) -> tuple:
+            sem = self._node_semaphores.get(name)
             try:
-                result = await asyncio.wait_for(node.call(method, params), timeout=timeout)
+                if sem:
+                    async with sem:
+                        result = await asyncio.wait_for(node.call(method, params), timeout=timeout)
+                else:
+                    result = await asyncio.wait_for(node.call(method, params), timeout=timeout)
                 return (name, result)
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout calling {method} on {name}")
@@ -395,7 +444,7 @@ class HiveFleet:
             except Exception as e:
                 logger.error(f"Error calling {method} on {name}: {e}")
                 return (name, {"error": str(e)})
-        
+
         tasks = [call_with_timeout(name, node) for name, node in self.nodes.items()]
         results_list = await asyncio.gather(*tasks)
         return dict(results_list)
@@ -404,9 +453,9 @@ class HiveFleet:
         """Quick health check on all nodes - returns status without heavy operations."""
         async def check_node(name: str, node: NodeConnection) -> tuple:
             try:
-                start = asyncio.get_event_loop().time()
+                start = asyncio.get_running_loop().time()
                 result = await asyncio.wait_for(node.call("getinfo"), timeout=timeout)
-                latency = asyncio.get_event_loop().time() - start
+                latency = asyncio.get_running_loop().time() - start
                 if "error" in result:
                     return (name, {"status": "error", "error": result["error"]})
                 return (name, {
@@ -3528,321 +3577,18 @@ Provides comprehensive view of MCF optimizer health including:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
-    """Handle tool calls."""
-
+    """Handle tool calls via registry dispatch."""
     try:
         if name == "hive_health":
+            # Special case: inline handler with custom argument extraction
             timeout = arguments.get("timeout", 5.0)
             result = await fleet.health_check(timeout=timeout)
-        elif name == "hive_fleet_snapshot":
-            result = await handle_fleet_snapshot(arguments)
-        elif name == "hive_anomalies":
-            result = await handle_anomalies(arguments)
-        elif name == "hive_compare_periods":
-            result = await handle_compare_periods(arguments)
-        elif name == "hive_channel_deep_dive":
-            result = await handle_channel_deep_dive(arguments)
-        elif name == "hive_recommended_actions":
-            result = await handle_recommended_actions(arguments)
-        elif name == "hive_peer_search":
-            result = await handle_peer_search(arguments)
-        elif name == "hive_status":
-            result = await handle_hive_status(arguments)
-        elif name == "hive_pending_actions":
-            result = await handle_pending_actions(arguments)
-        elif name == "hive_approve_action":
-            result = await handle_approve_action(arguments)
-        elif name == "hive_reject_action":
-            result = await handle_reject_action(arguments)
-        elif name == "hive_members":
-            result = await handle_members(arguments)
-        elif name == "hive_onboard_new_members":
-            result = await handle_onboard_new_members(arguments)
-        elif name == "hive_propose_promotion":
-            result = await handle_propose_promotion(arguments)
-        elif name == "hive_vote_promotion":
-            result = await handle_vote_promotion(arguments)
-        elif name == "hive_pending_promotions":
-            result = await handle_pending_promotions(arguments)
-        elif name == "hive_execute_promotion":
-            result = await handle_execute_promotion(arguments)
-        elif name == "hive_node_info":
-            result = await handle_node_info(arguments)
-        elif name == "hive_channels":
-            result = await handle_channels(arguments)
-        elif name == "hive_set_fees":
-            result = await handle_set_fees(arguments)
-        elif name == "hive_topology_analysis":
-            result = await handle_topology_analysis(arguments)
-        elif name == "hive_planner_ignore":
-            result = await handle_planner_ignore(arguments)
-        elif name == "hive_planner_unignore":
-            result = await handle_planner_unignore(arguments)
-        elif name == "hive_planner_ignored_peers":
-            result = await handle_planner_ignored_peers(arguments)
-        elif name == "hive_governance_mode":
-            result = await handle_governance_mode(arguments)
-        elif name == "hive_expansion_mode":
-            result = await handle_expansion_mode(arguments)
-        elif name == "hive_bump_version":
-            result = await handle_bump_version(arguments)
-        elif name == "hive_gossip_stats":
-            result = await handle_gossip_stats(arguments)
-        # Splice coordination tools
-        elif name == "hive_splice_check":
-            result = await handle_splice_check(arguments)
-        elif name == "hive_splice_recommendations":
-            result = await handle_splice_recommendations(arguments)
-        elif name == "hive_splice":
-            result = await handle_splice(arguments)
-        elif name == "hive_splice_status":
-            result = await handle_splice_status(arguments)
-        elif name == "hive_splice_abort":
-            result = await handle_splice_abort(arguments)
-        elif name == "hive_liquidity_intelligence":
-            result = await handle_liquidity_intelligence(arguments)
-        # Anticipatory Liquidity tools (Phase 7.1)
-        elif name == "hive_anticipatory_status":
-            result = await handle_anticipatory_status(arguments)
-        elif name == "hive_detect_patterns":
-            result = await handle_detect_patterns(arguments)
-        elif name == "hive_predict_liquidity":
-            result = await handle_predict_liquidity(arguments)
-        elif name == "hive_anticipatory_predictions":
-            result = await handle_anticipatory_predictions(arguments)
-        # Time-Based Fee tools (Phase 7.4)
-        elif name == "hive_time_fee_status":
-            result = await handle_time_fee_status(arguments)
-        elif name == "hive_time_fee_adjustment":
-            result = await handle_time_fee_adjustment(arguments)
-        elif name == "hive_time_peak_hours":
-            result = await handle_time_peak_hours(arguments)
-        elif name == "hive_time_low_hours":
-            result = await handle_time_low_hours(arguments)
-        # Routing Intelligence tools (Pheromones + Stigmergic Markers)
-        elif name == "hive_backfill_routing_intelligence":
-            result = await handle_backfill_routing_intelligence(arguments)
-        elif name == "hive_routing_intelligence_status":
-            result = await handle_routing_intelligence_status(arguments)
-        # cl-revenue-ops tools
-        elif name == "revenue_status":
-            result = await handle_revenue_status(arguments)
-        elif name == "revenue_profitability":
-            result = await handle_revenue_profitability(arguments)
-        elif name == "revenue_dashboard":
-            result = await handle_revenue_dashboard(arguments)
-        elif name == "revenue_portfolio":
-            result = await handle_revenue_portfolio(arguments)
-        elif name == "revenue_portfolio_summary":
-            result = await handle_revenue_portfolio_summary(arguments)
-        elif name == "revenue_portfolio_rebalance":
-            result = await handle_revenue_portfolio_rebalance(arguments)
-        elif name == "revenue_portfolio_correlations":
-            result = await handle_revenue_portfolio_correlations(arguments)
-        elif name == "revenue_policy":
-            result = await handle_revenue_policy(arguments)
-        elif name == "revenue_set_fee":
-            result = await handle_revenue_set_fee(arguments)
-        elif name == "revenue_rebalance":
-            result = await handle_revenue_rebalance(arguments)
-        elif name == "revenue_report":
-            result = await handle_revenue_report(arguments)
-        elif name == "revenue_config":
-            result = await handle_revenue_config(arguments)
-        elif name == "revenue_debug":
-            result = await handle_revenue_debug(arguments)
-        elif name == "revenue_history":
-            result = await handle_revenue_history(arguments)
-        elif name == "revenue_outgoing":
-            result = await handle_revenue_outgoing(arguments)
-        elif name == "revenue_competitor_analysis":
-            result = await handle_revenue_competitor_analysis(arguments)
-        elif name == "goat_feeder_history":
-            result = await handle_goat_feeder_history(arguments)
-        elif name == "goat_feeder_trends":
-            result = await handle_goat_feeder_trends(arguments)
-        # Advisor database tools
-        elif name == "advisor_record_snapshot":
-            result = await handle_advisor_record_snapshot(arguments)
-        elif name == "advisor_get_trends":
-            result = await handle_advisor_get_trends(arguments)
-        elif name == "advisor_get_velocities":
-            result = await handle_advisor_get_velocities(arguments)
-        elif name == "advisor_get_channel_history":
-            result = await handle_advisor_get_channel_history(arguments)
-        elif name == "advisor_record_decision":
-            result = await handle_advisor_record_decision(arguments)
-        elif name == "advisor_get_recent_decisions":
-            result = await handle_advisor_get_recent_decisions(arguments)
-        elif name == "advisor_db_stats":
-            result = await handle_advisor_db_stats(arguments)
-        # New advisor intelligence tools
-        elif name == "advisor_get_context_brief":
-            result = await handle_advisor_get_context_brief(arguments)
-        elif name == "advisor_check_alert":
-            result = await handle_advisor_check_alert(arguments)
-        elif name == "advisor_record_alert":
-            result = await handle_advisor_record_alert(arguments)
-        elif name == "advisor_resolve_alert":
-            result = await handle_advisor_resolve_alert(arguments)
-        elif name == "advisor_get_peer_intel":
-            result = await handle_advisor_get_peer_intel(arguments)
-        elif name == "advisor_measure_outcomes":
-            result = await handle_advisor_measure_outcomes(arguments)
-        # Proactive Advisor tools
-        elif name == "advisor_run_cycle":
-            result = await handle_advisor_run_cycle(arguments)
-        elif name == "advisor_run_cycle_all":
-            result = await handle_advisor_run_cycle_all(arguments)
-        elif name == "advisor_get_goals":
-            result = await handle_advisor_get_goals(arguments)
-        elif name == "advisor_set_goal":
-            result = await handle_advisor_set_goal(arguments)
-        elif name == "advisor_get_learning":
-            result = await handle_advisor_get_learning(arguments)
-        elif name == "advisor_get_status":
-            result = await handle_advisor_get_status(arguments)
-        elif name == "advisor_get_cycle_history":
-            result = await handle_advisor_get_cycle_history(arguments)
-        elif name == "advisor_scan_opportunities":
-            result = await handle_advisor_scan_opportunities(arguments)
-        # Routing Pool tools
-        elif name == "pool_status":
-            result = await handle_pool_status(arguments)
-        elif name == "pool_member_status":
-            result = await handle_pool_member_status(arguments)
-        elif name == "pool_distribution":
-            result = await handle_pool_distribution(arguments)
-        elif name == "pool_snapshot":
-            result = await handle_pool_snapshot(arguments)
-        elif name == "pool_settle":
-            result = await handle_pool_settle(arguments)
-        # Phase 1: Yield Metrics tools
-        elif name == "yield_metrics":
-            result = await handle_yield_metrics(arguments)
-        elif name == "yield_summary":
-            result = await handle_yield_summary(arguments)
-        elif name == "velocity_prediction":
-            result = await handle_velocity_prediction(arguments)
-        elif name == "critical_velocity":
-            result = await handle_critical_velocity(arguments)
-        elif name == "internal_competition":
-            result = await handle_internal_competition(arguments)
-        # Kalman Velocity Integration tools
-        elif name == "kalman_velocity_query":
-            result = await handle_kalman_velocity_query(arguments)
-        # Phase 2: Fee Coordination tools
-        elif name == "coord_fee_recommendation":
-            result = await handle_coord_fee_recommendation(arguments)
-        elif name == "corridor_assignments":
-            result = await handle_corridor_assignments(arguments)
-        elif name == "stigmergic_markers":
-            result = await handle_stigmergic_markers(arguments)
-        elif name == "defense_status":
-            result = await handle_defense_status(arguments)
-        elif name == "ban_candidates":
-            result = await handle_ban_candidates(arguments)
-        elif name == "accumulated_warnings":
-            result = await handle_accumulated_warnings(arguments)
-        elif name == "pheromone_levels":
-            result = await handle_pheromone_levels(arguments)
-        elif name == "fee_coordination_status":
-            result = await handle_fee_coordination_status(arguments)
-        # Phase 3: Cost Reduction tools
-        elif name == "rebalance_recommendations":
-            result = await handle_rebalance_recommendations(arguments)
-        elif name == "fleet_rebalance_path":
-            result = await handle_fleet_rebalance_path(arguments)
-        elif name == "circular_flow_status":
-            result = await handle_circular_flow_status(arguments)
-        elif name == "execute_hive_circular_rebalance":
-            result = await handle_execute_hive_circular_rebalance(arguments)
-        elif name == "cost_reduction_status":
-            result = await handle_cost_reduction_status(arguments)
-        # Routing Intelligence tools
-        elif name == "routing_stats":
-            result = await handle_routing_stats(arguments)
-        elif name == "route_suggest":
-            result = await handle_route_suggest(arguments)
-        # Channel Rationalization tools
-        elif name == "coverage_analysis":
-            result = await handle_coverage_analysis(arguments)
-        elif name == "close_recommendations":
-            result = await handle_close_recommendations(arguments)
-        elif name == "rationalization_summary":
-            result = await handle_rationalization_summary(arguments)
-        elif name == "rationalization_status":
-            result = await handle_rationalization_status(arguments)
-        # Phase 5: Strategic Positioning
-        elif name == "valuable_corridors":
-            result = await handle_valuable_corridors(arguments)
-        elif name == "exchange_coverage":
-            result = await handle_exchange_coverage(arguments)
-        elif name == "positioning_recommendations":
-            result = await handle_positioning_recommendations(arguments)
-        elif name == "flow_recommendations":
-            result = await handle_flow_recommendations(arguments)
-        elif name == "positioning_summary":
-            result = await handle_positioning_summary(arguments)
-        elif name == "positioning_status":
-            result = await handle_positioning_status(arguments)
-        # Physarum Auto-Trigger tools (Phase 7.2)
-        elif name == "physarum_cycle":
-            result = await handle_physarum_cycle(arguments)
-        elif name == "physarum_status":
-            result = await handle_physarum_status(arguments)
-        # Settlement tools (BOLT12 Revenue Distribution)
-        elif name == "settlement_register_offer":
-            result = await handle_settlement_register_offer(arguments)
-        elif name == "settlement_generate_offer":
-            result = await handle_settlement_generate_offer(arguments)
-        elif name == "settlement_list_offers":
-            result = await handle_settlement_list_offers(arguments)
-        elif name == "settlement_calculate":
-            result = await handle_settlement_calculate(arguments)
-        elif name == "settlement_execute":
-            result = await handle_settlement_execute(arguments)
-        elif name == "settlement_history":
-            result = await handle_settlement_history(arguments)
-        elif name == "settlement_period_details":
-            result = await handle_settlement_period_details(arguments)
-        # Phase 12: Distributed Settlement
-        elif name == "distributed_settlement_status":
-            result = await handle_distributed_settlement_status(arguments)
-        elif name == "distributed_settlement_proposals":
-            result = await handle_distributed_settlement_proposals(arguments)
-        elif name == "distributed_settlement_participation":
-            result = await handle_distributed_settlement_participation(arguments)
-        # Network Metrics
-        elif name == "hive_network_metrics":
-            result = await handle_network_metrics(arguments)
-        elif name == "hive_rebalance_hubs":
-            result = await handle_rebalance_hubs(arguments)
-        elif name == "hive_rebalance_path":
-            result = await handle_rebalance_path(arguments)
-        # Fleet Health Monitoring
-        elif name == "hive_fleet_health":
-            result = await handle_fleet_health(arguments)
-        elif name == "hive_connectivity_alerts":
-            result = await handle_connectivity_alerts(arguments)
-        elif name == "hive_member_connectivity":
-            result = await handle_member_connectivity(arguments)
-        # Promotion Criteria
-        elif name == "hive_neophyte_rankings":
-            result = await handle_neophyte_rankings(arguments)
-        # MCF (Min-Cost Max-Flow) Optimization tools (Phase 15)
-        elif name == "hive_mcf_status":
-            result = await handle_mcf_status(arguments)
-        elif name == "hive_mcf_solve":
-            result = await handle_mcf_solve(arguments)
-        elif name == "hive_mcf_assignments":
-            result = await handle_mcf_assignments(arguments)
-        elif name == "hive_mcf_optimized_path":
-            result = await handle_mcf_optimized_path(arguments)
-        elif name == "hive_mcf_health":
-            result = await handle_mcf_health(arguments)
         else:
-            result = {"error": f"Unknown tool: {name}"}
+            handler = TOOL_HANDLERS.get(name)
+            if handler is None:
+                result = {"error": f"Unknown tool: {name}"}
+            else:
+                result = await handler(arguments)
 
         if HIVE_NORMALIZE_RESPONSES:
             result = _normalize_response(result)
@@ -9203,6 +8949,180 @@ async def handle_mcf_health(args: Dict) -> Dict:
         )
 
     return health_result
+
+
+# =============================================================================
+# Tool Dispatch Registry
+# =============================================================================
+
+TOOL_HANDLERS: Dict[str, Any] = {
+    # Hive core tools
+    "hive_fleet_snapshot": handle_fleet_snapshot,
+    "hive_anomalies": handle_anomalies,
+    "hive_compare_periods": handle_compare_periods,
+    "hive_channel_deep_dive": handle_channel_deep_dive,
+    "hive_recommended_actions": handle_recommended_actions,
+    "hive_peer_search": handle_peer_search,
+    "hive_status": handle_hive_status,
+    "hive_pending_actions": handle_pending_actions,
+    "hive_approve_action": handle_approve_action,
+    "hive_reject_action": handle_reject_action,
+    "hive_members": handle_members,
+    "hive_onboard_new_members": handle_onboard_new_members,
+    "hive_propose_promotion": handle_propose_promotion,
+    "hive_vote_promotion": handle_vote_promotion,
+    "hive_pending_promotions": handle_pending_promotions,
+    "hive_execute_promotion": handle_execute_promotion,
+    "hive_node_info": handle_node_info,
+    "hive_channels": handle_channels,
+    "hive_set_fees": handle_set_fees,
+    "hive_topology_analysis": handle_topology_analysis,
+    "hive_planner_ignore": handle_planner_ignore,
+    "hive_planner_unignore": handle_planner_unignore,
+    "hive_planner_ignored_peers": handle_planner_ignored_peers,
+    "hive_governance_mode": handle_governance_mode,
+    "hive_expansion_mode": handle_expansion_mode,
+    "hive_bump_version": handle_bump_version,
+    "hive_gossip_stats": handle_gossip_stats,
+    # Splice coordination
+    "hive_splice_check": handle_splice_check,
+    "hive_splice_recommendations": handle_splice_recommendations,
+    "hive_splice": handle_splice,
+    "hive_splice_status": handle_splice_status,
+    "hive_splice_abort": handle_splice_abort,
+    "hive_liquidity_intelligence": handle_liquidity_intelligence,
+    # Anticipatory Liquidity (Phase 7.1)
+    "hive_anticipatory_status": handle_anticipatory_status,
+    "hive_detect_patterns": handle_detect_patterns,
+    "hive_predict_liquidity": handle_predict_liquidity,
+    "hive_anticipatory_predictions": handle_anticipatory_predictions,
+    # Time-Based Fee (Phase 7.4)
+    "hive_time_fee_status": handle_time_fee_status,
+    "hive_time_fee_adjustment": handle_time_fee_adjustment,
+    "hive_time_peak_hours": handle_time_peak_hours,
+    "hive_time_low_hours": handle_time_low_hours,
+    # Routing Intelligence (Pheromones + Stigmergic Markers)
+    "hive_backfill_routing_intelligence": handle_backfill_routing_intelligence,
+    "hive_routing_intelligence_status": handle_routing_intelligence_status,
+    # cl-revenue-ops
+    "revenue_status": handle_revenue_status,
+    "revenue_profitability": handle_revenue_profitability,
+    "revenue_dashboard": handle_revenue_dashboard,
+    "revenue_portfolio": handle_revenue_portfolio,
+    "revenue_portfolio_summary": handle_revenue_portfolio_summary,
+    "revenue_portfolio_rebalance": handle_revenue_portfolio_rebalance,
+    "revenue_portfolio_correlations": handle_revenue_portfolio_correlations,
+    "revenue_policy": handle_revenue_policy,
+    "revenue_set_fee": handle_revenue_set_fee,
+    "revenue_rebalance": handle_revenue_rebalance,
+    "revenue_report": handle_revenue_report,
+    "revenue_config": handle_revenue_config,
+    "revenue_debug": handle_revenue_debug,
+    "revenue_history": handle_revenue_history,
+    "revenue_outgoing": handle_revenue_outgoing,
+    "revenue_competitor_analysis": handle_revenue_competitor_analysis,
+    "goat_feeder_history": handle_goat_feeder_history,
+    "goat_feeder_trends": handle_goat_feeder_trends,
+    # Advisor database
+    "advisor_record_snapshot": handle_advisor_record_snapshot,
+    "advisor_get_trends": handle_advisor_get_trends,
+    "advisor_get_velocities": handle_advisor_get_velocities,
+    "advisor_get_channel_history": handle_advisor_get_channel_history,
+    "advisor_record_decision": handle_advisor_record_decision,
+    "advisor_get_recent_decisions": handle_advisor_get_recent_decisions,
+    "advisor_db_stats": handle_advisor_db_stats,
+    # Advisor intelligence
+    "advisor_get_context_brief": handle_advisor_get_context_brief,
+    "advisor_check_alert": handle_advisor_check_alert,
+    "advisor_record_alert": handle_advisor_record_alert,
+    "advisor_resolve_alert": handle_advisor_resolve_alert,
+    "advisor_get_peer_intel": handle_advisor_get_peer_intel,
+    "advisor_measure_outcomes": handle_advisor_measure_outcomes,
+    # Proactive Advisor
+    "advisor_run_cycle": handle_advisor_run_cycle,
+    "advisor_run_cycle_all": handle_advisor_run_cycle_all,
+    "advisor_get_goals": handle_advisor_get_goals,
+    "advisor_set_goal": handle_advisor_set_goal,
+    "advisor_get_learning": handle_advisor_get_learning,
+    "advisor_get_status": handle_advisor_get_status,
+    "advisor_get_cycle_history": handle_advisor_get_cycle_history,
+    "advisor_scan_opportunities": handle_advisor_scan_opportunities,
+    # Routing Pool
+    "pool_status": handle_pool_status,
+    "pool_member_status": handle_pool_member_status,
+    "pool_distribution": handle_pool_distribution,
+    "pool_snapshot": handle_pool_snapshot,
+    "pool_settle": handle_pool_settle,
+    # Phase 1: Yield Metrics
+    "yield_metrics": handle_yield_metrics,
+    "yield_summary": handle_yield_summary,
+    "velocity_prediction": handle_velocity_prediction,
+    "critical_velocity": handle_critical_velocity,
+    "internal_competition": handle_internal_competition,
+    # Kalman Velocity Integration
+    "kalman_velocity_query": handle_kalman_velocity_query,
+    # Phase 2: Fee Coordination
+    "coord_fee_recommendation": handle_coord_fee_recommendation,
+    "corridor_assignments": handle_corridor_assignments,
+    "stigmergic_markers": handle_stigmergic_markers,
+    "defense_status": handle_defense_status,
+    "ban_candidates": handle_ban_candidates,
+    "accumulated_warnings": handle_accumulated_warnings,
+    "pheromone_levels": handle_pheromone_levels,
+    "fee_coordination_status": handle_fee_coordination_status,
+    # Phase 3: Cost Reduction
+    "rebalance_recommendations": handle_rebalance_recommendations,
+    "fleet_rebalance_path": handle_fleet_rebalance_path,
+    "circular_flow_status": handle_circular_flow_status,
+    "execute_hive_circular_rebalance": handle_execute_hive_circular_rebalance,
+    "cost_reduction_status": handle_cost_reduction_status,
+    # Routing Intelligence
+    "routing_stats": handle_routing_stats,
+    "route_suggest": handle_route_suggest,
+    # Channel Rationalization
+    "coverage_analysis": handle_coverage_analysis,
+    "close_recommendations": handle_close_recommendations,
+    "rationalization_summary": handle_rationalization_summary,
+    "rationalization_status": handle_rationalization_status,
+    # Phase 5: Strategic Positioning
+    "valuable_corridors": handle_valuable_corridors,
+    "exchange_coverage": handle_exchange_coverage,
+    "positioning_recommendations": handle_positioning_recommendations,
+    "flow_recommendations": handle_flow_recommendations,
+    "positioning_summary": handle_positioning_summary,
+    "positioning_status": handle_positioning_status,
+    # Physarum Auto-Trigger (Phase 7.2)
+    "physarum_cycle": handle_physarum_cycle,
+    "physarum_status": handle_physarum_status,
+    # Settlement (BOLT12 Revenue Distribution)
+    "settlement_register_offer": handle_settlement_register_offer,
+    "settlement_generate_offer": handle_settlement_generate_offer,
+    "settlement_list_offers": handle_settlement_list_offers,
+    "settlement_calculate": handle_settlement_calculate,
+    "settlement_execute": handle_settlement_execute,
+    "settlement_history": handle_settlement_history,
+    "settlement_period_details": handle_settlement_period_details,
+    # Phase 12: Distributed Settlement
+    "distributed_settlement_status": handle_distributed_settlement_status,
+    "distributed_settlement_proposals": handle_distributed_settlement_proposals,
+    "distributed_settlement_participation": handle_distributed_settlement_participation,
+    # Network Metrics
+    "hive_network_metrics": handle_network_metrics,
+    "hive_rebalance_hubs": handle_rebalance_hubs,
+    "hive_rebalance_path": handle_rebalance_path,
+    # Fleet Health Monitoring
+    "hive_fleet_health": handle_fleet_health,
+    "hive_connectivity_alerts": handle_connectivity_alerts,
+    "hive_member_connectivity": handle_member_connectivity,
+    # Promotion Criteria
+    "hive_neophyte_rankings": handle_neophyte_rankings,
+    # MCF (Min-Cost Max-Flow) Optimization (Phase 15)
+    "hive_mcf_status": handle_mcf_status,
+    "hive_mcf_solve": handle_mcf_solve,
+    "hive_mcf_assignments": handle_mcf_assignments,
+    "hive_mcf_optimized_path": handle_mcf_optimized_path,
+    "hive_mcf_health": handle_mcf_health,
+}
 
 
 # =============================================================================
