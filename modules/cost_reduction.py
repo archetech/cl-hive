@@ -1208,7 +1208,9 @@ class CircularFlowDetector:
                 if cf.total_amount_sats < min_amount_sats:
                     continue
 
-                recommendation = self._generate_recommendation(cf.cycle)
+                recommendation = self._get_circular_flow_recommendation(
+                    cf.cycle, cf.total_amount_sats, cf.total_cost_sats
+                )
 
                 shareable.append({
                     "members_involved": cf.cycle,
@@ -1290,7 +1292,9 @@ class CircularFlowDetector:
                     "total_amount_sats": cf.total_amount_sats,
                     "total_cost_sats": cf.total_cost_sats,
                     "cycle_count": cf.cycle_count,
-                    "recommendation": self._generate_recommendation(cf.cycle)
+                    "recommendation": self._get_circular_flow_recommendation(
+                        cf.cycle, cf.total_amount_sats, cf.total_cost_sats
+                    )
                 })
         except Exception:
             pass

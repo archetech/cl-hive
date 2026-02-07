@@ -700,7 +700,7 @@ plugin.add_option(
 
 plugin.add_option(
     name='hive-probation-days',
-    default='30',
+    default='90',
     description='Minimum days as Neophyte before promotion eligibility',
     dynamic=True
 )
@@ -2846,7 +2846,7 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
     # Handle contribution tracking
     if contribution_mgr:
         try:
-            contribution_mgr.handle_forward_event({"forward_event": forward_event})
+            contribution_mgr.handle_forward_event(forward_event)
         except Exception as e:
             if safe_plugin:
                 safe_plugin.log(f"Forward event handling error: {e}", level="warn")
@@ -3359,8 +3359,8 @@ def _broadcast_to_members(message_bytes: bytes) -> int:
     sent_count = 0
     for member in database.get_all_members():
         tier = member.get("tier")
-        # Broadcast to both members and admins
-        if tier not in (MembershipTier.MEMBER.value,):
+        # Broadcast to all tiers (member, neophyte)
+        if tier not in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value):
             continue
         member_id = member["peer_id"]
         if member_id == our_pubkey:
@@ -3401,7 +3401,7 @@ def _outbox_get_member_ids() -> List[str]:
         return []
     return [
         m["peer_id"] for m in database.get_all_members()
-        if m.get("tier") in (MembershipTier.MEMBER.value,)
+        if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value)
     ]
 
 

@@ -119,7 +119,7 @@ def _check_method_allowed(method: str) -> bool:
             with open(HIVE_ALLOWED_METHODS_FILE) as f:
                 _allowed_methods = set(json.load(f))
         except Exception:
-            return True
+            return False
     return method in _allowed_methods
 
 

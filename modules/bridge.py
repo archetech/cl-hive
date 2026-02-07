@@ -18,6 +18,7 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -116,6 +117,7 @@ class CircuitBreaker:
         self.reset_timeout = reset_timeout
         self.half_open_success_threshold = half_open_success_threshold
 
+        self._lock = threading.RLock()
         self._state = CircuitState.CLOSED
         self._failure_count = 0
         self._half_open_success_count = 0  # Track consecutive successes in HALF_OPEN
@@ -125,17 +127,17 @@ class CircuitBreaker:
     @property
     def state(self) -> CircuitState:
         """Get current state, checking for automatic transitions."""
-        if self._state == CircuitState.OPEN:
-            # Check if we should transition to HALF_OPEN
-            now = int(time.time())
-            if now - self._last_failure_time >= self.reset_timeout:
-                self._state = CircuitState.HALF_OPEN
-        return self._state
-    
+        with self._lock:
+            if self._state == CircuitState.OPEN:
+                now = int(time.time())
+                if now - self._last_failure_time >= self.reset_timeout:
+                    self._state = CircuitState.HALF_OPEN
+            return self._state
+
     def is_available(self) -> bool:
         """Check if requests can be made (not OPEN)."""
         return self.state != CircuitState.OPEN
-    
+
     def record_success(self) -> None:
         """
         Record a successful call.
@@ -144,50 +146,50 @@ class CircuitBreaker:
         successes before fully closing the circuit to prevent rapid flapping
         with unstable dependencies.
         """
-        self._failure_count = 0
-        self._last_success_time = int(time.time())
+        with self._lock:
+            self._failure_count = 0
+            self._last_success_time = int(time.time())
 
-        if self._state == CircuitState.HALF_OPEN:
-            self._half_open_success_count += 1
-            # Only close after multiple consecutive successes
-            if self._half_open_success_count >= self.half_open_success_threshold:
-                self._state = CircuitState.CLOSED
+            if self._state == CircuitState.HALF_OPEN:
+                self._half_open_success_count += 1
+                if self._half_open_success_count >= self.half_open_success_threshold:
+                    self._state = CircuitState.CLOSED
+                    self._half_open_success_count = 0
+            else:
                 self._half_open_success_count = 0
-        else:
-            # Reset counter when in CLOSED state
-            self._half_open_success_count = 0
-    
+
     def record_failure(self) -> None:
         """Record a failed call."""
-        self._failure_count += 1
-        self._last_failure_time = int(time.time())
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = int(time.time())
 
-        if self._state == CircuitState.HALF_OPEN:
-            # Probe failed, re-open the circuit and reset success counter
-            self._state = CircuitState.OPEN
-            self._half_open_success_count = 0
-        elif self._failure_count >= self.max_failures:
-            # Too many failures, open the circuit
-            self._state = CircuitState.OPEN
-    
+            if self._state == CircuitState.HALF_OPEN:
+                self._state = CircuitState.OPEN
+                self._half_open_success_count = 0
+            elif self._failure_count >= self.max_failures:
+                self._state = CircuitState.OPEN
+
     def reset(self) -> None:
         """Reset circuit breaker to initial state."""
-        self._state = CircuitState.CLOSED
-        self._failure_count = 0
-        self._half_open_success_count = 0
-        self._last_failure_time = 0
-    
+        with self._lock:
+            self._state = CircuitState.CLOSED
+            self._failure_count = 0
+            self._half_open_success_count = 0
+            self._last_failure_time = 0
+
     def get_stats(self) -> Dict[str, Any]:
         """Get circuit breaker statistics."""
-        return {
-            "name": self.name,
-            "state": self.state.value,
-            "failure_count": self._failure_count,
-            "max_failures": self.max_failures,
-            "reset_timeout": self.reset_timeout,
-            "last_failure_ago": int(time.time()) - self._last_failure_time if self._last_failure_time else None,
-            "last_success_ago": int(time.time()) - self._last_success_time if self._last_success_time else None
-        }
+        with self._lock:
+            return {
+                "name": self.name,
+                "state": self.state.value,
+                "failure_count": self._failure_count,
+                "max_failures": self.max_failures,
+                "reset_timeout": self.reset_timeout,
+                "last_failure_ago": int(time.time()) - self._last_failure_time if self._last_failure_time else None,
+                "last_success_ago": int(time.time()) - self._last_success_time if self._last_success_time else None
+            }
 
 
 # =============================================================================
@@ -520,6 +522,7 @@ class Bridge:
             self._log(f"RPC call {method} timed out: {e}", level='warn')
             raise
         except Exception as e:
+            cb.record_failure()
             self._log(f"RPC call {method} failed: {e}", level='warn')
             raise
     

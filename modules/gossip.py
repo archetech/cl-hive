@@ -482,11 +482,12 @@ class GossipManager:
         """
         # Per-peer rate limit to prevent DoS via repeated FULL_SYNC
         now = time.time()
-        last_sync = self._full_sync_times.get(sender_id, 0)
-        if now - last_sync < FULL_SYNC_COOLDOWN:
-            self._log(f"Rate-limited FULL_SYNC from {sender_id[:16]}...", level="warn")
-            return 0
-        self._full_sync_times[sender_id] = now
+        with self._lock:
+            last_sync = self._full_sync_times.get(sender_id, 0)
+            if now - last_sync < FULL_SYNC_COOLDOWN:
+                self._log(f"Rate-limited FULL_SYNC from {sender_id[:16]}...", level="warn")
+                return 0
+            self._full_sync_times[sender_id] = now
 
         states = payload.get('states', [])
 

@@ -17,6 +17,7 @@ How this helps without fund transfer:
 Security: All operations use cryptographic signatures.
 """
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -156,6 +157,9 @@ class LiquidityCoordinator:
         self.our_pubkey = our_pubkey
         self.fee_intel_mgr = fee_intel_mgr
         self.state_manager = state_manager
+
+        # Lock protecting in-memory state
+        self._lock = threading.Lock()
 
         # In-memory tracking
         self._liquidity_needs: Dict[str, LiquidityNeed] = {}  # reporter_id -> need
