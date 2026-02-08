@@ -1313,7 +1313,7 @@ class Planner:
             hive_share = hive_capacity / public_capacity
 
         # Check saturation threshold
-        is_saturated = hive_share >= cfg.market_share_cap_pct
+        is_saturated = hive_share >= getattr(cfg, 'market_share_cap_pct', 0.20)
 
         # Check release threshold (hysteresis)
         should_release = hive_share < SATURATION_RELEASE_THRESHOLD_PCT
@@ -1978,6 +1978,35 @@ class Planner:
             )
             return decisions
 
+        # Feerate gate: block expansions when on-chain fees are too high
+        max_feerate = getattr(cfg, 'max_expansion_feerate_perkb', 5000)
+        if max_feerate != 0 and self.plugin:
+            try:
+                feerates = self.plugin.rpc.feerates("perkb")
+                opening_feerate = feerates.get("perkb", {}).get("opening")
+                if opening_feerate is None:
+                    opening_feerate = feerates.get("perkb", {}).get("min_acceptable", 0)
+
+                if opening_feerate > 0 and opening_feerate > max_feerate:
+                    self._log(
+                        f"Feerate gate: expansion blocked, opening feerate "
+                        f"{opening_feerate} sat/kB > max {max_feerate} sat/kB",
+                        level='info'
+                    )
+                    self.db.log_planner_action(
+                        action_type='expansion',
+                        result='skipped',
+                        details={
+                            'reason': 'feerate_too_high',
+                            'opening_feerate': opening_feerate,
+                            'max_feerate': max_feerate,
+                            'run_id': run_id
+                        }
+                    )
+                    return decisions
+            except Exception as e:
+                self._log(f"Feerate check failed, allowing expansion: {e}", level='debug')
+
         # Check onchain balance with realistic threshold
         # The threshold includes: channel size + safety reserve + on-chain fee buffer
         onchain_balance = self._get_local_onchain_balance()
@@ -2206,7 +2235,7 @@ class Planner:
                     decisions[-1]['governance_result'] = 'error'
             else:
                 # Fallback: Manual governance handling (backwards compatibility)
-                if cfg.governance_mode == 'failsafe':
+                if getattr(cfg, 'governance_mode', 'advisor') == 'failsafe':
                     self._broadcast_intent(intent)
                     decisions[-1]['broadcast'] = True
                 else:
@@ -2223,7 +2252,7 @@ class Planner:
                         expires_hours=24
                     )
                     self._log(
-                        f"Action queued for approval (id={action_id}, mode={cfg.governance_mode})",
+                        f"Action queued for approval (id={action_id}, mode={getattr(cfg, 'governance_mode', 'advisor')})",
                         level='info'
                     )
                     decisions[-1]['broadcast'] = False

@@ -336,6 +336,20 @@ class GossipManager:
             self._log(f"Rejected gossip: sender mismatch "
                      f"({sender_id[:16]}... != {payload['peer_id'][:16]}...)")
             return False
+
+        # Timestamp freshness check - reject messages too old or too far in the future
+        now = int(time.time())
+        msg_timestamp = payload.get('timestamp', 0)
+        MAX_GOSSIP_AGE = 3600  # 1 hour
+        MAX_CLOCK_SKEW = 300   # 5 minutes
+        if msg_timestamp < (now - MAX_GOSSIP_AGE):
+            self._log(f"Rejected stale gossip from {sender_id[:16]}...: "
+                     f"timestamp {now - msg_timestamp}s old")
+            return False
+        if msg_timestamp > (now + MAX_CLOCK_SKEW):
+            self._log(f"Rejected future gossip from {sender_id[:16]}...: "
+                     f"timestamp {msg_timestamp - now}s ahead")
+            return False
         
         fee_policy = payload.get("fee_policy", {})
         topology = payload.get("topology", [])
