@@ -5264,6 +5264,15 @@ class HiveDatabase:
     # SPLICE SESSION OPERATIONS (Phase 11)
     # =========================================================================
 
+    # Valid values for splice session fields (kept in sync with protocol.py)
+    _VALID_SPLICE_INITIATORS = {'local', 'remote'}
+    _VALID_SPLICE_TYPES = {'splice_in', 'splice_out'}
+    _VALID_SPLICE_STATUSES = {
+        'pending', 'init_sent', 'init_received', 'updating',
+        'signing', 'completed', 'aborted', 'failed'
+    }
+    _MAX_SPLICE_AMOUNT_SATS = 2_100_000_000_000_000  # 21M BTC in sats
+
     def create_splice_session(
         self,
         session_id: str,
@@ -5289,6 +5298,17 @@ class HiveDatabase:
         Returns:
             True if created successfully
         """
+        # Validate inputs
+        if initiator not in self._VALID_SPLICE_INITIATORS:
+            self.plugin.log(f"Invalid splice initiator: {initiator}", level='warn')
+            return False
+        if splice_type not in self._VALID_SPLICE_TYPES:
+            self.plugin.log(f"Invalid splice type: {splice_type}", level='warn')
+            return False
+        if not isinstance(amount_sats, int) or amount_sats <= 0 or amount_sats > self._MAX_SPLICE_AMOUNT_SATS:
+            self.plugin.log(f"Invalid splice amount: {amount_sats}", level='warn')
+            return False
+
         conn = self._get_connection()
         now = int(time.time())
         timeout_at = now + timeout_seconds
@@ -5390,6 +5410,9 @@ class HiveDatabase:
 
         updates = {"updated_at": now}
         if status is not None:
+            if status not in self._VALID_SPLICE_STATUSES:
+                self.plugin.log(f"Invalid splice status: {status}", level='warn')
+                return False
             updates["status"] = status
             if status in ('completed', 'aborted', 'failed'):
                 updates["completed_at"] = now

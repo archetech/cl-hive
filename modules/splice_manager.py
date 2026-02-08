@@ -220,6 +220,11 @@ class SpliceManager:
         """
         self._log(f"Initiating splice: peer={peer_id[:16]}... channel={channel_id} amount={relative_amount}")
 
+        # Validate amount bounds
+        MAX_SPLICE_AMOUNT = 2_100_000_000_000_000  # 21M BTC in sats
+        if not isinstance(relative_amount, int) or abs(relative_amount) > MAX_SPLICE_AMOUNT:
+            return {"error": "invalid_amount", "message": f"Amount out of bounds (max {MAX_SPLICE_AMOUNT} sats)"}
+
         # Determine splice type
         if relative_amount > 0:
             splice_type = SPLICE_TYPE_IN
@@ -315,7 +320,7 @@ class SpliceManager:
         now = int(time.time())
 
         # Store full hex channel_id in session - CLN RPC calls require this format
-        self.db.create_splice_session(
+        if not self.db.create_splice_session(
             session_id=session_id,
             channel_id=full_channel_id,
             peer_id=peer_id,
@@ -323,7 +328,9 @@ class SpliceManager:
             splice_type=splice_type,
             amount_sats=amount_sats,
             timeout_seconds=SPLICE_SESSION_TIMEOUT_SECONDS
-        )
+        ):
+            self._log("Failed to create splice session in database", level='error')
+            return {"error": "database_error", "message": "Failed to create splice session"}
         self.db.update_splice_session(session_id, status=SPLICE_STATUS_INIT_SENT, psbt=psbt)
 
         # Create and send SPLICE_INIT_REQUEST
@@ -456,7 +463,7 @@ class SpliceManager:
             return {"error": "channel_busy"}
 
         # Create session for tracking - use full hex channel_id for CLN RPC compatibility
-        self.db.create_splice_session(
+        if not self.db.create_splice_session(
             session_id=session_id,
             channel_id=full_channel_id,
             peer_id=sender_id,
@@ -464,7 +471,10 @@ class SpliceManager:
             splice_type=splice_type,
             amount_sats=amount_sats,
             timeout_seconds=SPLICE_SESSION_TIMEOUT_SECONDS
-        )
+        ):
+            self._log("Failed to create splice session in database", level='error')
+            self._send_reject(sender_id, session_id, SPLICE_REJECT_CHANNEL_BUSY, rpc)
+            return {"error": "database_error"}
         self.db.update_splice_session(session_id, status=SPLICE_STATUS_INIT_RECEIVED, psbt=psbt)
 
         # NOTE: The responder does NOT call splice_update here.
@@ -533,6 +543,7 @@ class SpliceManager:
         session = self.db.get_splice_session(session_id)
         if not session:
             self._log(f"Unknown session {session_id}")
+            self._send_abort(sender_id, session_id, "unknown_session", rpc)
             return {"error": "unknown_session"}
 
         if session.get("peer_id") != sender_id:
@@ -655,6 +666,7 @@ class SpliceManager:
         # Get session
         session = self.db.get_splice_session(session_id)
         if not session:
+            self._send_abort(sender_id, session_id, "unknown_session", rpc)
             return {"error": "unknown_session"}
 
         if session.get("peer_id") != sender_id:
@@ -750,6 +762,7 @@ class SpliceManager:
         # Get session
         session = self.db.get_splice_session(session_id)
         if not session:
+            self._send_abort(sender_id, session_id, "unknown_session", rpc)
             return {"error": "unknown_session"}
 
         if session.get("peer_id") != sender_id:
@@ -916,6 +929,11 @@ class SpliceManager:
         if msg:
             self._send_message(peer_id, msg, rpc)
 
+    # Valid predecessor states for each transition
+    _VALID_SIGNING_PREDECESSORS = {
+        SPLICE_STATUS_INIT_RECEIVED, SPLICE_STATUS_UPDATING, SPLICE_STATUS_SIGNING
+    }
+
     def _proceed_to_signing(
         self,
         session_id: str,
@@ -926,6 +944,14 @@ class SpliceManager:
     ) -> Dict[str, Any]:
         """Proceed to signing phase after commitments secured."""
         self._log(f"Proceeding to signing for session {session_id}")
+
+        # Validate state transition
+        session = self.db.get_splice_session(session_id)
+        if session:
+            current_status = session.get("status")
+            if current_status in (SPLICE_STATUS_COMPLETED, SPLICE_STATUS_ABORTED, SPLICE_STATUS_FAILED):
+                self._log(f"Cannot proceed to signing: session {session_id} already in terminal state {current_status}")
+                return {"error": "invalid_state", "message": f"Session already {current_status}"}
 
         self.db.update_splice_session(session_id, status=SPLICE_STATUS_SIGNING)
 

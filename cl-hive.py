@@ -7710,10 +7710,10 @@ def handle_splice_init_response(peer_id: str, payload: Dict, plugin: Plugin) -> 
     if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SPLICE_INIT_RESPONSE"):
         return {"result": "continue"}
 
-    # Verify sender is a hive member
+    # Verify sender is a hive member and not banned
     sender = database.get_member(peer_id)
-    if not sender:
-        plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE from non-member {peer_id[:16]}...", level='debug')
+    if not sender or database.is_banned(peer_id):
+        plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE from non-member/banned {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
     # SECURITY: Verify signature
@@ -7766,9 +7766,9 @@ def handle_splice_update(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SPLICE_UPDATE"):
         return {"result": "continue"}
 
-    # Verify sender is a hive member
+    # Verify sender is a hive member and not banned
     sender = database.get_member(peer_id)
-    if not sender:
+    if not sender or database.is_banned(peer_id):
         return {"result": "continue"}
 
     # SECURITY: Verify signature
@@ -7821,9 +7821,9 @@ def handle_splice_signed(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SPLICE_SIGNED"):
         return {"result": "continue"}
 
-    # Verify sender is a hive member
+    # Verify sender is a hive member and not banned
     sender = database.get_member(peer_id)
-    if not sender:
+    if not sender or database.is_banned(peer_id):
         return {"result": "continue"}
 
     # SECURITY: Verify signature
@@ -7881,9 +7881,9 @@ def handle_splice_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _check_timestamp_freshness(payload, MAX_SETTLEMENT_AGE_SECONDS, "SPLICE_ABORT"):
         return {"result": "continue"}
 
-    # Verify sender is a hive member
+    # Verify sender is a hive member and not banned
     sender = database.get_member(peer_id)
-    if not sender:
+    if not sender or database.is_banned(peer_id):
         return {"result": "continue"}
 
     # SECURITY: Verify signature
