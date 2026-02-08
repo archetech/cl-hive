@@ -603,11 +603,11 @@ class FeeIntelligenceManager:
         # NNLB health adjustment
         if our_health < HEALTH_STRUGGLING:
             # Critical/struggling: lower fees to attract traffic
-            health_mult = 0.7 + (our_health / 100 * 0.3)  # 0.7x to 0.85x
+            health_mult = 0.7 + (our_health / 100 * 0.3)  # 0.7x (health=0) to 0.775x (health=25)
             health_reason = "lowered for NNLB (struggling node)"
         elif our_health > HEALTH_THRIVING:
             # Thriving: can yield to others
-            health_mult = 1.0 + ((our_health - 75) / 100 * 0.15)  # 1.0x to 1.04x
+            health_mult = 1.0 + ((our_health - 75) / 100 * 0.15)  # 1.0x (health=75) to 1.0375x (health=100)
             health_reason = "slightly raised (thriving, yielding to others)"
         else:
             health_mult = 1.0

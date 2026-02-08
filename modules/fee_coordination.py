@@ -2423,6 +2423,7 @@ class FeeCoordinationManager:
 
         # If not salient, recommend keeping current fee
         if not is_salient:
+            recommended_fee = current_fee
             reasons.append(f"not_salient:{salience_reason}")
 
         return FeeRecommendation(

@@ -15710,6 +15710,54 @@ def hive_deposit_marker(
     )
 
 
+@plugin.method("hive-record-routing-outcome")
+def hive_record_routing_outcome(
+    plugin: Plugin,
+    channel_id: str,
+    peer_id: str,
+    fee_ppm: int,
+    success: bool,
+    amount_sats: int = 0,
+    source: str = None,
+    destination: str = None
+):
+    """
+    Record a routing outcome for pheromone and stigmergic learning.
+
+    Updates pheromone levels for the channel and optionally deposits
+    a stigmergic marker if source/destination are provided.
+
+    Args:
+        channel_id: Channel that routed the payment
+        peer_id: Peer on this channel
+        fee_ppm: Fee charged in ppm
+        success: Whether routing succeeded
+        amount_sats: Amount routed in satoshis
+        source: Source peer (optional, for stigmergic marker)
+        destination: Destination peer (optional, for stigmergic marker)
+
+    Returns:
+        Dict with status.
+    """
+    ctx = _get_hive_context()
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination not initialized"}
+
+    try:
+        ctx.fee_coordination_mgr.record_routing_outcome(
+            channel_id=channel_id,
+            peer_id=peer_id,
+            fee_ppm=fee_ppm,
+            success=success,
+            revenue_sats=amount_sats,
+            source=source,
+            destination=destination
+        )
+        return {"status": "recorded", "channel_id": channel_id}
+    except Exception as e:
+        return {"error": f"Failed to record routing outcome: {e}"}
+
+
 @plugin.method("hive-defense-status")
 def hive_defense_status(plugin: Plugin, peer_id: str = None):
     """

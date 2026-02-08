@@ -2450,10 +2450,17 @@ def pheromone_levels(ctx: HiveContext, channel_id: str = None) -> Dict[str, Any]
 
         if channel_id:
             level = all_levels.get(channel_id, 0.0)
+            above = level > 10.0
             return {
                 "channel_id": channel_id,
                 "pheromone_level": round(level, 2),
-                "above_exploit_threshold": level > 10.0
+                "above_exploit_threshold": above,
+                # Also return in list format for cl-revenue-ops compatibility
+                "pheromone_levels": [{
+                    "channel_id": channel_id,
+                    "level": round(level, 2),
+                    "above_threshold": above
+                }]
             }
 
         # Sort by level descending
@@ -2470,6 +2477,14 @@ def pheromone_levels(ctx: HiveContext, channel_id: str = None) -> Dict[str, Any]
             ),
             "levels": [
                 {"channel_id": k, "level": round(v, 2)}
+                for k, v in sorted_levels[:50]
+            ],
+            "pheromone_levels": [
+                {
+                    "channel_id": k,
+                    "level": round(v, 2),
+                    "above_threshold": v > 10.0
+                }
                 for k, v in sorted_levels[:50]
             ]
         }
