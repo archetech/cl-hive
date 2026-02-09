@@ -708,7 +708,8 @@ class Bridge:
             self._daily_rebalance_sats = max(0, self._daily_rebalance_sats - amount_sats)
 
     def trigger_rebalance(self, target_peer: str, amount_sats: int,
-                          source_peer: str) -> bool:
+                          source_peer: str,
+                          max_fee_sats: int = None) -> bool:
         """
         Trigger a rebalance toward a Hive peer.
 
@@ -718,6 +719,7 @@ class Bridge:
             target_peer: Destination peer_id (will lookup SCID automatically)
             amount_sats: Amount to rebalance in satoshis
             source_peer: Source peer_id to drain liquidity from (required)
+            max_fee_sats: Optional max fee cap in sats (for fleet zero-fee routes)
 
         Returns:
             True if rebalance was initiated successfully
@@ -770,11 +772,15 @@ class Bridge:
             return False
 
         try:
-            result = self.safe_call("revenue-rebalance", {
+            payload = {
                 "from_channel": source_scid,
                 "to_channel": target_scid,
                 "amount_sats": amount_sats
-            })
+            }
+            if max_fee_sats is not None:
+                payload["max_fee_sats"] = max_fee_sats
+
+            result = self.safe_call("revenue-rebalance", payload)
 
             success = result.get("status") in ("success", "initiated", "pending")
             if success:

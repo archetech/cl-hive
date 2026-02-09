@@ -1897,13 +1897,15 @@ class CostReductionManager:
         to_channel: str,
         amount_sats: int,
         via_members: Optional[List[str]] = None,
-        dry_run: bool = True
+        dry_run: bool = True,
+        bridge: Any = None
     ) -> Dict[str, Any]:
         """
-        Execute a circular rebalance through the hive using explicit sendpay route.
+        Execute a circular rebalance through the hive, delegating to sling via bridge.
 
-        This bypasses sling's automatic route finding and uses an explicit route
-        through hive members, ensuring zero-fee internal routing.
+        Dry-run mode shows the route preview. Execution delegates to cl-revenue-ops
+        via the bridge, which feeds the rebalance through sling with proper retries,
+        parallelism, and budget enforcement.
 
         Args:
             from_channel: Source channel SCID (where we have outbound liquidity)
@@ -1912,6 +1914,7 @@ class CostReductionManager:
             via_members: Optional list of intermediate member pubkeys. If not provided,
                         will attempt to find a path automatically.
             dry_run: If True, just show the route without executing (default: True)
+            bridge: Bridge instance for delegating execution to cl-revenue-ops
 
         Returns:
             Dict with route details and execution result (or preview if dry_run)
@@ -2082,70 +2085,35 @@ class CostReductionManager:
                 result["message"] = "Dry run - route preview only. Set dry_run=false to execute."
                 return result
 
-            # Execute the rebalance
-            # 1. Create invoice for ourselves
-            import secrets
-            label = f"hive-rebalance-{int(time.time())}-{secrets.token_hex(4)}"
-            invoice = rpc.invoice(
-                amount_msat=amount_msat,
-                label=label,
-                description="Hive circular rebalance"
-            )
-            payment_hash = invoice['payment_hash']
-            payment_secret = invoice.get('payment_secret')
+            # Execute via bridge delegation to cl-revenue-ops / sling
+            if not bridge:
+                result["status"] = "failed"
+                result["error"] = "Bridge not available — cl-revenue-ops required for rebalance execution"
+                return result
 
-            result["invoice_label"] = label
-            result["payment_hash"] = payment_hash
-
-            # 2. Send via explicit route
             try:
-                sendpay_result = rpc.sendpay(
-                    route=route,
-                    payment_hash=payment_hash,
-                    payment_secret=payment_secret,
-                    amount_msat=amount_msat
-                )
-                result["sendpay_result"] = sendpay_result
+                bridge_result = bridge.safe_call("revenue-rebalance", {
+                    "from_channel": from_channel,
+                    "to_channel": to_channel,
+                    "amount_sats": amount_sats,
+                    "max_fee_sats": 10  # Nominal cap — fleet routes are zero-fee
+                })
 
-                # 3. Wait for completion using short polling to avoid RPC lock starvation
-                # Use short timeouts (2s) with retries to allow other RPC calls
-                max_attempts = 30  # 30 * 2s = 60s total
-                waitsendpay_result = None
-                for attempt in range(max_attempts):
-                    try:
-                        waitsendpay_result = rpc.waitsendpay(
-                            payment_hash=payment_hash,
-                            timeout=2  # Short timeout to release RPC lock frequently
-                        )
-                        # Success - payment completed
-                        break
-                    except Exception as wait_err:
-                        err_str = str(wait_err)
-                        # Check if it's just a timeout (payment still in progress)
-                        if "Timed out" in err_str or "timeout" in err_str.lower():
-                            # Payment still in progress, continue polling
-                            continue
-                        # Real error - payment failed
-                        raise
-
-                if waitsendpay_result:
-                    result["status"] = "success"
-                    result["waitsendpay_result"] = waitsendpay_result
-                    result["message"] = f"Successfully rebalanced {amount_sats} sats through hive at zero fees!"
+                bridge_status = bridge_result.get("status", "unknown")
+                if bridge_status in ("success", "initiated", "pending"):
+                    result["status"] = "initiated"
+                    result["message"] = (
+                        f"Rebalance of {amount_sats} sats delegated to sling via cl-revenue-ops"
+                    )
+                    result["bridge_result"] = bridge_result
                 else:
-                    result["status"] = "timeout"
-                    result["error"] = "Payment timed out after 60 seconds"
+                    result["status"] = "failed"
+                    result["error"] = bridge_result.get("error", f"Bridge returned status: {bridge_status}")
+                    result["bridge_result"] = bridge_result
 
             except Exception as e:
-                error_str = str(e)
                 result["status"] = "failed"
-                result["error"] = error_str
-
-                # Clean up the invoice
-                try:
-                    rpc.delinvoice(label=label, status="unpaid")
-                except Exception:
-                    pass
+                result["error"] = f"Bridge call failed: {e}"
 
             return result
 

@@ -15988,7 +15988,8 @@ def hive_report_rebalance_outcome(
     amount_sats: int,
     cost_sats: int,
     success: bool,
-    via_fleet: bool = False
+    via_fleet: bool = False,
+    failure_reason: str = ""
 ):
     """
     Record a rebalance outcome for tracking and circular flow detection.
@@ -16000,6 +16001,7 @@ def hive_report_rebalance_outcome(
         cost_sats: Cost paid
         success: Whether rebalance succeeded
         via_fleet: Whether routed through fleet members
+        failure_reason: Error description if failed
 
     Returns:
         Dict with recording result and any circular flow warnings.
@@ -16011,7 +16013,8 @@ def hive_report_rebalance_outcome(
         amount_sats=amount_sats,
         cost_sats=cost_sats,
         success=success,
-        via_fleet=via_fleet
+        via_fleet=via_fleet,
+        failure_reason=failure_reason
     )
 
 

@@ -2616,7 +2616,8 @@ def record_rebalance_outcome(
     amount_sats: int,
     cost_sats: int,
     success: bool,
-    via_fleet: bool = False
+    via_fleet: bool = False,
+    failure_reason: str = ""
 ) -> Dict[str, Any]:
     """
     Record a rebalance outcome for tracking and circular flow detection.
@@ -2632,6 +2633,7 @@ def record_rebalance_outcome(
         cost_sats: Cost paid
         success: Whether rebalance succeeded
         via_fleet: Whether routed through fleet members
+        failure_reason: Error description if failed
 
     Returns:
         Dict with recording result and any circular flow warnings.
@@ -2741,7 +2743,8 @@ def execute_hive_circular_rebalance(
             to_channel=to_channel,
             amount_sats=amount_sats,
             via_members=via_members,
-            dry_run=dry_run
+            dry_run=dry_run,
+            bridge=ctx.bridge
         )
 
     except Exception as e:
