@@ -22,7 +22,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
@@ -598,7 +598,7 @@ class AnticipatoryLiquidityManager:
             timestamp: Observation timestamp (defaults to now)
         """
         ts = timestamp or int(time.time())
-        dt = datetime.utcfromtimestamp(ts)
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
 
         sample = HourlyFlowSample(
             channel_id=channel_id,
@@ -1005,7 +1005,7 @@ class AnticipatoryLiquidityManager:
         # Group by day of month
         monthly_flows: Dict[int, List[int]] = defaultdict(list)
         for sample in samples:
-            dt = datetime.utcfromtimestamp(sample.timestamp)
+            dt = datetime.fromtimestamp(sample.timestamp, tz=timezone.utc)
             day_of_month = dt.day
             monthly_flows[day_of_month].append(sample.net_flow_sats)
 
@@ -1355,7 +1355,7 @@ class AnticipatoryLiquidityManager:
             return None
 
         # Determine current phase
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         current_hour = now.hour
         current_phase = self._get_phase_for_hour(current_hour)
         next_phase = self._get_next_phase(current_phase)
@@ -1603,7 +1603,7 @@ class AnticipatoryLiquidityManager:
         patterns = self.detect_patterns(channel_id)
 
         # Find matching pattern for prediction window
-        target_time = datetime.utcfromtimestamp(time.time() + hours_ahead * 3600)
+        target_time = datetime.fromtimestamp(time.time() + hours_ahead * 3600, tz=timezone.utc)
         target_hour = target_time.hour
         target_day = target_time.weekday()
 

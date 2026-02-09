@@ -6556,6 +6556,8 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
         prof_by_id = {c.get("channel_id"): c for c in prof_data}
 
         for ch in channels_data.get("channels", []):
+            if ch.get("state") != "CHANNELD_NORMAL":
+                continue
             scid = ch.get("short_channel_id", "")
             prof_ch = prof_by_id.get(scid, {})
 
@@ -6760,7 +6762,8 @@ async def handle_advisor_get_recent_decisions(args: Dict) -> Dict:
     with db._get_conn() as conn:
         rows = conn.execute("""
             SELECT id, timestamp, decision_type, node_name, channel_id, peer_id,
-                   recommendation, reasoning, confidence, status
+                   recommendation, reasoning, confidence, status,
+                   outcome_measured_at, outcome_success, outcome_metrics
             FROM ai_decisions
             ORDER BY timestamp DESC
             LIMIT ?
@@ -6768,7 +6771,7 @@ async def handle_advisor_get_recent_decisions(args: Dict) -> Dict:
 
     decisions = []
     for row in rows:
-        decisions.append({
+        decision = {
             "id": row["id"],
             "timestamp": datetime.fromtimestamp(row["timestamp"]).isoformat(),
             "decision_type": row["decision_type"],
@@ -6778,8 +6781,16 @@ async def handle_advisor_get_recent_decisions(args: Dict) -> Dict:
             "recommendation": row["recommendation"],
             "reasoning": row["reasoning"],
             "confidence": row["confidence"],
-            "status": row["status"]
-        })
+            "status": row["status"],
+            "outcome_success": row["outcome_success"],
+            "outcome_measured_at": datetime.fromtimestamp(row["outcome_measured_at"]).isoformat() if row["outcome_measured_at"] else None,
+        }
+        if row["outcome_metrics"]:
+            try:
+                decision["outcome_metrics"] = json.loads(row["outcome_metrics"])
+            except (json.JSONDecodeError, TypeError):
+                decision["outcome_metrics"] = row["outcome_metrics"]
+        decisions.append(decision)
 
     return {
         "count": len(decisions),

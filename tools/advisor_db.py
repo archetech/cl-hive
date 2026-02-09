@@ -649,9 +649,9 @@ class AdvisorDB:
                 hours_depleted = None
                 hours_full = None
 
-                if trend == "depleting" and velocity_sats < 0:
+                if trend == "depleting" and velocity_sats < -0.001:
                     hours_depleted = newest['local_sats'] / abs(velocity_sats)
-                elif trend == "filling" and velocity_sats > 0:
+                elif trend == "filling" and velocity_sats > 0.001:
                     remote = newest['capacity_sats'] - newest['local_sats']
                     hours_full = remote / velocity_sats
 
@@ -801,8 +801,8 @@ class AdvisorDB:
             # Count depleting/filling channels
             velocity_stats = conn.execute("""
                 SELECT
-                    SUM(CASE WHEN trend = 'depleting' THEN 1 ELSE 0 END) as depleting,
-                    SUM(CASE WHEN trend = 'filling' THEN 1 ELSE 0 END) as filling
+                    COALESCE(SUM(CASE WHEN trend = 'depleting' THEN 1 ELSE 0 END), 0) as depleting,
+                    COALESCE(SUM(CASE WHEN trend = 'filling' THEN 1 ELSE 0 END), 0) as filling
                 FROM channel_velocity
             """).fetchone()
 
@@ -1270,24 +1270,26 @@ class AdvisorDB:
         prev_cutoff = int((now - timedelta(days=days * 2)).timestamp())
 
         with self._get_conn() as conn:
-            # Current period stats
+            # Current period stats (latest snapshot, not MAX)
             current = conn.execute("""
                 SELECT
-                    MAX(total_capacity_sats) as capacity,
-                    MAX(total_channels) as channels,
-                    SUM(CASE WHEN total_revenue_sats IS NOT NULL THEN total_revenue_sats ELSE 0 END) as revenue
+                    total_capacity_sats as capacity,
+                    total_channels as channels,
+                    total_revenue_sats as revenue
                 FROM fleet_snapshots
                 WHERE timestamp > ?
+                ORDER BY timestamp DESC LIMIT 1
             """, (cutoff,)).fetchone()
 
-            # Previous period stats for comparison
+            # Previous period stats for comparison (latest snapshot from previous period)
             previous = conn.execute("""
                 SELECT
-                    MAX(total_capacity_sats) as capacity,
-                    MAX(total_channels) as channels,
-                    SUM(CASE WHEN total_revenue_sats IS NOT NULL THEN total_revenue_sats ELSE 0 END) as revenue
+                    total_capacity_sats as capacity,
+                    total_channels as channels,
+                    total_revenue_sats as revenue
                 FROM fleet_snapshots
                 WHERE timestamp > ? AND timestamp <= ?
+                ORDER BY timestamp DESC LIMIT 1
             """, (prev_cutoff, cutoff)).fetchone()
 
             # Calculate changes
@@ -1306,8 +1308,8 @@ class AdvisorDB:
             # Velocity alerts
             velocity_stats = conn.execute("""
                 SELECT
-                    SUM(CASE WHEN trend = 'depleting' THEN 1 ELSE 0 END) as depleting,
-                    SUM(CASE WHEN trend = 'filling' THEN 1 ELSE 0 END) as filling
+                    COALESCE(SUM(CASE WHEN trend = 'depleting' THEN 1 ELSE 0 END), 0) as depleting,
+                    COALESCE(SUM(CASE WHEN trend = 'filling' THEN 1 ELSE 0 END), 0) as filling
                 FROM channel_velocity
             """).fetchone()
 

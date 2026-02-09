@@ -29,7 +29,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -260,7 +260,7 @@ class ProactiveAdvisor:
 
     def _load_or_create_budget(self) -> DailyBudget:
         """Load or create daily budget."""
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         stored = self.db.get_daily_budget(today)
         if stored:
             return DailyBudget(
@@ -384,9 +384,14 @@ class ProactiveAdvisor:
                 hours_ago_min=6,
                 hours_ago_max=24
             )
-            result.outcomes_measured = len(outcomes)
+            # Also update ai_decisions table with outcome measurements
+            decision_outcomes = self.db.measure_decision_outcomes(
+                min_hours=6,
+                max_hours=24
+            )
+            result.outcomes_measured = len(outcomes) + len(decision_outcomes)
             result.learning_summary = self.learning_engine.get_learning_summary()
-            logger.info(f"  Outcomes measured: {len(outcomes)}")
+            logger.info(f"  Outcomes measured: {len(outcomes)} actions, {len(decision_outcomes)} decisions")
             success_count = sum(1 for o in outcomes if o.success)
             if outcomes:
                 logger.info(f"  Success rate: {success_count}/{len(outcomes)} ({100*success_count/len(outcomes):.0f}%)")
@@ -943,7 +948,7 @@ class ProactiveAdvisor:
         skipped = []
 
         # Check budget
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self._daily_budget.date != today:
             self._daily_budget = DailyBudget(date=today)
 
