@@ -9164,12 +9164,14 @@ def settlement_loop():
                                     f"SETTLEMENT: Proposed settlement for {previous_period}"
                                 )
 
-                                # Vote on our own proposal
+                                # Vote on our own proposal (skip hash re-verification
+                                # since we just computed the plan moments ago)
                                 vote = settlement_mgr.verify_and_vote(
                                     proposal=proposal,
                                     our_peer_id=our_pubkey,
                                     state_manager=state_manager,
-                                    rpc=safe_plugin.rpc
+                                    rpc=safe_plugin.rpc,
+                                    skip_hash_verify=True,
                                 )
                                 if vote:
                                     from modules.protocol import create_settlement_ready
@@ -9369,15 +9371,16 @@ def _check_settlement_gaming_and_propose_bans():
                             total_owed -= amount
 
         vote_rate = (vote_count / period_count) * 100 if period_count > 0 else 100
-        exec_rate = (exec_count / period_count) * 100 if period_count > 0 else 100
 
-        # Check if high-risk gaming behavior
+        # Gaming detection uses vote_rate only. Execution compliance is
+        # enforced structurally: settlement won't complete without payer
+        # execution.  Receivers submit 0-sat confirmations which would
+        # inflate exec_rate, making it an unreliable gaming signal.
         is_low_vote = vote_rate < SETTLEMENT_GAMING_LOW_VOTE_THRESHOLD
-        is_low_exec = exec_rate < SETTLEMENT_GAMING_LOW_EXEC_THRESHOLD
         owes_money = total_owed < 0
 
-        # HIGH RISK: Low participation AND owes money
-        if (is_low_vote or is_low_exec) and owes_money:
+        # HIGH RISK: Low vote participation AND owes money
+        if is_low_vote and owes_money:
             # Check if there's already a pending ban proposal for this member
             existing = database.get_ban_proposal_for_target(peer_id)
             if existing and existing.get("status") == "pending":
@@ -9385,15 +9388,15 @@ def _check_settlement_gaming_and_propose_bans():
 
             # Propose ban
             reason = (
-                f"Settlement gaming detected: vote_rate={vote_rate:.1f}%, "
-                f"exec_rate={exec_rate:.1f}% over {period_count} periods "
+                f"Settlement gaming detected: vote_rate={vote_rate:.1f}% "
+                f"over {period_count} periods "
                 f"while owing {abs(total_owed)} sats. "
                 f"Automatic proposal for repeated settlement evasion."
             )
 
             safe_plugin.log(
                 f"SETTLEMENT GAMING: Proposing ban for {peer_id[:16]}... "
-                f"(vote={vote_rate:.1f}%, exec={exec_rate:.1f}%, owed={total_owed})",
+                f"(vote={vote_rate:.1f}%, owed={total_owed})",
                 level='warn'
             )
 
@@ -14587,9 +14590,9 @@ def hive_settlement_calculate(plugin: Plugin):
     Calculate fair shares for the current period without executing.
 
     Shows what each member would receive/pay based on:
-    - 40% capacity weight
-    - 40% routing volume weight
-    - 20% uptime weight
+    - 30% capacity weight
+    - 60% routing activity weight
+    - 10% uptime weight
 
     Returns:
         Dict with calculated fair shares.
