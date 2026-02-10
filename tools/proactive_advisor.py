@@ -309,6 +309,12 @@ class ProactiveAdvisor:
         )
 
         try:
+            # Housekeeping: expire stale decisions and enforce cap
+            expired = self.db.expire_stale_decisions(max_age_hours=48)
+            capped = self.db.cleanup_decisions(max_pending=200)
+            if expired or capped:
+                logger.info(f"  Housekeeping: expired {expired}, capped {capped} stale decisions")
+
             # Phase 1: Record snapshot for history
             logger.info("[Phase 1] Recording snapshot...")
             await self._record_snapshot(node_name)
@@ -1126,6 +1132,16 @@ class ProactiveAdvisor:
 
             # Skip very low confidence
             if opp.adjusted_confidence < SAFETY_CONSTRAINTS["min_confidence_for_queue"]:
+                continue
+
+            # Skip actions the learning engine says to avoid
+            should_skip, skip_reason = self.learning_engine.should_skip_action(
+                opp.action_type.value,
+                opp.opportunity_type.value,
+                opp.confidence_score
+            )
+            if should_skip:
+                logger.info(f"  Learning skip: {opp.opportunity_type.value} - {skip_reason}")
                 continue
 
             # Queue for review

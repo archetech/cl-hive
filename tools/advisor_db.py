@@ -840,17 +840,40 @@ class AdvisorDB:
                         recommendation: str, reasoning: str = None,
                         channel_id: str = None, peer_id: str = None,
                         confidence: float = None) -> int:
-        """Record an AI decision/recommendation."""
+        """Record an AI decision/recommendation. Deduplicates against recent pending decisions."""
+        node_name_normalized = node_name.lower() if node_name else node_name
+        now_ts = int(datetime.now().timestamp())
+        dedup_window = now_ts - 86400  # 24h
+
         with self._get_conn() as conn:
+            # Dedup: check for existing recommended decision with same key within 24h
+            if channel_id:
+                existing = conn.execute("""
+                    SELECT id FROM ai_decisions
+                    WHERE decision_type = ? AND LOWER(node_name) = ? AND channel_id = ?
+                    AND status = 'recommended' AND timestamp > ?
+                    ORDER BY timestamp DESC LIMIT 1
+                """, (decision_type, node_name_normalized, channel_id, dedup_window)).fetchone()
+            else:
+                existing = conn.execute("""
+                    SELECT id FROM ai_decisions
+                    WHERE decision_type = ? AND LOWER(node_name) = ? AND channel_id IS NULL
+                    AND status = 'recommended' AND timestamp > ?
+                    ORDER BY timestamp DESC LIMIT 1
+                """, (decision_type, node_name_normalized, dedup_window)).fetchone()
+
+            if existing:
+                return existing['id']
+
             cursor = conn.execute("""
                 INSERT INTO ai_decisions (
                     timestamp, decision_type, node_name, channel_id, peer_id,
                     recommendation, reasoning, confidence, status
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'recommended')
             """, (
-                int(datetime.now().timestamp()),
+                now_ts,
                 decision_type,
-                node_name,
+                node_name_normalized,
                 channel_id,
                 peer_id,
                 recommendation,
@@ -891,7 +914,60 @@ class AdvisorDB:
                 WHERE timestamp < ?
             """, (cutoff,))
 
+            # Clean up old expired decisions (keep recent for audit)
+            conn.execute("""
+                DELETE FROM ai_decisions
+                WHERE status IN ('expired') AND timestamp < ?
+            """, (cutoff,))
+
+            # Clean up old action outcomes (keep recent for learning)
+            conn.execute("""
+                DELETE FROM action_outcomes
+                WHERE measured_at < ?
+            """, (cutoff,))
+
             conn.commit()
+
+    def expire_stale_decisions(self, max_age_hours: int = 48) -> int:
+        """Expire pending decisions older than max_age_hours.
+
+        Returns number of decisions expired.
+        """
+        cutoff = int((datetime.now() - timedelta(hours=max_age_hours)).timestamp())
+        with self._get_conn() as conn:
+            cursor = conn.execute("""
+                UPDATE ai_decisions
+                SET status = 'expired'
+                WHERE status = 'recommended' AND timestamp < ?
+            """, (cutoff,))
+            conn.commit()
+            return cursor.rowcount
+
+    def cleanup_decisions(self, max_pending: int = 200) -> int:
+        """Enforce hard cap on pending decisions. Expire oldest if over limit.
+
+        Returns number of decisions expired.
+        """
+        with self._get_conn() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM ai_decisions WHERE status = 'recommended'"
+            ).fetchone()['cnt']
+
+            if count <= max_pending:
+                return 0
+
+            excess = count - max_pending
+            cursor = conn.execute("""
+                UPDATE ai_decisions SET status = 'expired'
+                WHERE id IN (
+                    SELECT id FROM ai_decisions
+                    WHERE status = 'recommended'
+                    ORDER BY timestamp ASC
+                    LIMIT ?
+                )
+            """, (excess,))
+            conn.commit()
+            return cursor.rowcount
 
     def get_stats(self) -> Dict[str, Any]:
         """Get database statistics."""
@@ -1423,7 +1499,7 @@ class AdvisorDB:
                 pass
 
         # For channel-related decisions, compare channel state
-        if channel_id and decision_type in ('flag_channel', 'approve', 'reject'):
+        if channel_id and decision_type in ('flag_channel', 'approve', 'reject', 'fee_change', 'rebalance', 'config_change', 'flag_for_review'):
             # Get current channel state
             current = conn.execute("""
                 SELECT * FROM channel_history
