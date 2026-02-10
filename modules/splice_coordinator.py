@@ -36,6 +36,9 @@ MIN_FLEET_CAPACITY_SATS = 1_000_000
 # Cache TTL for channel lookups (seconds)
 CHANNEL_CACHE_TTL = 300
 
+# Maximum cache entries before eviction
+MAX_CHANNEL_CACHE_SIZE = 500
+
 # Maximum age for liquidity state data to consider valid
 MAX_STATE_AGE_HOURS = 1
 
@@ -66,12 +69,28 @@ class SpliceCoordinator:
         self.state_manager = state_manager
 
         # Cache for channel data
-        self._channel_cache: Dict[str, tuple] = {}  # peer_id -> (data, timestamp)
+        self._channel_cache: Dict[str, tuple] = {}  # key -> (data, timestamp)
 
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
         if self.plugin:
             self.plugin.log(f"SPLICE_COORD: {message}", level=level)
+
+    def _cache_put(self, key: str, data) -> None:
+        """Store a value in the channel cache, evicting stale entries if full."""
+        if len(self._channel_cache) >= MAX_CHANNEL_CACHE_SIZE:
+            now = time.time()
+            # Evict stale entries first
+            stale = [k for k, (_, ts) in self._channel_cache.items()
+                     if now - ts >= CHANNEL_CACHE_TTL]
+            for k in stale:
+                del self._channel_cache[k]
+            # If still over limit, evict oldest 10%
+            if len(self._channel_cache) >= MAX_CHANNEL_CACHE_SIZE:
+                by_age = sorted(self._channel_cache.items(), key=lambda x: x[1][1])
+                for k, _ in by_age[:max(1, len(by_age) // 10)]:
+                    del self._channel_cache[k]
+        self._channel_cache[key] = (data, time.time())
 
     def check_splice_out_safety(
         self,
@@ -272,7 +291,7 @@ class SpliceCoordinator:
             )
 
             # Cache result
-            self._channel_cache[cache_key] = (total, time.time())
+            self._cache_put(cache_key, total)
             return total
 
         except Exception as e:
@@ -297,7 +316,7 @@ class SpliceCoordinator:
             )
 
             # Cache result
-            self._channel_cache[cache_key] = (total, time.time())
+            self._cache_put(cache_key, total)
             return total
 
         except Exception as e:

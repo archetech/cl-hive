@@ -274,9 +274,11 @@ class TestCleanupExpiry:
         expired_count = manager.cleanup_expired_holds()
         assert expired_count == 1
 
-        hold = manager.get_hold(hold_id)
-        assert hold.status == "expired"
+        # After cleanup, expired holds are evicted from memory and persisted to DB.
+        # Verify the DB was notified of expiry.
         mock_database.expire_budget_hold.assert_called_once_with(hold_id)
+        # Hold should no longer be in memory (evicted)
+        assert hold_id not in manager._holds
 
     def test_load_from_database(self, manager, mock_database):
         """Load active holds from database on init."""

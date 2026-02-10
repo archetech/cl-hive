@@ -851,12 +851,16 @@ class LiquidityCoordinator:
         members_rebalancing = 0
         all_rebalancing_peers = set()
 
+        # Snapshot shared state under lock
+        with self._lock:
+            state_snapshot = dict(self._member_liquidity_state)
+
         # Get our own state
-        our_state = self._member_liquidity_state.get(self.our_pubkey, {})
+        our_state = state_snapshot.get(self.our_pubkey, {})
 
         for member in members:
             member_id = member.get("peer_id")
-            state = self._member_liquidity_state.get(member_id)
+            state = state_snapshot.get(member_id)
 
             if state:
                 if state.get("depleted_channels"):
@@ -902,7 +906,10 @@ class LiquidityCoordinator:
         """
         needs = []
 
-        for member_id, state in self._member_liquidity_state.items():
+        with self._lock:
+            state_snapshot = dict(self._member_liquidity_state)
+
+        for member_id, state in state_snapshot.items():
             if member_id == self.our_pubkey:
                 continue  # Skip ourselves
 
@@ -1012,7 +1019,10 @@ class LiquidityCoordinator:
         """
         peer_issue_count: Dict[str, int] = defaultdict(int)
 
-        for state in self._member_liquidity_state.values():
+        with self._lock:
+            state_values = list(self._member_liquidity_state.values())
+
+        for state in state_values:
             for ch in state.get("depleted_channels", []):
                 peer_id = ch.get("peer_id")
                 if peer_id:
@@ -1357,10 +1367,17 @@ class LiquidityCoordinator:
         """
         mcf_needs = []
 
+        # Snapshot shared state under lock
+        with self._lock:
+            liquidity_needs_snapshot = list(self._liquidity_needs.values())
+            remote_mcf_snapshot = list(self._remote_mcf_needs.items())
+
+        now = time.time()
+
         # Add needs from _liquidity_needs (received via gossip)
-        for need in self._liquidity_needs.values():
+        for need in liquidity_needs_snapshot:
             # Skip stale needs (older than 30 minutes)
-            if time.time() - need.timestamp > 1800:
+            if now - need.timestamp > 1800:
                 continue
 
             mcf_needs.append({
@@ -1393,10 +1410,10 @@ class LiquidityCoordinator:
             self._log(f"Error assessing our needs for MCF: {e}", "debug")
 
         # Add remote MCF needs (received from other fleet members)
-        for reporter_id, need in self._remote_mcf_needs.items():
+        for reporter_id, need in remote_mcf_snapshot:
             # Skip stale needs (older than 30 minutes)
             received_at = need.get("received_at", 0)
-            if time.time() - received_at > 1800:
+            if now - received_at > 1800:
                 continue
 
             mcf_needs.append({
@@ -1476,12 +1493,13 @@ class LiquidityCoordinator:
             Number of needs removed
         """
         now = time.time()
-        stale_keys = [
-            k for k, v in self._remote_mcf_needs.items()
-            if now - v.get("received_at", 0) > max_age_seconds
-        ]
-        for k in stale_keys:
-            del self._remote_mcf_needs[k]
+        with self._lock:
+            stale_keys = [
+                k for k, v in self._remote_mcf_needs.items()
+                if now - v.get("received_at", 0) > max_age_seconds
+            ]
+            for k in stale_keys:
+                del self._remote_mcf_needs[k]
         return len(stale_keys)
 
     def receive_mcf_assignment(
