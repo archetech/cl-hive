@@ -2426,13 +2426,15 @@ class AnticipatoryLiquidityManager:
             self._channel_peer_map[channel_id] = peer_id
 
     def update_channel_peer_mappings(self, channels: List[Dict[str, Any]]) -> None:
-        """Update channel-to-peer mappings from a list of channel info."""
+        """Replace channel-to-peer mappings so closed channels are evicted."""
+        new_map = {}
+        for ch in channels:
+            channel_id = ch.get("short_channel_id")
+            peer_id = ch.get("peer_id")
+            if channel_id and peer_id:
+                new_map[channel_id] = peer_id
         with self._lock:
-            for ch in channels:
-                channel_id = ch.get("short_channel_id")
-                peer_id = ch.get("peer_id")
-                if channel_id and peer_id:
-                    self._channel_peer_map[channel_id] = peer_id
+            self._channel_peer_map = new_map
 
     def receive_pattern_from_fleet(
         self,

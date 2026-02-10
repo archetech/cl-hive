@@ -3208,12 +3208,24 @@ def _record_forward_for_fee_coordination(forward_event: Dict, status: str):
         if not out_channel:
             return
 
-        # Get peer IDs for the channels
-        funds = safe_plugin.rpc.listfunds()
-        channels = {ch.get("short_channel_id"): ch for ch in funds.get("channels", [])}
+        # Get peer IDs using cached channel-to-peer mapping (avoid RPC per forward)
+        peer_map = fee_coordination_mgr.adaptive_controller._channel_peer_map
+        in_peer = peer_map.get(in_channel, "") if in_channel else ""
+        out_peer = peer_map.get(out_channel, "")
 
-        in_peer = channels.get(in_channel, {}).get("peer_id", "") if in_channel else ""
-        out_peer = channels.get(out_channel, {}).get("peer_id", "")
+        # Fall back to RPC on cache miss for outbound channel
+        if not out_peer:
+            try:
+                funds = safe_plugin.rpc.listfunds()
+                channels_map = {ch.get("short_channel_id"): ch for ch in funds.get("channels", [])}
+                in_peer = channels_map.get(in_channel, {}).get("peer_id", "") if in_channel else ""
+                out_peer = channels_map.get(out_channel, {}).get("peer_id", "")
+                # Update cache with discovered mappings
+                for scid, ch in channels_map.items():
+                    if scid and ch.get("peer_id"):
+                        peer_map[scid] = ch["peer_id"]
+            except Exception:
+                return
 
         if not out_peer:
             return

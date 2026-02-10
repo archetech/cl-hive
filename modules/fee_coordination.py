@@ -574,15 +574,16 @@ class FlowCorridorManager:
             now - self._assignments_timestamp < self._assignments_ttl):
             return list(self._assignments.values())
 
-        # Refresh assignments
+        # Refresh assignments (build into local dict, then atomic swap)
         corridors = self.identify_corridors()
-        self._assignments = {}
+        new_assignments = {}
 
         for corridor in corridors:
             assignment = self.assign_corridor(corridor)
             key = (corridor.source_peer_id, corridor.destination_peer_id)
-            self._assignments[key] = assignment
+            new_assignments[key] = assignment
 
+        self._assignments = new_assignments
         self._assignments_timestamp = now
         self._log(f"Refreshed {len(self._assignments)} corridor assignments")
 
@@ -663,7 +664,8 @@ class AdaptiveFeeController:
         self._velocity_cache: Dict[str, float] = {}
         self._velocity_cache_time: Dict[str, float] = {}
 
-        # Network fee volatility tracking
+        # Network fee volatility tracking (separate lock to avoid nesting with _lock)
+        self._fee_obs_lock = threading.Lock()
         self._fee_observations: List[Tuple[float, int]] = []  # (timestamp, fee)
 
     def set_our_pubkey(self, pubkey: str) -> None:
@@ -723,13 +725,14 @@ class AdaptiveFeeController:
 
     def record_fee_observation(self, fee_ppm: int) -> None:
         """Record a network fee observation for volatility calculation."""
-        self._fee_observations.append((time.time(), fee_ppm))
+        with self._fee_obs_lock:
+            self._fee_observations.append((time.time(), fee_ppm))
 
-        # Keep only recent observations
-        cutoff = time.time() - 3600
-        self._fee_observations = [
-            (t, f) for t, f in self._fee_observations if t > cutoff
-        ]
+            # Keep only recent observations
+            cutoff = time.time() - 3600
+            self._fee_observations = [
+                (t, f) for t, f in self._fee_observations if t > cutoff
+            ]
 
     def update_pheromone(
         self,
@@ -776,8 +779,9 @@ class AdaptiveFeeController:
                 deposit = revenue_sats * PHEROMONE_DEPOSIT_SCALE
                 self._pheromone[channel_id] += deposit
 
-                # Track the fee that earned this pheromone
-                self._pheromone_fee[channel_id] = current_fee
+                # Track fee via exponential moving average (not just last value)
+                prev_fee = self._pheromone_fee.get(channel_id, current_fee)
+                self._pheromone_fee[channel_id] = int(0.3 * current_fee + 0.7 * prev_fee)
 
                 self._log(
                     f"Channel {channel_id[:8]}: pheromone deposit {deposit:.2f}, "
@@ -806,11 +810,11 @@ class AdaptiveFeeController:
             # Weak signal - explore
             if local_balance_pct < 0.3:
                 # Depleting - raise fees to slow outflow
-                new_fee = int(current_fee * 1.15)
+                new_fee = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, int(current_fee * 1.15)))
                 return new_fee, "explore_raise_depleting"
             elif local_balance_pct > 0.7:
                 # Saturating - lower fees to attract flow
-                new_fee = int(current_fee * 0.85)
+                new_fee = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, int(current_fee * 0.85)))
                 return new_fee, "explore_lower_saturating"
             else:
                 # Balanced - small exploration
@@ -837,16 +841,20 @@ class AdaptiveFeeController:
 
     def update_channel_peer_mappings(self, channels: List[Dict[str, Any]]) -> None:
         """
-        Update channel-to-peer mappings from a list of channel info.
+        Replace channel-to-peer mappings from a list of channel info.
+
+        Replaces the entire map (not merge) so closed channels are evicted.
 
         Args:
             channels: List of channel dicts with 'short_channel_id' and 'peer_id'
         """
+        new_map = {}
         for ch in channels:
             channel_id = ch.get("short_channel_id")
             peer_id = ch.get("peer_id")
             if channel_id and peer_id:
-                self._channel_peer_map[channel_id] = peer_id
+                new_map[channel_id] = peer_id
+        self._channel_peer_map = new_map
 
     def get_shareable_pheromones(
         self,
@@ -1022,8 +1030,10 @@ class AdaptiveFeeController:
 
     def get_all_fleet_hints(self) -> Dict[str, Tuple[int, float]]:
         """Get fee hints for all peers with remote pheromone data."""
+        with self._lock:
+            peer_ids = list(self._remote_pheromones.keys())
         hints = {}
-        for peer_id in self._remote_pheromones:
+        for peer_id in peer_ids:
             hint = self.get_fleet_fee_hint(peer_id)
             if hint:
                 hints[peer_id] = hint
@@ -1086,7 +1096,17 @@ class AdaptiveFeeController:
 
                     evaporated += 1
 
-            return evaporated
+        # Evict stale velocity cache entries (separate from pheromone lock)
+        stale_cutoff = time.time() - 48 * 3600  # 48 hours
+        stale_keys = [
+            k for k, t in self._velocity_cache_time.items()
+            if t < stale_cutoff
+        ]
+        for k in stale_keys:
+            self._velocity_cache.pop(k, None)
+            self._velocity_cache_time.pop(k, None)
+
+        return evaporated
 
 
 # =============================================================================
@@ -1235,17 +1255,16 @@ class StigmergicCoordinator:
                 recommended = max(FLEET_FEE_FLOOR_PPM, int(weighted_fee))
             else:
                 recommended = max(FLEET_FEE_FLOOR_PPM, default_fee)
-            confidence = min(0.9, 0.5 + (total_weight / len(successful)) * 0.1)
+            confidence = min(0.9, 0.5 + len(successful) * 0.05)
 
             return recommended, confidence
 
         if failed:
-            # All failures - try lower or avoid
-            avg_failed_fee = sum(m.fee_ppm for m in failed) / len(failed)
-            recommended = max(FLEET_FEE_FLOOR_PPM, int(avg_failed_fee * 0.8))
-            confidence = 0.4
-
-            return recommended, confidence
+            # All failures — no reliable directional signal. Failures can mean
+            # fee too high (payer routes around us) OR too low (no capacity,
+            # uncompetitive). Return default fee with low confidence and let
+            # other signals (pheromones, intelligence) provide direction.
+            return default_fee, 0.35
 
         return default_fee, 0.3
 
@@ -1271,6 +1290,20 @@ class StigmergicCoordinator:
             with self._lock:
                 self._markers[key].append(marker)
                 self._prune_markers(key)
+
+                # Evict least-active route pair if dict exceeds limit
+                max_routes = 1000
+                if len(self._markers) > max_routes:
+                    oldest_key = min(
+                        (k for k in self._markers if k != key),
+                        key=lambda k: max(
+                            (m.timestamp for m in self._markers[k]),
+                            default=0
+                        ),
+                        default=None
+                    )
+                    if oldest_key:
+                        del self._markers[oldest_key]
 
             return marker
         except (KeyError, TypeError) as e:
@@ -1482,8 +1515,9 @@ class MyceliumDefenseSystem:
         """
         Send warning to fleet (like chemical signal through mycelium).
         """
-        # Store locally
-        self._warnings[warning.peer_id] = warning
+        # Store locally (under lock — shared with handle_warning/check_warning_expiration)
+        with self._lock:
+            self._warnings[warning.peer_id] = warning
 
         # Broadcast via gossip if available
         if self.gossip_mgr:
@@ -1622,17 +1656,25 @@ class MyceliumDefenseSystem:
 
     def get_active_warnings(self) -> List[PeerWarning]:
         """Get all active (non-expired) warnings."""
-        return [w for w in self._warnings.values() if not w.is_expired()]
+        with self._lock:
+            warnings_snapshot = list(self._warnings.values())
+        return [w for w in warnings_snapshot if not w.is_expired()]
 
     def get_defense_status(self) -> Dict:
         """Get current defense system status."""
         self.check_warning_expiration()
 
+        with self._lock:
+            warnings_snapshot = list(self._warnings.values())
+            num_warnings = len(self._warnings)
+            num_defensive = len(self._defensive_fees)
+            defensive_peers = list(self._defensive_fees.keys())
+
         return {
-            "active_warnings": len(self._warnings),
-            "defensive_fees_active": len(self._defensive_fees),
-            "warnings": [w.to_dict() for w in self._warnings.values()],
-            "defensive_peers": list(self._defensive_fees.keys()),
+            "active_warnings": num_warnings,
+            "defensive_fees_active": num_defensive,
+            "warnings": [w.to_dict() for w in warnings_snapshot],
+            "defensive_peers": defensive_peers,
             "ban_candidates": self.get_ban_candidates()
         }
 
@@ -2278,6 +2320,14 @@ class FeeCoordinationManager:
         """Record that a fee change was made for a channel."""
         with self._lock:
             self._fee_change_times[channel_id] = time.time()
+
+            # Evict entries past their cooldown (no longer useful)
+            if len(self._fee_change_times) > 500:
+                cutoff = time.time() - SALIENT_FEE_CHANGE_COOLDOWN * 2
+                self._fee_change_times = {
+                    k: v for k, v in self._fee_change_times.items()
+                    if v > cutoff
+                }
         self._log(f"Recorded fee change for {channel_id}")
 
     def _get_centrality_fee_adjustment(self) -> Tuple[float, float]:
@@ -2372,6 +2422,18 @@ class FeeCoordinationManager:
         if adaptive_fee != recommended_fee:
             recommended_fee = adaptive_fee
             reasons.append(adaptive_reason)
+
+        # 2a. Incorporate fleet pheromone hints
+        fleet_hint = self.adaptive_controller.get_fleet_fee_hint(peer_id)
+        if fleet_hint:
+            hint_fee, hint_confidence = fleet_hint
+            if hint_confidence > 0.3:
+                blend_weight = min(0.25, hint_confidence * 0.3)
+                recommended_fee = int(
+                    recommended_fee * (1 - blend_weight) +
+                    hint_fee * blend_weight
+                )
+                reasons.append(f"fleet_pheromone_{hint_confidence:.2f}")
 
         # 2b. Incorporate fee intelligence if available
         if self.fee_intelligence_mgr:
