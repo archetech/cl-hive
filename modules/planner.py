@@ -673,7 +673,8 @@ class Planner:
         else:
             self.quality_scorer = None
 
-        # Network cache (refreshed each cycle)
+        # Network cache (refreshed each cycle).
+        # NOTE: Only accessed from planner_loop's single thread — no snapshot needed.
         self._network_cache: Dict[str, List[ChannelInfo]] = {}
         self._network_cache_time: int = 0
 

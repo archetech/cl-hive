@@ -975,6 +975,11 @@ class LiquidityCoordinator:
 
         Based on whether we have a channel to this peer and our balance state.
         Higher score = we're better positioned to influence flow via fees.
+
+        Note: Makes an RPC call (listpeerchannels). Callers are responsible for
+        ensuring RPC serialization (e.g., via RPC_LOCK or ThreadSafeRpcProxy).
+        Currently called from get_fleet_liquidity_needs() which uses
+        ThreadSafeRpcProxy for RPC serialization.
         """
         try:
             channels = self.plugin.rpc.listpeerchannels(id=peer_id)

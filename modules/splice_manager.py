@@ -119,6 +119,11 @@ class SpliceManager:
             # Remove old entries
             tracker[sender_id] = [t for t in tracker[sender_id] if t > cutoff]
 
+            # Evict empty keys to prevent unbounded growth
+            if not tracker[sender_id]:
+                del tracker[sender_id]
+                return True  # No entries means within limit
+
             return len(tracker[sender_id]) < max_count
 
     def _record_message(self, sender_id: str, tracker: Dict[str, List[int]]):
@@ -331,6 +336,11 @@ class SpliceManager:
         ):
             self._log("Failed to create splice session in database", level='error')
             return {"error": "database_error", "message": "Failed to create splice session"}
+        # Validate session is in PENDING state before transitioning to INIT_SENT
+        session = self.db.get_splice_session(session_id)
+        if not session or session.get("status") != SPLICE_STATUS_PENDING:
+            self._log(f"Session {session_id} not in pending state, aborting", level='error')
+            return {"error": "invalid_state", "message": "Session not in pending state"}
         self.db.update_splice_session(session_id, status=SPLICE_STATUS_INIT_SENT, psbt=psbt)
 
         # Create and send SPLICE_INIT_REQUEST

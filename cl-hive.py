@@ -988,7 +988,8 @@ def _reload_config_from_cln(plugin_obj: Plugin) -> Dict[str, Any]:
     if results["updated"]:
         config._version += 1
 
-        # Validate the new config
+        # Normalize and validate the new config
+        config._normalize()
         validation_error = config.validate()
         if validation_error:
             results["errors"].append({"validation": validation_error})
@@ -8717,6 +8718,15 @@ def membership_maintenance_loop():
 
                 # Prune old pool contributions (keep 12 most recent periods)
                 database.cleanup_old_pool_contributions(periods_to_keep=12)
+
+                # Prune old pool distributions (365-day retention)
+                database.cleanup_old_pool_distributions(days_to_keep=365)
+
+                # Prune old settlement periods (fee_reports, pool data > 365 days)
+                database.prune_old_settlement_periods(older_than_days=365)
+
+                # Prune old ban proposals and votes (180-day retention)
+                database.prune_old_ban_data(older_than_days=180)
 
                 # Issue #38: Auto-connect to hive members we're not connected to
                 reconnected = _auto_connect_to_all_members()

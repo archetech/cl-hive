@@ -403,9 +403,8 @@ class FlowCorridorManager:
         self.liquidity_coordinator = liquidity_coordinator
         self.our_pubkey: Optional[str] = None
 
-        # Cache of assignments
-        self._assignments: Dict[Tuple[str, str], CorridorAssignment] = {}
-        self._assignments_timestamp: float = 0
+        # Cache of assignments — single atomic tuple: (dict, timestamp)
+        self._assignments_snapshot: Tuple[Dict[Tuple[str, str], CorridorAssignment], float] = ({}, 0)
         self._assignments_ttl: float = 3600  # 1 hour cache
 
     def set_our_pubkey(self, pubkey: str) -> None:
@@ -569,10 +568,11 @@ class FlowCorridorManager:
         """Get all corridor assignments, refreshing if needed."""
         now = time.time()
 
+        assignments, ts = self._assignments_snapshot
         if (not force_refresh and
-            self._assignments and
-            now - self._assignments_timestamp < self._assignments_ttl):
-            return list(self._assignments.values())
+            assignments and
+            now - ts < self._assignments_ttl):
+            return list(assignments.values())
 
         # Refresh assignments (build into local dict, then atomic swap)
         corridors = self.identify_corridors()
@@ -583,11 +583,10 @@ class FlowCorridorManager:
             key = (corridor.source_peer_id, corridor.destination_peer_id)
             new_assignments[key] = assignment
 
-        self._assignments = new_assignments
-        self._assignments_timestamp = now
-        self._log(f"Refreshed {len(self._assignments)} corridor assignments")
+        self._assignments_snapshot = (new_assignments, now)
+        self._log(f"Refreshed {len(new_assignments)} corridor assignments")
 
-        return list(self._assignments.values())
+        return list(new_assignments.values())
 
     def is_primary_for_corridor(
         self,
@@ -597,7 +596,8 @@ class FlowCorridorManager:
     ) -> bool:
         """Check if member is primary for a specific corridor."""
         key = (source, destination)
-        assignment = self._assignments.get(key)
+        assignments, _ = self._assignments_snapshot
+        assignment = assignments.get(key)
         if assignment:
             return assignment.primary_member == member_id
         return False
@@ -614,7 +614,8 @@ class FlowCorridorManager:
         Returns (fee_ppm, is_primary)
         """
         key = (source, destination)
-        assignment = self._assignments.get(key)
+        assignments, _ = self._assignments_snapshot
+        assignment = assignments.get(key)
 
         if not assignment:
             return DEFAULT_FEE_PPM, False
@@ -683,7 +684,8 @@ class AdaptiveFeeController:
         Dynamic environment: High evaporation (explore new fee points)
         """
         # Get balance velocity (if available)
-        velocity = self._velocity_cache.get(channel_id, 0.0)
+        with self._lock:
+            velocity = self._velocity_cache.get(channel_id, 0.0)
 
         # Get network fee volatility
         fee_volatility = self._calculate_fee_volatility()
@@ -723,8 +725,9 @@ class AdaptiveFeeController:
 
     def update_velocity(self, channel_id: str, velocity_pct_per_hour: float) -> None:
         """Update cached velocity for a channel."""
-        self._velocity_cache[channel_id] = velocity_pct_per_hour
-        self._velocity_cache_time[channel_id] = time.time()
+        with self._lock:
+            self._velocity_cache[channel_id] = velocity_pct_per_hour
+            self._velocity_cache_time[channel_id] = time.time()
 
     def record_fee_observation(self, fee_ppm: int) -> None:
         """Record a network fee observation for volatility calculation."""
@@ -840,7 +843,8 @@ class AdaptiveFeeController:
         This is needed for sharing pheromones - we share by peer_id
         so other members with channels to the same peer can learn.
         """
-        self._channel_peer_map[channel_id] = peer_id
+        with self._lock:
+            self._channel_peer_map[channel_id] = peer_id
 
     def update_channel_peer_mappings(self, channels: List[Dict[str, Any]]) -> None:
         """
@@ -857,7 +861,8 @@ class AdaptiveFeeController:
             peer_id = ch.get("peer_id")
             if channel_id and peer_id:
                 new_map[channel_id] = peer_id
-        self._channel_peer_map = new_map
+        with self._lock:
+            self._channel_peer_map = new_map
 
     def get_shareable_pheromones(
         self,
@@ -1072,6 +1077,9 @@ class AdaptiveFeeController:
         Returns:
             Number of channels that had pheromone evaporated
         """
+        # Pre-compute fee volatility outside lock (uses _fee_obs_lock)
+        fee_volatility = self._calculate_fee_volatility()
+
         with self._lock:
             now = time.time()
             evaporated = 0
@@ -1085,7 +1093,15 @@ class AdaptiveFeeController:
                 hours_elapsed = (now - last_update) / 3600.0
 
                 if hours_elapsed > 0:
-                    evap_rate = self.calculate_evaporation_rate(channel_id)
+                    # Inline evaporation rate calc to avoid deadlock
+                    # (calculate_evaporation_rate also acquires _lock)
+                    velocity = self._velocity_cache.get(channel_id, 0.0)
+                    base = BASE_EVAPORATION_RATE
+                    velocity_factor = min(0.4, abs(velocity) * 4)
+                    volatility_factor = min(0.3, fee_volatility / 200)
+                    evap_rate = base + velocity_factor + volatility_factor
+                    evap_rate = max(MIN_EVAPORATION_RATE, min(MAX_EVAPORATION_RATE, evap_rate))
+
                     decay_factor = math.pow(1 - evap_rate, hours_elapsed)
                     old_level = self._pheromone[channel_id]
                     self._pheromone[channel_id] *= decay_factor
@@ -1099,15 +1115,15 @@ class AdaptiveFeeController:
 
                     evaporated += 1
 
-        # Evict stale velocity cache entries (separate from pheromone lock)
-        stale_cutoff = time.time() - 48 * 3600  # 48 hours
-        stale_keys = [
-            k for k, t in self._velocity_cache_time.items()
-            if t < stale_cutoff
-        ]
-        for k in stale_keys:
-            self._velocity_cache.pop(k, None)
-            self._velocity_cache_time.pop(k, None)
+            # Evict stale velocity cache entries (already under lock)
+            stale_cutoff = now - 48 * 3600  # 48 hours
+            stale_keys = [
+                k for k, t in self._velocity_cache_time.items()
+                if t < stale_cutoff
+            ]
+            for k in stale_keys:
+                self._velocity_cache.pop(k, None)
+                self._velocity_cache_time.pop(k, None)
 
         return evaporated
 
@@ -1775,7 +1791,8 @@ class MyceliumDefenseSystem:
         }
 
         # Local warning
-        local = self._warnings.get(peer_id)
+        with self._lock:
+            local = self._warnings.get(peer_id)
         if local and not local.is_expired():
             result["local_warning"] = local.to_dict()
 
@@ -1815,7 +1832,8 @@ class MyceliumDefenseSystem:
         candidates = []
 
         # Check all peers with active warnings
-        checked_peers = set(self._warnings.keys())
+        with self._lock:
+            checked_peers = set(self._warnings.keys())
 
         # Also check peers in reputation system with warnings
         if hasattr(self, '_peer_rep_mgr') and self._peer_rep_mgr:
@@ -2228,8 +2246,12 @@ class TimeBasedFeeAdjuster:
         """
         current_hour, current_day = self._get_current_time_context()
 
+        # Take a snapshot under lock before iterating
+        with self._cache_lock:
+            cache_snapshot = dict(self._adjustment_cache)
+
         active = []
-        for channel_id, (adjustment, _) in self._adjustment_cache.items():
+        for channel_id, (adjustment, _) in cache_snapshot.items():
             if adjustment.adjustment_type != "none":
                 active.append(adjustment.to_dict())
 

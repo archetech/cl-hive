@@ -872,10 +872,17 @@ class FleetPositioningStrategy:
         Returns:
             PositionRecommendation or None
         """
+        # Cleanup stale recommendation cooldown entries
+        now = time.time()
+        stale = [k for k, v in self._recent_recommendations.items()
+                 if now - v > POSITION_RECOMMENDATION_COOLDOWN_HOURS * 3600]
+        for k in stale:
+            del self._recent_recommendations[k]
+
         # Check cooldown
         cooldown_key = member_id or "fleet"
         last_rec = self._recent_recommendations.get(cooldown_key, 0)
-        if time.time() - last_rec < POSITION_RECOMMENDATION_COOLDOWN_HOURS * 3600:
+        if now - last_rec < POSITION_RECOMMENDATION_COOLDOWN_HOURS * 3600:
             return None
 
         # Get valuable corridors
@@ -1416,6 +1423,15 @@ class PhysarumChannelManager:
         if not hasattr(self, '_database') or not self._database:
             self._log("Physarum cycle skipped: no database", level="debug")
             return result
+
+        # Periodic cleanup: remove flow history entries not seen in > 7 days
+        seven_days_ago = now - 7 * 86400
+        stale_channels = [
+            cid for cid, entries in self._flow_history.items()
+            if not entries or max(ts for ts, _ in entries) < seven_days_ago
+        ]
+        for cid in stale_channels:
+            del self._flow_history[cid]
 
         # Get all recommendations
         recommendations = self.get_all_recommendations()

@@ -313,7 +313,7 @@ class TestAssignmentsAtomicSwap:
             destination_peer_id="dst",
             capable_members=["03us"],
         )
-        mgr._assignments[("src", "dst")] = CorridorAssignment(
+        initial_assignments = {("src", "dst"): CorridorAssignment(
             corridor=corridor,
             primary_member="03us",
             secondary_members=[],
@@ -321,7 +321,8 @@ class TestAssignmentsAtomicSwap:
             secondary_fee_ppm=750,
             assignment_reason="test",
             confidence=0.8,
-        )
+        )}
+        mgr._assignments_snapshot = (initial_assignments, 0)
 
         # Mock identify_corridors to return empty (simulates no competitions)
         mgr.liquidity_coordinator.detect_internal_competition.return_value = []
@@ -333,7 +334,8 @@ class TestAssignmentsAtomicSwap:
         def slow_assign(corridor):
             """Simulate slow assignment to test concurrency."""
             # Check if assignments dict is visible during rebuild
-            if len(mgr._assignments) == 0:
+            assignments, _ = mgr._assignments_snapshot
+            if len(assignments) == 0:
                 seen_empty.append(True)
             return original_assign(corridor)
 

@@ -79,16 +79,19 @@ class ContributionManager:
             self._log(f"Failed to load daily stats: {exc}", level="warn")
 
     def _parse_msat(self, value: Any) -> Optional[int]:
-        if isinstance(value, int):
-            return value
-        if isinstance(value, dict) and "msat" in value:
-            return self._parse_msat(value["msat"])
-        if isinstance(value, str):
-            text = value.strip()
-            if text.endswith("msat"):
-                text = text[:-4]
-            if text.isdigit():
-                return int(text)
+        for _ in range(3):  # Max 3 levels of nesting
+            if isinstance(value, int):
+                return value
+            if isinstance(value, dict) and "msat" in value:
+                value = value["msat"]
+                continue
+            if isinstance(value, str):
+                text = value.strip()
+                if text.endswith("msat"):
+                    text = text[:-4]
+                if text.isdigit():
+                    return int(text)
+            return None
         return None
 
     def _refresh_channel_map(self) -> None:

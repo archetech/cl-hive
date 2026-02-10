@@ -253,8 +253,7 @@ class TestBFSFleetPathConnectivity:
         }
 
         # Cache the topology
-        self.router._topology_cache = topology
-        self.router._topology_cache_time = time.time()
+        self.router._topology_snapshot = (topology, time.time())
 
         # ext1 connects to memberA, ext2 connects to memberB
         path = self.router.find_fleet_path("ext1", "ext2", 100000)
@@ -272,8 +271,7 @@ class TestBFSFleetPathConnectivity:
             "memberC": {"ext2", "ext_shared"},
         }
 
-        self.router._topology_cache = topology
-        self.router._topology_cache_time = time.time()
+        self.router._topology_snapshot = (topology, time.time())
 
         # Looking for path from ext1 to ext2
         path = self.router.find_fleet_path("ext1", "ext2", 100000)

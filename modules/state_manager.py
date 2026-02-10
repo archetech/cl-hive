@@ -684,12 +684,15 @@ class StateManager:
     def get_cached_hash(self) -> Tuple[str, int]:
         """
         Get the cached fleet hash if still fresh.
-        
+
         Returns:
             Tuple of (hash_hex, age_seconds)
         """
-        age = int(time.time()) - self._last_hash_time
-        return (self._last_hash, age)
+        with self._lock:
+            last_hash = self._last_hash
+            last_hash_time = self._last_hash_time
+        age = int(time.time()) - last_hash_time
+        return (last_hash, age)
     
     # =========================================================================
     # ANTI-ENTROPY (DIVERGENCE DETECTION)
@@ -863,7 +866,10 @@ class StateManager:
             Dict with fleet-wide metrics
         """
         with self._lock:
-            states = list(self._local_state.values())
+            states = [
+                HivePeerState.from_dict(state.to_dict())
+                for state in self._local_state.values()
+            ]
 
         if not states:
             return {

@@ -433,9 +433,8 @@ class FleetRebalanceRouter:
         self.liquidity_coordinator = liquidity_coordinator
         self._our_pubkey: Optional[str] = None
 
-        # Cache for fleet topology
-        self._topology_cache: Dict[str, Set[str]] = {}  # member -> connected peers
-        self._topology_cache_time: float = 0
+        # Cache for fleet topology (atomic snapshot pattern for thread safety)
+        self._topology_snapshot: Tuple[Dict[str, Set[str]], float] = ({}, 0)  # (topology, timestamp)
         self._topology_cache_ttl: float = 300  # 5 minutes
 
     def set_our_pubkey(self, pubkey: str) -> None:
@@ -452,13 +451,15 @@ class FleetRebalanceRouter:
         Get fleet member topology (who is connected to whom).
 
         Returns cached topology if fresh, otherwise rebuilds from state.
+        Uses atomic snapshot replacement for thread safety.
         """
         now = time.time()
+        snapshot = self._topology_snapshot  # Atomic read
 
         # Return cached if fresh
-        if (self._topology_cache and
-            now - self._topology_cache_time < self._topology_cache_ttl):
-            return self._topology_cache
+        if (snapshot[0] and
+            now - snapshot[1] < self._topology_cache_ttl):
+            return snapshot[0]
 
         # Rebuild from state manager
         topology = {}
@@ -474,8 +475,7 @@ class FleetRebalanceRouter:
             except Exception as e:
                 self._log(f"Error getting fleet topology: {e}", level="debug")
 
-        self._topology_cache = topology
-        self._topology_cache_time = now
+        self._topology_snapshot = (topology, now)  # Atomic replacement
         return topology
 
     def _get_fleet_members(self) -> List[str]:

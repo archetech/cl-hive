@@ -692,6 +692,13 @@ class ChannelRationalizer:
         Returns:
             List of CloseRecommendation
         """
+        # Cleanup stale recommendation cooldown entries
+        now = int(time.time())
+        stale = [k for k, v in self._recent_recommendations.items()
+                 if now - v > CLOSE_RECOMMENDATION_COOLDOWN_HOURS * 3600]
+        for k in stale:
+            del self._recent_recommendations[k]
+
         recommendations = []
 
         # Get all redundant peer coverage

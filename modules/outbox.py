@@ -152,6 +152,12 @@ class OutboxManager:
             return stats
 
         for entry in pending:
+            # Check message expiry before retrying
+            if int(time.time()) >= entry.get("expires_at", float('inf')):
+                self._db.fail_outbox(entry["msg_id"], entry["peer_id"], "expired")
+                stats["failed"] += 1
+                continue
+
             msg_id = entry["msg_id"]
             peer_id = entry["peer_id"]
             msg_type = entry["msg_type"]

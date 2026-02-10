@@ -164,6 +164,12 @@ class FeeIntelligenceManager:
         history = [t for t in history if t > cutoff]
         rate_dict[sender_id] = history
 
+        # Evict stale keys to prevent unbounded dict growth
+        if len(rate_dict) > 200:
+            stale = [k for k, v in rate_dict.items() if not v]
+            for k in stale:
+                del rate_dict[k]
+
         if len(history) >= max_count:
             return False
 

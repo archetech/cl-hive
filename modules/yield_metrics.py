@@ -658,6 +658,22 @@ class YieldMetricsManager:
 
             # Cache result
             with self._lock:
+                # Evict stale entries if cache exceeds 500
+                if len(self._velocity_cache) > 500:
+                    stale_cutoff = now - self._velocity_cache_ttl
+                    stale_keys = [
+                        k for k, v in self._velocity_cache.items()
+                        if v.get("timestamp", 0) < stale_cutoff
+                    ]
+                    for k in stale_keys:
+                        del self._velocity_cache[k]
+                    # If still over limit after TTL eviction, remove oldest
+                    if len(self._velocity_cache) > 500:
+                        oldest_key = min(
+                            self._velocity_cache,
+                            key=lambda k: self._velocity_cache[k].get("timestamp", 0)
+                        )
+                        del self._velocity_cache[oldest_key]
                 self._velocity_cache[channel_id] = result
 
             return result

@@ -3042,6 +3042,13 @@ def validate_fee_report(payload: Dict[str, Any]) -> bool:
     if payload["period_end"] < payload["period_start"]:
         return False
 
+    # Timestamp freshness validation
+    now = int(time.time())
+    if payload["period_end"] > now + 3600:  # More than 1 hour in future
+        return False
+    if payload["period_start"] < now - 90 * 86400:  # More than 90 days old
+        return False
+
     return True
 
 
@@ -4406,7 +4413,7 @@ def validate_stigmergic_marker_batch(payload: Dict[str, Any]) -> bool:
     # Required fields
     if not payload.get("reporter_id"):
         return False
-    if not payload.get("timestamp"):
+    if not isinstance(payload.get("timestamp"), (int, float)):
         return False
     if not payload.get("signature"):
         return False

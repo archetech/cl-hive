@@ -1749,9 +1749,15 @@ class AnticipatoryLiquidityManager:
             pattern_intensity=pattern_intensity
         )
 
-        # Cache prediction
+        # Cache prediction and evict stale entries
         with self._lock:
             self._prediction_cache[channel_id] = prediction
+
+            # Evict stale predictions older than PREDICTION_STALE_HOURS
+            stale_cutoff = time.time() - PREDICTION_STALE_HOURS * 3600
+            stale_keys = [k for k, v in self._prediction_cache.items() if v.predicted_at < stale_cutoff]
+            for k in stale_keys:
+                del self._prediction_cache[k]
 
         return prediction
 
@@ -2642,6 +2648,17 @@ class AnticipatoryLiquidityManager:
             # Update peer-to-channel mapping
             if peer_id:
                 self._peer_to_channels[peer_id].add(channel_id)
+
+            # Evict peer_to_channels entries if map exceeds 2000 entries
+            MAX_PEER_TO_CHANNELS = 2000
+            if len(self._peer_to_channels) > MAX_PEER_TO_CHANNELS:
+                # Remove peers with fewest channel mappings (least useful)
+                sorted_peers = sorted(
+                    self._peer_to_channels.keys(),
+                    key=lambda p: len(self._peer_to_channels[p])
+                )
+                while len(self._peer_to_channels) > MAX_PEER_TO_CHANNELS and sorted_peers:
+                    del self._peer_to_channels[sorted_peers.pop(0)]
 
         self._log(
             f"Received Kalman velocity for {channel_id[:12]}... from {reporter_id[:12]}...: "

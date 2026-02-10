@@ -262,10 +262,19 @@ class CooperativeExpansionManager:
         try:
             funds = self.plugin.rpc.listfunds()
             outputs = funds.get('outputs', [])
+            def _parse_output_sats(o):
+                amt = o.get('amount_msat')
+                if isinstance(amt, int):
+                    return amt // 1000
+                if isinstance(amt, str):
+                    try:
+                        return int(amt.rstrip('msat')) // 1000
+                    except (ValueError, TypeError):
+                        return o.get('value', 0)
+                return o.get('value', 0)
+
             return sum(
-                (o.get('amount_msat', 0) // 1000 if isinstance(o.get('amount_msat'), int)
-                 else int(o.get('amount_msat', '0msat')[:-4]) // 1000
-                 if isinstance(o.get('amount_msat'), str) else o.get('value', 0))
+                _parse_output_sats(o)
                 for o in outputs if o.get('status') == 'confirmed'
             )
         except Exception:
@@ -720,6 +729,10 @@ class CooperativeExpansionManager:
         if not round_id:
             return {"error": "missing round_id"}
 
+        # Validate round_id format (prevent oversized or non-string IDs)
+        if not isinstance(round_id, str) or len(round_id) > 64:
+            return {"success": False, "error": "invalid_round_id"}
+
         # If we don't know about this round, join it
         with self._lock:
             round_obj = self._rounds.get(round_id)
@@ -751,7 +764,7 @@ class CooperativeExpansionManager:
                                 trigger_event="merged",
                                 trigger_reporter=peer_id,
                                 quality_score=payload.get("quality_score", 0.5),
-                                expires_at=int(time.time()) + self.ROUND_EXPIRE_SECONDS,
+                                expires_at=old_round.started_at + self.ROUND_EXPIRE_SECONDS,
                             )
                             # Copy our nominations
                             new_round.nominations = old_round.nominations.copy()
@@ -761,6 +774,16 @@ class CooperativeExpansionManager:
                     self._log(f"Keeping our round {existing_round_id[:8]}..., ignoring remote {round_id[:8]}...")
                     round_id = existing_round_id
             else:
+                # Check active round count before creating from remote
+                with self._lock:
+                    active_count = sum(
+                        1 for r in self._rounds.values()
+                        if r.state in (ExpansionRoundState.NOMINATING, ExpansionRoundState.ELECTING)
+                    )
+                if active_count >= self.MAX_ACTIVE_ROUNDS:
+                    self._log(f"Ignoring remote round {round_id[:8]}...: max active rounds reached", level='debug')
+                    return {"success": False, "error": "max_active_rounds"}
+
                 # No active round for this target - join the remote round
                 self._log(f"Joining remote expansion round {round_id[:8]}... for {target_peer_id[:16]}...")
                 now = int(time.time())
@@ -1105,7 +1128,12 @@ class CooperativeExpansionManager:
         self._log(f"Round {round_id[:8]}... cancelled: {reason}")
 
     def get_round(self, round_id: str) -> Optional[ExpansionRound]:
-        """Get a round by ID."""
+        """Get a round by ID.
+
+        Note: Returns a direct reference to the internal round object.
+        Callers must not mutate the returned object outside of the
+        ExpansionCoordinator's lock.
+        """
         with self._lock:
             return self._rounds.get(round_id)
 

@@ -421,14 +421,20 @@ class VPNTransportManager:
         Returns:
             Tuple of (accept: bool, reason: str)
         """
+        # Snapshot mutable config under lock
+        with self._lock:
+            mode = self._mode
+            required_messages = set(self._required_messages)
+            vpn_subnets = list(self._vpn_subnets)
+
         # Always accept in ANY mode
-        if self._mode == TransportMode.ANY:
+        if mode == TransportMode.ANY:
             with self._lock:
                 self._stats["messages_accepted"] += 1
             return (True, "any transport allowed")
 
         # Check if this message type requires VPN
-        if not self._message_requires_vpn(message_type):
+        if not self._message_requires_vpn_snapshot(message_type, required_messages):
             with self._lock:
                 self._stats["messages_accepted"] += 1
             return (True, f"message type '{message_type}' does not require VPN")
@@ -437,16 +443,18 @@ class VPNTransportManager:
         conn_info = self._get_or_create_connection_info(peer_id)
 
         # Check if peer is connected via VPN
-        is_vpn = conn_info.connected_via_vpn
+        with self._lock:
+            is_vpn = conn_info.connected_via_vpn
 
         # If we have a peer address, verify it
         if peer_address and not is_vpn:
             ip = self.extract_ip_from_address(peer_address)
             if ip and self.is_vpn_address(ip):
                 is_vpn = True
-                conn_info.connected_via_vpn = True
-                conn_info.vpn_ip = ip
-                conn_info.last_verified = int(time.time())
+                with self._lock:
+                    conn_info.connected_via_vpn = True
+                    conn_info.vpn_ip = ip
+                    conn_info.last_verified = int(time.time())
 
         # Check against configured VPN peers
         if not is_vpn and peer_id in self._vpn_peers:
@@ -455,7 +463,7 @@ class VPNTransportManager:
             pass
 
         # Apply transport mode policy
-        if self._mode == TransportMode.VPN_ONLY:
+        if mode == TransportMode.VPN_ONLY:
             if is_vpn:
                 with self._lock:
                     self._stats["messages_accepted"] += 1
@@ -469,7 +477,7 @@ class VPNTransportManager:
                 )
                 return (False, "vpn-only mode: non-VPN connection rejected")
 
-        if self._mode == TransportMode.VPN_PREFERRED:
+        if mode == TransportMode.VPN_PREFERRED:
             with self._lock:
                 self._stats["messages_accepted"] += 1
             if is_vpn:
@@ -514,6 +522,34 @@ class VPNTransportManager:
 
         return False
 
+    @staticmethod
+    def _message_requires_vpn_snapshot(
+        message_type: str,
+        required_messages: set
+    ) -> bool:
+        """Check if a message type requires VPN using a pre-snapshotted set."""
+        if MessageRequirement.NONE in required_messages:
+            return False
+
+        if MessageRequirement.ALL in required_messages:
+            return True
+
+        message_type_upper = message_type.upper()
+
+        if MessageRequirement.GOSSIP in required_messages:
+            if "GOSSIP" in message_type_upper or "STATE" in message_type_upper:
+                return True
+
+        if MessageRequirement.INTENT in required_messages:
+            if "INTENT" in message_type_upper:
+                return True
+
+        if MessageRequirement.SYNC in required_messages:
+            if "SYNC" in message_type_upper or "FULL_STATE" in message_type_upper:
+                return True
+
+        return False
+
     # =========================================================================
     # PEER MANAGEMENT
     # =========================================================================
@@ -528,8 +564,9 @@ class VPNTransportManager:
         Returns:
             VPN address string (ip:port) or None
         """
-        mapping = self._vpn_peers.get(peer_id)
-        return mapping.vpn_address if mapping else None
+        with self._lock:
+            mapping = self._vpn_peers.get(peer_id)
+            return mapping.vpn_address if mapping else None
 
     def add_vpn_peer(self, pubkey: str, vpn_ip: str, vpn_port: int = DEFAULT_VPN_PORT) -> bool:
         """
@@ -680,13 +717,14 @@ class VPNTransportManager:
         """
         result = {}
 
-        # Check configured mapping
-        if peer_id in self._vpn_peers:
-            result["configured_mapping"] = self._vpn_peers[peer_id].to_dict()
+        with self._lock:
+            # Check configured mapping
+            if peer_id in self._vpn_peers:
+                result["configured_mapping"] = self._vpn_peers[peer_id].to_dict()
 
-        # Check connection info
-        if peer_id in self._peer_connections:
-            result["connection_info"] = self._peer_connections[peer_id].to_dict()
+            # Check connection info
+            if peer_id in self._peer_connections:
+                result["connection_info"] = self._peer_connections[peer_id].to_dict()
 
         return result if result else None
 

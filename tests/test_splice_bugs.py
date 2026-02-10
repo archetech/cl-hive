@@ -169,6 +169,7 @@ class TestSessionCreationFailureHandling:
     ):
         """initiate_splice should succeed when DB create succeeds."""
         mock_database.create_splice_session.return_value = True
+        mock_database.get_splice_session.return_value = {"status": "pending"}
         mock_database.get_member.return_value = {"peer_id": sample_pubkey, "tier": "member"}
 
         mock_rpc.call.return_value = {"psbt": "cHNidP8B" + "A" * 100}

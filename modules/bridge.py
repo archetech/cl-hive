@@ -557,14 +557,14 @@ class Bridge:
         if not bypass_rate_limit:
             with self._budget_lock:
                 last_change = self._policy_last_change.get(peer_id, 0)
-            if now - last_change < POLICY_RATE_LIMIT_SECONDS:
-                wait_time = int(POLICY_RATE_LIMIT_SECONDS - (now - last_change))
-                self._log(
-                    f"Rate limited: Cannot change policy for {peer_id[:16]}... "
-                    f"(wait {wait_time}s)",
-                    level='debug'
-                )
-                return False
+                if now - last_change < POLICY_RATE_LIMIT_SECONDS:
+                    wait_time = int(POLICY_RATE_LIMIT_SECONDS - (now - last_change))
+                    self._log(
+                        f"Rate limited: Cannot change policy for {peer_id[:16]}... "
+                        f"(wait {wait_time}s)",
+                        level='debug'
+                    )
+                    return False
 
         try:
             if is_member:

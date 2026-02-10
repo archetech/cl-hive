@@ -117,6 +117,13 @@ class TaskManager:
             stale = [k for k, v in tracker.items() if not v]
             for k in stale:
                 del tracker[k]
+        # Also evict keys whose most recent timestamp is older than the window
+        stale_window = [
+            k for k, v in tracker.items()
+            if v and max(v) <= cutoff
+        ]
+        for k in stale_window:
+            del tracker[k]
 
         return len(tracker[sender_id]) < max_count
 

@@ -289,6 +289,11 @@ class DecisionEngine:
 
         # Atomically check budget+rate, execute, and update tracking
         amount_sats = packet.context.get('amount_sats', 0)
+        if not isinstance(amount_sats, (int, float)):
+            try:
+                amount_sats = int(amount_sats)
+            except (ValueError, TypeError):
+                amount_sats = 0
         if isinstance(amount_sats, (int, float)) and amount_sats < 0:
             amount_sats = 0
 
@@ -394,18 +399,20 @@ class DecisionEngine:
         now = int(time.time())
         cutoff = now - 3600
 
-        # Prune old actions for accurate count
-        recent_actions = [ts for ts in self._hourly_actions if ts > cutoff]
+        with self._failsafe_lock:
+            # Prune old actions for accurate count
+            recent_actions = [ts for ts in self._hourly_actions if ts > cutoff]
 
-        return {
-            'daily_spend_sats': self._daily_spend_sats,
-            'daily_spend_reset_day': self._daily_spend_reset_day,
-            'hourly_action_count': len(recent_actions),
-            'registered_executors': list(self._executors.keys()),
-        }
+            return {
+                'daily_spend_sats': self._daily_spend_sats,
+                'daily_spend_reset_day': self._daily_spend_reset_day,
+                'hourly_action_count': len(recent_actions),
+                'registered_executors': list(self._executors.keys()),
+            }
 
     def reset_limits(self) -> None:
         """Reset all rate limits and budget tracking (for testing)."""
-        self._daily_spend_sats = 0
-        self._daily_spend_reset_day = 0
-        self._hourly_actions = []
+        with self._failsafe_lock:
+            self._daily_spend_sats = 0
+            self._daily_spend_reset_day = 0
+            self._hourly_actions = []

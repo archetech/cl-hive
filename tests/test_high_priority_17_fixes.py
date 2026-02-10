@@ -335,8 +335,7 @@ class TestBug5BoundedFleetPaths:
             peers = {from_peer, to_peer} | (set(members) - {m})
             topology[m] = peers
 
-        router._topology_cache = topology
-        router._topology_cache_time = time.time()
+        router._topology_snapshot = (topology, time.time())
 
         paths = router._find_all_fleet_paths(from_peer, to_peer, max_depth=4)
         assert len(paths) <= router._MAX_CANDIDATE_PATHS

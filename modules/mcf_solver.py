@@ -54,6 +54,8 @@ INFINITY = float('inf')
 
 # Network size limits (prevent unbounded memory)
 MAX_MCF_NODES = 200                # Maximum nodes in network
+# INVARIANT: MAX_BELLMAN_FORD_ITERATIONS must be >= MAX_MCF_NODES
+assert MAX_BELLMAN_FORD_ITERATIONS >= MAX_MCF_NODES, "BF iterations must be >= node count"
 MAX_MCF_EDGES = 2000               # Maximum edges in network
 
 # Cost scaling
@@ -1298,18 +1300,21 @@ class MCFCoordinator:
     def is_coordinator(self) -> bool:
         """Check if we are the elected coordinator (uses cached result)."""
         now = time.time()
-        if (self._cached_coordinator is not None
-                and (now - self._election_cache_time) < self._election_cache_ttl):
-            return self._cached_coordinator == self.our_pubkey
+        with self._solution_lock:
+            if (self._cached_coordinator is not None
+                    and (now - self._election_cache_time) < self._election_cache_ttl):
+                return self._cached_coordinator == self.our_pubkey
         result = self.elect_coordinator()
-        self._cached_coordinator = result
-        self._election_cache_time = now
+        with self._solution_lock:
+            self._cached_coordinator = result
+            self._election_cache_time = now
         return result == self.our_pubkey
 
     def invalidate_election_cache(self) -> None:
         """Invalidate the coordinator election cache (e.g. on membership change)."""
-        self._cached_coordinator = None
-        self._election_cache_time = 0
+        with self._solution_lock:
+            self._cached_coordinator = None
+            self._election_cache_time = 0
 
     def collect_fleet_needs(self) -> List[RebalanceNeed]:
         """

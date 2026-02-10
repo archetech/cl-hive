@@ -339,6 +339,10 @@ class HiveDatabase:
                 event_count INTEGER NOT NULL DEFAULT 0
             )
         """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rate_limits_window "
+            "ON contribution_rate_limits(window_start)"
+        )
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS contribution_daily_stats (
@@ -1892,7 +1896,6 @@ class HiveDatabase:
                 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
             """, (proposal_id, target_peer_id, proposer_peer_id, reason,
                   proposed_at, expires_at, proposal_type))
-            conn.commit()
             return True
         except Exception:
             return False
@@ -1932,7 +1935,6 @@ class HiveDatabase:
             cursor = conn.execute("""
                 UPDATE ban_proposals SET status = ? WHERE proposal_id = ?
             """, (status, proposal_id))
-            conn.commit()
             return cursor.rowcount > 0
         except Exception:
             return False
@@ -1947,7 +1949,6 @@ class HiveDatabase:
                 (proposal_id, voter_peer_id, vote, voted_at, signature)
                 VALUES (?, ?, ?, ?, ?)
             """, (proposal_id, voter_peer_id, vote, voted_at, signature))
-            conn.commit()
             return True
         except Exception:
             return False
@@ -1978,8 +1979,41 @@ class HiveDatabase:
             SET status = 'expired'
             WHERE status = 'pending' AND expires_at < ?
         """, (now,))
-        conn.commit()
         return cursor.rowcount
+
+    def prune_old_ban_data(self, older_than_days: int = 180) -> int:
+        """
+        Remove old ban proposals and their votes for terminal states.
+
+        Only prunes proposals in terminal states (approved, rejected, expired).
+        Pending proposals are never pruned.
+
+        Args:
+            older_than_days: Remove records older than this many days
+
+        Returns:
+            Number of ban proposals deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (older_than_days * 86400)
+
+        with self.transaction() as tx_conn:
+            # Delete votes for old terminal proposals first (foreign key safety)
+            tx_conn.execute("""
+                DELETE FROM ban_votes WHERE proposal_id IN (
+                    SELECT proposal_id FROM ban_proposals
+                    WHERE status IN ('approved', 'rejected', 'expired')
+                    AND proposed_at < ?
+                )
+            """, (cutoff,))
+
+            # Delete the old terminal proposals
+            cursor = tx_conn.execute("""
+                DELETE FROM ban_proposals
+                WHERE status IN ('approved', 'rejected', 'expired')
+                AND proposed_at < ?
+            """, (cutoff,))
+            return cursor.rowcount
 
     # =========================================================================
     # PEER PRESENCE
@@ -2078,29 +2112,30 @@ class HiveDatabase:
         """).fetchall()
 
         updated = 0
-        for row in rows:
-            online_seconds = row['online_seconds_rolling']
+        with self.transaction() as tx_conn:
+            for row in rows:
+                online_seconds = row['online_seconds_rolling']
 
-            # If currently online, add time since last state change
-            if row['is_online']:
-                online_seconds += max(0, now - row['last_change_ts'])
+                # If currently online, add time since last state change
+                if row['is_online']:
+                    online_seconds += max(0, now - row['last_change_ts'])
 
-            # Calculate window elapsed time
-            elapsed = max(1, now - row['window_start_ts'])
+                # Calculate window elapsed time
+                elapsed = max(1, now - row['window_start_ts'])
 
-            # Cap at window size
-            if elapsed > window_seconds:
-                elapsed = window_seconds
-            if online_seconds > elapsed:
-                online_seconds = elapsed
+                # Cap at window size
+                if elapsed > window_seconds:
+                    elapsed = window_seconds
+                if online_seconds > elapsed:
+                    online_seconds = elapsed
 
-            uptime_pct = online_seconds / elapsed
+                uptime_pct = online_seconds / elapsed
 
-            conn.execute(
-                "UPDATE hive_members SET uptime_pct = ? WHERE peer_id = ?",
-                (uptime_pct, row['peer_id'])
-            )
-            updated += 1
+                tx_conn.execute(
+                    "UPDATE hive_members SET uptime_pct = ? WHERE peer_id = ?",
+                    (uptime_pct, row['peer_id'])
+                )
+                updated += 1
 
         return updated
 
@@ -3098,12 +3133,13 @@ class HiveDatabase:
         rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
-    def get_peers_with_events(self, days: int = 90) -> List[str]:
+    def get_peers_with_events(self, days: int = 90, limit: int = 500) -> List[str]:
         """
         Get list of all external peers that have event history.
 
         Args:
             days: Only include peers with events in last N days
+            limit: Maximum number of peers to return (default 500)
 
         Returns:
             List of peer_id strings
@@ -3114,7 +3150,8 @@ class HiveDatabase:
         rows = conn.execute("""
             SELECT DISTINCT peer_id FROM peer_events
             WHERE timestamp > ?
-        """, (cutoff,)).fetchall()
+            LIMIT ?
+        """, (cutoff, limit)).fetchall()
 
         return [row['peer_id'] for row in rows]
 
@@ -3612,7 +3649,6 @@ class HiveDatabase:
                 (hold_id, round_id, peer_id, amount_sats, created_at, expires_at, status)
                 VALUES (?, ?, ?, ?, ?, ?, 'active')
             """, (hold_id, round_id, peer_id, amount_sats, now, expires_at))
-            conn.commit()
             return True
         except Exception:
             return False
@@ -3625,7 +3661,6 @@ class HiveDatabase:
                 UPDATE budget_holds SET status = 'released'
                 WHERE hold_id = ? AND status = 'active'
             """, (hold_id,))
-            conn.commit()
             return result.rowcount > 0
         except Exception:
             return False
@@ -3640,7 +3675,6 @@ class HiveDatabase:
                 SET status = 'consumed', consumed_by = ?, consumed_at = ?
                 WHERE hold_id = ? AND status = 'active'
             """, (consumed_by, now, hold_id))
-            conn.commit()
             return result.rowcount > 0
         except Exception:
             return False
@@ -3653,7 +3687,6 @@ class HiveDatabase:
                 UPDATE budget_holds SET status = 'expired'
                 WHERE hold_id = ? AND status = 'active'
             """, (hold_id,))
-            conn.commit()
             return result.rowcount > 0
         except Exception:
             return False
@@ -3704,7 +3737,6 @@ class HiveDatabase:
             UPDATE budget_holds SET status = 'expired'
             WHERE status = 'active' AND expires_at <= ?
         """, (now,))
-        conn.commit()
         return cursor.rowcount
 
     # =========================================================================
@@ -4756,21 +4788,12 @@ class HiveDatabase:
         """
         conn = self._get_connection()
 
-        # Deduplicate by payment_hash if provided
-        if payment_hash:
-            existing = conn.execute(
-                "SELECT id FROM pool_revenue WHERE payment_hash = ?",
-                (payment_hash,)
-            ).fetchone()
-            if existing:
-                return existing[0]
-
         cursor = conn.execute("""
-            INSERT INTO pool_revenue
+            INSERT OR IGNORE INTO pool_revenue
             (member_id, amount_sats, channel_id, payment_hash, recorded_at)
             VALUES (?, ?, ?, ?, ?)
         """, (member_id, amount_sats, channel_id, payment_hash, int(time.time())))
-        return cursor.lastrowid
+        return cursor.lastrowid or 0
 
     def get_pool_revenue(
         self,
@@ -5071,6 +5094,23 @@ class HiveDatabase:
                 ORDER BY period DESC LIMIT ?
             )
         """, (periods_to_keep,))
+        return result.rowcount
+
+    def cleanup_old_pool_distributions(self, days_to_keep: int = 365) -> int:
+        """
+        Remove old pool distribution records to limit database growth.
+
+        Args:
+            days_to_keep: Days of distribution records to retain
+
+        Returns:
+            Number of rows deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (days_to_keep * 86400)
+        result = conn.execute(
+            "DELETE FROM pool_distributions WHERE settled_at < ?", (cutoff,)
+        )
         return result.rowcount
 
     # =========================================================================
@@ -6246,6 +6286,43 @@ class HiveDatabase:
                     old_ids
                 )
                 total += result.rowcount
+
+        return total
+
+    def prune_old_settlement_periods(self, older_than_days: int = 365) -> int:
+        """
+        Remove old fee_reports and pool data older than specified days.
+
+        Prunes fee_reports, pool_contributions, pool_revenue, and
+        pool_distributions that are older than the cutoff.
+
+        Args:
+            older_than_days: Remove data older than this many days
+
+        Returns:
+            Total number of rows deleted
+        """
+        cutoff = int(time.time()) - (older_than_days * 86400)
+        total = 0
+
+        with self.transaction() as conn:
+            # Prune old fee reports by period_end timestamp
+            result = conn.execute(
+                "DELETE FROM fee_reports WHERE period_end < ?", (cutoff,)
+            )
+            total += result.rowcount
+
+            # Prune old pool revenue
+            result = conn.execute(
+                "DELETE FROM pool_revenue WHERE recorded_at < ?", (cutoff,)
+            )
+            total += result.rowcount
+
+            # Prune old pool distributions
+            result = conn.execute(
+                "DELETE FROM pool_distributions WHERE settled_at < ?", (cutoff,)
+            )
+            total += result.rowcount
 
         return total
 
