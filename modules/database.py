@@ -1099,6 +1099,20 @@ class HiveDatabase:
             )
         """)
 
+        # Settlement sub-payments - crash recovery for partial execution (S-2 fix)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settlement_sub_payments (
+                proposal_id TEXT NOT NULL,
+                from_peer_id TEXT NOT NULL,
+                to_peer_id TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                payment_hash TEXT,
+                status TEXT NOT NULL DEFAULT 'completed',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (proposal_id, from_peer_id, to_peer_id)
+            )
+        """)
+
         # Fee reports from hive members - persisted for settlement calculations
         # This stores FEE_REPORT gossip data so it survives restarts
         conn.execute("""
@@ -1782,6 +1796,10 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
         try:
+            # Clear stale approvals from any previous proposal for this target
+            conn.execute("""
+                DELETE FROM admin_promotion_approvals WHERE target_peer_id = ?
+            """, (target_peer_id,))
             conn.execute("""
                 INSERT OR REPLACE INTO admin_promotions
                 (target_peer_id, proposed_by, proposed_at, status)
@@ -2297,14 +2315,17 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
 
+        # Escape LIKE metacharacters in target to prevent over-matching
+        escaped = target.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
         # Use LIKE for initial filtering, then parse JSON to confirm
         # This is more efficient than scanning all rows
         rows = conn.execute("""
             SELECT payload FROM pending_actions
             WHERE status = 'pending' AND expires_at > ?
-            AND payload LIKE ?
+            AND payload LIKE ? ESCAPE '\\'
             LIMIT ?
-        """, (now, f'%{target}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
+        """, (now, f'%{escaped}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
 
         for row in rows:
             try:
@@ -2337,13 +2358,16 @@ class HiveDatabase:
         now = int(time.time())
         cutoff = now - cooldown_seconds
 
+        # Escape LIKE metacharacters in target to prevent over-matching
+        escaped = target.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
         # Use LIKE for initial filtering, then parse JSON to confirm
         rows = conn.execute("""
             SELECT payload FROM pending_actions
             WHERE status = 'rejected' AND proposed_at > ?
-            AND payload LIKE ?
+            AND payload LIKE ? ESCAPE '\\'
             LIMIT ?
-        """, (cutoff, f'%{target}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
+        """, (cutoff, f'%{escaped}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
 
         for row in rows:
             try:
@@ -2373,13 +2397,16 @@ class HiveDatabase:
         now = int(time.time())
         cutoff = now - (days * 86400)
 
+        # Escape LIKE metacharacters in target to prevent over-matching
+        escaped = target.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
         # Use LIKE for initial filtering, then parse JSON to confirm
         rows = conn.execute("""
             SELECT payload FROM pending_actions
             WHERE status = 'rejected' AND proposed_at > ?
-            AND payload LIKE ?
+            AND payload LIKE ? ESCAPE '\\'
             LIMIT ?
-        """, (cutoff, f'%{target}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
+        """, (cutoff, f'%{escaped}%', self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
 
         count = 0
         for row in rows:
@@ -2490,13 +2517,16 @@ class HiveDatabase:
         """
         conn = self._get_connection()
 
+        # Escape LIKE metacharacters in channel_id to prevent over-matching
+        escaped = channel_id.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
         # Use LIKE for initial filtering, then parse to confirm
         rows = conn.execute("""
             SELECT payload FROM pending_actions
             WHERE action_type = ? AND proposed_at >= ?
-            AND payload LIKE ?
+            AND payload LIKE ? ESCAPE '\\'
             LIMIT 10
-        """, (action_type, since_timestamp, f'%{channel_id}%')).fetchall()
+        """, (action_type, since_timestamp, f'%{escaped}%')).fetchall()
 
         for row in rows:
             try:
@@ -3591,12 +3621,12 @@ class HiveDatabase:
         """Release a budget hold (round completed/cancelled)."""
         conn = self._get_connection()
         try:
-            conn.execute("""
+            result = conn.execute("""
                 UPDATE budget_holds SET status = 'released'
                 WHERE hold_id = ? AND status = 'active'
             """, (hold_id,))
             conn.commit()
-            return conn.total_changes > 0
+            return result.rowcount > 0
         except Exception:
             return False
 
@@ -3605,13 +3635,13 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
         try:
-            conn.execute("""
+            result = conn.execute("""
                 UPDATE budget_holds
                 SET status = 'consumed', consumed_by = ?, consumed_at = ?
                 WHERE hold_id = ? AND status = 'active'
             """, (consumed_by, now, hold_id))
             conn.commit()
-            return conn.total_changes > 0
+            return result.rowcount > 0
         except Exception:
             return False
 
@@ -3619,12 +3649,12 @@ class HiveDatabase:
         """Mark a hold as expired."""
         conn = self._get_connection()
         try:
-            conn.execute("""
+            result = conn.execute("""
                 UPDATE budget_holds SET status = 'expired'
                 WHERE hold_id = ? AND status = 'active'
             """, (hold_id,))
             conn.commit()
-            return conn.total_changes > 0
+            return result.rowcount > 0
         except Exception:
             return False
 
@@ -5006,6 +5036,43 @@ class HiveDatabase:
 
         return (int(start.timestamp()), int(end.timestamp()))
 
+    def cleanup_old_pool_revenue(self, days_to_keep: int = 90) -> int:
+        """
+        Remove old pool revenue records to limit database growth.
+
+        Args:
+            days_to_keep: Days of revenue records to retain
+
+        Returns:
+            Number of rows deleted
+        """
+        conn = self._get_connection()
+        cutoff = int(time.time()) - (days_to_keep * 86400)
+        result = conn.execute(
+            "DELETE FROM pool_revenue WHERE recorded_at < ?", (cutoff,)
+        )
+        return result.rowcount
+
+    def cleanup_old_pool_contributions(self, periods_to_keep: int = 12) -> int:
+        """
+        Remove old pool contribution records, keeping only the most recent periods.
+
+        Args:
+            periods_to_keep: Number of most recent periods to retain
+
+        Returns:
+            Number of rows deleted
+        """
+        conn = self._get_connection()
+        result = conn.execute("""
+            DELETE FROM pool_contributions
+            WHERE period NOT IN (
+                SELECT DISTINCT period FROM pool_contributions
+                ORDER BY period DESC LIMIT ?
+            )
+        """, (periods_to_keep,))
+        return result.rowcount
+
     # =========================================================================
     # FLOW SAMPLES OPERATIONS (Phase 7.1 - Anticipatory Liquidity)
     # =========================================================================
@@ -6033,6 +6100,35 @@ class HiveDatabase:
             WHERE proposal_id = ? AND executor_peer_id = ?
         """, (proposal_id, executor_peer_id)).fetchone()
         return row is not None
+
+    def record_settlement_sub_payment(
+        self, proposal_id: str, from_peer_id: str, to_peer_id: str,
+        amount_sats: int, payment_hash: str, status: str
+    ) -> bool:
+        """Record a completed sub-payment for crash recovery (S-2 fix)."""
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO settlement_sub_payments
+                (proposal_id, from_peer_id, to_peer_id, amount_sats,
+                 payment_hash, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (proposal_id, from_peer_id, to_peer_id, amount_sats,
+                  payment_hash, status, int(time.time())))
+            return True
+        except Exception:
+            return False
+
+    def get_settlement_sub_payment(
+        self, proposal_id: str, from_peer_id: str, to_peer_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Get a specific sub-payment record for crash recovery."""
+        conn = self._get_connection()
+        row = conn.execute("""
+            SELECT * FROM settlement_sub_payments
+            WHERE proposal_id = ? AND from_peer_id = ? AND to_peer_id = ?
+        """, (proposal_id, from_peer_id, to_peer_id)).fetchone()
+        return dict(row) if row else None
 
     def is_period_settled(self, period: str) -> bool:
         """Check if a period has already been settled."""

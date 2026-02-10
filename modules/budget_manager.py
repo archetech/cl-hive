@@ -154,10 +154,10 @@ class BudgetHoldManager:
         Returns:
             hold_id if successful, None if failed (e.g., max holds reached)
         """
-        # Cleanup expired holds first
-        self._cleanup_expired_holds_unlocked()
-
         with self._lock:
+            # Cleanup expired holds first (inside lock)
+            self._cleanup_expired_holds_unlocked()
+
             # Check concurrent hold limit
             active_holds = [h for h in self._holds.values() if h.is_active()]
             if len(active_holds) >= MAX_CONCURRENT_HOLDS:

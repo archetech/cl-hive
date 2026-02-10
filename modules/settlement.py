@@ -1460,6 +1460,21 @@ class SettlementManager:
         for p in our_payments:
             to_peer = p["to_peer"]
             amount = int(p["amount_sats"])
+
+            # Check if we already paid this sub-payment (crash recovery)
+            already_paid = self.db.get_settlement_sub_payment(proposal_id, our_peer_id, to_peer) if self.db else None
+            if already_paid and already_paid.get("status") == "completed":
+                self.plugin.log(
+                    f"SETTLEMENT: Skipping already-completed payment to {to_peer[:16]}... "
+                    f"({amount} sats, proposal {proposal_id[:16]}...)",
+                    level="info"
+                )
+                total_sent += amount
+                ph = already_paid.get("payment_hash", "")
+                if ph:
+                    payment_hashes.append(ph)
+                continue
+
             offer = self.get_offer(to_peer)
             if not offer:
                 self.plugin.log(
@@ -1482,6 +1497,13 @@ class SettlementManager:
                     level="warn"
                 )
                 return None
+
+            # Record successful sub-payment for crash recovery
+            if self.db:
+                self.db.record_settlement_sub_payment(
+                    proposal_id, our_peer_id, to_peer, amount,
+                    pay.payment_hash or "", "completed"
+                )
 
             total_sent += amount
             if pay.payment_hash:

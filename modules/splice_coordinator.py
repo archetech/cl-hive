@@ -15,6 +15,7 @@ How this helps without fund transfer:
 Author: Lightning Goats Team
 """
 
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -70,6 +71,7 @@ class SpliceCoordinator:
 
         # Cache for channel data
         self._channel_cache: Dict[str, tuple] = {}  # key -> (data, timestamp)
+        self._cache_lock = threading.Lock()
 
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
@@ -78,19 +80,20 @@ class SpliceCoordinator:
 
     def _cache_put(self, key: str, data) -> None:
         """Store a value in the channel cache, evicting stale entries if full."""
-        if len(self._channel_cache) >= MAX_CHANNEL_CACHE_SIZE:
-            now = time.time()
-            # Evict stale entries first
-            stale = [k for k, (_, ts) in self._channel_cache.items()
-                     if now - ts >= CHANNEL_CACHE_TTL]
-            for k in stale:
-                del self._channel_cache[k]
-            # If still over limit, evict oldest 10%
+        with self._cache_lock:
             if len(self._channel_cache) >= MAX_CHANNEL_CACHE_SIZE:
-                by_age = sorted(self._channel_cache.items(), key=lambda x: x[1][1])
-                for k, _ in by_age[:max(1, len(by_age) // 10)]:
+                now = time.time()
+                # Evict stale entries first
+                stale = [k for k, (_, ts) in self._channel_cache.items()
+                         if now - ts >= CHANNEL_CACHE_TTL]
+                for k in stale:
                     del self._channel_cache[k]
-        self._channel_cache[key] = (data, time.time())
+                # If still over limit, evict oldest 10%
+                if len(self._channel_cache) >= MAX_CHANNEL_CACHE_SIZE:
+                    by_age = sorted(self._channel_cache.items(), key=lambda x: x[1][1])
+                    for k, _ in by_age[:max(1, len(by_age) // 10)]:
+                        del self._channel_cache[k]
+            self._channel_cache[key] = (data, time.time())
 
     def check_splice_out_safety(
         self,
@@ -213,11 +216,11 @@ class SpliceCoordinator:
 
         except Exception as e:
             self._log(f"Error checking splice safety: {e}", level="warning")
-            # Fail open - allow local decision
+            # Fail closed - require coordination rather than allowing unsafe splice
             return {
-                "safety": SPLICE_SAFE,
-                "reason": f"Safety check failed ({e}), local decision",
-                "can_proceed": True,
+                "safety": SPLICE_COORDINATE,
+                "reason": f"Safety check error ({e}), requires coordination",
+                "can_proceed": False,
                 "error": str(e)
             }
 
@@ -277,10 +280,11 @@ class SpliceCoordinator:
         """Get our capacity to an external peer."""
         # Check cache first
         cache_key = f"our_to_{peer_id}"
-        if cache_key in self._channel_cache:
-            data, timestamp = self._channel_cache[cache_key]
-            if time.time() - timestamp < CHANNEL_CACHE_TTL:
-                return data
+        with self._cache_lock:
+            if cache_key in self._channel_cache:
+                data, timestamp = self._channel_cache[cache_key]
+                if time.time() - timestamp < CHANNEL_CACHE_TTL:
+                    return data
 
         try:
             channels = self.plugin.rpc.listpeerchannels(id=peer_id)
@@ -302,10 +306,11 @@ class SpliceCoordinator:
         """Get external peer's total public capacity."""
         # Check cache first
         cache_key = f"peer_total_{peer_id}"
-        if cache_key in self._channel_cache:
-            data, timestamp = self._channel_cache[cache_key]
-            if time.time() - timestamp < CHANNEL_CACHE_TTL:
-                return data
+        with self._cache_lock:
+            if cache_key in self._channel_cache:
+                data, timestamp = self._channel_cache[cache_key]
+                if time.time() - timestamp < CHANNEL_CACHE_TTL:
+                    return data
 
         try:
             # Get channels where this peer is the source
@@ -401,5 +406,6 @@ class SpliceCoordinator:
 
     def clear_cache(self) -> None:
         """Clear the channel cache."""
-        self._channel_cache.clear()
+        with self._cache_lock:
+            self._channel_cache.clear()
         self._log("Channel cache cleared")

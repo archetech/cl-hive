@@ -781,11 +781,11 @@ class CooperativeExpansionManager:
                 self._auto_nominate(round_id, target_peer_id, payload.get("quality_score", 0.5))
 
         nomination = Nomination(
-            nominator_id=payload.get("nominator_id", peer_id),
+            nominator_id=peer_id,  # Always use authenticated sender, never trust payload
             target_peer_id=target_peer_id,
             timestamp=payload.get("timestamp", int(time.time())),
-            available_liquidity_sats=payload.get("available_liquidity_sats", 0),
-            quality_score=payload.get("quality_score", 0.5),
+            available_liquidity_sats=max(0, min(100_000_000_000, payload.get("available_liquidity_sats", 0))),  # Cap at 1000 BTC
+            quality_score=max(0.0, min(1.0, payload.get("quality_score", 0.5))),  # Clamp 0-1
             has_existing_channel=payload.get("has_existing_channel", False),
             channel_count=payload.get("channel_count", 0),
             reason=payload.get("reason", "")
@@ -892,17 +892,17 @@ class CooperativeExpansionManager:
                 round_obj.ranked_candidates = ranked_candidates  # Phase 8: Store for fallback
                 target_peer_id = round_obj.target_peer_id
 
+            # Track this as a recent open for fairness (inside lock)
+            self._recent_opens[winner.nominator_id] = now
+
+            # Set cooldown for this target (inside lock)
+            if target_peer_id:
+                self._target_cooldowns[target_peer_id] = now + self.COOLDOWN_SECONDS
+
         self._log(
             f"Round {round_id[:8]}... elected {winner.nominator_id[:16]}... "
             f"(score={winner_score:.3f}, factors={winner_factors})"
         )
-
-        # Track this as a recent open for fairness
-        self._recent_opens[winner.nominator_id] = now
-
-        # Set cooldown for this target
-        if target_peer_id:
-            self._target_cooldowns[target_peer_id] = now + self.COOLDOWN_SECONDS
 
         return winner.nominator_id
 
@@ -1056,13 +1056,13 @@ class CooperativeExpansionManager:
             channel_size_sats = round_obj.recommended_size_sats
             decline_count = round_obj.decline_count
 
+            # Track this as a recent open for fairness (inside lock)
+            self._recent_opens[next_candidate] = int(time.time())
+
         self._log(
             f"Round {round_id[:8]}... fallback elected {next_candidate[:16]}... "
             f"(score={next_score:.3f})"
         )
-
-        # Track this as a recent open for fairness
-        self._recent_opens[next_candidate] = int(time.time())
 
         return {
             "action": "fallback_elected",
@@ -1159,10 +1159,10 @@ class CooperativeExpansionManager:
             for rid in expired_ids:
                 del self._rounds[rid]
 
-        # Prune stale _recent_opens (older than 7 days) and expired _target_cooldowns
-        week_ago = now - 7 * 86400
-        self._recent_opens = {k: v for k, v in self._recent_opens.items() if v > week_ago}
-        self._target_cooldowns = {k: v for k, v in self._target_cooldowns.items() if v > now}
+            # Prune stale _recent_opens (older than 7 days) and expired _target_cooldowns (inside lock)
+            week_ago = now - 7 * 86400
+            self._recent_opens = {k: v for k, v in self._recent_opens.items() if v > week_ago}
+            self._target_cooldowns = {k: v for k, v in self._target_cooldowns.items() if v > now}
 
         if cleaned > 0:
             self._log(f"Cleaned up {cleaned} expired rounds")

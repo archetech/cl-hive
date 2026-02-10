@@ -8709,6 +8709,15 @@ def membership_maintenance_loop():
                 # Prune old budget tracking (90-day retention)
                 database.prune_budget_tracking(older_than_days=90)
 
+                # Prune old flow samples (30-day retention)
+                database.prune_old_flow_samples(days_to_keep=30)
+
+                # Prune old pool revenue (90-day retention)
+                database.cleanup_old_pool_revenue(days_to_keep=90)
+
+                # Prune old pool contributions (keep 12 most recent periods)
+                database.cleanup_old_pool_contributions(periods_to_keep=12)
+
                 # Issue #38: Auto-connect to hive members we're not connected to
                 reconnected = _auto_connect_to_all_members()
                 if reconnected > 0 and safe_plugin:
@@ -9291,6 +9300,11 @@ def settlement_loop():
 
             # Step 4: Execute ready settlements
             try:
+                # Governance gate: only auto-execute in failsafe mode.
+                # In advisor mode, queue for human/AI approval.
+                cfg = config.snapshot() if config else None
+                governance_mode = getattr(cfg, 'governance_mode', 'advisor') if cfg else 'advisor'
+
                 ready = database.get_ready_settlement_proposals()
                 for proposal in ready:
                     proposal_id = proposal.get('proposal_id')
@@ -9306,6 +9320,25 @@ def settlement_loop():
                     try:
                         contributions = json.loads(contributions_json)
                     except Exception:
+                        continue
+
+                    if governance_mode != "failsafe":
+                        # Queue settlement execution as a pending action for approval
+                        database.add_pending_action(
+                            action_type="settlement_execute",
+                            target=proposal_id,
+                            payload=json.dumps({
+                                "proposal_id": proposal_id,
+                                "period": proposal.get("period", ""),
+                                "total_fees_sats": proposal.get("total_fees_sats", 0),
+                                "member_count": proposal.get("member_count", 0),
+                            }),
+                            source="settlement_loop",
+                        )
+                        safe_plugin.log(
+                            f"SETTLEMENT: Queued execution of {proposal_id[:16]}... for approval (governance={governance_mode})",
+                            level='info'
+                        )
                         continue
 
                     # Execute our settlement (this is async but we run it sync here)

@@ -388,11 +388,14 @@ class IntentManager:
             True if an intent was aborted
         """
         local_intents = self.db.get_conflicting_intents(target, intent_type)
-        
+
         aborted = False
         for intent_row in local_intents:
             intent_id = intent_row.get('id')
             if intent_id:
+                if not self._validate_transition(intent_id, STATUS_ABORTED):
+                    self._log(f"Cannot abort intent {intent_id}: invalid transition", level="warn")
+                    continue
                 self.db.update_intent_status(intent_id, STATUS_ABORTED, reason="tie_breaker_loss")
                 self._log(f"Aborted local intent {intent_id} for {target[:16]}... (lost tie-breaker)")
                 aborted = True

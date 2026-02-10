@@ -121,8 +121,18 @@ class DecisionEngine:
         # Failsafe mode state tracking (budget and rate limits)
         self._failsafe_lock = threading.Lock()
         self._daily_spend_sats: int = 0
-        self._daily_spend_reset_day: int = 0  # Day of year for reset
+        self._daily_spend_reset_day: int = int(time.time() // 86400)  # Day since epoch for reset
         self._hourly_actions: List[int] = []  # Timestamps of recent actions
+
+        # Load persisted failsafe budget from database if available
+        if self.db:
+            try:
+                date_key = self.db.get_today_date_key()
+                saved_spend = self.db.get_daily_spend(date_key)
+                if isinstance(saved_spend, int) and saved_spend >= 0:
+                    self._daily_spend_sats = saved_spend
+            except Exception:
+                pass
 
         # Executor callbacks (set by cl-hive.py)
         self._executors: Dict[str, Callable] = {}
@@ -308,6 +318,17 @@ class DecisionEngine:
                     # Update tracking (atomic with checks above)
                     self._daily_spend_sats += amount_sats
                     self._hourly_actions.append(int(time.time()))
+
+                    # Persist budget spend to database
+                    if self.db and amount_sats > 0:
+                        try:
+                            self.db.record_budget_spend(
+                                action_type=packet.action_type,
+                                amount_sats=amount_sats,
+                                target=packet.target
+                            )
+                        except Exception:
+                            pass
 
                     self._log(f"Emergency action executed (FAILSAFE mode)")
 

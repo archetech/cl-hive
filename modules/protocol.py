@@ -647,6 +647,8 @@ def validate_promotion_request(payload: Dict[str, Any]) -> bool:
     timestamp = payload.get("timestamp")
     if not isinstance(target_pubkey, str) or not target_pubkey:
         return False
+    if not _valid_pubkey(target_pubkey):
+        return False
     if not _valid_request_id(request_id):
         return False
     if not isinstance(timestamp, int) or timestamp < 0:
@@ -664,11 +666,15 @@ def validate_vouch(payload: Dict[str, Any]) -> bool:
             return False
     if not isinstance(payload["target_pubkey"], str) or not payload["target_pubkey"]:
         return False
+    if not _valid_pubkey(payload["target_pubkey"]):
+        return False
     if not _valid_request_id(payload["request_id"]):
         return False
     if not isinstance(payload["timestamp"], int) or payload["timestamp"] < 0:
         return False
     if not isinstance(payload["voucher_pubkey"], str) or not payload["voucher_pubkey"]:
+        return False
+    if not _valid_pubkey(payload["voucher_pubkey"]):
         return False
     if not isinstance(payload["sig"], str) or not payload["sig"]:
         return False
@@ -5971,7 +5977,8 @@ def create_msg_ack(ack_msg_id: str, status: str, sender_id: str, rpc=None) -> by
             sig_result = rpc.signmessage(signing_message)
             payload["signature"] = sig_result["zbase"]
         except Exception:
-            pass  # Best-effort signing
+            # Signing failed — unsigned ACK could be forged by MITM
+            return None
 
     return serialize(HiveMessageType.MSG_ACK, payload)
 

@@ -326,12 +326,13 @@ class TestIntentAbort:
     def test_abort_local_intent(self, intent_manager, mock_database):
         """abort_local_intent should update DB status."""
         mock_database.get_conflicting_intents.return_value = [
-            {'id': 5, 'intent_type': 'channel_open', 'target': 'target', 
+            {'id': 5, 'intent_type': 'channel_open', 'target': 'target',
              'initiator': intent_manager.our_pubkey, 'status': 'pending'}
         ]
-        
+        mock_database.get_intent_by_id.return_value = {'id': 5, 'status': 'pending'}
+
         result = intent_manager.abort_local_intent('target', 'channel_open')
-        
+
         assert result is True
         mock_database.update_intent_status.assert_called_with(5, STATUS_ABORTED, reason="tie_breaker_loss")
     
@@ -726,6 +727,7 @@ class TestAuditTrailReason:
             {'id': 5, 'intent_type': 'channel_open', 'target': 'target',
              'initiator': intent_manager.our_pubkey, 'status': 'pending'}
         ]
+        mock_database.get_intent_by_id.return_value = {'id': 5, 'status': 'pending'}
         intent_manager.abort_local_intent('target', 'channel_open')
         mock_database.update_intent_status.assert_called_with(
             5, STATUS_ABORTED, reason="tie_breaker_loss"

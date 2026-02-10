@@ -60,6 +60,10 @@ MAX_MCF_EDGES = 2000               # Maximum edges in network
 HIVE_INTERNAL_COST_PPM = 0         # Zero fees for hive internal channels
 DEFAULT_EXTERNAL_COST_PPM = 500    # Default external route cost estimate
 
+# Assignment validation
+MAX_ASSIGNMENT_AMOUNT_SATS = 50_000_000  # 0.5 BTC max per assignment
+MAX_TOTAL_SOLUTION_SATS = 500_000_000    # 5 BTC max total solution flow
+
 # Circuit breaker configuration
 MCF_CIRCUIT_FAILURE_THRESHOLD = 3  # Failures before opening circuit
 MCF_CIRCUIT_RECOVERY_TIMEOUT = 300 # 5 minutes before half-open
@@ -194,7 +198,7 @@ class MCFHealthMetrics:
     """
     Tracks MCF solver health and performance metrics.
 
-    Used for monitoring and alerting.
+    Used for monitoring and alerting. Thread-safe via _metrics_lock.
     """
     # Solution metrics
     last_solution_timestamp: int = 0
@@ -217,6 +221,9 @@ class MCFHealthMetrics:
     last_network_node_count: int = 0
     last_network_edge_count: int = 0
 
+    def __post_init__(self):
+        self._metrics_lock = threading.Lock()
+
     def record_solution(
         self,
         flow_sats: int,
@@ -227,22 +234,24 @@ class MCFHealthMetrics:
         edge_count: int
     ) -> None:
         """Record metrics from a successful solution."""
-        self.last_solution_timestamp = int(time.time())
-        self.last_solution_flow_sats = flow_sats
-        self.last_solution_cost_sats = cost_sats
-        self.last_solution_assignments = assignments
-        self.last_computation_time_ms = computation_time_ms
-        self.last_network_node_count = node_count
-        self.last_network_edge_count = edge_count
-        self.consecutive_stale_cycles = 0
+        with self._metrics_lock:
+            self.last_solution_timestamp = int(time.time())
+            self.last_solution_flow_sats = flow_sats
+            self.last_solution_cost_sats = cost_sats
+            self.last_solution_assignments = assignments
+            self.last_computation_time_ms = computation_time_ms
+            self.last_network_node_count = node_count
+            self.last_network_edge_count = edge_count
+            self.consecutive_stale_cycles = 0
 
     def record_stale_cycle(self) -> None:
         """Record that a cycle had stale/insufficient data."""
-        self.consecutive_stale_cycles += 1
-        self.max_consecutive_stale = max(
-            self.max_consecutive_stale,
-            self.consecutive_stale_cycles
-        )
+        with self._metrics_lock:
+            self.consecutive_stale_cycles += 1
+            self.max_consecutive_stale = max(
+                self.max_consecutive_stale,
+                self.consecutive_stale_cycles
+            )
 
     def record_assignment_completion(
         self,
@@ -251,12 +260,13 @@ class MCFHealthMetrics:
         cost_sats: int
     ) -> None:
         """Record completion of an assignment."""
-        if success:
-            self.successful_assignments += 1
-            self.total_flow_executed_sats += amount_sats
-            self.total_cost_paid_sats += cost_sats
-        else:
-            self.failed_assignments += 1
+        with self._metrics_lock:
+            if success:
+                self.successful_assignments += 1
+                self.total_flow_executed_sats += amount_sats
+                self.total_cost_paid_sats += cost_sats
+            else:
+                self.failed_assignments += 1
 
     def is_healthy(self) -> bool:
         """Check if MCF is operating healthily."""
@@ -1653,6 +1663,23 @@ class MCFCoordinator:
             self._log(
                 f"Solution from wrong coordinator: {solution.coordinator_id[:16]}... "
                 f"expected {expected_coordinator[:16]}...",
+                level="warn"
+            )
+            return False
+
+        # Validate assignment amounts (L-11: prevent data poisoning)
+        for a in assignments:
+            if a.amount_sats <= 0 or a.amount_sats > MAX_ASSIGNMENT_AMOUNT_SATS:
+                self._log(
+                    f"Rejecting solution: assignment amount {a.amount_sats} sats "
+                    f"out of bounds (0, {MAX_ASSIGNMENT_AMOUNT_SATS}]",
+                    level="warn"
+                )
+                return False
+        if solution.total_flow_sats > MAX_TOTAL_SOLUTION_SATS:
+            self._log(
+                f"Rejecting solution: total flow {solution.total_flow_sats} sats "
+                f"exceeds max {MAX_TOTAL_SOLUTION_SATS}",
                 level="warn"
             )
             return False

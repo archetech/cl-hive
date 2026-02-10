@@ -2233,8 +2233,9 @@ class Planner:
                 }
 
                 # Define executor for channel_open (broadcasts intent)
-                def channel_open_executor(target, ctx):
-                    self._broadcast_intent(intent)
+                # Pass intent via default arg to capture current value, not mutable closure
+                def channel_open_executor(target, ctx, _intent=intent):
+                    self._broadcast_intent(_intent)
 
                 self.decision_engine.register_executor('channel_open', channel_open_executor)
 

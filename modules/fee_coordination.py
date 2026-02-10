@@ -703,12 +703,15 @@ class AdaptiveFeeController:
 
     def _calculate_fee_volatility(self) -> float:
         """Calculate recent fee volatility in the network."""
-        if len(self._fee_observations) < 2:
+        with self._fee_obs_lock:
+            observations = list(self._fee_observations)
+
+        if len(observations) < 2:
             return 0.0
 
         # Filter to recent observations (last hour)
         now = time.time()
-        recent = [f for t, f in self._fee_observations if now - t < 3600]
+        recent = [f for t, f in observations if now - t < 3600]
 
         if len(recent) < 2:
             return 0.0
@@ -1275,14 +1278,24 @@ class StigmergicCoordinator:
             raw_strength = marker_data.get("strength", 1.0)
             bounded_strength = max(0.0, min(1.0, float(raw_strength)))
 
+            # Bound fee_ppm to fleet floor/ceiling to prevent manipulation
+            fee_ppm = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, int(marker_data.get("fee_ppm", 0))))
+
+            # Bound volume_sats to reasonable max (100M sats = 1 BTC)
+            volume_sats = max(0, min(100_000_000, int(marker_data.get("volume_sats", 0))))
+
+            # Clamp timestamp to prevent future-dated or stale markers
+            now = int(time.time())
+            timestamp = max(now - 86400, min(now + 60, int(marker_data.get("timestamp", now))))
+
             marker = RouteMarker(
                 depositor=marker_data["depositor"],
                 source_peer_id=marker_data["source_peer_id"],
                 destination_peer_id=marker_data["destination_peer_id"],
-                fee_ppm=marker_data["fee_ppm"],
+                fee_ppm=fee_ppm,
                 success=marker_data["success"],
-                volume_sats=marker_data["volume_sats"],
-                timestamp=marker_data["timestamp"],
+                volume_sats=volume_sats,
+                timestamp=timestamp,
                 strength=bounded_strength
             )
 
@@ -1427,7 +1440,8 @@ class MyceliumDefenseSystem:
         # Temporary defensive fees
         self._defensive_fees: Dict[str, Dict] = {}
 
-        # Peer statistics cache
+        # Peer statistics cache (protected by _stats_lock)
+        self._stats_lock = threading.Lock()
         self._peer_stats: Dict[str, Dict] = {}
 
     def set_our_pubkey(self, pubkey: str) -> None:
@@ -1449,29 +1463,33 @@ class MyceliumDefenseSystem:
         failed_forwards: int
     ) -> None:
         """Update statistics for a peer."""
-        self._peer_stats[peer_id] = {
-            "inflow": inflow_sats,
-            "outflow": outflow_sats,
-            "successful": successful_forwards,
-            "failed": failed_forwards,
-            "updated_at": time.time()
-        }
+        with self._stats_lock:
+            self._peer_stats[peer_id] = {
+                "inflow": inflow_sats,
+                "outflow": outflow_sats,
+                "successful": successful_forwards,
+                "failed": failed_forwards,
+                "updated_at": time.time()
+            }
 
-        # Evict stale entries if exceeding limit
-        if len(self._peer_stats) > self.MAX_PEER_STATS:
-            oldest = min(
-                (p for p in self._peer_stats if p != peer_id),
-                key=lambda p: self._peer_stats[p].get("updated_at", 0),
-                default=None
-            )
-            if oldest:
-                del self._peer_stats[oldest]
+            # Evict stale entries if exceeding limit
+            if len(self._peer_stats) > self.MAX_PEER_STATS:
+                oldest = min(
+                    (p for p in self._peer_stats if p != peer_id),
+                    key=lambda p: self._peer_stats[p].get("updated_at", 0),
+                    default=None
+                )
+                if oldest:
+                    del self._peer_stats[oldest]
 
     def detect_threat(self, peer_id: str) -> Optional[PeerWarning]:
         """
         Detect peers that are draining us or behaving badly.
         """
-        stats = self._peer_stats.get(peer_id)
+        with self._stats_lock:
+            stats = self._peer_stats.get(peer_id)
+            if stats is not None:
+                stats = dict(stats)  # snapshot under lock
         if not stats:
             return None
 
@@ -2395,6 +2413,20 @@ class FeeCoordinationManager:
         5. Time-based adjustment (Phase 7.4)
         6. Centrality-based adjustment (Use Case 8)
         """
+        # Safety: hive member channels MUST always have 0 fees
+        if self.database and peer_id:
+            member = self.database.get_member(peer_id)
+            if member and member.get("tier") in ("member", "neophyte"):
+                return FeeRecommendation(
+                    channel_id=channel_id,
+                    peer_id=peer_id,
+                    recommended_fee_ppm=0,
+                    is_primary=False,
+                    current_fee_ppm=current_fee,
+                    confidence=1.0,
+                    reason="hive_member_zero_fee",
+                )
+
         # Start with current fee
         recommended_fee = current_fee
         is_primary = False

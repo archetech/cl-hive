@@ -957,8 +957,11 @@ class YieldMetricsManager:
         if not hasattr(self, "_remote_yield_metrics"):
             return {}
 
+        with self._lock:
+            peer_ids = list(self._remote_yield_metrics.keys())
+
         consensus = {}
-        for peer_id in self._remote_yield_metrics:
+        for peer_id in peer_ids:
             result = self.get_fleet_yield_consensus(peer_id)
             if result:
                 consensus[peer_id] = result

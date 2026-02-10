@@ -145,7 +145,12 @@ def vpn_add_peer(ctx: HiveContext, pubkey: str, vpn_address: str) -> Dict[str, A
     # Parse address
     if ':' in vpn_address:
         ip, port_str = vpn_address.rsplit(':', 1)
-        port = int(port_str)
+        try:
+            port = int(port_str)
+        except (ValueError, TypeError):
+            return {"error": "Invalid port number"}
+        if not (1 <= port <= 65535):
+            return {"error": f"Port {port} out of valid range (1-65535)"}
     else:
         ip = vpn_address
         port = 9735

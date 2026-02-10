@@ -577,6 +577,10 @@ class VPNTransportManager:
         """Get or create connection info for a peer."""
         with self._lock:
             if peer_id not in self._peer_connections:
+                if len(self._peer_connections) > 500:
+                    # Evict oldest entry
+                    oldest_key = min(self._peer_connections, key=lambda k: self._peer_connections[k].last_verified)
+                    del self._peer_connections[oldest_key]
                 self._peer_connections[peer_id] = VPNConnectionInfo(peer_id=peer_id)
             return self._peer_connections[peer_id]
 

@@ -245,7 +245,7 @@ class ContributionManager:
         stats = self.get_contribution_stats(peer_id, window_days=LEECH_WINDOW_DAYS)
         ratio = stats["ratio"]
 
-        if ratio > LEECH_BAN_RATIO:
+        if ratio >= LEECH_WARN_RATIO:
             self.db.clear_leech_flag(peer_id)
             return {"is_leech": ratio < LEECH_WARN_RATIO, "ratio": ratio}
 

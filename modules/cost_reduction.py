@@ -1029,6 +1029,9 @@ class CircularFlowDetector:
         # Remote circular flow alerts received from fleet
         self._remote_circular_alerts: List[Dict[str, Any]] = []
 
+        # Thread safety for history and alerts
+        self._history_lock = threading.Lock()
+
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
         if self.plugin:
@@ -1076,11 +1079,12 @@ class CircularFlowDetector:
             member_id=member_id
         )
 
-        self._rebalance_history.append(outcome)
+        with self._history_lock:
+            self._rebalance_history.append(outcome)
 
-        # Trim history if too large
-        if len(self._rebalance_history) > self._max_history_size:
-            self._rebalance_history = self._rebalance_history[-self._max_history_size:]
+            # Trim history if too large
+            if len(self._rebalance_history) > self._max_history_size:
+                self._rebalance_history = self._rebalance_history[-self._max_history_size:]
 
     def detect_circular_flows(
         self,
@@ -1097,9 +1101,10 @@ class CircularFlowDetector:
         """
         circular_flows = []
 
-        # Filter to recent rebalances
+        # Filter to recent rebalances (snapshot under lock)
         cutoff = time.time() - (window_hours * 3600)
-        recent = [r for r in self._rebalance_history if r.timestamp >= cutoff]
+        with self._history_lock:
+            recent = [r for r in self._rebalance_history if r.timestamp >= cutoff]
 
         if len(recent) < 2:
             return circular_flows
@@ -1307,11 +1312,12 @@ class CircularFlowDetector:
             "timestamp": time.time()
         }
 
-        self._remote_circular_alerts.append(entry)
+        with self._history_lock:
+            self._remote_circular_alerts.append(entry)
 
-        # Keep only last 100 alerts
-        if len(self._remote_circular_alerts) > 100:
-            self._remote_circular_alerts = self._remote_circular_alerts[-100:]
+            # Keep only last 100 alerts
+            if len(self._remote_circular_alerts) > 100:
+                self._remote_circular_alerts = self._remote_circular_alerts[-100:]
 
         return True
 
@@ -1344,10 +1350,12 @@ class CircularFlowDetector:
         except Exception:
             pass
 
-        # Remote alerts
+        # Remote alerts (snapshot under lock)
         if include_remote:
             now = time.time()
-            for alert in self._remote_circular_alerts:
+            with self._history_lock:
+                remote_snapshot = list(self._remote_circular_alerts)
+            for alert in remote_snapshot:
                 # Only include recent alerts (last 24 hours)
                 if now - alert.get("timestamp", 0) < 86400:
                     alert_copy = alert.copy()
@@ -2136,6 +2144,16 @@ class CostReductionManager:
                 result["status"] = "preview"
                 result["message"] = "Dry run - route preview only. Set dry_run=false to execute."
                 return result
+
+            # Governance gate: only execute if explicitly requested (dry_run=False is
+            # an explicit RPC call). The caller is responsible for governance checks.
+            # Log the execution for audit trail.
+            if self.plugin:
+                self.plugin.log(
+                    f"cl-hive: Executing hive circular rebalance: {amount_sats} sats "
+                    f"{from_channel} -> {to_channel}",
+                    level="info"
+                )
 
             # Execute via bridge delegation to cl-revenue-ops / sling
             if not bridge:

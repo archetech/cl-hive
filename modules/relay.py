@@ -123,6 +123,9 @@ class MessageDeduplicator:
             if msg_id in self._seen:
                 return False
             self._seen[msg_id] = int(time.time())
+            # Enforce size limit
+            if len(self._seen) > MAX_SEEN_MESSAGES:
+                self._cleanup_oldest()
             return True
 
     def _maybe_cleanup(self) -> None:
@@ -214,8 +217,9 @@ class RelayManager:
         instead of hashing the full payload.
         """
         # Prefer deterministic event ID when available
+        # Range check: accept 16-64 char IDs; content hash fallback is the safety net
         eid = payload.get("_event_id")
-        if isinstance(eid, str) and len(eid) == 32:
+        if isinstance(eid, str) and 16 <= len(eid) <= 64:
             return eid
 
         # Fallback: hash core content (exclude relay + internal metadata)
@@ -280,6 +284,10 @@ class RelayManager:
         relay_data = payload.get("_relay", {})
         ttl = relay_data.get("ttl", DEFAULT_TTL)
         relay_path = relay_data.get("relay_path", [])
+
+        # Don't relay if we're already in the relay path
+        if self.our_pubkey in relay_path:
+            return False
 
         # Don't relay if TTL exhausted
         if ttl <= 0:
