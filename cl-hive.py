@@ -1367,7 +1367,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     planner.set_cooperation_modules(
         liquidity_coordinator=liquidity_coord,
         splice_coordinator=splice_coord,
-        health_aggregator=health_aggregator
+        health_aggregator=health_aggregator,
+        cooperative_expansion=coop_expansion
     )
     plugin.log("cl-hive: Planner linked to cooperation modules")
 
