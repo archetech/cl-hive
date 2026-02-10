@@ -2,7 +2,8 @@
 Min-Cost Max-Flow (MCF) Solver for Global Fleet Rebalance Optimization.
 
 This module implements a Successive Shortest Paths (SSP) algorithm with
-Bellman-Ford for finding optimal fleet-wide rebalancing assignments.
+Dijkstra+Johnson potentials for finding optimal fleet-wide rebalancing
+assignments.
 
 Key Benefits:
 - Global optimization vs local decisions
@@ -10,16 +11,20 @@ Key Benefits:
 - Prevents circular flows at planning stage
 - Coordinates simultaneous rebalances across fleet
 
-Algorithm: Successive Shortest Paths (SSP) with Bellman-Ford
+Algorithm: Successive Shortest Paths (SSP) with Dijkstra+Johnson Potentials
+
+The first shortest-path query uses Bellman-Ford (O(V*E)) to handle negative
+residual costs and establish Johnson potentials. All subsequent queries use
+Dijkstra (O(E log V)) with reduced costs guaranteed non-negative.
 
 Why SSP:
 1. Handles asymmetric channel capacities and per-direction fees
-2. Bellman-Ford handles negative reduced costs in residual networks
-3. Simple to implement and debug (critical for distributed system)
-4. Fleet sizes (5-50 members, ~500 edges) are well within O(VE) bounds
+2. Bellman-Ford bootstrap handles negative reduced costs in residual networks
+3. Dijkstra acceleration keeps per-path queries fast after first iteration
+4. Fleet sizes (5-50 members, ~500 edges) are well within bounds
 5. Can warm-start from previous solutions
 
-Complexity: O(V * E * flow) - under 1 second for typical fleets
+Complexity: O(E log V * flow) after first iteration - under 1 second for typical fleets
 
 Author: Lightning Goats Team
 """
@@ -1008,12 +1013,15 @@ class MCFNetworkBuilder:
                 # Needs inbound = has excess remote = sink
                 network.add_node(need.member_id, supply=-need.amount_sats)
 
-        # Add edges from fleet topology
-        self._add_edges_from_topology(network, all_states, member_ids)
-
-        # Add edges from our channels
+        # Add edges from our channels first (precise data takes priority)
+        channel_edge_pairs: Set[Tuple[str, str]] = set()
         if our_channels:
-            self._add_edges_from_channels(network, our_pubkey, our_channels, member_ids)
+            channel_edge_pairs = self._add_edges_from_channels(
+                network, our_pubkey, our_channels, member_ids
+            )
+
+        # Add inferred edges from fleet topology, skipping pairs with precise data
+        self._add_edges_from_topology(network, all_states, member_ids, channel_edge_pairs)
 
         # Setup super-source and super-sink
         network.setup_super_source_sink()
@@ -1029,7 +1037,8 @@ class MCFNetworkBuilder:
         self,
         network: MCFNetwork,
         all_states: List,
-        member_ids: Set[str]
+        member_ids: Set[str],
+        skip_pairs: Set[Tuple[str, str]] = None
     ) -> None:
         """
         Add edges between fleet members based on gossip state.
@@ -1038,8 +1047,13 @@ class MCFNetworkBuilder:
         liquidity) but not per-channel breakdown, we infer connectivity
         by distributing available_sats across edges to all other known
         hive members (conservative full-mesh assumption).
+
+        Pairs already covered by precise channel data (skip_pairs) are excluded
+        to prevent duplicate edges that would overstate capacity.
         """
         MAX_ESTIMATED_EDGE_CAPACITY = 16_777_215  # standard channel cap
+        if skip_pairs is None:
+            skip_pairs = set()
         state_by_id = {s.peer_id: s for s in all_states}
         member_list = sorted(member_ids)
 
@@ -1057,6 +1071,8 @@ class MCFNetworkBuilder:
             if per_edge <= 0:
                 continue
             for to_node in other_members:
+                if (from_node, to_node) in skip_pairs:
+                    continue
                 network.add_edge(
                     from_node=from_node,
                     to_node=to_node,
@@ -1071,8 +1087,15 @@ class MCFNetworkBuilder:
         our_pubkey: str,
         channels: List[Dict[str, Any]],
         member_ids: Set[str]
-    ) -> None:
-        """Add edges from our channel data."""
+    ) -> Set[Tuple[str, str]]:
+        """
+        Add edges from our channel data.
+
+        Returns:
+            Set of (from_node, to_node) pairs that were added, so the
+            topology builder can skip them to avoid duplicate edges.
+        """
+        added_pairs: Set[Tuple[str, str]] = set()
         for ch in channels:
             if ch.get("state") != "CHANNELD_NORMAL":
                 continue
@@ -1112,6 +1135,7 @@ class MCFNetworkBuilder:
                     channel_id=channel_id,
                     is_hive_internal=is_hive_internal
                 )
+                added_pairs.add((our_pubkey, peer_id))
 
             # Edge from peer to us (inbound capacity = remote balance)
             if remote_sats > 0:
@@ -1123,6 +1147,9 @@ class MCFNetworkBuilder:
                     channel_id=channel_id,
                     is_hive_internal=is_hive_internal
                 )
+                added_pairs.add((peer_id, our_pubkey))
+
+        return added_pairs
 
 
 # =============================================================================
@@ -1494,8 +1521,8 @@ class MCFCoordinator:
 
     def get_status(self) -> Dict[str, Any]:
         """Get MCF coordinator status including circuit breaker and health."""
-        is_coord = self.is_coordinator()
-        coordinator_id = self.elect_coordinator()
+        is_coord = self.is_coordinator()  # populates _cached_coordinator
+        coordinator_id = self._cached_coordinator or self.elect_coordinator()
 
         with self._solution_lock:
             solution_age = 0
