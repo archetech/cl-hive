@@ -579,7 +579,7 @@ class IntentManager:
         cutoff = int(time.time()) - max_age_seconds
         result = conn.execute(
             "UPDATE intent_locks SET status = 'failed' "
-            "WHERE status = 'committed' AND created_at < ?",
+            "WHERE status = 'committed' AND timestamp < ?",
             (cutoff,)
         )
         count = result.rowcount
