@@ -5879,8 +5879,12 @@ async def handle_revenue_dashboard(args: Dict) -> Dict:
     since_timestamp = int(time.time()) - (window_days * 86400)
 
     # Fetch goat feeder revenue from LNbits (only for hive-nexus-01)
+    goat_feeder_error = None
     if node_name == "hive-nexus-01":
         goat_feeder = await get_goat_feeder_revenue(since_timestamp)
+        if "error" in goat_feeder:
+            goat_feeder_error = goat_feeder["error"]
+            logger.warning(f"Goat feeder data unavailable: {goat_feeder_error}")
     else:
         goat_feeder = {"total_sats": 0, "payment_count": 0}
 
@@ -5928,19 +5932,21 @@ async def handle_revenue_dashboard(args: Dict) -> Dict:
     }
 
     # Record goat feeder snapshot to advisor database for historical tracking
-    try:
-        db = ensure_advisor_db()
-        db.record_goat_feeder_snapshot(
-            node_name=node_name,
-            window_days=window_days,
-            revenue_sats=goat_revenue,
-            revenue_count=goat_count,
-            expense_sats=0,
-            expense_count=0,
-            expense_routing_fee_sats=0
-        )
-    except Exception as e:
-        logger.warning(f"Failed to record goat feeder snapshot: {e}")
+    # Skip recording when LNbits returned an error to avoid polluting data with zeros
+    if goat_feeder_error is None:
+        try:
+            db = ensure_advisor_db()
+            db.record_goat_feeder_snapshot(
+                node_name=node_name,
+                window_days=window_days,
+                revenue_sats=goat_revenue,
+                revenue_count=goat_count,
+                expense_sats=0,
+                expense_count=0,
+                expense_routing_fee_sats=0
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record goat feeder snapshot: {e}")
 
     pnl["combined"] = {
         "total_revenue_sats": total_revenue,
@@ -6547,6 +6553,8 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
         # Process channel details for history
         channels_data = await node.call("listpeerchannels")
         channels_by_class = profitability.get("channels_by_class", {})
+        if not channels_by_class and "error" in profitability:
+            logger.warning(f"Profitability returned error for {node_name}: {profitability.get('error')}")
         prof_data = []
         for class_name, class_channels in channels_by_class.items():
             if isinstance(class_channels, list):
@@ -6554,11 +6562,17 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
                     ch["profitability_class"] = class_name
                     prof_data.append(ch)
         prof_by_id = {c.get("channel_id"): c for c in prof_data}
+        if prof_data:
+            logger.info(f"Profitability data: {len(prof_data)} channels classified for {node_name}")
+        else:
+            logger.warning(f"No profitability classification data available for {node_name}")
 
         for ch in channels_data.get("channels", []):
             if ch.get("state") != "CHANNELD_NORMAL":
                 continue
             scid = ch.get("short_channel_id", "")
+            if not scid:
+                continue
             prof_ch = prof_by_id.get(scid, {})
 
             local_msat = ch.get("to_us_msat", 0)
