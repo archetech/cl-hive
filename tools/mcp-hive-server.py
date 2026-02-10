@@ -1947,6 +1947,14 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
                     "confidence": {
                         "type": "number",
                         "description": "Confidence score 0-1 (optional)"
+                    },
+                    "predicted_benefit": {
+                        "type": "integer",
+                        "description": "Predicted benefit in sats from opportunity scanner (optional)"
+                    },
+                    "snapshot_metrics": {
+                        "type": "string",
+                        "description": "JSON snapshot of decision context metrics (optional)"
                     }
                 },
                 "required": ["decision_type", "node", "recommendation"]
@@ -3775,13 +3783,13 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
     now = int(time.time())
     since_24h = now - 86400
 
-    info = await node.call("getinfo")
-    peers = await node.call("listpeers")
-    channels_result = await node.call("listpeerchannels")
-    pending = await node.call("hive-pending-actions")
-
-    # Routing stats (24h) from listforwards
-    forwards = await node.call("listforwards", {"status": "settled"})
+    info, peers, channels_result, pending, forwards = await asyncio.gather(
+        node.call("getinfo"),
+        node.call("listpeers"),
+        node.call("listpeerchannels"),
+        node.call("hive-pending-actions"),
+        node.call("listforwards", {"status": "settled"}),
+    )
     forward_count = 0
     total_volume_msat = 0
     total_revenue_msat = 0
@@ -4114,16 +4122,25 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
     remote_msat = max(0, total_msat - local_msat)
     local_pct = round((local_msat / total_msat) * 100, 2) if total_msat else 0.0
 
-    peers = await node.call("listpeers")
+    # Gather remaining RPC calls in parallel (all independent after finding target_channel)
+    peers, prof, debug, forwards = await asyncio.gather(
+        node.call("listpeers"),
+        node.call("revenue-profitability", {"channel_id": channel_id}),
+        node.call("revenue-fee-debug"),
+        node.call("listforwards", {"status": "settled"}),
+        return_exceptions=True,
+    )
+
+    # Process peers result
+    if isinstance(peers, Exception):
+        peers = {"peers": []}
     peer_info = next((p for p in peers.get("peers", []) if p.get("id") == peer_id), {})
     peer_alias = peer_info.get("alias") or peer_info.get("alias_or_local", "") or ""
     connected = bool(peer_info.get("connected", False))
 
     # Profitability
     profitability = {}
-    try:
-        prof = await node.call("revenue-profitability", {"channel_id": channel_id})
-        # Single-channel response has {channel_id, profitability: {...}}
+    if not isinstance(prof, Exception):
         prof_data = prof.get("profitability", {})
         if prof_data:
             profitability = {
@@ -4137,9 +4154,8 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
                 "flow_profile": prof_data.get("flow_profile", "unknown"),
                 "days_active": prof_data.get("days_active", 0),
             }
-    except Exception as e:
-        logger.debug(f"Could not fetch profitability for {channel_id}: {e}")
-        profitability = {}
+    else:
+        logger.debug(f"Could not fetch profitability for {channel_id}: {prof}")
 
     # Flow analysis + velocity
     flow = _flow_profile(target_channel)
@@ -4173,14 +4189,12 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
         "current_base_fee_msat": local_updates.get("fee_base_msat", 0),
         "recent_changes": None
     }
-    try:
-        debug = await node.call("revenue-fee-debug")
+    if not isinstance(debug, Exception):
         fee_history["recent_changes"] = debug.get("recent_fee_changes")
-    except Exception:
-        pass
 
-    # Recent forwards through channel
-    forwards = await node.call("listforwards", {"status": "settled"})
+    # Process forwards result
+    if isinstance(forwards, Exception):
+        forwards = {"forwards": []}
     recent = []
     for fwd in sorted(
         forwards.get("forwards", []),
@@ -4316,21 +4330,28 @@ async def handle_recommended_actions(args: Dict) -> Dict:
 async def _node_peer_search(node: NodeConnection, query: str) -> Dict[str, Any]:
     query_lower = query.lower()
 
-    peers = await node.call("listpeers")
-    channels_result = await node.call("listpeerchannels")
+    peers, channels_result, nodes_result = await asyncio.gather(
+        node.call("listpeers"),
+        node.call("listpeerchannels"),
+        node.call("listnodes"),
+        return_exceptions=True,
+    )
+
+    # Handle potential exceptions from gather
+    if isinstance(peers, Exception):
+        peers = {"peers": []}
+    if isinstance(channels_result, Exception):
+        channels_result = {"channels": []}
     channels = channels_result.get("channels", [])
 
     # Build pubkey -> alias map from listnodes (best-effort)
     alias_map = {}
-    try:
-        nodes = await node.call("listnodes")
-        for n in nodes.get("nodes", []):
+    if not isinstance(nodes_result, Exception):
+        for n in nodes_result.get("nodes", []):
             pubkey = n.get("nodeid")
             alias = n.get("alias")
             if pubkey and alias:
                 alias_map[pubkey] = alias
-    except Exception:
-        pass
 
     channel_by_peer = {}
     for ch in channels:
@@ -4484,11 +4505,13 @@ async def handle_onboard_new_members(args: Dict) -> Dict:
     # Initialize advisor DB for onboarding tracking (uses configured ADVISOR_DB_PATH)
     db = ensure_advisor_db()
 
-    # Gather required data
+    # Gather required data in parallel
     try:
-        members_data = await node.call("hive-members")
-        node_info = await node.call("getinfo")
-        channels_data = await node.call("listpeerchannels")
+        members_data, node_info, channels_data = await asyncio.gather(
+            node.call("hive-members"),
+            node.call("getinfo"),
+            node.call("listpeerchannels"),
+        )
     except Exception as e:
         return {"error": f"Failed to gather node data: {e}"}
 
@@ -4853,16 +4876,21 @@ async def handle_topology_analysis(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    # Get planner log, topology info, and expansion recommendations
-    planner_log = await node.call("hive-planner-log", {"limit": 10})
-    topology = await node.call("hive-topology")
+    # Get planner log, topology info, and expansion recommendations in parallel
+    planner_log, topology, expansion_recs = await asyncio.gather(
+        node.call("hive-planner-log", {"limit": 10}),
+        node.call("hive-topology"),
+        node.call("hive-expansion-recommendations", {"limit": 10}),
+        return_exceptions=True,
+    )
 
-    # Get expansion recommendations with cooperation module intelligence
-    try:
-        expansion_recs = await node.call("hive-expansion-recommendations", {"limit": 10})
-    except Exception as e:
-        # Graceful fallback if RPC not available
-        expansion_recs = {"error": str(e), "recommendations": []}
+    # Handle potential exceptions
+    if isinstance(planner_log, Exception):
+        planner_log = {"error": str(planner_log)}
+    if isinstance(topology, Exception):
+        topology = {"error": str(topology)}
+    if isinstance(expansion_recs, Exception):
+        expansion_recs = {"error": str(expansion_recs), "recommendations": []}
 
     return {
         "planner_log": planner_log,
@@ -6973,6 +7001,8 @@ async def handle_advisor_record_decision(args: Dict) -> Dict:
     channel_id = args.get("channel_id")
     peer_id = args.get("peer_id")
     confidence = args.get("confidence")
+    predicted_benefit = args.get("predicted_benefit")
+    snapshot_metrics = args.get("snapshot_metrics")
 
     db = ensure_advisor_db()
 
@@ -6983,7 +7013,9 @@ async def handle_advisor_record_decision(args: Dict) -> Dict:
         reasoning=reasoning,
         channel_id=channel_id,
         peer_id=peer_id,
-        confidence=confidence
+        confidence=confidence,
+        predicted_benefit=predicted_benefit,
+        snapshot_metrics=snapshot_metrics
     )
 
     return {

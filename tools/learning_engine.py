@@ -215,6 +215,12 @@ class LearningEngine:
                 snapshot_metrics = {}
         snapshot_metrics = snapshot_metrics or {}
 
+        # Enrich decision with data from snapshot_metrics if not already present
+        if not decision.get("predicted_benefit") and snapshot_metrics:
+            decision["predicted_benefit"] = snapshot_metrics.get("predicted_benefit", 0)
+        if not decision.get("opportunity_type") and snapshot_metrics.get("opportunity_type"):
+            decision["opportunity_type"] = snapshot_metrics["opportunity_type"]
+
         # Get current state for comparison
         current_state = self._get_current_channel_state(node_name, channel_id)
 

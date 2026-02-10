@@ -839,7 +839,9 @@ class AdvisorDB:
     def record_decision(self, decision_type: str, node_name: str,
                         recommendation: str, reasoning: str = None,
                         channel_id: str = None, peer_id: str = None,
-                        confidence: float = None) -> int:
+                        confidence: float = None,
+                        predicted_benefit: int = None,
+                        snapshot_metrics: str = None) -> int:
         """Record an AI decision/recommendation. Deduplicates against recent pending decisions."""
         node_name_normalized = node_name.lower() if node_name else node_name
         now_ts = int(datetime.now().timestamp())
@@ -868,8 +870,8 @@ class AdvisorDB:
             cursor = conn.execute("""
                 INSERT INTO ai_decisions (
                     timestamp, decision_type, node_name, channel_id, peer_id,
-                    recommendation, reasoning, confidence, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'recommended')
+                    recommendation, reasoning, confidence, status, snapshot_metrics
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'recommended', ?)
             """, (
                 now_ts,
                 decision_type,
@@ -878,7 +880,8 @@ class AdvisorDB:
                 peer_id,
                 recommendation,
                 reasoning,
-                confidence
+                confidence,
+                snapshot_metrics
             ))
             conn.commit()
             return cursor.lastrowid

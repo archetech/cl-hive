@@ -1158,6 +1158,11 @@ class ProactiveAdvisor:
     ) -> None:
         """Record a decision to the audit trail."""
         try:
+            snapshot = {
+                "predicted_benefit": opp.predicted_benefit,
+                "current_state": opp.current_state,
+                "opportunity_type": opp.opportunity_type.value,
+            }
             await self.mcp.call(
                 "advisor_record_decision",
                 {
@@ -1167,7 +1172,9 @@ class ProactiveAdvisor:
                     "reasoning": opp.reasoning,
                     "channel_id": opp.channel_id,
                     "peer_id": opp.peer_id,
-                    "confidence": opp.adjusted_confidence
+                    "confidence": opp.adjusted_confidence,
+                    "predicted_benefit": opp.predicted_benefit,
+                    "snapshot_metrics": json.dumps(snapshot),
                 }
             )
         except Exception:
