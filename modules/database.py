@@ -2527,6 +2527,10 @@ class HiveDatabase:
 
         return results
 
+    # Maximum lookback for consecutive rejection counting (7 days).
+    # Prevents ancient rejections from permanently deadlocking the planner.
+    REJECTION_LOOKBACK_HOURS = 168
+
     def count_consecutive_expansion_rejections(self) -> int:
         """
         Count consecutive expansion rejections without any approvals.
@@ -2534,19 +2538,24 @@ class HiveDatabase:
         This detects patterns where ALL expansion proposals are being rejected
         (e.g., due to global liquidity constraints), regardless of target.
 
+        Only counts rejections within REJECTION_LOOKBACK_HOURS (7 days) to
+        prevent ancient rejections from permanently deadlocking the planner.
+
         Returns:
             Number of consecutive rejections since last approval/execution
         """
         conn = self._get_connection()
+        cutoff = int(time.time()) - (self.REJECTION_LOOKBACK_HOURS * 3600)
 
-        # Get the most recent actions, ordered by time
+        # Get the most recent actions within the lookback window, ordered by time
         # Look for the first non-rejection to break the streak
         rows = conn.execute("""
             SELECT status FROM pending_actions
             WHERE action_type IN ('channel_open', 'expansion')
+            AND proposed_at > ?
             ORDER BY proposed_at DESC
             LIMIT ?
-        """, (self.MAX_PENDING_ACTIONS_SCAN,)).fetchall()
+        """, (cutoff, self.MAX_PENDING_ACTIONS_SCAN)).fetchall()
 
         consecutive = 0
         for row in rows:
