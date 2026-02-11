@@ -228,11 +228,13 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
         our_member = ctx.database.get_member(ctx.our_pubkey)
         if our_member:
             uptime_raw = our_member.get("uptime_pct", 0.0)
+            # Normalize to 0-100 scale (DB stores 0.0-1.0)
+            if uptime_raw <= 1.0:
+                uptime_raw = round(uptime_raw * 100, 2)
             contribution_ratio = our_member.get("contribution_ratio", 0.0)
             # Enrich with live contribution ratio if available (Issue #59)
             if ctx.membership_mgr:
                 contribution_ratio = ctx.membership_mgr.calculate_contribution_ratio(ctx.our_pubkey)
-                uptime_raw = round(uptime_raw * 100, 2)
             our_membership = {
                 "tier": our_member.get("tier"),
                 "joined_at": our_member.get("joined_at"),
@@ -722,8 +724,30 @@ def _execute_channel_open(
         if ctx.log:
             ctx.log(f"cl-hive: Could not check existing channels: {e}", 'debug')
 
-    # Calculate intelligent budget limits
+    # Re-check feerate gate at approval time (feerates may have changed since proposal)
     cfg = ctx.config.snapshot() if ctx.config else None
+    if cfg and ctx.safe_plugin:
+        max_feerate = getattr(cfg, 'max_expansion_feerate_perkb', 5000)
+        if max_feerate != 0:
+            try:
+                feerates = ctx.safe_plugin.rpc.feerates("perkb")
+                opening_feerate = feerates.get("perkb", {}).get("opening")
+                if opening_feerate is None:
+                    opening_feerate = feerates.get("perkb", {}).get("min_acceptable", 0)
+                if opening_feerate > 0 and opening_feerate > max_feerate:
+                    ctx.database.update_action_status(action_id, 'failed')
+                    return {
+                        "error": "Feerate gate: on-chain fees too high for channel open",
+                        "action_id": action_id,
+                        "opening_feerate_perkb": opening_feerate,
+                        "max_feerate_perkb": max_feerate,
+                        "hint": "Wait for feerates to drop or increase hive-max-expansion-feerate"
+                    }
+            except Exception as e:
+                if ctx.log:
+                    ctx.log(f"cl-hive: Could not check feerates: {e}", 'debug')
+
+    # Calculate intelligent budget limits
     budget_info = {}
     if cfg:
         # Get onchain balance for reserve calculation
@@ -824,8 +848,9 @@ def _execute_channel_open(
                         "msg": msg.hex()
                     })
                     broadcast_count += 1
-                except Exception:
-                    pass
+                except Exception as send_err:
+                    if ctx.log:
+                        ctx.log(f"cl-hive: Intent send to {member_id[:16]}... failed: {send_err}", 'debug')
 
             if ctx.log:
                 ctx.log(f"cl-hive: Broadcast intent to {broadcast_count} hive members", 'info')
@@ -920,7 +945,11 @@ def _execute_channel_open(
             ctx.log(f"cl-hive: fundchannel failed: {error_msg}", 'error')
 
         # Update action status to failed
-        ctx.database.update_action_status(action_id, 'failed')
+        try:
+            ctx.database.update_action_status(action_id, 'failed')
+        except Exception as db_err:
+            if ctx.log:
+                ctx.log(f"cl-hive: Failed to update action status: {db_err}", 'error')
 
         # Classify the error to determine if delegation is appropriate
         failure_info = _classify_channel_open_failure(error_msg)
@@ -1329,7 +1358,7 @@ def pending_bans(ctx: HiveContext) -> Dict[str, Any]:
         result.append({
             "proposal_id": p["proposal_id"],
             "target_peer_id": target_id,
-            "target_tier": ctx.database.get_member(target_id).get("tier") if ctx.database.get_member(target_id) else "unknown",
+            "target_tier": next((m.get("tier", "unknown") for m in all_members if m["peer_id"] == target_id), "unknown"),
             "proposer": p["proposer_peer_id"][:16] + "...",
             "reason": p["reason"],
             "proposed_at": p["proposed_at"],
@@ -2312,9 +2341,24 @@ def deposit_marker(
 
     Returns:
         Dict with deposited marker info.
+
+    Permission: Member only
     """
+    # Permission check: Member only
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
     if not ctx.fee_coordination_mgr:
         return {"error": "Fee coordination not initialized"}
+
+    # Input validation
+    fee_ppm = int(fee_ppm)
+    volume_sats = int(volume_sats)
+    if fee_ppm < 0 or fee_ppm > 50000:
+        return {"error": "fee_ppm must be between 0 and 50000"}
+    if volume_sats < 0 or volume_sats > 10_000_000_000:  # 100 BTC
+        return {"error": "volume_sats out of range"}
 
     try:
         marker = ctx.fee_coordination_mgr.stigmergic_coord.deposit_marker(
@@ -3149,9 +3193,21 @@ def report_flow_intensity(
 
     Returns:
         Dict with acknowledgment.
+
+    Permission: Member only
     """
+    # Permission check: Member only
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
     if not ctx.strategic_positioning_mgr:
         return {"error": "Strategic positioning not initialized"}
+
+    # Input validation
+    intensity = float(intensity)
+    if intensity < 0.0 or intensity > 100.0:
+        return {"error": "intensity must be between 0.0 and 100.0"}
 
     try:
         return ctx.strategic_positioning_mgr.report_flow_intensity(
@@ -3638,12 +3694,11 @@ def mcf_solve(ctx: HiveContext, dry_run: bool = True) -> Dict[str, Any]:
         }
 
         if not dry_run:
-            # Broadcast solution (integration will be added when cl-hive.py wrapper is created)
-            result["broadcast"] = True
-            result["message"] = "Solution broadcast to fleet"
+            result["broadcast"] = False
+            result["message"] = "Solution generated. Fleet broadcast not yet implemented — use assignments to execute manually."
         else:
             result["broadcast"] = False
-            result["message"] = "Dry run - solution not broadcast (use dry_run=false to broadcast)"
+            result["message"] = "Dry run - solution not broadcast (use dry_run=false to generate)"
 
         return result
 

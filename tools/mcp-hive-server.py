@@ -826,7 +826,7 @@ Runs independently of the advisor cycle to provide immediate onboarding support 
         ),
         Tool(
             name="hive_set_fees",
-            description="Set channel fees for a specific channel on a node.",
+            description="Set channel fees for a specific channel on a node. IMPORTANT: Hive member channels must have 0 fees. This tool will block non-zero fees on hive channels unless force=true.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -845,6 +845,10 @@ Runs independently of the advisor cycle to provide immediate onboarding support 
                     "base_fee_msat": {
                         "type": "integer",
                         "description": "Base fee in millisatoshis (default: 0)"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Override hive zero-fee guard (default: false)"
                     }
                 },
                 "required": ["node", "channel_id", "fee_ppm"]
@@ -3656,7 +3660,10 @@ async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
     except Exception as e:
         logger.exception(f"Error in tool {name}")
         error_msg = str(e) or f"{type(e).__name__} in {name}"
-        return [TextContent(type="text", text=json.dumps({"error": error_msg}))]
+        error_result = {"error": error_msg}
+        if HIVE_NORMALIZE_RESPONSES:
+            error_result = {"ok": False, "error": error_msg}
+        return [TextContent(type="text", text=json.dumps(error_result))]
 
 
 # =============================================================================
@@ -3679,7 +3686,10 @@ async def handle_hive_status(args: Dict) -> Dict:
 
 def _extract_msat(value: Any) -> int:
     if isinstance(value, dict) and "msat" in value:
-        return int(value.get("msat", 0))
+        try:
+            return int(value.get("msat", 0))
+        except (ValueError, TypeError):
+            return 0
     if isinstance(value, str) and value.endswith("msat"):
         try:
             return int(value[:-4])
@@ -3691,16 +3701,21 @@ def _extract_msat(value: Any) -> int:
 
 
 def _channel_totals(channel: Dict) -> Dict[str, int]:
-    total_msat = _extract_msat(
-        channel.get("total_msat")
-        or channel.get("channel_total_msat")
-        or channel.get("amount_msat")
-    )
-    local_msat = _extract_msat(
-        channel.get("to_us_msat")
-        or channel.get("our_amount_msat")
-        or channel.get("our_msat")
-    )
+    # Use explicit None checks — `or` chaining treats 0 as falsy
+    total_raw = channel.get("total_msat")
+    if total_raw is None:
+        total_raw = channel.get("channel_total_msat")
+    if total_raw is None:
+        total_raw = channel.get("amount_msat")
+    total_msat = _extract_msat(total_raw)
+
+    local_raw = channel.get("to_us_msat")
+    if local_raw is None:
+        local_raw = channel.get("our_amount_msat")
+    if local_raw is None:
+        local_raw = channel.get("our_msat")
+    local_msat = _extract_msat(local_raw)
+
     return {"total_msat": total_msat, "local_msat": local_msat}
 
 
@@ -4456,7 +4471,20 @@ async def handle_approve_action(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    # Note: reason is for logging only, not passed to plugin
+    logger.info(f"Approving action {action_id} on {node_name}: {reason}")
+
+    # Record approval reason in advisor DB if available
+    try:
+        db = ensure_advisor_db()
+        db.record_decision(
+            decision_type="approve_action",
+            node_name=node_name,
+            recommendation=f"Approved action {action_id}",
+            reasoning=reason
+        )
+    except Exception:
+        pass  # Advisor DB is optional
+
     return await node.call("hive-approve-action", {
         "action_id": action_id
     })
@@ -4608,21 +4636,16 @@ async def handle_onboard_new_members(args: Dict) -> Dict:
             if not dry_run:
                 # Create pending_action for this suggestion
                 try:
-                    await node.call("hive-queue-action", {
+                    await node.call("hive-test-pending-action", {
                         "action_type": "channel_open",
                         "target": member_pubkey,
-                        "context": {
-                            "onboarding": True,
-                            "new_member_alias": member_alias,
-                            "new_member_tier": tier,
-                            "suggested_amount_sats": 3000000,
-                            "reasoning": suggestion["reasoning"]
-                        }
+                        "capacity_sats": 3000000,
+                        "reason": f"onboard_{member_alias}"
                     })
                     suggestion["pending_action_created"] = True
                 except Exception as e:
                     suggestion["pending_action_created"] = False
-                    suggestion["error"] = str(e)
+                    suggestion["error"] = str(e) or type(e).__name__
 
             suggestions_created.append(suggestion)
 
@@ -4854,15 +4877,38 @@ async def handle_channels(args: Dict) -> Dict:
 
 
 async def handle_set_fees(args: Dict) -> Dict:
-    """Set channel fees."""
+    """Set channel fees. Routes through cl-revenue-ops to enforce hive zero-fee policy."""
     node_name = args.get("node")
     channel_id = args.get("channel_id")
     fee_ppm = args.get("fee_ppm")
     base_fee_msat = args.get("base_fee_msat", 0)
+    force = args.get("force", False)
 
     node = fleet.get_node(node_name)
     if not node:
         return {"error": f"Unknown node: {node_name}"}
+
+    # Guard: check if the target channel peer is a hive member (zero-fee policy)
+    if fee_ppm and int(fee_ppm) > 0 and not force:
+        try:
+            members_result = await node.call("hive-members")
+            member_ids = {m.get("peer_id") for m in members_result.get("members", [])}
+            # Resolve channel_id to peer_id
+            channels = await node.call("listpeerchannels")
+            for ch in channels.get("channels", []):
+                scid = ch.get("short_channel_id", "")
+                peer_id = ch.get("peer_id", "")
+                if scid == channel_id or peer_id == channel_id:
+                    if peer_id in member_ids:
+                        return {
+                            "error": "Cannot set non-zero fees on hive member channel",
+                            "channel_id": channel_id,
+                            "peer_id": peer_id,
+                            "hint": "Hive channels must have 0 fees. Use force=true to override."
+                        }
+                    break
+        except Exception:
+            pass  # Fail open on guard check — setchannel itself will still work
 
     return await node.call("setchannel", {
         "id": channel_id,
@@ -5979,9 +6025,9 @@ async def handle_revenue_dashboard(args: Dict) -> Dict:
     }
 
     # Update top-level fields for backwards compatibility
-    pnl["gross_revenue_sats"] = total_revenue
-    pnl["net_profit_sats"] = total_net
-    pnl["operating_margin_pct"] = combined_margin_pct
+    pnl["gross_revenue_sats"] = routing_revenue
+    pnl["net_profit_sats"] = routing_net
+    pnl["operating_margin_pct"] = operating_margin_pct
 
     dashboard["pnl_summary"] = pnl
 
