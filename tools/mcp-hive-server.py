@@ -112,6 +112,8 @@ def _check_method_allowed(method: str) -> bool:
             with open(HIVE_ALLOWED_METHODS_FILE) as f:
                 _allowed_methods = set(json.load(f))
         except Exception:
+            # Parse error: deny all and stop retrying on every call
+            _allowed_methods = set()
             return False
     return method in _allowed_methods
 
@@ -300,6 +302,7 @@ class NodeConnection:
             "lightning-cli",
             f"--lightning-dir={self.lightning_dir}",
             f"--network={self.network}",
+            "--",  # Separate options from method/params
             method
         ]
 
@@ -3826,16 +3829,11 @@ Provides comprehensive view of MCF optimizer health including:
 async def call_tool(name: str, arguments: Dict) -> List[TextContent]:
     """Handle tool calls via registry dispatch."""
     try:
-        if name == "hive_health":
-            # Special case: inline handler with custom argument extraction
-            timeout = arguments.get("timeout", 5.0)
-            result = await fleet.health_check(timeout=timeout)
+        handler = TOOL_HANDLERS.get(name)
+        if handler is None:
+            result = {"error": f"Unknown tool: {name}"}
         else:
-            handler = TOOL_HANDLERS.get(name)
-            if handler is None:
-                result = {"error": f"Unknown tool: {name}"}
-            else:
-                result = await handler(arguments)
+            result = await handler(arguments)
 
         if HIVE_NORMALIZE_RESPONSES:
             result = _normalize_response(result)
@@ -3979,7 +3977,7 @@ def _flow_profile(channel: Dict) -> Dict[str, Any]:
 
     return {
         "flow_profile": flow_profile,
-        "inbound_outbound_ratio": ratio if ratio != float("inf") else "infinite",
+        "inbound_outbound_ratio": ratio if ratio != float("inf") else 999.99,
         "inbound_payments": in_fulfilled,
         "outbound_payments": out_fulfilled,
         "inbound_volume_sats": _extract_msat(in_msat) // 1000,
@@ -4091,6 +4089,12 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
         "pending_actions": len(pending.get("actions", [])),
         "top_issues": top_issues
     }
+
+
+async def handle_health(args: Dict) -> Dict:
+    """Quick health check on all nodes."""
+    timeout = args.get("timeout", 5.0)
+    return await fleet.health_check(timeout=timeout)
 
 
 async def handle_fleet_snapshot(args: Dict) -> Dict:
@@ -5215,7 +5219,7 @@ async def handle_channels(args: Dict) -> Dict:
 
             # Add flow metrics to channel
             channel["flow_profile"] = flow_profile
-            channel["inbound_outbound_ratio"] = inbound_outbound_ratio if inbound_outbound_ratio != float('inf') else "infinite"
+            channel["inbound_outbound_ratio"] = inbound_outbound_ratio if inbound_outbound_ratio != float('inf') else 999.99
             channel["inbound_payments"] = in_fulfilled
             channel["outbound_payments"] = out_fulfilled
             channel["inbound_volume_sats"] = in_msat // 1000 if isinstance(in_msat, int) else 0
@@ -7801,16 +7805,13 @@ def _get_proactive_advisor():
                 }
 
                 async def call(self, tool_name, params):
-                    # Route to internal handlers
-                    handler_name = self.TOOL_TO_HANDLER.get(tool_name)
-                    if not handler_name:
-                        # Try handle_{tool_name} first
-                        handler_name = f"handle_{tool_name}"
-                        if handler_name not in globals():
-                            # Try stripping hive_ prefix: hive_foo -> handle_foo
-                            if tool_name.startswith("hive_"):
-                                handler_name = f"handle_{tool_name[5:]}"
-                    handler = globals().get(handler_name)
+                    # Route to internal handlers via TOOL_HANDLERS registry
+                    handler = TOOL_HANDLERS.get(tool_name)
+                    if not handler:
+                        # Fallback: try explicit mapping for non-standard names
+                        handler_name = self.TOOL_TO_HANDLER.get(tool_name)
+                        if handler_name:
+                            handler = globals().get(handler_name)
                     if handler:
                         return await handler(params)
                     return {"error": f"Unknown tool: {tool_name}"}
@@ -9681,6 +9682,7 @@ async def handle_mcf_health(args: Dict) -> Dict:
 
 TOOL_HANDLERS: Dict[str, Any] = {
     # Hive core tools
+    "hive_health": handle_health,
     "hive_fleet_snapshot": handle_fleet_snapshot,
     "hive_anomalies": handle_anomalies,
     "hive_compare_periods": handle_compare_periods,

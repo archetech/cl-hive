@@ -142,6 +142,11 @@ def vpn_add_peer(ctx: HiveContext, pubkey: str, vpn_address: str) -> Dict[str, A
     if not ctx.vpn_transport:
         return {"error": "VPN transport not initialized"}
 
+    # Validate pubkey format (66 hex chars for compressed secp256k1 key)
+    import re
+    if not re.match(r'^[0-9a-fA-F]{66}$', pubkey):
+        return {"error": "Invalid pubkey format: expected 66 hex characters"}
+
     # Parse address
     if ':' in vpn_address:
         ip, port_str = vpn_address.rsplit(':', 1)
@@ -405,7 +410,7 @@ def reject_action(ctx: HiveContext, action_id, reason=None) -> Dict[str, Any]:
         return {"error": f"Action already {action['status']}", "action_id": action_id}
 
     # Also abort the associated intent if it exists
-    payload = action['payload']
+    payload = action.get('payload', {})
     intent_id = payload.get('intent_id')
     if intent_id:
         ctx.database.update_intent_status(intent_id, 'aborted', reason="action_rejected")
@@ -485,7 +490,7 @@ def budget_summary(ctx: HiveContext, days: int = 7) -> Dict[str, Any]:
 
     Args:
         ctx: HiveContext
-        days: Number of days of history to include (default: 7)
+        days: Number of days of history to include (default: 7, max: 365)
 
     Returns:
         Dict with budget utilization and spending history.
@@ -499,6 +504,12 @@ def budget_summary(ctx: HiveContext, days: int = 7) -> Dict[str, Any]:
 
     if not ctx.database:
         return {"error": "Database not initialized"}
+
+    # Bound days parameter (CLAUDE.md: "Bound everything")
+    try:
+        days = min(max(int(days), 1), 365)
+    except (ValueError, TypeError):
+        days = 7
 
     cfg = ctx.config.snapshot() if ctx.config else None
     if not cfg:
@@ -541,6 +552,8 @@ def approve_action(ctx: HiveContext, action_id, amount_sats: int = None) -> Dict
 
     # Handle "all" option
     if action_id == "all":
+        if amount_sats is not None:
+            return {"error": "amount_sats override not supported with 'all' — approve individually to set custom amounts"}
         return _approve_all_actions(ctx)
 
     # Single action approval - validate action_id
@@ -862,8 +875,8 @@ def _execute_channel_open(
     # Step 2: Connect to target if not already connected
     try:
         # Check if already connected
-        peers = ctx.safe_plugin.rpc.listpeers(target)
-        if not peers.get('peers'):
+        peerchannels = ctx.safe_plugin.rpc.listpeerchannels(target)
+        if not peerchannels.get('channels'):
             # Try to connect (will fail if no address known, but that's OK)
             try:
                 ctx.safe_plugin.rpc.connect(target)
@@ -1559,7 +1572,7 @@ def expansion_recommendations(ctx: HiveContext, limit: int = 10) -> Dict[str, An
             "alias": alias,
             "recommendation": rec.recommendation_type,
             "score": round(rec.score, 4),
-            "hive_coverage": f"{rec.hive_members_count}/{ctx.planner._get_hive_members().__len__()} members ({rec.hive_coverage_pct:.0%})",
+            "hive_coverage": f"{rec.hive_members_count}/{len(ctx.planner._get_hive_members())} members ({rec.hive_coverage_pct:.0%})",
             "hive_coverage_pct": round(rec.hive_coverage_pct * 100, 1),
             "hive_members_count": rec.hive_members_count,
             "competition_level": rec.competition_level,
@@ -1647,7 +1660,11 @@ def contribution(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
 
     if member:
         result["tier"] = member.get("tier")
-        result["uptime_pct"] = member.get("uptime_pct")
+        uptime_raw = member.get("uptime_pct", 0.0)
+        # Normalize to 0-100 scale (DB stores 0.0-1.0)
+        if uptime_raw is not None and uptime_raw <= 1.0:
+            uptime_raw = round(uptime_raw * 100, 2)
+        result["uptime_pct"] = uptime_raw
 
     return result
 
@@ -2696,7 +2713,7 @@ def record_rebalance_outcome(
         return {"error": "Cost reduction not initialized"}
 
     try:
-        return ctx.cost_reduction_mgr.record_rebalance_outcome(
+        result = ctx.cost_reduction_mgr.record_rebalance_outcome(
             from_channel=from_channel,
             to_channel=to_channel,
             amount_sats=amount_sats,
@@ -2704,6 +2721,9 @@ def record_rebalance_outcome(
             success=success,
             via_fleet=via_fleet
         )
+        if failure_reason and not success:
+            result["failure_reason"] = failure_reason
+        return result
 
     except Exception as e:
         return {"error": f"Failed to record rebalance outcome: {e}"}
