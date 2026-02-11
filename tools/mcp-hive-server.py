@@ -11580,9 +11580,15 @@ async def handle_routing_intelligence_health(args: Dict) -> Dict:
         return intel_status
 
     # Calculate pheromone coverage
-    pheromones = intel_status.get("pheromones", {})
-    pheromone_channels = pheromones.get("channels", [])
-    channels_with_data = len(pheromone_channels)
+    # Handle both nested (pheromones.channels) and flat (pheromone_levels) formats
+    pheromone_channels = intel_status.get("pheromone_levels", [])
+    if not pheromone_channels:
+        pheromones = intel_status.get("pheromones", {})
+        if isinstance(pheromones, dict):
+            pheromone_channels = pheromones.get("channels", [])
+        elif isinstance(pheromones, list):
+            pheromone_channels = pheromones
+    channels_with_data = intel_status.get("pheromone_channels", len(pheromone_channels))
 
     total_channels = len(channels_data.get("channels", [])) if "error" not in channels_data else 0
 
@@ -11590,16 +11596,27 @@ async def handle_routing_intelligence_health(args: Dict) -> Dict:
     stale_threshold = time.time() - (7 * 24 * 3600)
     stale_count = 0
     for ch in pheromone_channels:
-        last_update = ch.get("last_update", 0)
-        if last_update < stale_threshold:
+        last_update = ch.get("last_update", 0) if isinstance(ch, dict) else 0
+        if last_update > 0 and last_update < stale_threshold:
             stale_count += 1
 
     coverage_pct = round(channels_with_data * 100 / total_channels, 1) if total_channels else 0
 
-    # Get stigmergic marker stats
-    markers = intel_status.get("stigmergic_markers", {})
-    active_markers = markers.get("active_count", 0)
-    corridors_tracked = markers.get("corridors_tracked", 0)
+    # Get stigmergic marker stats - handle both dict and list formats
+    markers_data = intel_status.get("stigmergic_markers", [])
+    if isinstance(markers_data, list):
+        active_markers = intel_status.get("active_markers", len(markers_data))
+        # Count unique corridors from markers
+        corridors = set()
+        for m in markers_data:
+            if isinstance(m, dict):
+                corridor = m.get("corridor") or m.get("corridor_id")
+                if corridor:
+                    corridors.add(corridor)
+        corridors_tracked = len(corridors)
+    else:
+        active_markers = markers_data.get("active_count", 0)
+        corridors_tracked = markers_data.get("corridors_tracked", 0)
 
     # Determine health assessment
     needs_backfill = channels_with_data == 0 or coverage_pct < 30
@@ -11852,6 +11869,488 @@ async def handle_connectivity_recommendations(args: Dict) -> Dict:
         "recommendations": recommendations[:10],  # Top 10
         "well_connected_targets": well_connected[:3],
         "ai_note": ai_note
+    }
+
+
+# =============================================================================
+# Automation Tools (Phase 2 - Hex Enhancement)
+# =============================================================================
+
+async def handle_stagnant_channels(args: Dict) -> Dict:
+    """List channels with ≥95% local balance with enriched context."""
+    import time
+    
+    node_name = args.get("node")
+    min_local_pct = args.get("min_local_pct", 95)
+    min_age_days = args.get("min_age_days", 14)
+    
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    
+    # Get current blockheight for age calculation
+    info = await node.call("getinfo")
+    if "error" in info:
+        return info
+    current_blockheight = info.get("blockheight", 0)
+    
+    # Get all channels
+    channels_result = await node.call("listpeerchannels")
+    if "error" in channels_result:
+        return channels_result
+    
+    # Get forwards for last forward calculation
+    forwards = await node.call("listforwards", {"status": "settled"})
+    forwards_list = forwards.get("forwards", []) if not forwards.get("error") else []
+    
+    # Build map of channel -> last forward timestamp
+    channel_last_forward: Dict[str, int] = {}
+    for fwd in forwards_list:
+        for ch_key in ["in_channel", "out_channel"]:
+            ch_id = fwd.get(ch_key)
+            if ch_id:
+                ts = _coerce_ts(fwd.get("resolved_time") or fwd.get("resolved_at") or 0)
+                if ch_id not in channel_last_forward or ts > channel_last_forward[ch_id]:
+                    channel_last_forward[ch_id] = ts
+    
+    # Get peer intel if available
+    peer_intel_map: Dict[str, Dict] = {}
+    try:
+        db = ensure_advisor_db()
+        # Will be populated per-peer as needed
+    except Exception:
+        db = None
+    
+    now = int(time.time())
+    stagnant_channels = []
+    
+    for ch in channels_result.get("channels", []):
+        totals = _channel_totals(ch)
+        total_msat = totals["total_msat"]
+        local_msat = totals["local_msat"]
+        
+        if total_msat == 0:
+            continue
+            
+        local_pct = round((local_msat / total_msat) * 100, 2)
+        
+        if local_pct < min_local_pct:
+            continue
+        
+        channel_id = ch.get("short_channel_id", "")
+        peer_id = ch.get("peer_id", "")
+        
+        # Calculate channel age
+        channel_age_days = _scid_to_age_days(channel_id, current_blockheight) if channel_id else None
+        
+        if channel_age_days is not None and channel_age_days < min_age_days:
+            continue
+        
+        # Get peer alias
+        peer_alias = ""
+        try:
+            nodes_result = await node.call("listnodes", {"id": peer_id})
+            if nodes_result.get("nodes"):
+                peer_alias = nodes_result["nodes"][0].get("alias", "")
+        except Exception:
+            pass
+        
+        # Get current fee
+        local_updates = ch.get("updates", {}).get("local", {})
+        current_fee_ppm = local_updates.get("fee_proportional_millionths", 0)
+        
+        # Calculate days since last forward
+        last_forward_ts = channel_last_forward.get(channel_id, 0)
+        days_since_forward = None
+        if last_forward_ts > 0:
+            days_since_forward = (now - last_forward_ts) // 86400
+        
+        # Get peer quality from advisor if available
+        peer_quality = None
+        peer_recommendation = None
+        if db and peer_id:
+            try:
+                intel = db.get_peer_intel(peer_id)
+                if intel:
+                    peer_quality = intel.get("quality_score")
+                    peer_recommendation = intel.get("recommendation")
+            except Exception:
+                pass
+        
+        # Generate recommendation
+        recommendation = "wait"
+        reasoning = ""
+        
+        if peer_recommendation == "avoid":
+            recommendation = "close"
+            reasoning = "Peer marked as 'avoid' - consider closing channel"
+        elif channel_age_days is not None and channel_age_days > 90:
+            if days_since_forward is not None and days_since_forward > 30:
+                recommendation = "close"
+                reasoning = f"Channel >90 days old with no forwards in {days_since_forward} days"
+            elif current_fee_ppm > 100:
+                recommendation = "fee_reduction"
+                reasoning = f"Channel >90 days old, try reducing fee from {current_fee_ppm} ppm"
+            else:
+                recommendation = "static_policy"
+                reasoning = "Channel >90 days old with low fee already - apply static policy"
+        elif channel_age_days is not None and channel_age_days > 30:
+            if current_fee_ppm > 200:
+                recommendation = "fee_reduction"
+                reasoning = f"Consider reducing fee from {current_fee_ppm} ppm to attract flow"
+            else:
+                recommendation = "wait"
+                reasoning = "Channel 30-90 days old - give more time to attract flow"
+        else:
+            recommendation = "wait"
+            reasoning = "Channel too young for intervention"
+        
+        stagnant_channels.append({
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+            "peer_alias": peer_alias,
+            "capacity_sats": total_msat // 1000,
+            "local_pct": local_pct,
+            "channel_age_days": channel_age_days,
+            "days_since_last_forward": days_since_forward,
+            "peer_quality": peer_quality,
+            "current_fee_ppm": current_fee_ppm,
+            "recommendation": recommendation,
+            "reasoning": reasoning
+        })
+    
+    # Sort by recommendation priority: close > fee_reduction > static_policy > wait
+    priority = {"close": 0, "fee_reduction": 1, "static_policy": 2, "wait": 3}
+    stagnant_channels.sort(key=lambda x: (priority.get(x["recommendation"], 99), -(x.get("channel_age_days") or 0)))
+    
+    return {
+        "node": node_name,
+        "stagnant_count": len(stagnant_channels),
+        "channels": stagnant_channels,
+        "ai_note": f"Found {len(stagnant_channels)} stagnant channels (≥{min_local_pct}% local, ≥{min_age_days} days old)"
+    }
+
+
+async def handle_bulk_policy(args: Dict) -> Dict:
+    """Apply policies to multiple channels matching criteria."""
+    node_name = args.get("node")
+    filter_type = args.get("filter_type")
+    strategy = args.get("strategy")
+    fee_ppm = args.get("fee_ppm")
+    rebalance = args.get("rebalance")
+    dry_run = args.get("dry_run", True)
+    custom_filter = args.get("custom_filter", {})
+    
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    
+    if not filter_type:
+        return {"error": "filter_type is required"}
+    
+    # Get channels based on filter type
+    matched_channels = []
+    
+    if filter_type == "stagnant":
+        # Use stagnant_channels logic
+        stagnant_result = await handle_stagnant_channels({
+            "node": node_name,
+            "min_local_pct": custom_filter.get("min_local_pct", 95),
+            "min_age_days": custom_filter.get("min_age_days", 14)
+        })
+        if "error" in stagnant_result:
+            return stagnant_result
+        matched_channels = stagnant_result.get("channels", [])
+        
+    elif filter_type == "zombie":
+        # Get profitability and find zombies
+        prof = await node.call("revenue-profitability", {})
+        if "error" in prof:
+            return prof
+        channels_by_class = prof.get("channels_by_class", {})
+        for ch in channels_by_class.get("zombie", []):
+            matched_channels.append({
+                "channel_id": ch.get("short_channel_id"),
+                "peer_id": ch.get("peer_id"),
+                "peer_alias": ch.get("peer_alias", ""),
+                "classification": "zombie"
+            })
+            
+    elif filter_type == "underwater":
+        prof = await node.call("revenue-profitability", {})
+        if "error" in prof:
+            return prof
+        channels_by_class = prof.get("channels_by_class", {})
+        for ch in channels_by_class.get("bleeder", []):
+            matched_channels.append({
+                "channel_id": ch.get("short_channel_id"),
+                "peer_id": ch.get("peer_id"),
+                "peer_alias": ch.get("peer_alias", ""),
+                "classification": "bleeder"
+            })
+            
+    elif filter_type == "depleted":
+        # Channels with <5% local balance
+        channels_result = await node.call("listpeerchannels")
+        if "error" in channels_result:
+            return channels_result
+        for ch in channels_result.get("channels", []):
+            totals = _channel_totals(ch)
+            if totals["total_msat"] == 0:
+                continue
+            local_pct = (totals["local_msat"] / totals["total_msat"]) * 100
+            if local_pct < 5:
+                matched_channels.append({
+                    "channel_id": ch.get("short_channel_id"),
+                    "peer_id": ch.get("peer_id"),
+                    "local_pct": round(local_pct, 2),
+                    "classification": "depleted"
+                })
+                
+    elif filter_type == "custom":
+        # Custom filter based on provided criteria
+        channels_result = await node.call("listpeerchannels")
+        if "error" in channels_result:
+            return channels_result
+        for ch in channels_result.get("channels", []):
+            # Apply custom filters
+            match = True
+            totals = _channel_totals(ch)
+            local_pct = (totals["local_msat"] / totals["total_msat"] * 100) if totals["total_msat"] else 0
+            
+            if "min_local_pct" in custom_filter and local_pct < custom_filter["min_local_pct"]:
+                match = False
+            if "max_local_pct" in custom_filter and local_pct > custom_filter["max_local_pct"]:
+                match = False
+            if "min_capacity_sats" in custom_filter and (totals["total_msat"] // 1000) < custom_filter["min_capacity_sats"]:
+                match = False
+                
+            if match:
+                matched_channels.append({
+                    "channel_id": ch.get("short_channel_id"),
+                    "peer_id": ch.get("peer_id"),
+                    "local_pct": round(local_pct, 2)
+                })
+    else:
+        return {"error": f"Unknown filter_type: {filter_type}"}
+    
+    # Apply policies
+    applied = []
+    errors = []
+    
+    for ch in matched_channels:
+        peer_id = ch.get("peer_id")
+        if not peer_id:
+            continue
+            
+        if dry_run:
+            applied.append({
+                "peer_id": peer_id,
+                "channel_id": ch.get("channel_id"),
+                "would_apply": {
+                    "strategy": strategy,
+                    "fee_ppm": fee_ppm,
+                    "rebalance": rebalance
+                }
+            })
+        else:
+            # Actually apply the policy
+            params = {"action": "set", "peer_id": peer_id}
+            if strategy:
+                params["strategy"] = strategy
+            if fee_ppm is not None:
+                params["fee_ppm"] = fee_ppm
+            if rebalance:
+                params["rebalance"] = rebalance
+                
+            result = await node.call("revenue-policy", params)
+            if "error" in result:
+                errors.append({"peer_id": peer_id, "error": result["error"]})
+            else:
+                applied.append({
+                    "peer_id": peer_id,
+                    "channel_id": ch.get("channel_id"),
+                    "applied": params
+                })
+    
+    return {
+        "node": node_name,
+        "filter_type": filter_type,
+        "matched_count": len(matched_channels),
+        "applied_count": len(applied),
+        "dry_run": dry_run,
+        "applied": applied,
+        "errors": errors if errors else None,
+        "ai_note": f"{'Would apply' if dry_run else 'Applied'} policies to {len(applied)} channels matching '{filter_type}' filter"
+    }
+
+
+async def handle_enrich_peer(args: Dict) -> Dict:
+    """Get external data for peer evaluation from mempool.space."""
+    peer_id = args.get("peer_id")
+    timeout_seconds = args.get("timeout_seconds", 10)
+    
+    if not peer_id:
+        return {"error": "peer_id is required"}
+    
+    # Validate peer_id format (should be 66 hex chars)
+    if not isinstance(peer_id, str) or len(peer_id) != 66:
+        return {"error": "peer_id must be a 66-character hex pubkey"}
+    
+    MEMPOOL_API = "https://mempool.space/api"
+    
+    result = {
+        "peer_id": peer_id,
+        "source": "mempool.space",
+        "available": False
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            resp = await client.get(f"{MEMPOOL_API}/v1/lightning/nodes/{peer_id}")
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                result["available"] = True
+                result["alias"] = data.get("alias", "")
+                result["capacity_sats"] = data.get("capacity", 0)
+                result["channel_count"] = data.get("active_channel_count", 0)
+                result["first_seen"] = data.get("first_seen")
+                result["updated_at"] = data.get("updated_at")
+                result["color"] = data.get("color", "")
+                
+                # Calculate node age if first_seen is available
+                if data.get("first_seen"):
+                    import time
+                    node_age_days = (int(time.time()) - data["first_seen"]) // 86400
+                    result["node_age_days"] = node_age_days
+                    
+            elif resp.status_code == 404:
+                result["error"] = "Node not found in mempool.space database"
+            else:
+                result["error"] = f"API returned status {resp.status_code}"
+                
+    except httpx.TimeoutException:
+        result["error"] = f"API timeout after {timeout_seconds}s"
+    except Exception as e:
+        result["error"] = f"API error: {str(e)}"
+    
+    return result
+
+
+async def handle_enrich_proposal(args: Dict) -> Dict:
+    """Enhance a pending action with external peer data."""
+    node_name = args.get("node")
+    action_id = args.get("action_id")
+    
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    
+    if action_id is None:
+        return {"error": "action_id is required"}
+    
+    # Get pending actions
+    pending = await node.call("hive-pending-actions")
+    if "error" in pending:
+        return pending
+    
+    # Find the specific action
+    target_action = None
+    for action in pending.get("actions", []):
+        if action.get("id") == action_id:
+            target_action = action
+            break
+    
+    if not target_action:
+        return {"error": f"Action {action_id} not found in pending actions"}
+    
+    # Extract peer_id from action
+    peer_id = target_action.get("peer_id") or target_action.get("target_peer") or target_action.get("details", {}).get("peer_id")
+    
+    if not peer_id:
+        return {
+            "action": target_action,
+            "enrichment": None,
+            "note": "No peer_id found in action to enrich"
+        }
+    
+    # Get external peer data
+    external_data = await handle_enrich_peer({"peer_id": peer_id})
+    
+    # Get internal peer intel if available
+    internal_intel = None
+    try:
+        db = ensure_advisor_db()
+        if db:
+            internal_intel = db.get_peer_intel(peer_id)
+    except Exception:
+        pass
+    
+    # Generate enhanced recommendation
+    recommendation = None
+    reasoning = []
+    
+    action_type = target_action.get("action_type", "")
+    
+    if action_type in ("channel_open", "expansion"):
+        # Evaluate for channel open
+        if external_data.get("available"):
+            capacity = external_data.get("capacity_sats", 0)
+            channels = external_data.get("channel_count", 0)
+            node_age = external_data.get("node_age_days", 0)
+            
+            score = 0
+            if capacity > 100_000_000:  # >1 BTC
+                score += 2
+                reasoning.append(f"Good capacity: {capacity:,} sats")
+            elif capacity > 10_000_000:  # >0.1 BTC
+                score += 1
+                reasoning.append(f"Moderate capacity: {capacity:,} sats")
+            else:
+                reasoning.append(f"Low capacity: {capacity:,} sats")
+                
+            if channels >= 15:
+                score += 2
+                reasoning.append(f"Well-connected: {channels} channels")
+            elif channels >= 5:
+                score += 1
+                reasoning.append(f"Some connectivity: {channels} channels")
+            else:
+                reasoning.append(f"Low connectivity: {channels} channels")
+                
+            if node_age > 365:
+                score += 1
+                reasoning.append(f"Established node: {node_age} days old")
+            elif node_age < 30:
+                reasoning.append(f"New node: only {node_age} days old")
+                
+            if score >= 4:
+                recommendation = "approve"
+            elif score >= 2:
+                recommendation = "review"
+            else:
+                recommendation = "caution"
+        else:
+            reasoning.append("External data unavailable - manual review recommended")
+            recommendation = "review"
+            
+        if internal_intel:
+            if internal_intel.get("recommendation") == "avoid":
+                recommendation = "reject"
+                reasoning.append("Internal intel: peer marked as 'avoid'")
+            elif internal_intel.get("quality_score", 0) > 0.7:
+                reasoning.append(f"Internal intel: good quality score ({internal_intel['quality_score']:.2f})")
+    
+    return {
+        "node": node_name,
+        "action_id": action_id,
+        "action": target_action,
+        "external_data": external_data,
+        "internal_intel": internal_intel,
+        "recommendation": recommendation,
+        "reasoning": reasoning,
+        "ai_note": f"Enriched action {action_id} with peer data. Recommendation: {recommendation or 'N/A'}"
     }
 
 

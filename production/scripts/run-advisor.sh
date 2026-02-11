@@ -129,4 +129,24 @@ echo "=== Run completed: $(date) ===" | tee -a "$LOG_FILE"
 # Cleanup old logs (keep last 7 days)
 find "$LOG_DIR" -name "advisor_*.log" -mtime +7 -delete 2>/dev/null || true
 
+# Extract summary from the run and send to Hex via OpenClaw
+# Get the last run's output (between the last two "===" markers)
+SUMMARY=$(tail -200 "$LOG_FILE" | grep -v "^===" | head -100 | tr '\n' ' ' | cut -c1-2000)
+
+# Write summary to a file for Hex to pick up on next heartbeat
+SUMMARY_FILE="${PROD_DIR}/data/last-advisor-summary.txt"
+{
+    echo "=== Advisor Run $(date) ==="
+    tail -200 "$LOG_FILE" | grep -v "^===" | head -100
+} > "$SUMMARY_FILE"
+
+# Also send wake event to OpenClaw main session via gateway API
+GATEWAY_PORT=18789
+WAKE_TEXT="Hive Advisor cycle completed at $(date). Review summary at: ${SUMMARY_FILE}"
+
+curl -s -X POST "http://127.0.0.1:${GATEWAY_PORT}/api/cron/wake" \
+    -H "Content-Type: application/json" \
+    -d "{\"text\": \"${WAKE_TEXT}\", \"mode\": \"now\"}" \
+    2>/dev/null || true
+
 exit 0
