@@ -796,6 +796,190 @@ Runs independently of the advisor cycle to provide immediate onboarding support 
                 "required": ["node", "target_peer_id"]
             }
         ),
+        # --- Membership lifecycle ---
+        Tool(
+            name="hive_vouch",
+            description="Vouch for a neophyte to support their promotion to full member. Vouches count toward the quorum needed for promotion.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Public key of the neophyte to vouch for"}
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="hive_leave",
+            description="Voluntarily leave the hive. Removes this node from the member list and notifies other members. The last full member cannot leave.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "reason": {"type": "string", "description": "Reason for leaving (default: voluntary)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_force_promote",
+            description="Force-promote a neophyte to member during bootstrap phase. Only works when the hive is too small to reach normal vouch quorum. Admin only.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Public key of the neophyte to promote"}
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="hive_request_promotion",
+            description="Request promotion from neophyte to member. Broadcasts a promotion request to all hive members for voting.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_remove_member",
+            description="Remove a member from the hive (admin maintenance). Use to clean up stale/orphaned member entries. Cannot remove yourself - use hive_leave instead.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Public key of the member to remove"},
+                    "reason": {"type": "string", "description": "Reason for removal (default: maintenance)"}
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="hive_genesis",
+            description="Initialize this node as the genesis (first) node of a new hive. Creates the first member record with full privileges.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "hive_id": {"type": "string", "description": "Custom hive identifier (auto-generated if not provided)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_invite",
+            description="Generate an invitation ticket for a new member to join the hive. Only full members can generate invites.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "valid_hours": {"type": "integer", "description": "Hours until ticket expires (default: 24)"},
+                    "tier": {"type": "string", "description": "Starting tier: 'neophyte' (default) or 'member' (bootstrap only)", "enum": ["neophyte", "member"]}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_join",
+            description="Join a hive using an invitation ticket. Initiates the handshake protocol with a known hive member.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "ticket": {"type": "string", "description": "Base64-encoded invitation ticket"},
+                    "peer_id": {"type": "string", "description": "Node ID of a known hive member (optional, extracted from ticket if not provided)"}
+                },
+                "required": ["node", "ticket"]
+            }
+        ),
+        # --- Ban governance ---
+        Tool(
+            name="hive_propose_ban",
+            description="Propose banning a member from the hive. Requires quorum vote (51%% of members) to execute. Proposal is valid for 7 days.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Public key of the member to ban"},
+                    "reason": {"type": "string", "description": "Reason for the ban proposal (max 500 chars)"}
+                },
+                "required": ["node", "peer_id", "reason"]
+            }
+        ),
+        Tool(
+            name="hive_vote_ban",
+            description="Vote on a pending ban proposal. Use hive_pending_bans to see active proposals first.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "proposal_id": {"type": "string", "description": "ID of the ban proposal"},
+                    "vote": {"type": "string", "description": "Vote: 'approve' or 'reject'", "enum": ["approve", "reject"]}
+                },
+                "required": ["node", "proposal_id", "vote"]
+            }
+        ),
+        Tool(
+            name="hive_pending_bans",
+            description="View pending ban proposals with vote counts, quorum status, and your vote. Shows all active ban proposals awaiting votes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"}
+                },
+                "required": ["node"]
+            }
+        ),
+        # --- Health/reputation monitoring ---
+        Tool(
+            name="hive_nnlb_status",
+            description="Get NNLB (No Node Left Behind) status. Shows health distribution across hive members and identifies struggling members who may need assistance.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_peer_reputations",
+            description="Get aggregated peer reputations from hive intelligence. Peer reputations are aggregated from reports by all hive members with outlier detection.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Optional specific peer to query (omit for all peers)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_reputation_stats",
+            description="Get overall reputation tracking statistics. Returns summary statistics about tracked peer reputations across the fleet.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_contribution",
+            description="View contribution statistics for a peer. Shows forwarding contribution ratio, uptime, and leech detection status.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Optional peer to view (defaults to self)"}
+                },
+                "required": ["node"]
+            }
+        ),
         Tool(
             name="hive_node_info",
             description="Get detailed info about a specific Lightning node including channels, balance, and peers.",
@@ -4776,6 +4960,183 @@ async def handle_execute_promotion(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("hive-execute-promotion", {"target_peer_id": target_peer_id})
+
+
+# =============================================================================
+# Membership Lifecycle Handlers
+# =============================================================================
+
+async def handle_vouch(args: Dict) -> Dict:
+    """Vouch for a neophyte."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-vouch", {"peer_id": peer_id})
+
+
+async def handle_leave(args: Dict) -> Dict:
+    """Leave the hive voluntarily."""
+    node_name = args.get("node")
+    reason = args.get("reason", "voluntary")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-leave", {"reason": reason})
+
+
+async def handle_force_promote(args: Dict) -> Dict:
+    """Force-promote a neophyte during bootstrap."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-force-promote", {"peer_id": peer_id})
+
+
+async def handle_request_promotion(args: Dict) -> Dict:
+    """Request promotion from neophyte to member."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-request-promotion")
+
+
+async def handle_remove_member(args: Dict) -> Dict:
+    """Remove a member from the hive."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    reason = args.get("reason", "maintenance")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-remove-member", {"peer_id": peer_id, "reason": reason})
+
+
+async def handle_genesis(args: Dict) -> Dict:
+    """Initialize a new hive."""
+    node_name = args.get("node")
+    hive_id = args.get("hive_id")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    params = {}
+    if hive_id:
+        params["hive_id"] = hive_id
+    return await node.call("hive-genesis", params)
+
+
+async def handle_invite(args: Dict) -> Dict:
+    """Generate an invitation ticket."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    params = {}
+    if args.get("valid_hours") is not None:
+        params["valid_hours"] = args["valid_hours"]
+    if args.get("tier"):
+        params["tier"] = args["tier"]
+    return await node.call("hive-invite", params)
+
+
+async def handle_join(args: Dict) -> Dict:
+    """Join a hive using an invitation ticket."""
+    node_name = args.get("node")
+    ticket = args.get("ticket")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    params = {"ticket": ticket}
+    if args.get("peer_id"):
+        params["peer_id"] = args["peer_id"]
+    return await node.call("hive-join", params)
+
+
+# =============================================================================
+# Ban Governance Handlers
+# =============================================================================
+
+async def handle_propose_ban(args: Dict) -> Dict:
+    """Propose banning a member."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    reason = args.get("reason", "no reason given")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-propose-ban", {"peer_id": peer_id, "reason": reason})
+
+
+async def handle_vote_ban(args: Dict) -> Dict:
+    """Vote on a pending ban proposal."""
+    node_name = args.get("node")
+    proposal_id = args.get("proposal_id")
+    vote = args.get("vote")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-vote-ban", {"proposal_id": proposal_id, "vote": vote})
+
+
+async def handle_pending_bans(args: Dict) -> Dict:
+    """View pending ban proposals."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-pending-bans")
+
+
+# =============================================================================
+# Health/Reputation Monitoring Handlers
+# =============================================================================
+
+async def handle_nnlb_status(args: Dict) -> Dict:
+    """Get NNLB (No Node Left Behind) status."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-nnlb-status")
+
+
+async def handle_peer_reputations(args: Dict) -> Dict:
+    """Get aggregated peer reputations."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    params = {}
+    if peer_id:
+        params["peer_id"] = peer_id
+    return await node.call("hive-peer-reputations", params)
+
+
+async def handle_reputation_stats(args: Dict) -> Dict:
+    """Get overall reputation tracking statistics."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("hive-reputation-stats")
+
+
+async def handle_contribution(args: Dict) -> Dict:
+    """View contribution stats for a peer."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    params = {}
+    if peer_id:
+        params["peer_id"] = peer_id
+    return await node.call("hive-contribution", params)
 
 
 async def handle_node_info(args: Dict) -> Dict:
@@ -9336,6 +9697,24 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "hive_vote_promotion": handle_vote_promotion,
     "hive_pending_promotions": handle_pending_promotions,
     "hive_execute_promotion": handle_execute_promotion,
+    # Membership lifecycle
+    "hive_vouch": handle_vouch,
+    "hive_leave": handle_leave,
+    "hive_force_promote": handle_force_promote,
+    "hive_request_promotion": handle_request_promotion,
+    "hive_remove_member": handle_remove_member,
+    "hive_genesis": handle_genesis,
+    "hive_invite": handle_invite,
+    "hive_join": handle_join,
+    # Ban governance
+    "hive_propose_ban": handle_propose_ban,
+    "hive_vote_ban": handle_vote_ban,
+    "hive_pending_bans": handle_pending_bans,
+    # Health/reputation monitoring
+    "hive_nnlb_status": handle_nnlb_status,
+    "hive_peer_reputations": handle_peer_reputations,
+    "hive_reputation_stats": handle_reputation_stats,
+    "hive_contribution": handle_contribution,
     "hive_node_info": handle_node_info,
     "hive_channels": handle_channels,
     "hive_set_fees": handle_set_fees,
