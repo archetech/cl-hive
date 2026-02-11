@@ -12563,6 +12563,10 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "routing_intelligence_health": handle_routing_intelligence_health,
     "advisor_channel_history": handle_advisor_channel_history_tool,
     "connectivity_recommendations": handle_connectivity_recommendations,
+    # Phase 2: Automation Tools (Hex Enhancement)
+    "bulk_policy": handle_bulk_policy,
+    "enrich_peer": handle_enrich_peer,
+    "enrich_proposal": handle_enrich_proposal,
 }
 
 
