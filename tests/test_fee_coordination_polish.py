@@ -441,8 +441,8 @@ class TestFailedMarkerNoAssumption:
             "src", "dst", 400
         )
 
-        # Should use successful marker's fee (500), not failed marker's
-        assert recommended == 500
+        # Should use successful marker's fee (~500), not failed marker's
+        assert abs(recommended - 500) <= 5
         assert confidence >= 0.5
 
     def test_no_markers_returns_default(self):

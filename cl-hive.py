@@ -345,6 +345,7 @@ cost_reduction_mgr: Optional[CostReductionManager] = None
 rationalization_mgr: Optional[RationalizationManager] = None
 strategic_positioning_mgr: Optional[StrategicPositioningManager] = None
 anticipatory_liquidity_mgr: Optional[AnticipatoryLiquidityManager] = None
+quality_scorer_mgr: Optional[PeerQualityScorer] = None
 task_mgr: Optional[TaskManager] = None
 splice_mgr: Optional[SpliceManager] = None
 relay_mgr: Optional[RelayManager] = None
@@ -654,7 +655,7 @@ def _get_hive_context() -> HiveContext:
         our_pubkey=_our_pubkey,
         vpn_transport=_vpn_transport,
         planner=_planner,
-        quality_scorer=None,  # Local to init(), not needed for current commands
+        quality_scorer=quality_scorer_mgr if quality_scorer_mgr is not None else None,
         bridge=_bridge,
         intent_mgr=_intent_mgr,
         membership_mgr=_membership_mgr,
@@ -1293,8 +1294,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     plugin.log("cl-hive: Planner thread started")
 
     # Initialize Cooperative Expansion Manager (Phase 6.4)
-    global coop_expansion
+    global coop_expansion, quality_scorer_mgr
     quality_scorer = PeerQualityScorer(database, safe_plugin)
+    quality_scorer_mgr = quality_scorer
     coop_expansion = CooperativeExpansionManager(
         database=database,
         quality_scorer=quality_scorer,
@@ -17449,7 +17451,7 @@ def hive_get_defense_status(plugin: Plugin, scid: str = None):
         lightning-cli hive-get-defense-status
         lightning-cli hive-get-defense-status 932263x1883x0
     """
-    ctx = _build_rpc_context()
+    ctx = _get_hive_context()
     return rpc_get_defense_status(ctx, scid)
 
 
@@ -17472,7 +17474,7 @@ def hive_get_peer_quality(plugin: Plugin, peer_id: str = None):
         lightning-cli hive-get-peer-quality
         lightning-cli hive-get-peer-quality 03abc...
     """
-    ctx = _build_rpc_context()
+    ctx = _get_hive_context()
     return rpc_get_peer_quality(ctx, peer_id)
 
 
@@ -17495,7 +17497,7 @@ def hive_get_fee_change_outcomes(plugin: Plugin, scid: str = None, days: int = 3
         lightning-cli hive-get-fee-change-outcomes
         lightning-cli hive-get-fee-change-outcomes scid=932263x1883x0 days=14
     """
-    ctx = _build_rpc_context()
+    ctx = _get_hive_context()
     return rpc_get_fee_change_outcomes(ctx, scid, days)
 
 
@@ -17517,7 +17519,7 @@ def hive_get_channel_flags(plugin: Plugin, scid: str = None):
         lightning-cli hive-get-channel-flags
         lightning-cli hive-get-channel-flags 932263x1883x0
     """
-    ctx = _build_rpc_context()
+    ctx = _get_hive_context()
     return rpc_get_channel_flags(ctx, scid)
 
 
@@ -17536,7 +17538,7 @@ def hive_get_mcf_targets(plugin: Plugin):
     Example:
         lightning-cli hive-get-mcf-targets
     """
-    ctx = _build_rpc_context()
+    ctx = _get_hive_context()
     return rpc_get_mcf_targets(ctx)
 
 
@@ -17558,7 +17560,7 @@ def hive_get_nnlb_opportunities(plugin: Plugin, min_amount: int = 50000):
         lightning-cli hive-get-nnlb-opportunities
         lightning-cli hive-get-nnlb-opportunities 100000
     """
-    ctx = _build_rpc_context()
+    ctx = _get_hive_context()
     return rpc_get_nnlb_opportunities(ctx, min_amount)
 
 
@@ -17581,7 +17583,7 @@ def hive_get_channel_ages(plugin: Plugin, scid: str = None):
         lightning-cli hive-get-channel-ages
         lightning-cli hive-get-channel-ages 932263x1883x0
     """
-    ctx = _build_rpc_context()
+    ctx = _get_hive_context()
     return rpc_get_channel_ages(ctx, scid)
 
 

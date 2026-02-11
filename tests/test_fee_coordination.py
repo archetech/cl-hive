@@ -387,7 +387,7 @@ class TestStigmergicCoordinator:
 
     def test_marker_decay(self):
         """Test marker strength decays over time."""
-        # Deposit marker with old timestamp
+        # Deposit marker with old timestamp (MARKER_HALF_LIFE_HOURS=168, i.e. 7 days)
         marker = RouteMarker(
             depositor="02" + "0" * 64,
             source_peer_id="peer1",
@@ -395,14 +395,14 @@ class TestStigmergicCoordinator:
             fee_ppm=500,
             success=True,
             volume_sats=100_000,
-            timestamp=time.time() - 48 * 3600,  # 48 hours ago
+            timestamp=time.time() - 336 * 3600,  # 336 hours ago (2 half-lives)
             strength=1.0
         )
 
         now = time.time()
         current_strength = self.coordinator._calculate_marker_strength(marker, now)
 
-        # After 48 hours (2 half-lives), should be around 0.25
+        # After 336 hours (2 half-lives of 168h), should be around 0.25
         assert current_strength < 0.5
 
     def test_calculate_coordinated_fee_no_markers(self):
