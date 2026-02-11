@@ -9271,11 +9271,45 @@ async def handle_execute_safe_opportunities(args: Dict) -> Dict:
             "details": opp
         }
 
+        # Determine action category from action_type or opportunity_type
+        action_type = opp.get("action_type", "")
+
         if not dry_run:
             try:
-                if opp_type in ("fee_adjustment", "fee_change", "hill_climb_fee"):
+                # Fee change opportunities (match by action_type or specific opportunity_type)
+                if action_type == "fee_change" or opp_type in (
+                    "fee_adjustment", "fee_change", "hill_climb_fee",
+                    "stagnant_channel", "peak_hour_fee", "low_hour_fee",
+                    "critical_saturation", "competitor_undercut",
+                    "pheromone_fee_adjust", "stigmergic_coordination",
+                    "fleet_consensus_fee", "bleeder_fix", "imbalanced_channel"
+                ):
                     new_fee = opp.get("recommended_fee") or opp.get("new_fee_ppm")
+
+                    # Calculate fee from current state if not explicitly set
+                    if not new_fee and channel_id:
+                        current_state = opp.get("current_state", {})
+                        current_fee = current_state.get("fee_ppm") or current_state.get("fee_per_millionth", 0)
+
+                        if opp_type == "stagnant_channel":
+                            # Stagnant: reduce to 50 ppm floor (match remediation logic)
+                            new_fee = max(50, int(current_fee * 0.7)) if current_fee > 50 else 50
+                        elif opp_type == "critical_saturation":
+                            # Saturated: reduce by 20% to encourage outflow
+                            new_fee = max(25, int(current_fee * 0.8)) if current_fee else None
+                        elif opp_type == "peak_hour_fee":
+                            # Peak: increase by 15%
+                            new_fee = min(5000, int(current_fee * 1.15)) if current_fee else None
+                        elif opp_type in ("low_hour_fee", "competitor_undercut"):
+                            # Low hour / undercut: reduce by 10%
+                            new_fee = max(25, int(current_fee * 0.9)) if current_fee else None
+                        elif current_fee:
+                            # Generic fee change: reduce by 15%
+                            new_fee = max(25, int(current_fee * 0.85))
+
                     if new_fee and channel_id:
+                        # Enforce hard bounds (safety constraints)
+                        new_fee = max(25, min(5000, int(new_fee)))
                         action_result = await handle_revenue_set_fee({
                             "node": node_name,
                             "channel_id": channel_id,
@@ -9283,13 +9317,16 @@ async def handle_execute_safe_opportunities(args: Dict) -> Dict:
                         })
                         action_detail["action"] = "revenue_set_fee"
                         action_detail["new_fee_ppm"] = new_fee
+                    else:
+                        action_detail["action"] = "skipped_no_fee"
+                        action_result = {"skipped": True, "reason": f"No target fee for {opp_type}"}
 
                 elif opp_type in ("time_based_fee",):
                     # Time-based fees are usually handled by the plugin automatically
                     action_detail["action"] = "time_fee_handled_by_plugin"
                     action_result = {"message": "Time-based fees handled automatically by plugin"}
 
-                elif opp_type in ("rebalance", "circular_rebalance"):
+                elif action_type == "rebalance" or opp_type in ("rebalance", "circular_rebalance", "preemptive_rebalance"):
                     amount = opp.get("amount_sats", 0)
                     if amount <= 500_000:  # Only execute small rebalances
                         source = opp.get("source_channel")
