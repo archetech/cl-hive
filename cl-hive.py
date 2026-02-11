@@ -151,6 +151,7 @@ from modules.rpc_commands import (
     defense_status as rpc_defense_status,
     broadcast_warning as rpc_broadcast_warning,
     pheromone_levels as rpc_pheromone_levels,
+    get_routing_intelligence as rpc_get_routing_intelligence,
     fee_coordination_status as rpc_fee_coordination_status,
     # Phase 3 - Cost Reduction
     rebalance_recommendations as rpc_rebalance_recommendations,
@@ -16097,6 +16098,24 @@ def hive_pheromone_levels(plugin: Plugin, channel_id: str = None):
         Dict with pheromone levels.
     """
     return rpc_pheromone_levels(_get_hive_context(), channel_id=channel_id)
+
+
+@plugin.method("hive-get-routing-intelligence")
+def hive_get_routing_intelligence(plugin: Plugin, scid: str = None):
+    """
+    Get routing intelligence for channel(s).
+
+    Exports pheromone levels, trends, and corridor membership for use by
+    external fee optimization systems (e.g., cl-revenue-ops Thompson sampling).
+
+    Args:
+        scid: Optional specific channel short_channel_id. If None, returns all.
+
+    Returns:
+        Dict with routing intelligence including pheromone levels, trends,
+        last forward age, marker count, and active corridor status.
+    """
+    return rpc_get_routing_intelligence(_get_hive_context(), scid=scid)
 
 
 @plugin.method("hive-fee-coordination-status")

@@ -2564,6 +2564,154 @@ def pheromone_levels(ctx: HiveContext, channel_id: str = None) -> Dict[str, Any]
         return {"error": f"Failed to get pheromone levels: {e}"}
 
 
+def get_routing_intelligence(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
+    """
+    Get routing intelligence for channel(s).
+
+    Exports pheromone levels, trends, and corridor membership for use by
+    external fee optimization systems (e.g., cl-revenue-ops Thompson sampling).
+
+    Args:
+        ctx: HiveContext
+        scid: Optional specific channel short_channel_id. If None, returns all.
+
+    Returns:
+        Dict with routing intelligence:
+        {
+            "channels": {
+                "932263x1883x0": {
+                    "pheromone_level": 3.98,
+                    "pheromone_trend": "stable",  # rising/falling/stable
+                    "last_forward_age_hours": 2.5,
+                    "marker_count": 3,
+                    "on_active_corridor": true
+                },
+                ...
+            },
+            "timestamp": 1234567890
+        }
+    """
+    import time
+
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination not initialized"}
+
+    try:
+        adaptive = ctx.fee_coordination_mgr.adaptive_controller
+        stigmergic = ctx.fee_coordination_mgr.stigmergic_coord
+
+        # Get all pheromone levels
+        all_levels = adaptive.get_all_pheromone_levels()
+
+        # Get pheromone timestamps and fees
+        with adaptive._lock:
+            pheromone_timestamps = dict(adaptive._pheromone_last_update)
+            pheromone_fees = dict(adaptive._pheromone_fee)
+            channel_peer_map = dict(adaptive._channel_peer_map)
+
+        # Get all active markers
+        all_markers = stigmergic.get_all_markers()
+
+        # Build a set of (source, dest) pairs that have active markers
+        active_corridors = set()
+        marker_counts = {}  # (source, dest) -> count
+        for marker in all_markers:
+            key = (marker.source_peer_id, marker.destination_peer_id)
+            active_corridors.add(key)
+            marker_counts[key] = marker_counts.get(key, 0) + 1
+
+        now = time.time()
+
+        def get_channel_intel(channel_id: str) -> Dict[str, Any]:
+            """Build intelligence dict for a single channel."""
+            level = all_levels.get(channel_id, 0.0)
+            last_update = pheromone_timestamps.get(channel_id, 0)
+            peer_id = channel_peer_map.get(channel_id)
+
+            # Calculate last forward age in hours
+            if last_update > 0:
+                last_forward_age_hours = round((now - last_update) / 3600, 2)
+            else:
+                last_forward_age_hours = None
+
+            # Determine pheromone trend
+            # If we have a recent update (last 6 hours) and high pheromone, it's rising
+            # If pheromone is decaying (old update), it's falling
+            # Otherwise stable
+            if last_update > 0:
+                hours_since_update = (now - last_update) / 3600
+                if hours_since_update < 6 and level > 1.0:
+                    trend = "rising"
+                elif hours_since_update > 24 and level > 0.1:
+                    trend = "falling"
+                else:
+                    trend = "stable"
+            else:
+                trend = "stable"
+
+            # Check if this channel is on an active corridor
+            on_active_corridor = False
+            channel_marker_count = 0
+
+            if peer_id:
+                # Check all corridors involving this peer
+                for (src, dst), count in marker_counts.items():
+                    if src == peer_id or dst == peer_id:
+                        on_active_corridor = True
+                        channel_marker_count += count
+
+            return {
+                "pheromone_level": round(level, 2),
+                "pheromone_trend": trend,
+                "last_forward_age_hours": last_forward_age_hours,
+                "marker_count": channel_marker_count,
+                "on_active_corridor": on_active_corridor
+            }
+
+        # Build result
+        if scid:
+            # Single channel requested
+            if scid not in all_levels and scid not in channel_peer_map:
+                return {
+                    "channels": {
+                        scid: {
+                            "pheromone_level": 0.0,
+                            "pheromone_trend": "stable",
+                            "last_forward_age_hours": None,
+                            "marker_count": 0,
+                            "on_active_corridor": False
+                        }
+                    },
+                    "timestamp": int(now)
+                }
+            return {
+                "channels": {scid: get_channel_intel(scid)},
+                "timestamp": int(now)
+            }
+
+        # All channels
+        channels = {}
+        # Include all channels with pheromone levels
+        for channel_id in all_levels.keys():
+            channels[channel_id] = get_channel_intel(channel_id)
+
+        # Also include channels that have peer mappings but no pheromone yet
+        for channel_id in channel_peer_map.keys():
+            if channel_id not in channels:
+                channels[channel_id] = get_channel_intel(channel_id)
+
+        return {
+            "channels": channels,
+            "timestamp": int(now),
+            "total_channels": len(channels),
+            "channels_with_pheromone": len(all_levels),
+            "active_corridors": len(active_corridors)
+        }
+
+    except Exception as e:
+        return {"error": f"Failed to get routing intelligence: {e}"}
+
+
 def fee_coordination_status(ctx: HiveContext) -> Dict[str, Any]:
     """
     Get overall fee coordination status.
