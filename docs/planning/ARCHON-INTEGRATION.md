@@ -1060,6 +1060,172 @@ CREATE TABLE member_did_backups (
 
 ---
 
+---
+
+## Verifiable Credential Schemas
+
+*Schemas designed by Morningstar (2026-02-12)*
+
+### Ban Vote Schema
+
+Individual votes issued by community members:
+
+```json
+{
+  "name": "ban-vote-schema",
+  "description": "Individual vote on whether to ban a member from a community",
+  "version": "1.0.0",
+  "schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "community": {
+        "type": "string",
+        "description": "DID or identifier of the community/space"
+      },
+      "subject": {
+        "type": "string",
+        "description": "DID of the member being voted on"
+      },
+      "vote": {
+        "type": "string",
+        "enum": ["ban", "no-ban"],
+        "description": "The voter's decision"
+      },
+      "reason": {
+        "type": "string",
+        "description": "Justification for the vote"
+      },
+      "evidence": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Links or references to supporting evidence"
+      },
+      "severity": {
+        "type": "string",
+        "enum": ["warning", "temporary", "permanent"],
+        "description": "Recommended severity level"
+      },
+      "votedAt": {
+        "type": "string",
+        "format": "date-time"
+      }
+    },
+    "required": ["community", "subject", "vote", "reason", "votedAt"]
+  }
+}
+```
+
+### Ban Decision Schema
+
+Final decision issued by community authority/moderator:
+
+```json
+{
+  "name": "ban-decision-schema",
+  "description": "Final decision on a ban vote, recording outcome and vote tally",
+  "version": "1.0.0",
+  "schema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "community": {
+        "type": "string",
+        "description": "DID or identifier of the community/space"
+      },
+      "subject": {
+        "type": "string",
+        "description": "DID of the member being banned (or not)"
+      },
+      "decision": {
+        "type": "string",
+        "enum": ["banned", "not-banned", "warning-issued"],
+        "description": "Final outcome"
+      },
+      "voteTally": {
+        "type": "object",
+        "properties": {
+          "ban": { "type": "integer", "description": "Number of ban votes" },
+          "noBan": { "type": "integer", "description": "Number of no-ban votes" },
+          "threshold": { "type": "number", "description": "Required threshold (e.g., 0.67 for supermajority)" }
+        },
+        "required": ["ban", "noBan", "threshold"]
+      },
+      "severity": {
+        "type": "string",
+        "enum": ["warning", "temporary", "permanent"],
+        "description": "Severity of ban if decision is 'banned'"
+      },
+      "duration": {
+        "type": "string",
+        "description": "Duration for temporary bans (ISO 8601 duration)"
+      },
+      "expiresAt": {
+        "type": "string",
+        "format": "date-time",
+        "description": "When temporary ban expires"
+      },
+      "appealProcess": {
+        "type": "string",
+        "description": "How the subject can appeal the decision"
+      },
+      "decidedAt": {
+        "type": "string",
+        "format": "date-time"
+      },
+      "voteCredentials": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "CIDs of individual vote credentials"
+      }
+    },
+    "required": ["community", "subject", "decision", "voteTally", "decidedAt"]
+  }
+}
+```
+
+### Credential Flow
+
+```
+1. Community members issue ban-vote credentials for a subject
+   └─ Each vote is a signed VC with reason + evidence
+
+2. Moderator collects votes and issues ban-decision credential
+   └─ Aggregates vote results
+   └─ Links to individual vote credentials via CIDs
+
+3. Decision references all votes for full transparency
+   └─ voteCredentials[] contains CIDs of each ban-vote VC
+
+4. Subject's DID can be checked against ban decisions
+   └─ Community gatekeepers verify ban status
+```
+
+### Design Rationale
+
+**Ban Vote Schema:**
+- Individual voters issue these credentials
+- Subject field identifies who they're voting on
+- Includes reason and evidence for transparency
+- Severity recommendation captures voter's intent
+
+**Ban Decision Schema:**
+- Issued by community authority/moderator
+- Aggregates vote results
+- Links to individual vote credentials for auditability
+- Supports temporary bans with expiration
+- Includes appeal process for fairness
+
+### Future Schemas (TODO)
+
+- **settlement-receipt-schema**: Cryptographic proof of payment distribution
+- **config-change-vote-schema**: Individual votes on parameter changes
+- **config-change-decision-schema**: Final outcome of config governance
+- **dispute-filing-schema**: Formal dispute submission
+- **dispute-resolution-schema**: Arbitration outcome
+
+---
+
 ## Security Considerations
 
 1. **Passphrase handling**: Never log or expose `ARCHON_PASSPHRASE`
