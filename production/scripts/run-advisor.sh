@@ -111,6 +111,8 @@ You are the AI Advisor for the Lightning Hive fleet (hive-nexus-01 and hive-nexu
 - Any close/splice operation
 
 Run the complete advisor workflow now. Call tools on BOTH nodes.
+
+IMPORTANT: Generate ONE report only. After writing "End of Report", STOP. Do not continue or regenerate.
 PROMPTEOF
 
 # Pipe prompt via stdin - avoids all command-line escaping issues

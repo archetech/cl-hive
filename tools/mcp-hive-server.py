@@ -7221,6 +7221,10 @@ async def handle_revenue_policy(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
+    # Validate required action parameter
+    if not action:
+        return {"error": "action is required (list, get, set, delete)"}
+
     # Build the action string for revenue-policy command
     if action == "list":
         return await node.call("revenue-policy", {"action": "list"})
@@ -7321,6 +7325,10 @@ async def handle_revenue_config(args: Dict) -> Dict:
     node = fleet.get_node(node_name)
     if not node:
         return {"error": f"Unknown node: {node_name}"}
+
+    # Validate required action parameter
+    if not action:
+        return {"error": "action is required (get, set, reset, list-mutable)"}
 
     params = {"action": action}
     if key:
