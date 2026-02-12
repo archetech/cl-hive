@@ -1871,17 +1871,40 @@ Records the adjustment in advisor database, enabling outcome measurement and
 effectiveness analysis over time. Use instead of revenue_config when you want
 to track the decision and learn from outcomes.
 
-**Recommended config keys for advisor tuning:**
-- min_fee_ppm: Fee floor (raise if drain detected, lower if stagnating)
-- max_fee_ppm: Fee ceiling (adjust based on competitive positioning)
-- daily_budget_sats: Rebalance budget (scale with profitability)
-- rebalance_max_amount: Max rebalance size per operation
-- thompson_observation_decay_hours: Shorter (72h) in volatile, longer (168h) in stable
-- hive_prior_weight: Trust in hive intelligence (0-1)
-- scarcity_threshold: When to apply scarcity pricing (0-1)
+**IMPORTANT: Check config_effectiveness() and config_adjustment_history() BEFORE adjusting.**
+- Don't repeat failed adjustments within 7 days
+- Don't adjust same param within 24-48h of last change
+- One change at a time for related params
+
+**Tier 1 - Fee Bounds & Budget:**
+- min_fee_ppm: Fee floor (↑ if drain attacks, ↓ if stagnating)
+- max_fee_ppm: Fee ceiling (↓ if losing volume, ↑ if high demand)
+- daily_budget_sats: Rebalance budget (↑ if ROI positive, ↓ if negative)
+- rebalance_max_amount: Max rebalance size
+- rebalance_min_profit_ppm: Min profit margin (↑ if unprofitable rebalances)
+
+**Tier 1 - Liquidity Thresholds:**
+- low_liquidity_threshold: When to consider low (↑ if too aggressive)
+- high_liquidity_threshold: When to consider high (↓ if saturating)
+- new_channel_grace_days: Grace period before optimization
+
+**Tier 2 - AIMD Algorithm (careful):**
+- aimd_additive_increase_ppm: Fee increase step (↑ aggressive, ↓ stable)
+- aimd_multiplicative_decrease: Fee decrease factor (↓ if fees stuck high)
+- aimd_failure_threshold: Failures before decrease (↑ if too volatile)
+- aimd_success_threshold: Successes before increase (↓ for faster growth)
+
+**Tier 2 - Algorithm Tuning (careful):**
+- thompson_observation_decay_hours: Shorter in volatile, longer in stable
+- hive_prior_weight: Trust in swarm intelligence (0-1)
+- scarcity_threshold: When to apply scarcity pricing
+- vegas_decay_rate: Signal decay rate
 
 **Trigger reasons:** drain_detected, stagnation, profitability_low, profitability_high,
-budget_exhausted, market_conditions, competitive_pressure, channel_health""",
+budget_exhausted, market_conditions, competitive_pressure, rebalance_inefficiency,
+algorithm_tuning, liquidity_imbalance
+
+**Always include context_metrics** with revenue_24h, forward_count_24h, stagnant_count, etc.""",
             inputSchema={
                 "type": "object",
                 "properties": {
