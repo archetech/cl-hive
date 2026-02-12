@@ -64,16 +64,78 @@ The Thompson Sampling algorithm handles individual fee optimization; the advisor
 | `config_measure_outcomes` | Measure pending adjustment outcomes |
 | `revenue_config` | Get/set config (use config_adjust for tracked changes) |
 
-**Key Config Parameters to Tune:**
-| Parameter | Default | When to Adjust |
-|-----------|---------|----------------|
-| `min_fee_ppm` | 25 | Raise if drain attacks, lower if channels stagnating |
-| `max_fee_ppm` | 2500 | Lower if losing competitive routes, raise if high demand |
-| `daily_budget_sats` | 2000 | Increase during growth, decrease if bleeding |
-| `rebalance_max_amount` | 5M | Lower if budget tight, raise if profitable |
-| `thompson_observation_decay_hours` | 168 | Shorter (72h) in volatile, longer in stable |
-| `hive_prior_weight` | 0.6 | Increase if pheromone quality high |
+#### Fee Bounds & Budget (Tier 1)
+| Parameter | Default | Trigger Conditions |
+|-----------|---------|-------------------|
+| `min_fee_ppm` | 25 | ↑ if drain attacks (>3/day), ↓ if >50% channels stagnant |
+| `max_fee_ppm` | 2500 | ↓ if losing volume to competitors, ↑ if high demand |
+| `daily_budget_sats` | 2000 | ↑ if ROI positive & channels need balancing, ↓ if ROI negative |
+| `rebalance_max_amount` | 5M | Scale with channel sizes and budget |
+| `rebalance_min_profit_ppm` | 0 | ↑ (50-200) if too many unprofitable rebalances |
+
+#### Liquidity Thresholds (Tier 1)
+| Parameter | Default | Trigger Conditions |
+|-----------|---------|-------------------|
+| `low_liquidity_threshold` | 0.15 | ↑ (0.2-0.25) if rebalancing too aggressively |
+| `high_liquidity_threshold` | 0.8 | ↓ (0.7) if channels saturating before action |
+| `new_channel_grace_days` | 7 | ↓ (3-5) for fast markets, ↑ (14) for stability |
+
+#### AIMD Fee Algorithm (Tier 2 - Careful)
+| Parameter | Default | Trigger Conditions |
+|-----------|---------|-------------------|
+| `aimd_additive_increase_ppm` | 5 | ↑ (10-20) for aggressive growth, ↓ (2-3) for stability |
+| `aimd_multiplicative_decrease` | 0.85 | ↓ (0.7) if fees getting stuck high |
+| `aimd_failure_threshold` | 3 | ↑ (5) if fees too volatile |
+| `aimd_success_threshold` | 10 | ↓ (5) for faster fee increases |
+
+#### Algorithm Tuning (Tier 2 - Careful)
+| Parameter | Default | Trigger Conditions |
+|-----------|---------|-------------------|
+| `thompson_observation_decay_hours` | 168 | ↓ (72h) in volatile conditions, ↑ (336h) in stable |
+| `hive_prior_weight` | 0.6 | ↑ if pheromone quality high, ↓ if data sparse |
 | `scarcity_threshold` | 0.3 | Adjust based on depletion patterns |
+| `vegas_decay_rate` | 0.85 | ↓ for faster adaptation, ↑ for stability |
+
+## Config Adjustment Learning Loop
+
+**CRITICAL: Always check history before adjusting.**
+
+### Before Any Adjustment:
+```
+1. config_effectiveness(config_key=X) → What's the success rate for this param?
+2. config_adjustment_history(config_key=X, days=14) → Recent changes and outcomes?
+3. If success_rate < 50% for this param, reconsider or try different direction
+4. If same adjustment was tried <7 days ago and failed, don't repeat
+```
+
+### When Making Adjustments:
+```
+1. ALWAYS include context_metrics with current state:
+   - revenue_24h, forward_count_24h, volume_24h
+   - stagnant_channel_count, drain_event_count
+   - rebalance_cost_24h, rebalance_count_24h
+   
+2. Set confidence based on evidence strength:
+   - 0.8-1.0: Clear causal signal (e.g., 5 drain events → raise min_fee)
+   - 0.5-0.7: Moderate signal (e.g., declining revenue → try adjustment)
+   - 0.3-0.5: Exploratory (e.g., testing if lower threshold helps)
+
+3. Document reasoning thoroughly for future learning
+```
+
+### After Adjustments (24-48h later):
+```
+1. config_measure_outcomes(hours_since=24) → Evaluate all pending
+2. Review success/failure patterns
+3. Update mental model of what works for this fleet
+```
+
+### Learning Principles:
+- **One change at a time**: Don't adjust multiple related params simultaneously
+- **Wait for signal**: 24-48h minimum between adjustments to same param
+- **Revert failures**: If outcome_success=false, consider reverting
+- **Compound successes**: If a direction works, continue gradually
+- **Context matters**: Same param may need different values in different conditions
 
 ### Settlement & Membership
 | Tool | Purpose |
@@ -98,13 +160,35 @@ The Thompson Sampling algorithm handles individual fee optimization; the advisor
 3. process_all_pending(dry_run=false) → Execute approved/rejected
 ```
 
-### Phase 3: Config Tuning Analysis (1 minute)
-**Instead of setting fees directly, tune cl-revenue-ops parameters.**
+### Phase 3: Config Tuning & Learning (2 minutes)
+**Learn from past, adjust present, inform future.**
 ```
 1. config_measure_outcomes(hours_since=24) → Measure pending adjustment outcomes
-2. config_effectiveness() → Check what's working
-3. Analyze current conditions and decide if config adjustments needed
-4. If adjusting, use config_adjust with context_metrics for tracking
+   - Record which changes worked, which didn't
+   - Note patterns (e.g., "raising min_fee_ppm worked 3/4 times")
+
+2. config_effectiveness() → Review learned ranges and success rates
+   - If success_rate < 50% for a param, reconsider strategy
+   - Check learned_ranges for optimal values
+
+3. config_adjustment_history(days=7) → What was recently changed?
+   - Don't repeat failed adjustments within 7 days
+   - Don't adjust same param within 24-48h
+
+4. Analyze current conditions:
+   - Drain events? → Consider raising min_fee_ppm
+   - Stagnation? → Consider lowering thresholds
+   - Budget exhausted? → Adjust rebalance params
+   - Volatile routing? → Tune AIMD params
+
+5. If adjusting, include context_metrics:
+   {
+     "revenue_24h": X,
+     "forward_count_24h": Y,
+     "stagnant_count": Z,
+     "drain_events_24h": N,
+     "rebalance_cost_24h": C
+   }
 ```
 
 **When to adjust configs:**
