@@ -1457,6 +1457,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     fee_coordination_mgr.set_fee_intelligence_mgr(fee_intel_mgr)
     plugin.log("cl-hive: Fee coordination manager initialized (Phase 2)")
 
+    # Restore persisted routing intelligence
+    try:
+        restored = fee_coordination_mgr.restore_state_from_database()
+        plugin.log(f"cl-hive: Restored routing intelligence "
+                   f"(pheromones={restored['pheromones']}, markers={restored['markers']})")
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to restore routing intelligence: {e}", level='warn')
+
     # Initialize Cost Reduction Manager (Phase 3 - Cost Reduction)
     global cost_reduction_mgr
     cost_reduction_mgr = CostReductionManager(
@@ -1587,9 +1595,23 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Broadcast membership to peers for consistency (Phase 5 enhancement)
     _sync_membership_on_startup(plugin)
 
+    # Auto-backfill routing intelligence on first-ever startup (empty DB)
+    if fee_coordination_mgr and fee_coordination_mgr.should_auto_backfill():
+        plugin.log("cl-hive: Empty routing intelligence, auto-backfilling from forwards...")
+        try:
+            result = hive_backfill_routing_intelligence(plugin, days=7)
+            plugin.log(f"cl-hive: Auto-backfill complete: {result.get('processed', 0)} forwards")
+        except Exception as e:
+            plugin.log(f"cl-hive: Auto-backfill failed: {e}", level='warn')
+
     # Set up graceful shutdown handler
     def handle_shutdown_signal(signum, frame):
         plugin.log("cl-hive: Received shutdown signal, cleaning up...")
+        try:
+            if fee_coordination_mgr:
+                fee_coordination_mgr.save_state_to_database()
+        except Exception:
+            pass  # Best-effort on shutdown
         shutdown_event.set()
     
     try:
@@ -9104,6 +9126,19 @@ def fee_intelligence_loop():
                         fee_coordination_mgr.adaptive_controller.update_velocity(scid, velocity)
             except Exception as e:
                 safe_plugin.log(f"cl-hive: Velocity cache update error: {e}", level='debug')
+
+            # Step 10c: Save routing intelligence to database (every cycle, ~5 min)
+            try:
+                if fee_coordination_mgr:
+                    saved = fee_coordination_mgr.save_state_to_database()
+                    if saved.get('pheromones', 0) > 0 or saved.get('markers', 0) > 0:
+                        safe_plugin.log(
+                            f"cl-hive: Saved routing intelligence "
+                            f"(pheromones={saved['pheromones']}, markers={saved['markers']})",
+                            level='debug'
+                        )
+            except Exception as e:
+                safe_plugin.log(f"cl-hive: Failed to save routing intelligence: {e}", level='warn')
 
             # Step 11: Cleanup old remote yield metrics (Phase 14)
             try:

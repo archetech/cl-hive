@@ -26,6 +26,8 @@ from modules.fee_coordination import (
     DRAIN_RATIO_THRESHOLD,
     FAILURE_RATE_THRESHOLD,
     WARNING_TTL_HOURS,
+    MARKER_MIN_STRENGTH,
+    MARKER_HALF_LIFE_HOURS,
     # Data classes
     FlowCorridor,
     CorridorAssignment,
@@ -1066,3 +1068,200 @@ class TestCrossWireFeeIntelligence:
             local_balance_pct=0.5
         )
         assert rec is not None
+
+
+# =============================================================================
+# PERSISTENCE TESTS (Pheromone & Marker Save/Restore)
+# =============================================================================
+
+class MockPersistenceDatabase:
+    """Mock database with routing intelligence persistence methods."""
+
+    def __init__(self):
+        self.members = {}
+        self._pheromones = []
+        self._markers = []
+
+    def get_all_members(self):
+        return list(self.members.values()) if self.members else []
+
+    def get_member(self, peer_id):
+        return self.members.get(peer_id)
+
+    def save_pheromone_levels(self, levels):
+        self._pheromones = list(levels)
+        return len(levels)
+
+    def load_pheromone_levels(self):
+        return list(self._pheromones)
+
+    def save_stigmergic_markers(self, markers):
+        self._markers = list(markers)
+        return len(markers)
+
+    def load_stigmergic_markers(self):
+        return list(self._markers)
+
+    def get_pheromone_count(self):
+        return len(self._pheromones)
+
+    def get_latest_marker_timestamp(self):
+        if not self._markers:
+            return None
+        return max(m['timestamp'] for m in self._markers)
+
+
+class TestPersistence:
+    """Tests for pheromone and marker persistence."""
+
+    def setup_method(self):
+        self.db = MockPersistenceDatabase()
+        self.plugin = MockPlugin()
+        self.manager = FeeCoordinationManager(
+            database=self.db,
+            plugin=self.plugin
+        )
+        self.manager.set_our_pubkey("02" + "bb" * 32)
+
+    def test_save_load_pheromone_round_trip(self):
+        """Populate pheromones, save, clear, restore, verify."""
+        ctrl = self.manager.adaptive_controller
+
+        # Populate pheromones
+        now = time.time()
+        with ctrl._lock:
+            ctrl._pheromone["100x1x0"] = 1.5
+            ctrl._pheromone_fee["100x1x0"] = 300
+            ctrl._pheromone_last_update["100x1x0"] = now
+            ctrl._pheromone["200x2x0"] = 0.8
+            ctrl._pheromone_fee["200x2x0"] = 450
+            ctrl._pheromone_last_update["200x2x0"] = now
+
+        # Save
+        saved = self.manager.save_state_to_database()
+        assert saved['pheromones'] == 2
+
+        # Clear in-memory state
+        with ctrl._lock:
+            ctrl._pheromone.clear()
+            ctrl._pheromone_fee.clear()
+            ctrl._pheromone_last_update.clear()
+
+        assert len(ctrl._pheromone) == 0
+
+        # Restore
+        restored = self.manager.restore_state_from_database()
+        assert restored['pheromones'] == 2
+
+        # Verify data is back (values may have slight decay)
+        assert "100x1x0" in ctrl._pheromone
+        assert "200x2x0" in ctrl._pheromone
+        assert ctrl._pheromone["100x1x0"] > 0
+        assert ctrl._pheromone_fee["100x1x0"] == 300
+        assert ctrl._pheromone_fee["200x2x0"] == 450
+
+    def test_save_load_markers_round_trip(self):
+        """Populate markers, save, clear, restore, verify."""
+        coord = self.manager.stigmergic_coord
+        src = "02" + "aa" * 32
+        dst = "02" + "cc" * 32
+
+        # Deposit a marker
+        coord.deposit_marker(src, dst, 500, True, 50000)
+
+        # Save
+        saved = self.manager.save_state_to_database()
+        assert saved['markers'] == 1
+
+        # Clear in-memory
+        with coord._lock:
+            coord._markers.clear()
+
+        assert len(coord._markers) == 0
+
+        # Restore
+        restored = self.manager.restore_state_from_database()
+        assert restored['markers'] == 1
+
+        # Verify data
+        key = (src, dst)
+        assert key in coord._markers
+        assert len(coord._markers[key]) == 1
+        assert coord._markers[key][0].fee_ppm == 500
+        assert coord._markers[key][0].success is True
+
+    def test_save_filters_below_threshold(self):
+        """Pheromones < 0.01 and weak markers are excluded from save."""
+        ctrl = self.manager.adaptive_controller
+        coord = self.manager.stigmergic_coord
+
+        now = time.time()
+
+        # Add one above threshold and one below
+        with ctrl._lock:
+            ctrl._pheromone["100x1x0"] = 0.5   # Above 0.01
+            ctrl._pheromone_fee["100x1x0"] = 300
+            ctrl._pheromone_last_update["100x1x0"] = now
+            ctrl._pheromone["200x2x0"] = 0.005  # Below 0.01
+            ctrl._pheromone_fee["200x2x0"] = 100
+            ctrl._pheromone_last_update["200x2x0"] = now
+
+        # Add a very old marker (strength should decay below threshold)
+        old_marker = RouteMarker(
+            depositor="02" + "bb" * 32,
+            source_peer_id="02" + "aa" * 32,
+            destination_peer_id="02" + "cc" * 32,
+            fee_ppm=300,
+            success=True,
+            volume_sats=1000,
+            timestamp=now - (MARKER_HALF_LIFE_HOURS * 3600 * 10),  # Very old
+            strength=0.5,
+        )
+        with coord._lock:
+            coord._markers[("02" + "aa" * 32, "02" + "cc" * 32)].append(old_marker)
+
+        saved = self.manager.save_state_to_database()
+        assert saved['pheromones'] == 1  # Only the 0.5 level one
+        assert saved['markers'] == 0     # Decayed below threshold
+
+    def test_should_auto_backfill_empty(self):
+        """Empty DB returns True for auto-backfill."""
+        assert self.manager.should_auto_backfill() is True
+
+    def test_should_auto_backfill_with_data(self):
+        """Populated DB returns False for auto-backfill."""
+        # Add some pheromone data
+        self.db._pheromones = [
+            {'channel_id': '100x1x0', 'level': 1.0, 'fee_ppm': 300,
+             'last_update': time.time()}
+        ]
+        assert self.manager.should_auto_backfill() is False
+
+    def test_should_auto_backfill_stale_markers(self):
+        """Returns True when only old markers exist (>24h) and no pheromones."""
+        self.db._markers = [
+            {'depositor': 'x', 'source_peer_id': 'a', 'destination_peer_id': 'b',
+             'fee_ppm': 100, 'success': 1, 'volume_sats': 1000,
+             'timestamp': time.time() - 48 * 3600, 'strength': 0.5}
+        ]
+        assert self.manager.should_auto_backfill() is True
+
+    def test_restore_applies_decay(self):
+        """Restored pheromone values are decayed by elapsed time."""
+        ctrl = self.manager.adaptive_controller
+        hours_ago = 2.0
+        past_time = time.time() - hours_ago * 3600
+
+        # Directly populate the mock DB with a known level
+        self.db._pheromones = [
+            {'channel_id': '100x1x0', 'level': 1.0, 'fee_ppm': 300,
+             'last_update': past_time}
+        ]
+
+        restored = self.manager.restore_state_from_database()
+        assert restored['pheromones'] == 1
+
+        # Level should be decayed: 1.0 * (1 - 0.2)^2 = 0.64
+        expected = math.pow(1 - BASE_EVAPORATION_RATE, hours_ago)
+        actual = ctrl._pheromone["100x1x0"]
+        assert abs(actual - expected) < 0.05, f"Expected ~{expected:.3f}, got {actual:.3f}"

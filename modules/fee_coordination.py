@@ -2636,6 +2636,130 @@ class FeeCoordinationManager:
                 source, destination, fee_ppm, success, revenue_sats if success else 0
             )
 
+    def save_state_to_database(self) -> Dict[str, int]:
+        """
+        Save pheromone levels and stigmergic markers to database.
+        Called periodically from fee_intelligence_loop (~5 min) and on shutdown.
+
+        Returns:
+            Dict with counts of saved pheromones and markers.
+        """
+        # Snapshot pheromone data under lock
+        pheromone_snapshot = []
+        with self.adaptive_controller._lock:
+            for channel_id, level in self.adaptive_controller._pheromone.items():
+                if level < 0.01:
+                    continue
+                pheromone_snapshot.append({
+                    'channel_id': channel_id,
+                    'level': level,
+                    'fee_ppm': self.adaptive_controller._pheromone_fee.get(channel_id, 0),
+                    'last_update': self.adaptive_controller._pheromone_last_update.get(
+                        channel_id, time.time()
+                    ),
+                })
+
+        self.database.save_pheromone_levels(pheromone_snapshot)
+
+        # Snapshot marker data under lock
+        now = time.time()
+        marker_snapshot = []
+        with self.stigmergic_coord._lock:
+            for (src, dst), markers in self.stigmergic_coord._markers.items():
+                for m in markers:
+                    current_strength = self.stigmergic_coord._calculate_marker_strength(m, now)
+                    if current_strength < MARKER_MIN_STRENGTH:
+                        continue
+                    marker_snapshot.append({
+                        'depositor': m.depositor,
+                        'source_peer_id': m.source_peer_id,
+                        'destination_peer_id': m.destination_peer_id,
+                        'fee_ppm': m.fee_ppm,
+                        'success': m.success,
+                        'volume_sats': m.volume_sats,
+                        'timestamp': m.timestamp,
+                        'strength': m.strength,
+                    })
+
+        self.database.save_stigmergic_markers(marker_snapshot)
+
+        return {'pheromones': len(pheromone_snapshot), 'markers': len(marker_snapshot)}
+
+    def restore_state_from_database(self) -> Dict[str, int]:
+        """
+        Restore pheromone levels and stigmergic markers from database.
+        Called once on startup. Applies time-based decay since last save.
+
+        Returns:
+            Dict with counts of restored pheromones and markers.
+        """
+        now = time.time()
+        pheromone_count = 0
+        marker_count = 0
+
+        # Restore pheromones
+        rows = self.database.load_pheromone_levels()
+        with self.adaptive_controller._lock:
+            for row in rows:
+                channel_id = row['channel_id']
+                level = row['level']
+                last_update = row['last_update']
+
+                # Apply time-based decay since last save
+                hours_elapsed = (now - last_update) / 3600.0
+                if hours_elapsed > 0:
+                    decay_factor = math.pow(1 - BASE_EVAPORATION_RATE, hours_elapsed)
+                    level *= decay_factor
+
+                if level < 0.01:
+                    continue
+
+                self.adaptive_controller._pheromone[channel_id] = level
+                self.adaptive_controller._pheromone_fee[channel_id] = row['fee_ppm']
+                self.adaptive_controller._pheromone_last_update[channel_id] = now
+                pheromone_count += 1
+
+        # Restore markers
+        rows = self.database.load_stigmergic_markers()
+        with self.stigmergic_coord._lock:
+            for row in rows:
+                marker = RouteMarker(
+                    depositor=row['depositor'],
+                    source_peer_id=row['source_peer_id'],
+                    destination_peer_id=row['destination_peer_id'],
+                    fee_ppm=row['fee_ppm'],
+                    success=bool(row['success']),
+                    volume_sats=row['volume_sats'],
+                    timestamp=row['timestamp'],
+                    strength=row['strength'],
+                )
+
+                # Check if marker is still strong enough after decay
+                current_strength = self.stigmergic_coord._calculate_marker_strength(marker, now)
+                if current_strength < MARKER_MIN_STRENGTH:
+                    continue
+
+                key = (marker.source_peer_id, marker.destination_peer_id)
+                self.stigmergic_coord._markers[key].append(marker)
+                marker_count += 1
+
+        return {'pheromones': pheromone_count, 'markers': marker_count}
+
+    def should_auto_backfill(self) -> bool:
+        """
+        Check if routing intelligence is empty and should be auto-backfilled.
+        Returns True when DB has no pheromones AND no recent markers.
+        """
+        if self.database.get_pheromone_count() > 0:
+            return False
+
+        latest = self.database.get_latest_marker_timestamp()
+        if latest is None:
+            return True
+
+        # Also backfill if markers are older than 24 hours
+        return (time.time() - latest) > 24 * 3600
+
     def get_coordination_status(self) -> Dict:
         """Get overall fee coordination status."""
         assignments = self.corridor_mgr.get_assignments()

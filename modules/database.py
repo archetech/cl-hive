@@ -1215,6 +1215,35 @@ class HiveDatabase:
             ON proto_outbox(peer_id, status)
         """)
 
+        # Pheromone level persistence (routing intelligence)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pheromone_levels (
+                channel_id TEXT PRIMARY KEY,
+                level REAL NOT NULL,
+                fee_ppm INTEGER NOT NULL,
+                last_update REAL NOT NULL
+            )
+        """)
+
+        # Stigmergic marker persistence (routing intelligence)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS stigmergic_markers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                depositor TEXT NOT NULL,
+                source_peer_id TEXT NOT NULL,
+                destination_peer_id TEXT NOT NULL,
+                fee_ppm INTEGER NOT NULL,
+                success INTEGER NOT NULL,
+                volume_sats INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                strength REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_markers_route
+            ON stigmergic_markers(source_peer_id, destination_peer_id)
+        """)
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -6740,3 +6769,82 @@ class HiveDatabase:
             (peer_id,)
         ).fetchone()
         return row['cnt'] if row else 0
+
+    # =========================================================================
+    # ROUTING INTELLIGENCE PERSISTENCE
+    # =========================================================================
+
+    def save_pheromone_levels(self, levels: List[Dict[str, Any]]) -> int:
+        """
+        Bulk-save pheromone levels (full-table replace).
+
+        Args:
+            levels: List of dicts with channel_id, level, fee_ppm, last_update
+
+        Returns:
+            Number of rows written.
+        """
+        conn = self._get_connection()
+        conn.execute("DELETE FROM pheromone_levels")
+        for row in levels:
+            conn.execute(
+                """INSERT INTO pheromone_levels (channel_id, level, fee_ppm, last_update)
+                   VALUES (?, ?, ?, ?)""",
+                (row['channel_id'], row['level'], row['fee_ppm'], row['last_update'])
+            )
+        conn.commit()
+        return len(levels)
+
+    def load_pheromone_levels(self) -> List[Dict[str, Any]]:
+        """Load all persisted pheromone levels."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM pheromone_levels").fetchall()
+        return [dict(r) for r in rows]
+
+    def save_stigmergic_markers(self, markers: List[Dict[str, Any]]) -> int:
+        """
+        Bulk-save stigmergic markers (full-table replace).
+
+        Args:
+            markers: List of dicts with depositor, source_peer_id,
+                     destination_peer_id, fee_ppm, success, volume_sats,
+                     timestamp, strength
+
+        Returns:
+            Number of rows written.
+        """
+        conn = self._get_connection()
+        conn.execute("DELETE FROM stigmergic_markers")
+        for row in markers:
+            conn.execute(
+                """INSERT INTO stigmergic_markers
+                   (depositor, source_peer_id, destination_peer_id,
+                    fee_ppm, success, volume_sats, timestamp, strength)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (row['depositor'], row['source_peer_id'],
+                 row['destination_peer_id'], row['fee_ppm'],
+                 1 if row['success'] else 0, row['volume_sats'],
+                 row['timestamp'], row['strength'])
+            )
+        conn.commit()
+        return len(markers)
+
+    def load_stigmergic_markers(self) -> List[Dict[str, Any]]:
+        """Load all persisted stigmergic markers."""
+        conn = self._get_connection()
+        rows = conn.execute("SELECT * FROM stigmergic_markers").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_pheromone_count(self) -> int:
+        """Get count of persisted pheromone levels."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT COUNT(*) as cnt FROM pheromone_levels").fetchone()
+        return row['cnt'] if row else 0
+
+    def get_latest_marker_timestamp(self) -> Optional[float]:
+        """Get the most recent marker timestamp, or None if empty."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT MAX(timestamp) as latest FROM stigmergic_markers"
+        ).fetchone()
+        return row['latest'] if row and row['latest'] is not None else None
