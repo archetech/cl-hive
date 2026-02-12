@@ -4177,12 +4177,12 @@ class HiveDatabase:
             results.append(result)
         return results
 
-    def get_struggling_members(self, threshold: int = 40) -> List[Dict[str, Any]]:
+    def get_struggling_members(self, threshold: int = 20) -> List[Dict[str, Any]]:
         """
         Get members with health below threshold (NNLB candidates).
 
         Args:
-            threshold: Health score threshold (default 40)
+            threshold: Health score threshold (default 20, relaxed 2026-02-12)
 
         Returns:
             List of health records for struggling members

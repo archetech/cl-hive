@@ -43,9 +43,10 @@ MAX_FEE_PPM = 5000
 DEFAULT_BASE_FEE = 100
 
 # Health tier thresholds
-HEALTH_THRIVING = 75
-HEALTH_HEALTHY = 50
-HEALTH_STRUGGLING = 25
+# Member health thresholds (relaxed 2026-02-12 to align with NNLB tiers)
+HEALTH_THRIVING = 65    # Was 75 - members can help others
+HEALTH_HEALTHY = 40     # Was 50 - normal operation
+HEALTH_STRUGGLING = 20  # Was 25 - needs help
 
 # Elasticity thresholds
 ELASTICITY_VERY_ELASTIC = -0.5
