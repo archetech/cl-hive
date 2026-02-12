@@ -1898,13 +1898,30 @@ to track the decision and learn from outcomes.
 - thompson_observation_decay_hours: Shorter in volatile, longer in stable
 - hive_prior_weight: Trust in swarm intelligence (0-1)
 - scarcity_threshold: When to apply scarcity pricing
-- vegas_decay_rate: Signal decay rate
+
+**Tier 3 - Sling Rebalancer Targets (conservative):**
+- sling_target_source: Target balance for source channels (default 0.65, range 0.5-0.8)
+- sling_target_sink: Target balance for sink channels (default 0.4, range 0.2-0.5)
+- sling_target_balanced: Target for balanced channels (default 0.5, range 0.4-0.6)
+- sling_chunk_size_sats: Rebalance chunk size (scale with channel sizes)
+- rebalance_cooldown_hours: Hours between rebalances (↑ to reduce churn)
+
+**Tier 4 - Advanced Algorithm (expert, very conservative):**
+- vegas_decay_rate: Signal decay rate (default 0.85, range 0.7-0.95)
+- ema_smoothing_alpha: Flow smoothing (default 0.3, range 0.1-0.5)
+- kelly_fraction: Kelly bet sizing (default 0.6, range 0.3-0.8)
+- proportional_budget_pct: Revenue % for budget (default 0.3, range 0.1-0.5)
+
+**ISOLATION ENFORCED:** Related params cannot be adjusted within 24h of each other.
+Parameter groups: fee_bounds, budget, aimd, thompson, liquidity, sling_targets, sling_params, algorithm
 
 **Trigger reasons:** drain_detected, stagnation, profitability_low, profitability_high,
 budget_exhausted, market_conditions, competitive_pressure, rebalance_inefficiency,
-algorithm_tuning, liquidity_imbalance
+algorithm_tuning, liquidity_imbalance, rebalance_churn, target_optimization
 
-**Always include context_metrics** with revenue_24h, forward_count_24h, stagnant_count, etc.""",
+**Always include context_metrics** with revenue_24h, forward_count_24h, stagnant_count, etc.
+
+**Use config_recommend first** to get data-driven suggestions based on learned patterns.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2013,6 +2030,39 @@ This enables the learning loop: adjust -> measure -> learn -> improve.""",
                     }
                 },
                 "required": []
+            }
+        ),
+        Tool(
+            name="config_recommend",
+            description="""Recommend the next config adjustment based on learned patterns.
+
+Analyzes current fleet conditions, past adjustment outcomes, and learned
+optimal ranges to suggest the best next config change.
+
+**Uses learning from past adjustments:**
+- Success rates per parameter
+- Learned optimal min/max ranges
+- What conditions trigger which adjustments
+
+**Enforces isolation:**
+- Shows which params can be adjusted now
+- Hours until isolated params become available
+
+**Returns prioritized recommendations** with:
+- Suggested values based on learned ranges
+- Confidence scores adjusted by past success rate
+- Reasons tied to current conditions
+
+Call this BEFORE making adjustments to get data-driven suggestions.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to analyze"
+                    }
+                },
+                "required": ["node"]
             }
         ),
         Tool(
@@ -7325,6 +7375,58 @@ async def handle_config_adjust(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
     
+    # ISOLATION CHECK: Ensure no other config was adjusted recently
+    db = ensure_advisor_db()
+    recent_adjustments = db.get_config_adjustment_history(
+        node_name=node_name,
+        days=2,  # Look back 48 hours
+        limit=10
+    )
+    
+    # Define related parameter groups that shouldn't be changed together
+    PARAM_GROUPS = {
+        "fee_bounds": ["min_fee_ppm", "max_fee_ppm"],
+        "budget": ["daily_budget_sats", "rebalance_max_amount", "rebalance_min_amount", "proportional_budget_pct"],
+        "aimd": ["aimd_additive_increase_ppm", "aimd_multiplicative_decrease", "aimd_failure_threshold", "aimd_success_threshold"],
+        "thompson": ["thompson_observation_decay_hours", "thompson_prior_std_fee", "thompson_max_observations"],
+        "liquidity": ["low_liquidity_threshold", "high_liquidity_threshold", "scarcity_threshold"],
+        "sling_targets": ["sling_target_source", "sling_target_sink", "sling_target_balanced"],
+        "sling_params": ["sling_chunk_size_sats", "sling_max_hops", "sling_parallel_jobs"],
+        "algorithm": ["vegas_decay_rate", "ema_smoothing_alpha", "kelly_fraction", "hive_prior_weight"],
+    }
+    
+    # Find which group this param belongs to
+    param_group = None
+    for group_name, params in PARAM_GROUPS.items():
+        if config_key in params:
+            param_group = group_name
+            break
+    
+    # Check for recent changes to related params
+    import time
+    now = int(time.time())
+    isolation_hours = 24  # Minimum hours between related param changes
+    
+    for adj in recent_adjustments:
+        adj_key = adj.get("config_key")
+        adj_time = adj.get("timestamp", 0)
+        hours_ago = (now - adj_time) / 3600
+        
+        # Skip if it's the same param (we allow adjusting same param)
+        if adj_key == config_key:
+            continue
+        
+        # Check if in same group
+        if param_group:
+            for group_params in PARAM_GROUPS.values():
+                if adj_key in group_params and config_key in group_params:
+                    if hours_ago < isolation_hours:
+                        return {
+                            "error": f"ISOLATION VIOLATION: Related param '{adj_key}' was adjusted {hours_ago:.1f}h ago. "
+                                     f"Wait {isolation_hours - hours_ago:.1f}h more before adjusting '{config_key}'. "
+                                     f"Both are in group: {[k for k,v in PARAM_GROUPS.items() if config_key in v][0]}"
+                        }
+    
     # Get current value first
     current_config = await node.call("revenue-config", {"action": "get", "key": config_key})
     if "error" in current_config:
@@ -7587,6 +7689,167 @@ async def handle_config_measure_outcomes(args: Dict) -> Dict:
         "failed": sum(1 for r in results if r.get("success") is False),
         "errors": sum(1 for r in results if "error" in r),
         "results": results
+    }
+
+
+async def handle_config_recommend(args: Dict) -> Dict:
+    """
+    Recommend the next config adjustment based on learned patterns and current conditions.
+    
+    Analyzes:
+    1. Current fleet conditions (stagnation, drains, profitability)
+    2. Past adjustment outcomes (what worked, what didn't)
+    3. Learned optimal ranges per parameter
+    4. Isolation constraints (what can be adjusted now)
+    
+    Returns prioritized recommendations with confidence scores.
+    """
+    node_name = args.get("node")
+    
+    if not node_name:
+        return {"error": "node required"}
+    
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    
+    db = ensure_advisor_db()
+    import time
+    now = int(time.time())
+    
+    # 1. Get current conditions
+    try:
+        dashboard = await node.call("revenue-dashboard", {"window_days": 1})
+        config = await node.call("revenue-config", {"action": "get"})
+    except Exception as e:
+        return {"error": f"Failed to get current state: {e}"}
+    
+    current_config = config.get("config", {})
+    period = dashboard.get("period", {})
+    financial = dashboard.get("financial_health", {})
+    
+    current_conditions = {
+        "revenue_24h": period.get("gross_revenue_sats", 0),
+        "volume_24h": period.get("volume_sats", 0),
+        "forward_count_24h": period.get("forward_count", 0),
+        "rebalance_cost_24h": period.get("rebalance_cost_sats", 0),
+        "net_profit_24h": financial.get("net_profit_sats", 0),
+        "operating_margin_pct": financial.get("operating_margin_pct", 0),
+    }
+    
+    # 2. Get learned effectiveness
+    effectiveness = db.get_config_effectiveness(node_name=node_name)
+    learned_ranges = {r["config_key"]: r for r in effectiveness.get("learned_ranges", [])}
+    
+    # 3. Get recent adjustments (for isolation check)
+    recent = db.get_config_adjustment_history(node_name=node_name, days=2, limit=20)
+    recently_adjusted = {}
+    for adj in recent:
+        key = adj.get("config_key")
+        adj_time = adj.get("timestamp", 0)
+        hours_ago = (now - adj_time) / 3600
+        if key not in recently_adjusted or hours_ago < recently_adjusted[key]:
+            recently_adjusted[key] = hours_ago
+    
+    # 4. Analyze conditions and generate recommendations
+    recommendations = []
+    
+    # Define what to check and when
+    CONDITION_CHECKS = [
+        # (condition_name, check_fn, param, direction, reason)
+        ("low_revenue", lambda c: c["revenue_24h"] < 100, "min_fee_ppm", "decrease", 
+         "Revenue very low - lower fee floor to attract more routing"),
+        ("low_revenue", lambda c: c["revenue_24h"] < 100, "max_fee_ppm", "decrease",
+         "Revenue very low - lower fee ceiling to be more competitive"),
+        ("high_rebalance_cost", lambda c: c["rebalance_cost_24h"] > c["net_profit_24h"] * 2,
+         "daily_budget_sats", "decrease", "Rebalance costs exceed profit - reduce budget"),
+        ("high_rebalance_cost", lambda c: c["rebalance_cost_24h"] > c["net_profit_24h"] * 2,
+         "rebalance_min_profit_ppm", "increase", "Rebalance costs high - require higher profit margin"),
+        ("negative_margin", lambda c: c["operating_margin_pct"] < 0,
+         "daily_budget_sats", "decrease", "Negative margin - reduce rebalance spending"),
+        ("good_profitability", lambda c: c["operating_margin_pct"] > 50 and c["net_profit_24h"] > 500,
+         "daily_budget_sats", "increase", "Good profitability - can afford more rebalancing"),
+        ("low_volume", lambda c: c["volume_24h"] < 100000,
+         "low_liquidity_threshold", "increase", "Low volume - less aggressive rebalancing"),
+        ("high_volume", lambda c: c["volume_24h"] > 1000000,
+         "sling_chunk_size_sats", "increase", "High volume - larger rebalance chunks efficient"),
+    ]
+    
+    for condition_name, check_fn, param, direction, reason in CONDITION_CHECKS:
+        if not check_fn(current_conditions):
+            continue
+        
+        # Check if param can be adjusted (isolation)
+        hours_since = recently_adjusted.get(param, 999)
+        can_adjust = hours_since >= 24
+        
+        # Get current value
+        current_val = current_config.get(param)
+        if current_val is None:
+            continue
+        
+        # Calculate suggested value
+        try:
+            current_val = float(current_val)
+        except (ValueError, TypeError):
+            continue
+        
+        if direction == "increase":
+            suggested = current_val * 1.25  # 25% increase
+        else:
+            suggested = current_val * 0.8   # 20% decrease
+        
+        # Check learned ranges
+        learned = learned_ranges.get(param, {})
+        success_rate = 0
+        if learned.get("adjustments_count", 0) > 0:
+            success_rate = (learned.get("successful_adjustments", 0) / 
+                          learned.get("adjustments_count", 1))
+        
+        # Adjust confidence based on past success
+        base_confidence = 0.5
+        if success_rate > 0.7:
+            base_confidence = 0.8
+        elif success_rate < 0.3 and learned.get("adjustments_count", 0) >= 3:
+            base_confidence = 0.2  # This param doesn't seem to work well
+        
+        # Apply learned optimal range constraints
+        if learned.get("optimal_min") and suggested < learned["optimal_min"]:
+            suggested = learned["optimal_min"]
+        if learned.get("optimal_max") and suggested > learned["optimal_max"]:
+            suggested = learned["optimal_max"]
+        
+        recommendations.append({
+            "param": param,
+            "current_value": current_val,
+            "suggested_value": round(suggested, 2) if isinstance(suggested, float) else suggested,
+            "direction": direction,
+            "reason": reason,
+            "condition": condition_name,
+            "confidence": round(base_confidence, 2),
+            "can_adjust_now": can_adjust,
+            "hours_until_can_adjust": max(0, 24 - hours_since) if not can_adjust else 0,
+            "past_success_rate": round(success_rate, 2),
+            "past_adjustments": learned.get("adjustments_count", 0),
+            "learned_optimal_range": {
+                "min": learned.get("optimal_min"),
+                "max": learned.get("optimal_max")
+            } if learned else None
+        })
+    
+    # Sort by confidence and whether we can adjust now
+    recommendations.sort(key=lambda r: (r["can_adjust_now"], r["confidence"]), reverse=True)
+    
+    return {
+        "node": node_name,
+        "current_conditions": current_conditions,
+        "recommendations": recommendations[:10],  # Top 10
+        "recently_adjusted": {k: f"{v:.1f}h ago" for k, v in recently_adjusted.items()},
+        "learning_summary": {
+            "total_adjustments": effectiveness.get("total_adjustments", 0),
+            "overall_success_rate": round(effectiveness.get("overall_success_rate", 0), 2),
+            "params_with_learned_ranges": len(learned_ranges)
+        }
     }
 
 
@@ -12907,6 +13170,7 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "config_adjustment_history": handle_config_adjustment_history,
     "config_effectiveness": handle_config_effectiveness,
     "config_measure_outcomes": handle_config_measure_outcomes,
+    "config_recommend": handle_config_recommend,
     "revenue_debug": handle_revenue_debug,
     "revenue_history": handle_revenue_history,
     "revenue_competitor_analysis": handle_revenue_competitor_analysis,
