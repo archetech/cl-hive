@@ -644,33 +644,61 @@ CREATE INDEX idx_message_inbox_sender ON archon_message_inbox(sender_did, receiv
 ## Implementation Plan
 
 ### Phase 1: Core Infrastructure
-1. Add `archon` config section to hive config
-2. Create database tables
+1. Add `archon` config section to hive config schema
+2. Create database tables for contacts, queue, inbox, templates
 3. Implement `HiveArchonBridge` class for Keymaster integration
 4. Add basic send/receive RPC methods
+5. Error handling and retry logic for failed deliveries
 
-### Phase 2: Contact Registry
-1. `hive-register-contact` RPC
+### Phase 2: Docker Setup Wizard Integration
+1. Add optional Archon DID prompt to `cl-hive-setup.sh` wizard
+2. Prompt: "Enable Archon governance messaging? (y/n)"
+3. If yes:
+   - Check if `npx @didcid/keymaster` is available
+   - Prompt for existing DID or create new one
+   - Securely store passphrase in Docker secrets or env file
+   - Configure gatekeeper URL (public vs local node)
+   - Set default notification preferences
+4. Generate `archon` config block in node config
+5. Document setup in container README
+
+### Phase 3: Contact Registry
+1. `hive-register-contact` RPC — Map peer_id → Archon DID
 2. `hive-list-contacts` RPC
-3. DID verification flow (optional)
-4. Contact import/export
+3. `hive-verify-contact` — Optional challenge-response DID verification
+4. Contact import/export (JSON format)
+5. Auto-discovery: Parse DID from member metadata if provided
 
-### Phase 3: Message Templates
-1. Define all governance message templates
-2. Template variable substitution engine
-3. Admin template customization
+### Phase 4: Message Templates
+1. Define all governance message templates (20+ types)
+2. Template variable substitution engine (Jinja2-style)
+3. Admin template customization via RPC
+4. i18n support for multi-language templates (future)
 
-### Phase 4: Event Integration
-1. Hook into governance events (promotion, ban, settlement)
-2. Hook into health monitoring (NNLB)
-3. Hook into channel coordination
-4. Configurable auto-notify rules
+### Phase 5: Event Integration
+1. Hook into governance events:
+   - Membership: join, leave, promotion, ban
+   - Settlement: cycle start, ready, complete, gaming detected
+   - Health: NNLB critical alerts
+2. Hook into channel coordination:
+   - Expansion recommendations
+   - Close recommendations
+   - Splice requests
+3. Configurable `auto_notify` rules per event type
+4. Rate limiting to prevent spam
 
-### Phase 5: Inbox & History
-1. Periodic inbox polling
-2. Message history queries
-3. Read receipts (optional)
-4. Message archival
+### Phase 6: Inbox & History
+1. Periodic inbox polling (configurable interval)
+2. `hive-dmail-inbox` RPC for message history
+3. Read receipts (optional, via Archon acknowledgment)
+4. Message archival and retention policy
+5. Search/filter inbox by sender, type, date
+
+### Phase 7: Advisor Integration
+1. Advisor can send dmails on behalf of fleet
+2. Health alerts trigger auto-dmail to affected operator
+3. Settlement receipts auto-sent on completion
+4. Configurable escalation: critical alerts → multiple recipients
 
 ---
 
