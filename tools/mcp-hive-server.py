@@ -8952,9 +8952,11 @@ async def handle_advisor_get_peer_intel(args: Dict) -> Dict:
                 if channels_result.get("error"):
                     graph_data["rpc_errors"] = graph_data.get("rpc_errors", [])
                     graph_data["rpc_errors"].append(f"listchannels: {channels_result['error']}")
-                channels = channels_result.get("channels", [])
-
-                graph_data["channel_count"] = len(channels)
+                    channels = []
+                    # Don't set channel_count when RPC failed - leave it undefined
+                else:
+                    channels = channels_result.get("channels", [])
+                    graph_data["channel_count"] = len(channels)
 
                 if channels:
                     capacities = []
