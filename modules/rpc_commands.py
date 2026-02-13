@@ -2414,7 +2414,21 @@ def defense_status(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
         return {"error": "Fee coordination not initialized"}
 
     try:
-        result = ctx.fee_coordination_mgr.defense_system.get_defense_status()
+        defense = ctx.fee_coordination_mgr.defense_system
+
+        # Get active (non-expired) warnings and enrich with computed fields
+        active_warnings = []
+        for w in defense.get_active_warnings():
+            warning_dict = w.to_dict()
+            warning_dict["expires_at"] = w.timestamp + w.ttl
+            warning_dict["defensive_multiplier"] = defense.get_defensive_multiplier(w.peer_id)
+            active_warnings.append(warning_dict)
+
+        result = {
+            "active_warnings": active_warnings,
+            "warning_count": len(active_warnings),
+            "defensive_fees_active": len(defense._defensive_fees),
+        }
 
         # If peer_id specified, add peer-specific threat info
         if peer_id:
@@ -2425,8 +2439,7 @@ def defense_status(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
                 "defensive_multiplier": 1.0
             }
 
-            # Check if this peer has any active warnings
-            for warning in result.get("active_warnings", []):
+            for warning in active_warnings:
                 if warning.get("peer_id") == peer_id:
                     peer_threat = {
                         "is_threat": True,
@@ -2871,6 +2884,36 @@ def record_rebalance_outcome(
         )
         if failure_reason and not success:
             result["failure_reason"] = failure_reason
+
+        # Deposit stigmergic marker for routing intelligence
+        marker_deposited = False
+        if ctx.fee_coordination_mgr and ctx.safe_plugin:
+            try:
+                # Resolve SCIDs to peer_ids
+                channels = ctx.safe_plugin.rpc.listpeerchannels()
+                scid_to_peer = {}
+                for ch in channels.get('channels', []):
+                    ch_scid = ch.get('short_channel_id')
+                    if ch_scid:
+                        scid_to_peer[ch_scid] = ch.get('peer_id', '')
+
+                from_peer = scid_to_peer.get(from_channel)
+                to_peer = scid_to_peer.get(to_channel)
+
+                if from_peer and to_peer:
+                    fee_ppm = cost_sats * 1_000_000 // max(amount_sats, 1)
+                    ctx.fee_coordination_mgr.stigmergic_coord.deposit_marker(
+                        source=from_peer,
+                        destination=to_peer,
+                        fee_charged=fee_ppm,
+                        success=success,
+                        volume_sats=amount_sats if success else 0
+                    )
+                    marker_deposited = True
+            except Exception:
+                pass  # Non-fatal: marker deposit is best-effort
+
+        result["marker_deposited"] = marker_deposited
         return result
 
     except Exception as e:
