@@ -9385,7 +9385,8 @@ async def handle_auto_evaluate_proposal(args: Dict) -> Dict:
         local_data = peer_intel.get("local_experience", {}) or {}
         criteria = peer_intel.get("channel_open_criteria", {})
 
-        channel_count = graph_data.get("channel_count", 0)
+        # Check if we actually have graph data (None/empty means lookup failed)
+        channel_count = graph_data.get("channel_count") if graph_data else None
         recommendation = peer_intel.get("recommendation", "unknown")
         capacity_sats = action.get("capacity_sats") or action.get("amount_sats", 0)
 
@@ -9397,6 +9398,10 @@ async def handle_auto_evaluate_proposal(args: Dict) -> Dict:
         if recommendation == "avoid" or local_data.get("force_closes", 0) > 0:
             decision = "reject"
             reasoning.append(f"Peer has 'avoid' recommendation or force close history")
+        elif channel_count is None:
+            # Graph lookup failed - escalate instead of auto-rejecting
+            decision = "escalate"
+            reasoning.append("Could not retrieve peer's channel count from network graph")
         elif channel_count < 10:
             decision = "reject"
             reasoning.append(f"Peer has only {channel_count} channels (<10 minimum)")
