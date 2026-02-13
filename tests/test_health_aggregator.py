@@ -122,12 +122,12 @@ class TestScoreCalculation:
     def test_tier_boundaries(self, aggregator):
         """Verify exact tier boundary values."""
         assert aggregator._score_to_tier(0) == HealthTier.STRUGGLING
-        assert aggregator._score_to_tier(30) == HealthTier.STRUGGLING
-        assert aggregator._score_to_tier(31) == HealthTier.VULNERABLE
-        assert aggregator._score_to_tier(50) == HealthTier.VULNERABLE
-        assert aggregator._score_to_tier(51) == HealthTier.STABLE
-        assert aggregator._score_to_tier(70) == HealthTier.STABLE
-        assert aggregator._score_to_tier(71) == HealthTier.THRIVING
+        assert aggregator._score_to_tier(20) == HealthTier.STRUGGLING
+        assert aggregator._score_to_tier(21) == HealthTier.VULNERABLE
+        assert aggregator._score_to_tier(40) == HealthTier.VULNERABLE
+        assert aggregator._score_to_tier(41) == HealthTier.STABLE
+        assert aggregator._score_to_tier(65) == HealthTier.STABLE
+        assert aggregator._score_to_tier(66) == HealthTier.THRIVING
         assert aggregator._score_to_tier(100) == HealthTier.THRIVING
 
 
@@ -251,7 +251,7 @@ class TestUpdateQuery:
         """get_fleet_health_summary aggregates all members."""
         mock_database.get_all_member_health.return_value = [
             {"peer_id": "peer1", "overall_health": 80},  # thriving
-            {"peer_id": "peer2", "overall_health": 25},  # struggling
+            {"peer_id": "peer2", "overall_health": 15},  # struggling (≤20)
             {"peer_id": "peer3", "overall_health": 60},  # stable
         ]
 
@@ -260,7 +260,7 @@ class TestUpdateQuery:
         assert summary["thriving_count"] == 1
         assert summary["struggling_count"] == 1
         assert summary["stable_count"] == 1
-        assert summary["fleet_health"] == 55  # (80+25+60)//3
+        assert summary["fleet_health"] == 51  # (80+15+60)//3
         assert len(summary["members"]) == 3
 
     def test_fleet_summary_empty(self, aggregator, mock_database):

@@ -244,13 +244,13 @@ class TestFeeIntelligenceManager:
         # Healthy node recommendation
         healthy_rec = self.manager.get_fee_recommendation(
             target_peer_id=target,
-            our_health=60
+            our_health=70
         )
 
-        # Struggling node recommendation
+        # Struggling node recommendation (must be < HEALTH_STRUGGLING=20)
         struggling_rec = self.manager.get_fee_recommendation(
             target_peer_id=target,
-            our_health=20
+            our_health=10
         )
 
         # Struggling node should get lower fees
