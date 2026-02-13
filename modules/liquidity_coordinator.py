@@ -653,7 +653,7 @@ class LiquidityCoordinator:
         with self._lock:
             our_state = self._member_liquidity_state.get(self.our_pubkey, {})
             enriched = our_state.get("enriched_needs")
-        if enriched:
+        if enriched is not None:
             return enriched
 
         channels = funds.get("channels", [])
@@ -833,7 +833,7 @@ class LiquidityCoordinator:
                 "rebalancing_peers": rebalancing_peers or [],
                 "timestamp": timestamp
             }
-            if enriched_needs:
+            if enriched_needs is not None:
                 state_entry["enriched_needs"] = enriched_needs[:10]  # Bound to 10
             self._member_liquidity_state[member_id] = state_entry
 

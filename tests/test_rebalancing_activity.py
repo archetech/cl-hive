@@ -266,3 +266,19 @@ class TestEnrichedNeedsIntegration:
         )
         state = self.coord._member_liquidity_state[OUR_PUBKEY]
         assert "enriched_needs" not in state
+
+    def test_enriched_empty_list_returns_empty(self):
+        """Empty enriched_needs=[] should return [] (not fall through to raw)."""
+        self.coord.record_member_liquidity_report(
+            member_id=OUR_PUBKEY,
+            depleted_channels=[],
+            saturated_channels=[],
+            enriched_needs=[]
+        )
+        # Channel would trigger raw need, but enriched=[] should take priority
+        funds = {"channels": [
+            {"state": "CHANNELD_NORMAL", "peer_id": "ext1",
+             "amount_msat": 10000000000, "our_amount_msat": 500000000}
+        ]}
+        needs = self.coord.assess_our_liquidity_needs(funds)
+        assert needs == []
