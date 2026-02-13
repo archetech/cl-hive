@@ -700,11 +700,17 @@ def _execute_channel_open(
         payload.get('channel_size_sats') or
         1_000_000  # Default 1M sats
     )
-    proposed_size = int(proposed_size)  # Ensure int type
+    try:
+        proposed_size = int(proposed_size)
+    except (ValueError, TypeError):
+        return {"error": "Invalid channel_size_sats in action payload", "action_id": action_id}
 
     # Apply member override if provided
     if amount_sats is not None:
-        channel_size_sats = int(amount_sats)
+        try:
+            channel_size_sats = int(amount_sats)
+        except (ValueError, TypeError):
+            return {"error": "Invalid amount_sats", "action_id": action_id}
         override_applied = True
     else:
         channel_size_sats = proposed_size
@@ -2370,8 +2376,11 @@ def deposit_marker(
         return {"error": "Fee coordination not initialized"}
 
     # Input validation
-    fee_ppm = int(fee_ppm)
-    volume_sats = int(volume_sats)
+    try:
+        fee_ppm = int(fee_ppm)
+        volume_sats = int(volume_sats)
+    except (ValueError, TypeError):
+        return {"error": "fee_ppm and volume_sats must be numeric"}
     if fee_ppm < 0 or fee_ppm > 50000:
         return {"error": "fee_ppm must be between 0 and 50000"}
     if volume_sats < 0 or volume_sats > 10_000_000_000:  # 100 BTC
@@ -4552,7 +4561,7 @@ def get_channel_ages(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
             # We can derive approximate age from blockheight
             try:
                 parts = ch_scid.split('x')
-                if len(parts) >= 1:
+                if len(parts) >= 3:
                     funding_block = int(parts[0])
 
                     # Get current blockheight
