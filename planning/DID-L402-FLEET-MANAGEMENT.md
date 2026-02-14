@@ -44,6 +44,45 @@ A protocol for authenticated, paid, scoped remote management would create a **ma
 
 ---
 
+## Design Principles
+
+### DID Transparency
+
+Archon DIDs are the cryptographic backbone of this protocol, but **users should never see or interact with raw DID strings**. DIDs function like TLS certificates — essential infrastructure that operates invisibly:
+
+- Node operators "authorize an advisor" rather than "issue a VC to `did:cid:...`"
+- Advisors are displayed by human-readable names (e.g., "Hex Fleet Advisor"), not DID strings
+- DID provisioning happens automatically on first use — no manual "create DID" step
+- Credential management UX uses labels and aliases, not cryptographic identifiers
+- Technical sections in this spec reference DIDs for implementers; user-facing flows abstract them away
+
+### Archon Integration Tiers
+
+The protocol supports three Archon deployment tiers with graceful degradation:
+
+| Tier | Setup | DID Resolution | Sovereignty | Best For |
+|------|-------|---------------|-------------|----------|
+| **No Archon node** (default) | Zero — DID auto-provisioned via public gatekeeper (`archon.technology`) | Remote (public gateway) | Minimal — trusts public infrastructure | Non-technical operators, quick start |
+| **Own Archon node** (encouraged) | Run local Archon (`docker compose up`) | Local (no external dependency) | Full — self-sovereign identity | Serious operators, businesses |
+| **Archon behind L402** (future) | Public gatekeeper gates services via L402 | Remote (paid, rate-limited) | Moderate — pay-per-use | Scaling public infrastructure |
+
+Everything works at every tier. The `L402AccessCredential` defined in this spec applies to Tier 3 — the same credential that gates fleet management API access can gate Archon identity services.
+
+### Payment Flexibility
+
+This protocol supports four complementary payment methods, each suited to different use cases:
+
+| Method | Best For | Mechanism |
+|--------|----------|-----------|
+| **Cashu tokens** | Escrow (conditional payments), per-action micropayments | Bearer tokens with NUT-10/11/14 spending conditions |
+| **Bolt11 invoices** | Simple one-time payments, per-action fees | Standard Lightning invoices |
+| **Bolt12 offers** | Recurring payments, subscriptions | Reusable payment codes (BOLT 12) |
+| **L402** | API-style access, subscription macaroons | HTTP 402 + Lightning invoice + macaroon |
+
+Cashu is **required** for escrow (conditional spending conditions make it uniquely suited). Non-escrowed payments — simple per-action fees, subscriptions, one-time charges — can use any of the four methods. See the [Payment Layer](#2-payment-layer-l402--cashu--bolt11--bolt12) for details.
+
+---
+
 ## Architecture Overview
 
 ```
@@ -128,7 +167,8 @@ A node operator issues a **Management Credential** to an agent's DID. This is a 
     "compensation": {
       "model": "per_action",
       "rate_sats": 10,
-      "currency": "L402|cashu"
+      "accepted_methods": ["cashu", "bolt11", "l402"],
+      "escrow_method": "cashu"
     }
   },
   "validFrom": "2026-02-14T00:00:00Z",
@@ -162,25 +202,53 @@ An agent's management credential tier is constrained by their node's settlement 
 
 #### Credential Lifecycle
 
+> **UX note:** The credential lifecycle below is described in terms of DIDs and VCs for implementers. End users experience this as: "authorize this advisor" (issuance), "advisor manages your node" (active), and "revoke advisor access" (revocation). The client software (see [DID Hive Client](./DID-HIVE-CLIENT.md)) abstracts all DID operations behind simple commands like `hive-client-authorize --advisor="Hex Fleet Advisor"`.
+
 1. **Issuance:** Operator creates credential via Archon Keymaster, specifying scope and duration
 2. **Presentation:** Agent includes credential with each management command
 3. **Verification:** Node verifies credential against Archon network (DID resolution + signature check)
 4. **Revocation:** Operator can revoke at any time via Archon. Node checks revocation status before executing commands. **Revocation check strategy:** Cache with 1-hour TTL. If the Archon network is unreachable, deny all commands from the credential (fail-closed). Nodes should subscribe to revocation events via Archon's websocket feed for near-real-time revocation propagation.
 5. **Renewal:** Credentials have expiration dates. Auto-renewal possible if both parties agree
 
-### 2. Payment Layer (L402 / Cashu)
+### 2. Payment Layer (L402 / Cashu / Bolt11 / Bolt12)
 
 #### Payment Models
 
-| Model | Flow | Best For |
-|-------|------|----------|
-| **Per-action** | Each management command includes a Cashu token or L402 proof | Low-volume, pay-as-you-go |
-| **Subscription** | Agent pre-pays for a time window; receives an L402 macaroon valid for N actions | High-volume, predictable |
-| **Performance** | Base fee + bonus tied to outcome metrics (routing revenue delta) | Aligned incentives |
+| Model | Flow | Payment Method | Best For |
+|-------|------|---------------|----------|
+| **Per-action** | Each management command includes payment proof | Cashu token (escrow), Bolt11 invoice (simple), or L402 proof | Low-volume, pay-as-you-go |
+| **Subscription** | Agent pre-pays for a time window; receives access valid for N actions | Bolt12 offer (recurring), L402 macaroon (API-style), or Bolt11 (manual renewal) | High-volume, predictable |
+| **Performance** | Base fee + bonus tied to outcome metrics (routing revenue delta) | Cashu escrow (bonus contingent on metrics), Bolt11/Bolt12 (base fee) | Aligned incentives |
 
-#### Per-Action Flow (Cashu)
+#### Payment Method Selection
 
-> **Note:** The simple per-action flow below is suitable for low-risk, unconditional payments. For conditional escrow — where payment is released only on provable task completion — see the full [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md). That spec defines escrow tickets with P2PK + HTLC + timelock conditions for atomic task-completion-equals-payment-release.
+The choice of payment method depends on the payment context:
+
+| Context | Recommended Method | Why |
+|---------|-------------------|-----|
+| Conditional/escrow payments | **Cashu** (required) | Only Cashu supports NUT-10/11/14 spending conditions for atomic task-completion-equals-payment |
+| Simple per-action fees (no escrow) | **Bolt11** or **L402** | Standard Lightning invoices; L402 adds macaroon-based access control |
+| Recurring subscriptions | **Bolt12 offers** | Reusable payment codes; payer-initiated recurring payments without sharing secrets |
+| API-style access gating | **L402** | HTTP 402 flow with macaroon caveats for scoped access |
+| One-time setup/onboarding fees | **Bolt11** | Simple, widely supported |
+
+Nodes and advisors negotiate accepted payment methods during credential setup. The management credential's `compensation` field specifies which methods are acceptable:
+
+```json
+{
+  "compensation": {
+    "model": "per_action",
+    "rate_sats": 10,
+    "accepted_methods": ["cashu", "bolt11", "l402"],
+    "escrow_method": "cashu",
+    "subscription_method": "bolt12"
+  }
+}
+```
+
+#### Per-Action Flow (Cashu / Bolt11)
+
+> **Note:** The simple per-action flow below is suitable for low-risk, unconditional payments. For unconditional per-action payments, **Bolt11 invoices** are a simpler alternative to Cashu tokens — the node generates an invoice, the agent pays it, and includes the preimage as payment proof. For conditional escrow — where payment is released only on provable task completion — **Cashu is required** (see the full [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md)). That spec defines escrow tickets with P2PK + HTLC + timelock conditions for atomic task-completion-equals-payment-release.
 
 ```
 Agent                                    Node
@@ -202,7 +270,7 @@ Agent                                    Node
   │                                        │
 ```
 
-#### Subscription Flow (L402)
+#### Subscription Flow (L402 / Bolt12)
 
 ```
 Agent                                    Node
@@ -231,6 +299,8 @@ Agent                                    Node
   │                                        │
 ```
 
+**Bolt12 alternative:** For recurring subscriptions, the node publishes a Bolt12 offer. The agent pays the offer each billing period. The offer's `recurrence` field encodes the billing cycle. This is simpler than L402 for pure subscription models — no macaroon management needed. The agent includes the Bolt12 payment preimage as proof with each management command during the paid period.
+
 #### Escrow Model (Conditional Payment)
 
 For tasks where payment should be contingent on provable completion, the protocol uses **Cashu escrow tickets** — tokens with composite spending conditions (P2PK + HTLC + timelock). The operator mints a token locked to the agent's DID-derived pubkey and a hash whose preimage the node reveals only on successful task execution. This makes payment release atomic with task completion.
@@ -247,7 +317,7 @@ bonus = max(0, (current_revenue - baseline_revenue)) × performance_share
 
 Settlement happens via the hive's existing distributed settlement protocol, with the advisor's DID as a payment recipient. The settlement is triggered automatically when the management credential expires or renews.
 
-#### Why Cashu for Per-Action
+#### Why Cashu for Escrow
 
 - **No routing overhead** — Cashu tokens are bearer instruments, no Lightning payment per command
 - **Atomic** — Token + command are a single message. Either both succeed or neither does

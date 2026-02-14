@@ -16,6 +16,20 @@ The protocol is general-purpose. While motivated by Lightning fleet management, 
 
 ---
 
+## Scope: Cashu for Escrow
+
+> **Important:** This spec defines Cashu's role as the **escrow** mechanism — conditional payments where release depends on provable task completion. Cashu's NUT-10/11/14 spending conditions (P2PK + HTLC + timelock) make it uniquely suited for this.
+>
+> **Non-escrowed payments** (simple per-action fees, subscriptions, one-time charges) should use the most appropriate method from the full payment stack:
+> - **Bolt11 invoices** — Simple one-time payments
+> - **Bolt12 offers** — Recurring subscriptions
+> - **L402** — API-style access gating
+> - **Cashu tokens** (unconditional) — Bearer micropayments where offline capability matters
+>
+> See [DID+L402 Fleet Management — Payment Layer](./DID-L402-FLEET-MANAGEMENT.md#2-payment-layer-l402--cashu--bolt11--bolt12) for the full payment method selection guide.
+
+---
+
 ## Motivation
 
 ### The Escrow Problem in Agent Economies
