@@ -436,6 +436,14 @@ Maximum payout: 250 sats (task done + measurable improvement)
 - A rolling 7-day average from the pre-credential period is recommended
 - Agents must not have monitor-tier or higher access during baseline measurement
 
+> **⚠️ First-time relationship challenge.** The "baseline must precede credential" rule creates a chicken-and-egg problem for first-time advisor-operator relationships: the operator has no prior performance data specific to this advisor, and the advisor has no track record with this node. **Recommended approach:** Introduce a **trial period** mechanism:
+> - First-time engagements use a 7-day trial credential with reduced scope (monitor + standard tier only)
+> - During the trial, baseline metrics are established collaboratively — both parties observe performance together
+> - Trial period uses flat-fee compensation only (no performance bonus) to remove baseline manipulation incentives
+> - After the trial, a full credential is issued with the trial-period metrics as the baseline
+>
+> This needs real-world validation: trial periods may be too conservative for time-sensitive optimizations, or operators may exploit the trial to get cheap labor before switching advisors.
+
 **Use case:** Performance-based management contracts where the advisor's incentives align with the node's outcomes. Maps directly to the [performance-based payment model](./DID-L402-FLEET-MANAGEMENT.md#payment-models) in the fleet management spec.
 
 ---
@@ -572,6 +580,13 @@ Total escrow: 500 sats
 
 Both tickets share the same HTLC hash and timelock. The agent redeems both with the same preimage. If one mint fails, the agent still receives partial payment.
 
+> **⚠️ Atomicity challenge.** Multi-mint ticket redemption is NOT atomic — the agent redeems sequentially, and failure at one mint after success at another results in partial payment. This is an accepted tradeoff (partial payment > no payment), but it introduces edge cases:
+> - If Mint A succeeds but Mint B fails permanently, the agent receives 50% — is this a "completed" task for reputation purposes?
+> - If Mint B comes back online later, can the agent retry? The preimage is now public (used at Mint A), so the operator could theoretically front-run the redemption via the refund path if the timelock is close to expiry.
+> - **Mitigation:** Use staggered timelocks — the secondary mint's ticket should have a longer timelock than the primary, giving the agent time to retry after primary redemption.
+>
+> True atomic cross-mint redemption would require a cross-mint coordination protocol (analogous to cross-chain atomic swaps), which is an open research problem in the Cashu ecosystem. For now, single-mint escrow is recommended for high-value tickets, with multi-mint reserved for risk distribution on very large amounts.
+
 ---
 
 ## Failure Modes and Edge Cases
@@ -683,7 +698,7 @@ This separation is a significant advantage over Lightning-based escrow, where ro
 
 ## General Applicability
 
-While this spec is motivated by Lightning fleet management, the escrow ticket pattern is universal. The [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md) applies this escrow mechanism to eight distinct settlement types — routing revenue sharing, rebalancing costs, liquidity leases, splice settlements, pheromone markets, intelligence trading, and penalty enforcement — demonstrating the breadth of the pattern.
+While this spec is motivated by Lightning fleet management, the escrow ticket pattern is universal. The [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md) applies this escrow mechanism to nine distinct settlement types — routing revenue sharing, rebalancing costs, liquidity leases, splice settlements, pheromone markets, intelligence trading, and penalty enforcement — demonstrating the breadth of the pattern.
 
 Any scenario with these properties is a candidate:
 
