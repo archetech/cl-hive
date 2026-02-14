@@ -1296,7 +1296,89 @@ New advisors bootstrap reputation through:
 
 ---
 
-## 11. Privacy & Security
+## 11. Public Marketplace (Non-Hive Nodes)
+
+The marketplace described in sections 1–10 assumes hive membership — advisors and nodes discover each other through hive gossip, contract through hive PKI, and settle through the hive settlement protocol. But the real market is every Lightning node operator, most of whom will never join a hive.
+
+This section defines how non-hive nodes participate in the marketplace via lightweight client software (`cl-hive-client` for CLN, `hive-lnd` for LND) as specified in the [DID Hive Client](./DID-HIVE-CLIENT.md) spec.
+
+### Hive Marketplace vs Public Marketplace
+
+| Property | Hive Marketplace | Public Marketplace |
+|----------|-----------------|-------------------|
+| Discovery | Gossip-based (push + pull) | Archon queries, Nostr events, directories |
+| Participants | Hive members only (bonded) | Any node with a DID and client software |
+| Contracting | Full PKI handshake, settlement integration | Direct credential issuance, escrow-only |
+| Settlement | Netting, credit tiers, multilateral | Direct Cashu escrow per-action/subscription |
+| Bond requirement | 50,000–500,000 sats | None |
+| Intelligence access | Full market (buy/sell) | Advisor-mediated only |
+| Entry barrier | Bond + reputation | DID creation (free) |
+
+### Public Discovery Mechanisms
+
+Non-hive nodes discover advisors through three channels:
+
+1. **Archon network** — Query for `HiveServiceProfile` credentials. Advisors who want public marketplace clients publish their profiles to Archon (in addition to or instead of hive gossip). Nodes query via `hive-client-discover --source=archon`.
+
+2. **Nostr events** — Advisors publish profiles as Nostr events (kind `38383`, tag `t:hive-advisor`). Nodes subscribe to relevant relays. DID-to-Nostr binding verified via attestation credential.
+
+3. **Curated directories** — Web-based advisor directories that aggregate and present profiles. Not trusted — the client verifies underlying DID credentials independently.
+
+All three mechanisms use the same `HiveServiceProfile` credential format defined in [Section 1](#1-service-advertising). The profile is the same whether discovered via gossip, Archon, or Nostr.
+
+### Simplified Contracting for Non-Hive Nodes
+
+Non-hive nodes skip the hive PKI handshake and settlement integration:
+
+```
+Operator                              Advisor
+    │                                    │
+    │  1. Discover (Archon/Nostr/direct) │
+    │  ──────────────────────────────►   │
+    │                                    │
+    │  2. Review profile + reputation    │
+    │                                    │
+    │  3. Issue management credential    │
+    │     (direct, no hive PKI)          │
+    │  ──────────────────────────────►   │
+    │                                    │
+    │  4. Fund escrow wallet             │
+    │     (direct Cashu, no settlement)  │
+    │                                    │
+    │  5. Management begins              │
+    │  ◄─────────────────────────────►   │
+    │                                    │
+```
+
+Key differences from hive contracting:
+- **No settlement protocol** — All payments via direct Cashu escrow tickets. No netting, no credit tiers, no bilateral accounting.
+- **No bond verification** — The operator doesn't need to verify the advisor's hive bond (they may not have one). Reputation credentials are the primary trust signal.
+- **No gossip announcement** — The contract is private between the two parties. No `contract_announcement` to the hive.
+- **Direct credential delivery** — Via Bolt 8 custom message (if peered), Archon Dmail, or Nostr DM.
+
+### Non-Hive Nodes in the Reputation Loop
+
+Non-hive nodes participate fully in the reputation system:
+- They issue `DIDReputationCredential` with `domain: "hive:advisor"` to rate advisors (same format as hive members)
+- Advisors issue `DIDReputationCredential` with `domain: "hive:client"` to rate non-hive operators
+- These credentials are published to Archon and count toward the advisor's aggregate reputation
+- Non-hive operator reputation is visible to advisors evaluating potential clients
+
+### Client Software Requirements
+
+Non-hive nodes must run:
+- `cl-hive-client` (CLN) or `hive-lnd` (LND) — provides Schema Handler, Credential Verifier, Escrow Manager, Policy Engine
+- Archon Keymaster — for DID identity (lightweight, no full Archon node)
+
+See the [DID Hive Client](./DID-HIVE-CLIENT.md) spec for full architecture, installation, and configuration details.
+
+### Upgrade Path
+
+Non-hive nodes that want full marketplace features (gossip discovery, settlement netting, intelligence market, fleet rebalancing) can upgrade to hive membership. The migration preserves existing credentials, escrow state, and reputation history. See [DID Hive Client — Hive Membership Upgrade Path](./DID-HIVE-CLIENT.md#11-hive-membership-upgrade-path).
+
+---
+
+## 12. Privacy & Security
 
 ### Public vs. Private Information
 
@@ -1333,7 +1415,7 @@ Nodes must be able to discover and negotiate without revealing their full channe
 
 ---
 
-## 12. Implementation Roadmap
+## 13. Implementation Roadmap
 
 Phased delivery, aligned with the other specs' roadmaps. The marketplace builds on top of the protocol suite — most marketplace functionality requires Fleet Management, Reputation, and Escrow to be at least partially implemented.
 
@@ -1423,7 +1505,7 @@ Reputation Schema      ──────────►  Marketplace Phase 6 (r
 
 ---
 
-## 13. Open Questions
+## 14. Open Questions
 
 1. **Profile standardization:** Should the specialization taxonomy be fixed in the spec, or fully extensible via governance? Fixed is simpler for interoperability; extensible adapts to unforeseen use cases.
 
@@ -1447,7 +1529,7 @@ Reputation Schema      ──────────►  Marketplace Phase 6 (r
 
 ---
 
-## 14. References
+## 15. References
 
 - [DID + L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
 - [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
