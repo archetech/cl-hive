@@ -855,6 +855,7 @@ The three roles (Delegator, Executor, Verifier) may collapse — e.g., the Deleg
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) — Marketplace trial periods reference this spec's escrow and baseline mechanisms
+- [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md) — Liquidity services use escrow tickets for lease milestone payments, JIT settlement, sidecar multisig, and insurance bonds
 - [DID Hive Client: Universal Lightning Node Management](./DID-HIVE-CLIENT.md) — Client plugin/daemon for non-hive nodes
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 

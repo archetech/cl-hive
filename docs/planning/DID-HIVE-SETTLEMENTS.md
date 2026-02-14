@@ -164,6 +164,8 @@ Both parties sign. If either refuses to sign, the rebalance obligation is disput
 
 ### 3. Channel Leasing / Liquidity Rental
 
+> **Full liquidity protocol:** This settlement type covers the settlement mechanics for channel leasing. For the complete liquidity marketplace — including nine service types (leasing, pools, JIT, sidecar, swaps, submarine, turbo, balanced, insurance), pricing models, provider profiles, and proof mechanisms — see the [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md).
+
 **Scenario:** Node A wants inbound liquidity from Node B. B opens a channel to A (or keeps an existing channel well-balanced toward A) for a defined period. A pays B for this time-bounded access to capacity.
 
 **Obligation calculation:**
@@ -172,7 +174,7 @@ Both parties sign. If either refuses to sign, the rebalance obligation is disput
 lease_cost = capacity_sats × lease_rate_ppm × lease_duration_days / 365
 ```
 
-Lease rate is market-driven — nodes advertise rates via pheromone markers.
+Lease rate is market-driven — nodes advertise rates via pheromone markers and [liquidity service profiles](./DID-HIVE-LIQUIDITY.md#4-liquidity-provider-profiles).
 
 **Proof mechanism:** Periodic heartbeat attestations. The lessee (A) and lessor (B) exchange signed heartbeats confirming the leased capacity was available:
 

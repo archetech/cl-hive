@@ -215,8 +215,9 @@ Advisors declare specializations from a defined taxonomy. Specializations are no
 | `splice-management` | In-place channel resizing, multi-party splices | `hive:splice/*` |
 | `full-stack` | Comprehensive node management across all domains | All schemas |
 | `monitoring-only` | Read-only monitoring, alerting, reporting | `hive:monitor/*` |
+| `liquidity-services` | Liquidity provisioning — leasing, pools, JIT, swaps, insurance | `hive:liquidity/*` |
 
-New specializations can be proposed via hive governance, published as profile definitions on the Archon network.
+New specializations can be proposed via hive governance, published as profile definitions on the Archon network. For liquidity-specific service profiles and the full liquidity marketplace, see the [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md).
 
 ### Profile Refresh & Update
 

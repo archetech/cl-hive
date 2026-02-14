@@ -218,6 +218,7 @@ Building both `cl-hive-client` (Python, CLN plugin) and `hive-lnd` (Go, LND daem
 | Settlement protocol | ✗ | ✗ (direct escrow only) | ✓ (netting, credit tiers) |
 | Fleet rebalancing | ✗ | ✗ | ✓ (intra-hive paths) |
 | Pheromone routing | ✗ | ✗ | ✓ |
+| Liquidity marketplace | ✗ | ✓ (direct escrow with providers) | ✓ (full market + settlement netting) |
 | Intelligence market | ✗ | ✗ (buy from advisor directly) | ✓ (full market access) |
 | Payment methods | N/A | Bolt11, Bolt12, L402, Cashu escrow | Same + settlement netting |
 | Bond requirement | None | None | 50,000–500,000 sats |
@@ -1822,6 +1823,7 @@ Marketplace Phase 1    ──────────►  Client Phase 5 (discov
 - [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md) — Escrow ticket format, HTLC conditions, ticket types
 - [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) — Service profiles, discovery, negotiation, contracting, multi-advisor coordination
 - [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md) — Bond system, settlement types, credit tiers
+- [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md) — Liquidity-as-a-service marketplace (leasing, pools, JIT, swaps, insurance)
 - [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md) — Reputation credential format, `hive:advisor` and `hive:client` profiles
 - [CLN Plugin Documentation](https://docs.corelightning.org/docs/plugin-development)
 - [CLN Custom Messages](https://docs.corelightning.org/reference/lightning-sendcustommsg)
