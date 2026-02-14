@@ -1070,7 +1070,7 @@ Receipts are stored locally and can be published to the Archon network for verif
 
 ## Reputation System
 
-> **Note:** The reputation system described here implements the **`hive:advisor` profile** of the general [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md). That spec defines a universal `DIDReputationCredential` format for any DID holder — this section describes the Lightning fleet-specific application.
+> **Note:** The reputation system described here implements the **`hive:advisor` profile** of the general [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md). That spec defines a universal `DIDReputationCredential` format for any DID holder — this section describes the Lightning fleet-specific application. The reputation schemas have been adopted by the Archon project; canonical JSON Schema files are maintained at [archetech/schemas/credentials/reputation/v1](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1).
 
 ### Agent Reputation
 
@@ -1087,7 +1087,8 @@ The `HiveAdvisorReputationCredential` is a `DIDReputationCredential` with `domai
 {
   "@context": [
     "https://www.w3.org/ns/credentials/v2",
-    "https://archon.technology/schemas/reputation/v1"
+    "https://archon.technology/schemas/reputation/v1",
+    "https://schemas.archetech.com/credentials/reputation/v1"
   ],
   "type": ["VerifiableCredential", "DIDReputationCredential"],
   "issuer": "did:cid:<node_operator>",
@@ -1273,6 +1274,7 @@ Week 20+:   Fleet Management Phase 6 (marketplace) + Task Escrow Phase 5 (genera
 - [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
 - [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
+- [Archon Reputation Schemas (canonical)](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 - [CLN Custom Messages](https://docs.corelightning.org/reference/lightning-sendcustommsg)
 

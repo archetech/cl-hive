@@ -836,6 +836,7 @@ The three roles (Delegator, Executor, Verifier) may collapse — e.g., the Deleg
 - [DID+L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
 - [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
 - [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
+- [Archon Reputation Schemas (canonical)](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)
 - [W3C DID Core 1.0](https://www.w3.org/TR/did-core/)
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
