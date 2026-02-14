@@ -1308,6 +1308,7 @@ If a node disappears without broadcasting an intent-to-leave (crash, network fai
 - [W3C DID Core 1.0](https://www.w3.org/TR/did-core/)
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
+- [Archon Reputation Schemas (canonical)](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 - [Nisan & Rougearden, "Algorithmic Game Theory", Cambridge University Press (2007)](https://www.cs.cmu.edu/~sandholm/cs15-892F13/algorithmic-game-theory.pdf) — Chapters on mechanism design and repeated games
 - [Shapley, L.S. "A Value for n-Person Games" (1953)](https://doi.org/10.1515/9781400881970-018) — Foundation for contribution-proportional revenue sharing

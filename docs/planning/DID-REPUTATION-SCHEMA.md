@@ -16,6 +16,18 @@ The schema is designed for the Archon decentralized identity network but is port
 
 ---
 
+## Canonical Schema
+
+> **📦 The JSON schemas defined in this document have been adopted by the Archon project.** The canonical schema files — `reputation-credential.json` and `reputation-profile.json` — are maintained at:
+>
+> **[archetech/schemas/credentials/reputation/v1](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)**
+>
+> The canonical schema context URL is: `https://schemas.archetech.com/credentials/reputation/v1`
+>
+> This document remains the authoritative specification for semantics, aggregation algorithms, and domain profiles. The Archon schema repository contains the machine-readable JSON Schema files for credential validation.
+
+---
+
 ## Motivation
 
 Reputation is the missing primitive in decentralized identity. DIDs give us verifiable identity; Verifiable Credentials give us verifiable claims. But there is no standard way to say:
@@ -42,7 +54,8 @@ Existing approaches are domain-specific and siloed. A Lightning routing node's r
 {
   "@context": [
     "https://www.w3.org/ns/credentials/v2",
-    "https://archon.technology/schemas/reputation/v1"
+    "https://archon.technology/schemas/reputation/v1",
+    "https://schemas.archetech.com/credentials/reputation/v1"
   ],
   "type": ["VerifiableCredential", "DIDReputationCredential"],
   "issuer": "did:cid:<issuer_did>",
@@ -202,7 +215,8 @@ Any entity can propose a new profile by publishing a `DIDReputationProfile` cred
 {
   "@context": [
     "https://www.w3.org/ns/credentials/v2",
-    "https://archon.technology/schemas/reputation/v1"
+    "https://archon.technology/schemas/reputation/v1",
+    "https://schemas.archetech.com/credentials/reputation/v1"
   ],
   "type": ["VerifiableCredential", "DIDReputationProfile"],
   "issuer": "did:cid:<proposer_did>",
@@ -519,6 +533,7 @@ Operators are incentivized to issue `revoke` credentials against bad advisors to
 - [W3C DID Core 1.0](https://www.w3.org/TR/did-core/)
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
+- [Archon Reputation Schemas (canonical)](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)
 - [DID+L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
 - [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
