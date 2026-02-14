@@ -186,6 +186,27 @@ The `hive:node` profile is central to the hive settlements protocol — bond amo
 - `revoke` — Peer closes channels or blacklists this node
 - `neutral` — Routine measurement, no action taken
 
+### Profile: `hive:client`
+
+**Subject type:** DID of a node operator (as a client of advisory services)  
+**Issuer type:** DID of an advisor who managed the operator's fleet  
+**Reference:** [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md)
+
+| Metric Key | Type | Unit | Description |
+|------------|------|------|-------------|
+| `payment_timeliness` | number | 0.0–1.0 | Fraction of payments made on time per contract terms. |
+| `sla_reasonableness` | number | 0.0–1.0 | How reasonable the operator's SLA expectations were (advisor's assessment). |
+| `communication_quality` | number | 0.0–1.0 | Responsiveness and clarity of operator communication. |
+| `infrastructure_reliability` | number | 0.0–1.0 | Node infrastructure uptime and accessibility during management period. |
+| `trial_count_90d` | integer | count | Number of trial periods initiated in the last 90 days. (optional) |
+
+**Example evidence:** Escrow ticket redemption records, SLA definitions from contract credentials, communication logs.
+
+**Outcome interpretation:**
+- `renew` — Advisor would work with this operator again
+- `revoke` — Advisor terminates relationship or warns other advisors
+- `neutral` — Standard engagement, no strong signal
+
 ### Profile: `agent:general`
 
 **Subject type:** DID of an AI agent  

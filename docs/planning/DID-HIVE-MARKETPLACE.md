@@ -543,13 +543,13 @@ Node                     Hive Gossip              Advisors (A, B, C)
 
 For competitive scenarios where bid privacy matters:
 
-1. Advisors submit bids encrypted to the RFP issuer's DID pubkey
-2. Bids include a commitment hash: `SHA256(bid_content || nonce)`
-3. After the bid deadline, the issuer decrypts and evaluates all bids simultaneously
-4. The issuer publishes the commitment hashes of all received bids (proving no post-deadline modifications)
-5. Winner is announced; losing bidders can verify their commitment hash was included
+1. **Commit phase:** Advisors submit bids encrypted to the RFP issuer's DID pubkey. Each bid includes a commitment hash: `SHA256(bid_content || nonce)` where `nonce` is a 32-byte random value chosen by the advisor.
+2. **Seal deadline:** After the bid deadline, the issuer publishes the commitment hashes of all received bids (proving no post-deadline modifications were accepted).
+3. **Evaluation:** The issuer decrypts and evaluates all bids simultaneously.
+4. **Award & reveal:** Winner is announced. The issuer publishes the list of all commitment hashes received. Losing bidders verify their commitment hash is included by checking `SHA256(their_bid || their_nonce)` against the published list. If a bidder's hash is missing, they have cryptographic proof the issuer excluded their bid.
+5. **Optional dispute reveal:** Any losing bidder can publicly reveal their `nonce` and bid content, allowing anyone to verify the commitment hash was correctly computed. This enables third-party auditing of the RFP process.
 
-This prevents the RFP issuer from sharing early bids with favored advisors.
+This prevents: (a) the RFP issuer from sharing early bids with favored advisors (bids are encrypted), (b) post-deadline bid insertion (commitment hashes are published), and (c) bid suppression (bidders can prove exclusion).
 
 ### Counter-Offers & Negotiation Rounds
 
@@ -647,24 +647,26 @@ A contract is formalized as a signed Verifiable Credential binding both parties 
   },
   "validFrom": "2026-02-14T00:00:00Z",
   "validUntil": "2026-05-28T00:00:00Z",
-  "proof": {
-    "type": "EcdsaSecp256k1Signature2019",
-    "created": "2026-02-14T00:00:00Z",
-    "verificationMethod": "did:cid:<node_operator_did>#key-1",
-    "proofPurpose": "assertionMethod",
-    "proofValue": "<operator_signature>"
-  },
-  "counterSignature": {
-    "type": "EcdsaSecp256k1Signature2019",
-    "created": "2026-02-14T00:01:00Z",
-    "verificationMethod": "did:cid:<advisor_did>#key-1",
-    "proofPurpose": "assertionMethod",
-    "proofValue": "<advisor_signature>"
-  }
+  "proof": [
+    {
+      "type": "EcdsaSecp256k1Signature2019",
+      "created": "2026-02-14T00:00:00Z",
+      "verificationMethod": "did:cid:<node_operator_did>#key-1",
+      "proofPurpose": "assertionMethod",
+      "proofValue": "<operator_signature>"
+    },
+    {
+      "type": "EcdsaSecp256k1Signature2019",
+      "created": "2026-02-14T00:01:00Z",
+      "verificationMethod": "did:cid:<advisor_did>#key-1",
+      "proofPurpose": "assertionMethod",
+      "proofValue": "<advisor_signature>"
+    }
+  ]
 }
 ```
 
-Both parties sign the contract — the operator issues the credential and the advisor countersigns, creating a mutual binding.
+Both parties sign the contract — the operator issues the credential and the advisor adds a second proof entry to the `proof` array, creating a mutual binding per VC 2.0's support for multiple proofs.
 
 ### SLA Definition
 
@@ -805,6 +807,20 @@ Evaluation criteria are defined in the contract proposal and measured automatica
 | Some criteria met | Operator reviews; can extend trial, renegotiate terms, or exit |
 | No criteria met / major failure | Graceful exit; trial fee paid (work was done); no negative reputation for reasonable failure |
 | Advisor withdraws during trial | Partial fee proportional to days served; neutral reputation |
+
+### Anti-Trial-Cycling Protection
+
+To prevent operators from cycling through advisors on perpetual trial periods to avoid full-rate contracts:
+
+| Protection | Mechanism |
+|-----------|-----------|
+| **Concurrent trial limit** | A node can have at most 2 active trial contracts simultaneously |
+| **Sequential cooldown** | After a trial ends (pass or fail), the operator must wait 14 days before starting a new trial with a *different* advisor for the same capability scope |
+| **Trial history transparency** | Trial count is visible in the operator's `hive:client` reputation profile; advisors can check how many trials an operator has run |
+| **Graduated trial pricing** | An operator's 1st trial in a capability scope uses the advisor's standard trial fee; 2nd trial within 90 days costs 2×; 3rd+ costs 3× |
+| **Advisor opt-out** | Advisors can refuse trials from operators with high trial churn (e.g., >3 trials in 90 days with no full contract) |
+
+These protections are enforced by advisors (who check the operator's trial history via reputation credentials) rather than by protocol — an operator can always find a new advisor willing to offer a trial, but the reputation signal makes excessive trial cycling visible and costly.
 
 ### Trial Failure Handling
 
@@ -1084,7 +1100,7 @@ The referral fee is:
 
 ### Referral Reputation
 
-Referral quality is tracked as a meta-reputation signal:
+Referral quality is tracked as a meta-reputation signal. The `hive:referrer` domain is used within `DIDReputationCredential` credentials (credentialSubject excerpt shown):
 
 ```json
 {
@@ -1124,8 +1140,13 @@ Using the `hive:advisor` profile from the [DID Reputation Schema](./DID-REPUTATI
 
 ```json
 {
-  "type": "DIDReputationCredential",
+  "@context": [
+    "https://www.w3.org/ns/credentials/v2",
+    "https://schemas.archetech.com/credentials/reputation/v1"
+  ],
+  "type": ["VerifiableCredential", "DIDReputationCredential"],
   "issuer": "did:cid:<node_operator_did>",
+  "validFrom": "2026-05-14T00:00:00Z",
   "credentialSubject": {
     "id": "did:cid:<advisor_did>",
     "domain": "hive:advisor",
@@ -1147,15 +1168,20 @@ Using the `hive:advisor` profile from the [DID Reputation Schema](./DID-REPUTATI
 
 #### Advisor Rates Node
 
-Using the `hive:node` profile:
+Using the `hive:client` profile (see [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md#profile-hiveclient)):
 
 ```json
 {
-  "type": "DIDReputationCredential",
+  "@context": [
+    "https://www.w3.org/ns/credentials/v2",
+    "https://schemas.archetech.com/credentials/reputation/v1"
+  ],
+  "type": ["VerifiableCredential", "DIDReputationCredential"],
   "issuer": "did:cid:<advisor_did>",
+  "validFrom": "2026-05-14T00:00:00Z",
   "credentialSubject": {
     "id": "did:cid:<node_operator_did>",
-    "domain": "hive:node",
+    "domain": "hive:client",
     "period": { "start": "2026-02-14T00:00:00Z", "end": "2026-05-14T00:00:00Z" },
     "metrics": {
       "payment_timeliness": 1.0,
@@ -1171,7 +1197,7 @@ Using the `hive:node` profile:
 }
 ```
 
-> **Note:** The `hive:node` profile metrics above extend beyond the base profile defined in the [Reputation Schema](./DID-REPUTATION-SCHEMA.md#profile-hivenode) with marketplace-specific metrics (`payment_timeliness`, `sla_reasonableness`, `communication_quality`). These should be proposed as optional metrics for the `hive:node` profile or as a new `hive:client` profile.
+> **Note:** The `hive:client` profile used above is a new profile distinct from the `hive:node` profile defined in the [Reputation Schema](./DID-REPUTATION-SCHEMA.md#profile-hivenode). It captures marketplace-specific metrics (`payment_timeliness`, `sla_reasonableness`, `communication_quality`, `infrastructure_reliability`) from the advisor's perspective of the node operator as a client. This profile should be proposed to the Archon profile registry following the [Defining New Profiles](./DID-REPUTATION-SCHEMA.md#defining-new-profiles) process.
 
 ### Why Mutual Reputation Matters
 
