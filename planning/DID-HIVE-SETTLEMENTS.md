@@ -10,7 +10,7 @@
 
 ## Abstract
 
-This document defines a trustless settlement protocol for the Lightning Hive. It specifies how obligations between hive nodes — routing revenue shares, rebalancing costs, liquidity leases, splice contributions, pheromone market fees, intelligence payments, and penalty slashing — are tracked, netted, escrowed, and settled using Archon DIDs for identity, Cashu escrow tickets for conditional payment, and the DID Reputation Schema for trust calibration.
+This document defines a trustless settlement protocol for the Lightning Hive. It specifies how obligations between hive nodes — routing revenue shares, rebalancing costs, liquidity leases, splice contributions, pheromone market fees, intelligence payments, penalty slashing, and advisor management fees — are tracked, netted, escrowed, and settled using Archon DIDs for identity, Cashu escrow tickets for conditional payment, and the DID Reputation Schema for trust calibration.
 
 The result is a system where nodes operated by different parties can participate in the same hive without trusting each other. Obligations accumulate during normal hive operation, are periodically netted to minimize token volume, and settle through Cashu escrow tickets with cryptographic proof of work performed. Nodes that defect lose bonds and reputation. Nodes that cooperate earn credit lines and better terms.
 
@@ -304,6 +304,13 @@ Buyer requests intelligence → Seller provides data + holds HTLC secret
 
 This ensures sellers receive minimum compensation while aligning incentives for data quality.
 
+> **⚠️ Pricing validation needed.** The base+bonus split ratio for intelligence data is a design choice that needs real-world calibration. Key unknowns:
+> - What fraction of intelligence purchases actually correlate with routing improvement? If correlation is weak, buyers will consistently timeout on bonuses, discouraging sellers.
+> - What base fee makes data packaging worthwhile for sellers? Too low and no one bothers; too high and buyers won't experiment with new data sources.
+> - The 10% relative improvement threshold for bonus release is arbitrary — real-world data quality varies enormously, and the threshold should be adjustable per-relationship or per-data-type.
+>
+> **Recommended approach:** Start with a 70/30 base/bonus split and the 10% threshold. Collect data on timeout rates, routing improvement distributions, and seller participation. Adjust thresholds via governance after 90 days of market operation.
+
 ### 8. Penalty Settlements
 
 **Scenario:** A node violated hive policy. Examples:
@@ -348,6 +355,87 @@ penalty = base_penalty(violation_type) × severity_multiplier × repeat_offender
 Violations require quorum confirmation — at least N/2+1 hive members must independently observe and report the violation before penalty is applied. This prevents false accusation attacks.
 
 **Penalty execution:** The penalty is deducted from the offender's posted bond (see [Bond System](#bond-system)). If the bond is insufficient, the node's reputation is slashed and future settlement terms worsen.
+
+### 9. Advisor Fee Settlement
+
+**Scenario:** An advisor (per the [DID+L402 Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) spec) manages nodes across multiple operators. Per-action fees are handled through direct Cashu/L402 payment at command execution time (already spec'd in Fleet Management). However, three classes of advisor compensation require the settlement protocol:
+
+1. **Performance bonuses** — Measured over multi-day windows (e.g., "10% of revenue improvement over 30 days"), these span multiple settlement windows and can't be settled at action time
+2. **Subscription renewals** — Monthly management subscriptions where the obligation accumulates daily but settles at period end
+3. **Multi-operator billing** — An advisor managing 10 nodes across 5 operators needs consolidated fee accounting, netting (operators who also advise each other), and dispute resolution
+
+**Obligation calculation:**
+
+```
+For performance bonuses:
+  advisor_bonus(period) =
+    max(0, (end_revenue - baseline_revenue)) × performance_share_pct / 100
+
+  where:
+    baseline_revenue = signed 7-day average before credential validFrom
+    end_revenue = signed 7-day average at credential validUntil (or renewal)
+    performance_share_pct = from management credential compensation terms
+
+For subscription fees:
+  subscription_obligation(period) =
+    daily_rate × days_active_in_settlement_window
+
+  where:
+    daily_rate = monthly_rate / 30, from management credential
+    days_active = days where advisor uptime_pct > 95% (measured by node)
+
+For multi-operator consolidation:
+  net_advisor_fee(advisor, operator) =
+    Σ performance_bonuses(advisor, operator) +
+    Σ subscription_fees(advisor, operator) -
+    Σ reverse_obligations(operator, advisor)   // e.g., operator advises advisor's node
+```
+
+**Proof mechanism:** Management receipts (signed by both advisor and node per the Fleet Management spec) are the proof substrate. At settlement time, both parties compute the obligation from their shared receipt chain:
+
+```json
+{
+  "type": "AdvisorFeeReceipt",
+  "advisor_did": "did:cid:<advisor_did>",
+  "operator_did": "did:cid:<operator_did>",
+  "credential_ref": "did:cid:<management_credential>",
+  "period": {
+    "start": "2026-02-14T00:00:00Z",
+    "end": "2026-03-14T00:00:00Z"
+  },
+  "components": {
+    "per_action_fees_paid_sats": 870,
+    "subscription_fee_sats": 5000,
+    "performance_bonus_sats": 12000,
+    "total_obligation_sats": 17870,
+    "already_settled_sats": 870
+  },
+  "performance_proof": {
+    "baseline_revenue_msat": 45000,
+    "end_revenue_msat": 165000,
+    "delta_pct": 266,
+    "performance_share_pct": 10,
+    "baseline_signed_by": "did:cid:<node_did>",
+    "end_measurement_signed_by": "did:cid:<node_did>"
+  },
+  "actions_taken": 87,
+  "receipt_merkle_root": "sha256:<root_of_management_receipts>",
+  "advisor_signature": "<sig>",
+  "operator_signature": "<sig>"
+}
+```
+
+**Escrow flow:** The settlement window for advisor fees aligns with the management credential period (typically 30 days). At credential renewal time:
+
+1. Node computes performance metrics and generates the `AdvisorFeeReceipt`
+2. Both parties sign the receipt (disputes follow standard [Dispute Resolution](#dispute-resolution))
+3. Operator mints a Cashu escrow ticket for the net obligation (subscription + bonus - already-paid per-action fees)
+4. The HTLC secret is generated by the node and revealed when the advisor's receipt is countersigned — making acknowledgment the settlement trigger (same semantic as other settlement types)
+5. Advisor redeems the ticket
+
+**Multi-operator netting:** An advisor managing nodes for operators A, B, and C has three bilateral obligations. These participate in the standard [multilateral netting](#multilateral-netting) process — if operator A also owes the advisor for routing revenue sharing (Type 1), these obligations net together, reducing the number of Cashu tickets needed.
+
+**Dispute handling:** Advisor fee disputes are resolved through the same [Dispute Resolution](#dispute-resolution) process. The arbitration panel reviews management receipts, signed baseline/performance measurements, and the credential terms. Performance measurement disputes are the most common — the "baseline integrity" rules from the [Task Escrow spec](./DID-CASHU-TASK-ESCROW.md#performance-ticket) apply here as well.
 
 ---
 
@@ -570,6 +658,13 @@ Each panel member:
 
 **5-of-7 majority** vote determines the settlement amount. Panel members are compensated 1,000 sats each from an arbitration fee split between the disputing parties.
 
+> **Small-hive fallback:** The 7-member panel assumes a hive with ≥15 eligible members (excluding the 2 disputing parties and requiring tier ≥ Recognized). For smaller hives:
+> - **10–14 eligible members:** Reduce panel to 5 members, require 3-of-5 majority
+> - **5–9 eligible members:** Reduce panel to 3 members, require 2-of-3 majority
+> - **< 5 eligible members:** Fall back to bilateral negotiation with a 7-day cooling period. If unresolved, escalate to a cross-hive arbitration panel (members from allied hives, if federation exists) or accept the midpoint of both parties' claims as the default resolution.
+>
+> This edge case needs real-world validation — early hives will be small, and the arbitration mechanism must function from day one.
+
 #### Step 3: Reputation Consequences
 
 The party whose claimed amount deviates more from the arbitration result receives a `neutral` or `revoke` reputation signal in the `hive:node` profile. Repeated disputes erode trust tier and increase settlement costs.
@@ -594,6 +689,7 @@ For egregious disputes (evidence of fabricated receipts, dishonest claims), the 
 | Pheromone | `PheromoneReceipt` + forward receipts | Path nodes | Any node observing the path |
 | Intelligence | `IntelligenceReceipt` + routing stats | Buyer + seller | Statistical verification |
 | Penalty | `ViolationReport` + quorum sigs | Reporter + quorum | Any hive member |
+| Advisor fees | `AdvisorFeeReceipt` + management receipts | Advisor + operator | Arbitration panel |
 
 ### Receipt Storage
 
@@ -722,6 +818,17 @@ When a node joins the hive, its Lightning node pubkey is bound to its DID in the
 - Newcomer tier regardless of bond amount (no tier acceleration)
 
 This prevents the "slash, re-join with new DID" attack vector.
+
+### Calibration Notes
+
+> **⚠️ Real-world validation required.** The bond amounts specified above (50k–500k sats) are theoretical estimates designed to balance sybil resistance against barriers to entry. These values need market testing once the protocol is deployed:
+>
+> - **Too high** → Discourages legitimate new members, concentrates hive membership among wealthy operators, creates a plutocratic governance dynamic
+> - **Too low** → Enables sybil attacks, makes free-riding profitable, undermines arbitration integrity
+>
+> **Recommended approach:** Launch with the specified minimums but implement governance-adjustable bond parameters. Hive members vote on bond adjustments quarterly based on observed attack frequency, membership growth rate, and median node capacity. The `effective_minimum` dynamic floor (50% of median) provides automatic scaling, but the base minimums should also be tunable.
+>
+> **Key metrics to monitor:** Sybil attempt rate, membership churn, bond-to-channel-capacity ratio across the network, and time-to-ROI for new members at each tier.
 
 ### Slashing
 

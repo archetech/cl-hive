@@ -585,6 +585,72 @@ Emergency operations. Used by Category 14.
 **Required tier:** `advanced` / `admin`  
 **Danger score:** 3–10
 
+##### `hive:htlc/v1`
+
+HTLC inspection and forced resolution operations. Used for diagnosing stuck HTLCs and recovering locked liquidity.
+
+```json
+{
+  "schema": "hive:htlc/v1",
+  "action": "list_stuck",
+  "params": {
+    "min_age_seconds": 3600,
+    "include_details": true
+  }
+}
+```
+
+**Additional actions:**
+
+```json
+{
+  "schema": "hive:htlc/v1",
+  "action": "inspect",
+  "params": {
+    "htlc_id": "931770x2363x0:47",
+    "include_onion": false
+  }
+}
+```
+
+```json
+{
+  "schema": "hive:htlc/v1",
+  "action": "fail_htlc",
+  "params": {
+    "htlc_id": "931770x2363x0:47",
+    "reason": "Stuck for >6 hours, peer unresponsive",
+    "error_code": "temporary_channel_failure"
+  }
+}
+```
+
+```json
+{
+  "schema": "hive:htlc/v1",
+  "action": "settle_htlc",
+  "params": {
+    "htlc_id": "931770x2363x0:47",
+    "preimage": "abc123..."
+  }
+}
+```
+
+```json
+{
+  "schema": "hive:htlc/v1",
+  "action": "force_resolve_expired",
+  "params": {
+    "htlc_id": "931770x2363x0:47",
+    "reason": "CLTV expiry imminent, peer offline"
+  }
+}
+```
+
+**Required tier:** `monitor` (list/inspect), `admin` (fail/settle/force-resolve)
+**Danger score:** 2–3 (inspection), 7–8 (fail/settle/force-resolve)
+**Constraints:** Force-resolve only available for HTLCs past CLTV expiry minus safety margin. Fail/settle require explicit reason logged to audit trail.
+
 #### Schema Versioning
 
 Schemas use semantic versioning. The node advertises supported schemas during the initial capability exchange:
@@ -801,17 +867,29 @@ Last-resort actions for compromised or failing nodes. Maximum danger, maximum im
 | Force close all channels | Nuclear option — close everything | **10** | admin | `hive:emergency/v1` | Total defunding; all funds locked on-chain; recovery takes days/weeks; only for catastrophic compromise |
 | Revoke all agent credentials | Disable all remote management access | **3** | admin | `hive:emergency/v1` | Safe and prudent if compromise suspected; can re-issue later |
 
+### Category 15: HTLC Management
+
+Inspecting and resolving stuck or expired HTLCs. Inspection is safe; forced resolution carries significant risk.
+
+| Task | Description | Danger | Tier | Schema | Rationale |
+|------|------------|--------|------|--------|-----------|
+| List stuck HTLCs | Query in-flight HTLCs older than threshold | **2** | monitor | `hive:htlc/v1` | Read-only; surfaces diagnostic data |
+| Inspect HTLC details | Get full details of a specific HTLC (amount, CLTV, channel, peer) | **2** | monitor | `hive:htlc/v1` | Read-only; no state change |
+| Fail HTLC | Force-fail a stuck HTLC back to sender | **7** | admin | `hive:htlc/v1` | Releases locked liquidity but sender loses payment; wrong call = lost funds for counterparty |
+| Settle HTLC | Force-settle an HTLC with a known preimage | **7** | admin | `hive:htlc/v1` | Completes a stuck payment; requires valid preimage; wrong preimage = protocol violation |
+| Force-resolve expired HTLC | Force-resolve an HTLC past CLTV expiry | **8** | admin | `hive:htlc/v1` | Last resort for expired HTLCs; may trigger force close if peer disagrees; high-stakes timing |
+
 ### Danger Score Distribution
 
 ```
 Score 1  [██████████████] 14 tasks  — Read-only, receive-only
-Score 2  [███████]         7 tasks  — Cosmetic, backup, simple peer ops
+Score 2  [█████████]       9 tasks  — Cosmetic, backup, simple peer ops, HTLC inspection
 Score 3  [████████]        8 tasks  — Single-channel fee changes, simple policies
 Score 4  [██████████]     10 tasks  — Bulk policies, small payments, config changes
 Score 5  [██████████]     10 tasks  — Swaps, large rebalances, network config
 Score 6  [████████]        8 tasks  — Channel opens, on-chain sends, large payments
-Score 7  [████]            4 tasks  — Batch opens, unilateral closes, restarts
-Score 8  [███]             3 tasks  — Large on-chain sends, punitive closes
+Score 7  [██████]          6 tasks  — Batch opens, unilateral closes, restarts, HTLC fail/settle
+Score 8  [████]            4 tasks  — Large on-chain sends, punitive closes, HTLC force-resolve
 Score 9  [██]              2 tasks  — Wallet sweep, arbitrary plugin execution
 Score 10 [██]              2 tasks  — Close all channels, restore from backup
 ```
