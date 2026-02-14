@@ -840,6 +840,7 @@ The three roles (Delegator, Executor, Verifier) may collapse — e.g., the Deleg
 - [W3C DID Core 1.0](https://www.w3.org/TR/did-core/)
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
+- [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) — Marketplace trial periods reference this spec's escrow and baseline mechanisms
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 
 ---

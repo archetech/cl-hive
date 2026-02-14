@@ -536,6 +536,7 @@ Operators are incentivized to issue `revoke` credentials against bad advisors to
 - [Archon Reputation Schemas (canonical)](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)
 - [DID+L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
 - [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
+- [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) — Primary consumer of reputation credentials for advisor discovery, ranking, and contract formation
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 
 ---
