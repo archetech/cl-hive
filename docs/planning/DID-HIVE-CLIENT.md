@@ -14,13 +14,7 @@ This document specifies lightweight client software — a CLN plugin (`cl-hive-c
 
 The result: every Lightning node operator — from a hobbyist running a Raspberry Pi to a business with a multi-BTC routing node — can hire AI-powered or human expert advisors for fee optimization, rebalancing, and channel management. **Install the plugin, pick an advisor, approve access, done.** The client enforces local policy as the last line of defense against malicious or incompetent advisors. No trust required.
 
-### Design Principles
-
-Two principles govern the user experience:
-
-1. **Cryptographic identity is plumbing.** The protocol uses Archon DIDs for authentication, W3C Verifiable Credentials for authorization, and secp256k1 signatures for everything. The operator never sees any of it. DIDs are auto-provisioned on first run. Credentials are issued by clicking "authorize." Signatures happen silently. Like TLS — essential infrastructure that users never think about.
-
-2. **Payment flexibility is mandatory.** Advisors accept payment via standard Lightning invoices (Bolt11), recurring offers (Bolt12), API-gated access (L402), and conditional escrow (Cashu). The operator picks their preferred method. Only conditional escrow (payment-on-completion) specifically requires Cashu tokens. Everything else uses whatever Lightning payment method the operator and advisor agree on.
+Two design principles govern the user experience: (1) **cryptographic identity is plumbing** — DIDs, credentials, and signatures are essential infrastructure that operators never see, like TLS certificates; (2) **payment flexibility is mandatory** — advisors accept Bolt11, Bolt12, L402, and Cashu, with Cashu required only for conditional escrow. See [Design Principles](#design-principles) for full details.
 
 ---
 
@@ -1461,111 +1455,82 @@ All discovery results are ranked using the [Marketplace ranking algorithm](./DID
 
 ## 10. Onboarding Flow
 
-Step-by-step process for a new node operator to start using professional management:
+The entire flow from zero to managed node, as the operator experiences it:
 
-### Step 1: Install Plugin/Daemon
+### The Three-Command Quickstart
 
 ```bash
-# CLN
-curl -O https://github.com/lightning-goats/cl-hive-client/releases/latest/cl_hive_client.py
+# 1. Install
 lightning-cli plugin start /path/to/cl_hive_client.py
 
-# LND
-curl -LO https://github.com/lightning-goats/hive-lnd/releases/latest/hive-lnd-linux-amd64
-hive-lnd init && hive-lnd --config ~/.hive-lnd/hive-lnd.yaml
+# 2. Find an advisor
+lightning-cli hive-client-discover --capabilities="fee optimization"
+
+# 3. Hire them
+lightning-cli hive-client-authorize 1 --access="fee optimization"
 ```
 
-### Step 2: Identity (Automatic)
+Done. Your node is now professionally managed. Here's what happened behind the scenes:
 
-On first run, the client automatically provisions a DID identity via the configured Archon gateway. **No user action required.** The operator sees:
+1. **Install** → Plugin started, identity auto-provisioned, defaults configured
+2. **Discover** → Searched Archon/Nostr/directories, verified credentials, ranked by reputation
+3. **Authorize** → Issued a management credential, negotiated payment method, started trial period
 
-```
-✓ Node identity created (via archon.technology)
-✓ Ready to discover advisors
-```
+### Detailed Flow (What the Client Does Automatically)
 
-> **Advanced users** who already run an Archon node or have an existing DID can configure it manually in the config file. For most operators, auto-provisioning is the right choice. See [Archon Integration Tiers](#archon-integration-tiers) for details.
+| Step | User Action | What Happens Internally |
+|------|------------|------------------------|
+| Install plugin | `plugin start cl_hive_client.py` | DID auto-provisioned, Keymaster initialized, data directory created |
+| Discover | `hive-client-discover` | Parallel queries to Archon + Nostr + directories, credential verification, reputation aggregation, ranking |
+| Review | Read the results list | (Nothing — results already verified and ranked) |
+| Authorize | `hive-client-authorize 1 --access="fees"` | Credential created and signed, payment method negotiated with advisor, credential delivered via Bolt 8, trial period started |
+| Trial (automatic) | Wait 7–14 days | Advisor operates with reduced scope, client measures baseline, flat-fee payment via Bolt11 |
+| Review trial | `hive-client-trial --review` | Metrics computed: actions taken, revenue delta, uptime, response time |
+| Full access | `hive-client-authorize "Hex Advisor" --access="full routing"` | New credential with expanded scope, escrow auto-funded for conditional payments, full management begins |
+| Ongoing | (Automatic) | Advisor manages node, payments auto-processed, Policy Engine enforces limits, receipts logged, alerts sent |
 
-### Step 3: Discover Advisors
+### What the Operator Never Does
+
+- ~~Create a DID~~ (auto-provisioned)
+- ~~Install Archon Keymaster~~ (bundled)
+- ~~Configure credential schemas~~ (templates handle this)
+- ~~Fund a Cashu wallet manually~~ (auto-replenishment from node wallet)
+- ~~Verify cryptographic signatures~~ (automatic)
+- ~~Resolve DID documents~~ (abstraction layer)
+- ~~Manage payment tokens~~ (Payment Manager handles routing to Bolt11/Bolt12/Cashu)
+
+### Interactive Onboarding Wizard (Optional)
+
+For operators who prefer guided setup:
 
 ```bash
-lightning-cli hive-client-discover --capabilities="fee-optimization,rebalancing"
+$ lightning-cli hive-client-setup
+
+Welcome to Hive Client! Let's get your node managed.
+
+Your node identity has been created automatically.
+
+What kind of help do you need?
+  1. Fee optimization (most popular)
+  2. Full routing management
+  3. Monitoring only
+  4. Everything
+
+> 1
+
+Searching for fee optimization advisors...
+
+Found 5 advisors. Top recommendation:
+  Hex Fleet Advisor — ★★★★★ — 12 nodes managed — 3k sats/month
+  Revenue improvement: +180% average across clients
+
+Start a 14-day trial with Hex Fleet Advisor? (y/n)
+> y
+
+✓ Trial started. Hex Fleet Advisor can now optimize your fees.
+  You'll receive weekly reports. Review anytime with:
+  lightning-cli hive-client-trial --review
 ```
-
-Returns a ranked list of advisors with reputation scores, pricing, and availability.
-
-### Step 4: Review Advisor Reputation
-
-```bash
-# View detailed advisor profile and reputation
-lightning-cli hive-client-discover --advisor-did="did:cid:advisor..." --detail
-```
-
-Review:
-- Number of nodes managed and average tenure
-- Revenue improvement metrics across clients
-- Escrow history (completed tickets, timeouts, disputes)
-- Trial period success rate
-
-### Step 5: Select Advisor and Configure Credential
-
-```bash
-# Start with a trial period
-lightning-cli hive-client-trial \
-  --advisor-did="did:cid:advisor..." \
-  --duration-days=14 \
-  --scope="monitor,fee-policy"
-```
-
-### Step 6: Fund Escrow Wallet
-
-```bash
-# Check current balance
-lightning-cli hive-client-escrow balance
-
-# Mint initial escrow tokens
-lightning-cli hive-client-escrow mint --amount=10000
-```
-
-### Step 7: Trial Period (7–14 Days)
-
-During the trial:
-- Advisor operates with reduced scope (monitor + fee-policy only)
-- Flat-fee compensation (no performance bonus)
-- Client measures baseline metrics
-- Both parties evaluate fit
-
-### Step 8: Review Trial Results
-
-```bash
-# View trial metrics
-lightning-cli hive-client-trial --review
-
-# Output: actions taken, revenue delta, uptime, response time
-```
-
-### Step 9: Full Contract or Terminate
-
-```bash
-# If satisfied: upgrade to full credential
-lightning-cli hive-client-authorize \
-  --advisor-did="did:cid:advisor..." \
-  --template="full_routing" \
-  --duration-days=90
-
-# If not: terminate trial (no penalty)
-lightning-cli hive-client-revoke --advisor-did="did:cid:advisor..."
-```
-
-### Step 10: Ongoing Management
-
-With the full credential active:
-- Advisor manages the node per contracted scope
-- Escrow auto-replenishes
-- Policy Engine enforces local rules
-- Operator receives alerts for significant actions
-- Receipts accumulate for auditing
-- At contract end, both parties issue mutual reputation credentials
 
 ---
 
@@ -1597,21 +1562,17 @@ Client-only nodes can upgrade to full hive membership when they want the benefit
 ### Migration Process
 
 ```bash
-# 1. Install full cl-hive (replaces cl-hive-client)
-lightning-cli plugin stop cl_hive_client.py
-lightning-cli plugin start cl_hive.py
+# 1. Upgrade plugin (replaces cl-hive-client automatically)
+lightning-cli hive-upgrade
 
-# 2. Join hive PKI
-lightning-cli hive-join --hive-id="<hive_identifier>"
+# 2. Join a hive and post bond
+lightning-cli hive-join --bond=50000
 
-# 3. Post bond
-lightning-cli hive-bond --amount=50000 --mint="https://mint.hive.lightning"
-
-# 4. Wait for hive acceptance (bond verification + existing reputation review)
-lightning-cli hive-status
-
-# 5. Existing advisor relationships continue unchanged
+# 3. Existing advisor relationships continue unchanged
+lightning-cli hive-client-status  # same advisors, same credentials
 ```
+
+Under the hood: the upgrade installs `cl-hive`, migrates the identity and credential store, joins the hive PKI, and posts the bond via the Cashu escrow wallet.
 
 ### Incentives to Upgrade
 
@@ -1702,8 +1663,9 @@ The Receipt Store serves as a tamper-evident audit log:
 | Settlement netting | ✗ | ✗ | ✓ |
 | Credit tiers | ✗ | ✗ | ✓ |
 | Governance | ✗ | ✗ | ✓ |
+| Payment methods | N/A | Bolt11, Bolt12, L402, Cashu | Same + settlement netting |
 | Reputation earned | ✗ | ✓ (`hive:client`) | ✓ (`hive:node`) |
-| DID identity | Optional | Required | Required |
+| DID identity | Optional | Auto-provisioned (invisible) | Auto-provisioned (invisible) |
 | Local policy engine | ✗ | ✓ | ✓ |
 | Audit trail | ✗ | ✓ | ✓ |
 
@@ -1747,20 +1709,24 @@ Phased delivery, aligned with the other specs' roadmaps. The client is designed 
 *Prerequisites: Fleet Management Phase 1–2 (schemas + DID auth)*
 
 - `cl-hive-client` Python plugin with Schema Handler and Credential Verifier
+- **Identity auto-provisioning** (bundled Keymaster, DID generation on first run)
+- **DID Abstraction Layer** (alias registry, human-readable CLI output)
 - Custom message handling (types 49153/49155)
 - Basic Policy Engine (presets only)
 - Receipt Store (SQLite, hash-chained)
-- RPC commands: `hive-client-status`, `hive-client-authorize`, `hive-client-revoke`, `hive-client-receipts`
+- Bolt11 payment support (simple per-action via node wallet)
+- RPC commands with name-based addressing (no DIDs in default output)
 - CLN schema translation for categories 1–4 (monitor, fee-policy, HTLC policy, forwarding)
 
-### Phase 2: Escrow Integration (3–4 weeks)
+### Phase 2: Payment Manager (3–4 weeks)
 *Prerequisites: Task Escrow Phase 1 (single tickets)*
 
-- Built-in Cashu wallet (NUT-10/11/14)
-- Escrow ticket creation and management
-- Auto-replenishment
-- Spending limits
-- `hive-client-escrow` RPC command
+- Built-in Cashu wallet (NUT-10/11/14) for conditional escrow
+- Bolt12 offer handling for recurring subscriptions
+- L402 client for API-gated advisor access
+- Payment method negotiation with advisors
+- Auto-replenishment (escrow from node wallet)
+- Unified spending limits across all payment methods
 
 ### Phase 3: Full Schema Coverage (3–4 weeks)
 *Prerequisites: Phase 1*
@@ -1782,8 +1748,9 @@ Phased delivery, aligned with the other specs' roadmaps. The client is designed 
 *Prerequisites: Marketplace Phase 1 (service profiles)*
 
 - `hive-client-discover` with Archon, Nostr, and directory sources
+- Human-readable discovery output (ranked list with names, ratings, prices)
 - `hive-client-trial` for trial period management
-- Onboarding wizard (interactive CLI)
+- Interactive onboarding wizard (`hive-client-setup`)
 - Referral discovery support
 
 ### Phase 6: Advanced Policy & Alerts (2–3 weeks)
@@ -1821,7 +1788,7 @@ Marketplace Phase 1    ──────────►  Client Phase 5 (discov
 
 ## 15. Open Questions
 
-1. **Keymaster packaging:** Should the Archon Keymaster be bundled with the client plugin/daemon, or remain a separate dependency? Bundling reduces friction but increases maintenance burden.
+1. **Keymaster bundling size:** The bundled Archon Keymaster adds to the plugin/binary size. For Python (CLN), this means vendored dependencies. For Go (LND), this means a larger binary. What's the acceptable size budget? Can we use a minimal keymaster subset (just key generation + signing, no full node)?
 
 2. **Auto-replenishment funding source:** Should auto-replenishment draw from the node's on-chain wallet (simple, requires on-chain funds) or via Lightning invoice (more complex, uses existing liquidity)? Both have tradeoffs.
 
@@ -1840,6 +1807,12 @@ Marketplace Phase 1    ──────────►  Client Phase 5 (discov
 9. **Client-to-client communication:** Could client nodes discover and communicate with each other (e.g., for referral-based reputation, cooperative rebalancing) without full hive membership? This would create a "light hive" network.
 
 10. **Tiered client product:** Should there be a free tier (monitor-only, limited discovery) and a paid tier (full management, priority discovery)? Or should the client software be fully open and free, with advisors as the only revenue source?
+
+11. **Bolt12 adoption curve:** Bolt12 support varies across implementations. CLN has native support; LND's is experimental. Should the client gracefully degrade Bolt12 subscriptions to repeated Bolt11 invoices when Bolt12 isn't available?
+
+12. **L402 vs Bolt 8:** L402 requires HTTP connectivity; the primary management channel is Bolt 8 P2P. Should L402 be limited to advisor web dashboards and monitoring APIs, or should there be a Bolt 8 equivalent of L402 macaroon-gated access?
+
+13. **Alias collision:** Two advisors could have the same display name. How should the alias system handle collisions? Auto-suffix (`"Hex Advisor"` → `"Hex Advisor (2)"`)? Require unique local aliases?
 
 ---
 
@@ -1866,6 +1839,8 @@ Marketplace Phase 1    ──────────►  Client Phase 5 (discov
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [BOLT 1: Base Protocol](https://github.com/lightning/bolts/blob/master/01-messaging.md) — Custom message type rules (odd = optional)
 - [BOLT 8: Encrypted and Authenticated Transport](https://github.com/lightning/bolts/blob/master/08-transport.md)
+- [BOLT 12: Offers](https://github.com/lightning/bolts/blob/master/12-offer-encoding.md) — Recurring payments, reusable payment codes
+- [L402: Lightning HTTP 402 Protocol](https://docs.lightning.engineering/the-lightning-network/l402)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 
 ---

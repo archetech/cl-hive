@@ -165,9 +165,11 @@ An advisor advertises their services by publishing a `HiveServiceProfile` — a 
           "bonusEscrowMethod": "cashu"
         }
       ],
-      "acceptedPayment": ["cashu", "bolt11", "bolt12", "l402"],
+      "acceptedPayment": ["bolt11", "bolt12", "cashu", "l402"],
+      "preferredPayment": "bolt12",
       "acceptableMints": ["https://mint.hive.lightning", "https://mint.minibits.cash"],
-      "escrowRequired": true
+      "escrowRequired": true,
+      "escrowMinDangerScore": 3
     },
     "availability": {
       "maxNodes": 50,
@@ -1362,7 +1364,7 @@ All three mechanisms use the same `HiveServiceProfile` credential format defined
 
 ### Simplified Contracting for Non-Hive Nodes
 
-Non-hive nodes skip the hive PKI handshake and settlement integration:
+Non-hive nodes skip the hive PKI handshake and settlement integration. The client software handles everything automatically — the operator just picks an advisor and approves access:
 
 ```
 Operator                              Advisor
@@ -1372,12 +1374,13 @@ Operator                              Advisor
     │                                    │
     │  2. Review profile + reputation    │
     │                                    │
-    │  3. Issue management credential    │
-    │     (direct, no hive PKI)          │
+    │  3. Authorize access               │
+    │     (credential issued             │
+    │      automatically by client)      │
     │  ──────────────────────────────►   │
     │                                    │
-    │  4. Fund escrow wallet             │
-    │     (direct Cashu, no settlement)  │
+    │  4. Payment method negotiated      │
+    │     (Bolt11/Bolt12/L402/Cashu)     │
     │                                    │
     │  5. Management begins              │
     │  ◄─────────────────────────────►   │
@@ -1385,10 +1388,11 @@ Operator                              Advisor
 ```
 
 Key differences from hive contracting:
-- **No settlement protocol** — All payments via direct Cashu escrow tickets. No netting, no credit tiers, no bilateral accounting.
-- **No bond verification** — The operator doesn't need to verify the advisor's hive bond (they may not have one). Reputation credentials are the primary trust signal.
-- **No gossip announcement** — The contract is private between the two parties. No `contract_announcement` to the hive.
-- **Direct credential delivery** — Via Bolt 8 custom message (if peered), Archon Dmail, or Nostr DM.
+- **No settlement protocol** — Payments via standard Lightning (Bolt11/Bolt12) for simple fees, Cashu escrow for conditional payments. No netting, no credit tiers.
+- **No bond verification** — Reputation credentials are the primary trust signal.
+- **No gossip announcement** — The contract is private between the two parties.
+- **Flexible payment methods** — Operator and advisor negotiate payment method; not locked to Cashu. See the [Client spec Payment Manager](./DID-HIVE-CLIENT.md#payment-manager) for details.
+- **Invisible identity** — DIDs are auto-provisioned; operators never see or manage cryptographic identifiers.
 
 ### Non-Hive Nodes in the Reputation Loop
 
