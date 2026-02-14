@@ -1259,7 +1259,7 @@ Week 20+:   Fleet Management Phase 6 (marketplace) + Task Escrow Phase 5 (genera
 
 4. **Latency:** Bolt 8 custom messages add a round trip per command. For time-sensitive actions (velocity alerts), is this acceptable? Should critical schemas have a "pre-authorized" mode?
 
-5. **Cross-implementation:** This design assumes CLN. How portable is it to LND/Eclair/LDK? Custom messages are supported but implementations vary.
+5. **Cross-implementation:** This design assumes CLN. How portable is it to LND/Eclair/LDK? Custom messages are supported but implementations vary. See the [DID Hive Client spec](./DID-HIVE-CLIENT.md) for the full CLN/LND schema translation layer.
 
 6. **Privacy:** Management receipts prove what actions an advisor took. Should there be an option to keep management relationships private (no public reputation building)?
 
@@ -1279,6 +1279,7 @@ Week 20+:   Fleet Management Phase 6 (marketplace) + Task Escrow Phase 5 (genera
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [Archon Reputation Schemas (canonical)](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
+- [DID Hive Client: Universal Lightning Node Management](./DID-HIVE-CLIENT.md)
 - [CLN Custom Messages](https://docs.corelightning.org/reference/lightning-sendcustommsg)
 
 ---

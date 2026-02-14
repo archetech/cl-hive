@@ -558,6 +558,7 @@ Operators are incentivized to issue `revoke` credentials against bad advisors to
 - [DID+L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
 - [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
 - [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) — Primary consumer of reputation credentials for advisor discovery, ranking, and contract formation
+- [DID Hive Client: Universal Lightning Node Management](./DID-HIVE-CLIENT.md) — Client plugin/daemon for non-hive nodes
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 
 ---
