@@ -1,6 +1,7 @@
 # DID + Cashu Hive Settlements Protocol
 
 **Status:** Proposal / Design Draft  
+**Version:** 0.1.0  
 **Author:** Hex (`did:cid:bagaaierajrr7k6izcrdfwqxpgtrobflsv5oibymfnthjazkkokaugszyh4ka`)  
 **Date:** 2026-02-14  
 **Feedback:** Open — file issues or comment in #singularity
@@ -75,7 +76,7 @@ For each forwarded HTLC through a multi-operator path:
     - Channel capacity committed
     - Liquidity consumed (directional)
     - Position in route (source/sink premium)
-    - Opportunity cost (what else could that liquidity have earned?)
+    - Liquidity cost (sat-hours committed × node's configured liquidity rate)
 
   share(node_i) = total_fee × contribution(node_i) / Σ contributions
 ```
@@ -110,11 +111,14 @@ Both the incoming and outgoing nodes sign the receipt. A complete routing proof 
 ```
 rebalance_cost(B) =
   routing_fees_paid_through_B +
-  opportunity_cost(B, amount, duration) +
+  liquidity_cost(B, amount, duration) +
   B's_risk_premium
+
+where:
+  liquidity_cost = amount_sats × B.liquidity_rate_ppm × duration_hours / 8760
 ```
 
-Opportunity cost is estimated from B's recent routing revenue per sat of capacity. Risk premium is configurable per node.
+Liquidity cost uses a **configurable flat rate** per sat-hour (`liquidity_rate_ppm`), set by each node based on their target return. This avoids the complexity of computing true opportunity cost from counterfactual routing. Nodes advertise their liquidity rate via pheromone markers. Risk premium is configurable per node.
 
 **Proof mechanism:** Signed rebalance receipts from both endpoints:
 
@@ -230,6 +234,11 @@ Advertiser pays → Escrow ticket created
   HTLC secret held by: the next node in the advertised path
   Secret revealed when: an HTLC is successfully forwarded through the path
   Timeout: if no traffic within the placement window, advertiser reclaims
+
+Requirement: Path nodes MUST run the cl-hive settlement plugin to participate
+in pheromone market settlements. Non-settlement-aware path nodes cannot hold
+or reveal HTLC secrets for pheromone verification. Pheromone market paths are
+therefore limited to intra-hive routes where all nodes run the settlement protocol.
 ```
 
 ```json
@@ -285,7 +294,15 @@ Buyer requests intelligence → Seller provides data + holds HTLC secret
 }
 ```
 
-**Verification challenge:** Correlation doesn't prove causation. A node's routing success might improve for reasons unrelated to the purchased data. The protocol uses a statistical approach: if routing success improves by more than a threshold (configurable, default: 10% relative improvement) within the measurement window, the data is deemed useful.
+**Verification challenge:** Correlation doesn't prove causation. A node's routing success might improve for reasons unrelated to the purchased data.
+
+> **⚠️ Trust model:** Intelligence sharing escrow is **reputation-backed, not trustless**. The buyer ultimately decides whether to acknowledge value (revealing the HTLC secret). A dishonest buyer can always claim the data was useless and reclaim via timeout. The protocol mitigates this through reputation consequences: buyers who consistently timeout on intelligence purchases receive `revoke` credentials from sellers, degrading their trust tier and eventually losing access to intelligence markets.
+
+**Recommended approach:** Split intelligence payment into two parts:
+1. **Base payment** (non-escrowed): A flat fee paid upfront via simple Cashu token for data delivery. This compensates the seller for the work of packaging and transmitting data.
+2. **Performance bonus** (escrowed): An HTLC-locked bonus released if routing success improves by more than a threshold (configurable, default: 10% relative improvement) within a 6-hour measurement window.
+
+This ensures sellers receive minimum compensation while aligning incentives for data quality.
 
 ### 8. Penalty Settlements
 
@@ -308,7 +325,7 @@ penalty = base_penalty(violation_type) × severity_multiplier × repeat_offender
 | Unannounced close | 10,000 sats | 1–10× (based on channel size) |
 | Data leakage | 50,000 sats | 1–5× (based on sensitivity) |
 | Free-riding | 5,000 sats | 1–3× (based on duration) |
-| Heartbeat failure | 500 sats | 1× per missed window |
+| Heartbeat failure | 500 + (leased_capacity_sats × 0.001) sats | 1× per missed window |
 
 **Proof mechanism:** Policy violation is detected by peer nodes and reported with signed evidence:
 
@@ -428,11 +445,19 @@ Multilateral settlement (3 payments instead of 5):
   A→D: 700
 ```
 
-Multilateral netting requires all nodes to agree on the obligation set. This is achieved through the gossip protocol — nodes exchange signed obligation summaries and verify they agree on bilateral nets before computing the multilateral solution.
+Multilateral netting requires participating nodes to agree on the obligation set. This is achieved through the gossip protocol — nodes exchange signed obligation summaries and verify they agree on bilateral nets before computing the multilateral solution.
+
+**Timeout behavior:** Each node has 2 hours from netting proposal broadcast to submit their signed obligation acknowledgment. If a node does not respond within the window:
+1. The non-responding node is excluded from the multilateral netting round
+2. All obligations involving the non-responding node fall back to **bilateral settlement** with each of its counterparties
+3. The multilateral netting proceeds among the remaining responsive nodes
+4. Repeated non-response (3+ consecutive windows) triggers a heartbeat failure penalty
 
 ### Cashu Escrow Ticket Flow
 
 After netting, each net obligation becomes a Cashu escrow ticket following the [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md).
+
+> **Note:** Settlement escrow tickets use **obligation acknowledgment** as the verification event (the receiver signs confirmation that the obligation summary matches their local ledger). This differs from task escrow, where **task completion** triggers the preimage reveal. The cryptographic mechanism is identical — only the semantic trigger differs.
 
 #### For Routine Settlements (Routing Revenue, Rebalancing Costs)
 
@@ -527,13 +552,23 @@ Both nodes exchange their signed receipt chains for the disputed period. Receipt
 
 #### Step 2: Peer Arbitration
 
-If evidence comparison doesn't resolve the dispute, the disagreement is broadcast to N randomly selected hive members (the "arbitration panel"). Each panel member:
+If evidence comparison doesn't resolve the dispute, an arbitration panel of **7 members** is selected. Panel selection uses **stake-weighted randomness** to resist sybil capture:
+
+**Selection algorithm:**
+1. Compute selection seed: `SHA256(dispute_id || bitcoin_block_hash_at_filing_height)`
+2. Build eligible pool: all hive members who are (a) not party to the dispute, (b) have tier ≥ Recognized (30+ days tenure, reputation > 60), and (c) have posted bond ≥ 50,000 sats
+3. Weight each eligible member by `bond_amount × sqrt(tenure_days)`
+4. Select 7 members via weighted random sampling using the deterministic seed
+
+**Arbitrator bonds:** Each panel member must post a temporary arbitration bond of 5,000 sats, forfeited if they fail to vote within 72 hours or if meta-review reveals collusion.
+
+Each panel member:
 
 1. Reviews both parties' evidence
 2. Votes on the correct obligation amount
-3. Signs their vote
+3. Signs their vote with their DID key
 
-Majority vote determines the settlement amount. Panel members are compensated from a small arbitration fee split between the disputing parties.
+**5-of-7 majority** vote determines the settlement amount. Panel members are compensated 1,000 sats each from an arbitration fee split between the disputing parties.
 
 #### Step 3: Reputation Consequences
 
@@ -615,9 +650,28 @@ A bond is a Cashu token with special spending conditions:
 }
 ```
 
-The bond is locked to a hive multisig key — a threshold key requiring M-of-N hive founding members to authorize spending. This prevents any single entity from stealing bonds.
+The bond is locked to a hive multisig key using **NUT-11's multisig support**. The NUT-10 structured secret encodes:
 
-**Refund path:** After the bond timelock expires (default: 6 months), the node operator can reclaim their bond — provided no outstanding slash claims exist. Bond renewal is required for continued hive membership.
+```json
+[
+  "P2PK",
+  {
+    "nonce": "<unique_nonce>",
+    "data": "<primary_founding_member_pubkey>",
+    "tags": [
+      ["pubkeys", "<founder_2_pubkey>", "<founder_3_pubkey>", "<founder_4_pubkey>", "<founder_5_pubkey>"],
+      ["n_sigs", "3"],
+      ["locktime", "<bond_expiry_unix_timestamp>"],
+      ["refund", "<node_operator_pubkey>"],
+      ["sigflag", "SIG_ALL"]
+    ]
+  }
+]
+```
+
+This creates a **3-of-5 multisig** among founding members. Slashing requires 3 founding members to independently sign the spend. Founding members coordinate asynchronously — a slash proposal is broadcast to all 5 signers with evidence, and signatures are collected over a 72-hour signing window. The first 3 valid signatures trigger the slash.
+
+**Refund path:** After the bond timelock expires (default: 6 months), the node operator can reclaim their bond via the `refund` tag — provided no outstanding slash claims exist. If a slash claim is pending at timelock expiry, the timelock is effectively extended until the claim is resolved (the multisig signers simply do not sign a refund). Bond renewal is required for continued hive membership.
 
 ### Bond Sizing
 
@@ -626,20 +680,61 @@ Bond size scales with the privileges requested:
 | Privilege Level | Minimum Bond | Access Granted |
 |----------------|-------------|----------------|
 | **Observer** | 0 sats | Read-only hive gossip, no settlement participation |
-| **Basic routing** | 10,000 sats | Routing revenue sharing, basic intelligence access |
-| **Full member** | 50,000 sats | All settlement types, pheromone market, liquidity leasing |
-| **Liquidity provider** | 100,000 sats | Channel leasing, splice participation, premium pheromone placement |
-| **Founding member** | 250,000 sats | Governance voting, arbitration panel eligibility, highest credit tier |
+| **Basic routing** | 50,000 sats | Routing revenue sharing (no intelligence access) |
+| **Full member** | 150,000 sats | All settlement types, pheromone market, basic intelligence access |
+| **Liquidity provider** | 300,000 sats | Channel leasing, splice participation, premium pheromone placement, full intelligence access |
+| **Founding member** | 500,000 sats | Governance voting, arbitration panel eligibility, highest credit tier |
 
 Bond amounts are denominated in sats and may be adjusted by hive governance based on market conditions.
+
+#### Dynamic Bond Floor
+
+To prevent sybil attacks through minimum bonds, the effective minimum bond for new members scales with hive size:
+
+```
+effective_minimum(tier) = max(
+  base_minimum(tier),
+  median_bond(existing_members) × 0.5
+)
+```
+
+New members must post at least 50% of the existing median bond, ensuring that sybil attackers can't cheaply flood the membership.
+
+#### Time-Weighted Staking
+
+Bond effectiveness increases with tenure. A bond posted today provides less trust weight than the same amount held for 6 months:
+
+```
+effective_bond(node) = bond_amount × min(1.0, tenure_days / 180)
+```
+
+This means a sybil attacker who posts 10 bonds simultaneously gets only `10 × bond × (1/180)` ≈ 0.06× effective weight per bond on day 1, making short-term sybil attacks economically infeasible.
+
+#### Intelligence Access Gating
+
+Intelligence access (routing success rates, fee maps, liquidity estimates) requires **Full member** tier or higher. Basic routing tier can participate in revenue sharing but cannot access hive intelligence data. This ensures that free-riding on intelligence requires at minimum a 150,000 sat bond — making the "join, steal intelligence, leave" attack unprofitable for any intelligence package worth less than the bond.
+
+#### Node Pubkey Linking
+
+When a node joins the hive, its Lightning node pubkey is bound to its DID in the membership credential. If a DID is slashed and exits, any new DID joining from the **same node pubkey** within 180 days inherits:
+- The previous DID's slash history
+- A mandatory 2× bond multiplier
+- Newcomer tier regardless of bond amount (no tier acceleration)
+
+This prevents the "slash, re-join with new DID" attack vector.
 
 ### Slashing
 
 Bonds are slashed (partially or fully) for proven policy violations:
 
 ```
-slash_amount = penalty_base × severity × (1 + repeat_count × 0.5)
+slash_amount = max(
+  penalty_base × severity × (1 + repeat_count × 0.5),
+  estimated_profit_from_violation × 2.0   // slashing must exceed profit
+)
 ```
+
+The slash amount is always at least **2× the estimated profit** from the violation, ensuring that defection is never economically rational even in a single round. For violations where profit is hard to estimate (e.g., data leakage), the full bond is forfeited.
 
 Slashing requires:
 1. A `ViolationReport` with quorum confirmation (N/2+1)
@@ -693,17 +788,17 @@ Bond status is recorded in the `hive:node` reputation profile:
 | Tier | Requirements | Credit Line | Settlement Window | Escrow Model |
 |------|-------------|------------|-------------------|-------------|
 | **Newcomer** | Bond posted, no history | 0 sats | Per-event | Pre-paid escrow for all obligations |
-| **Established** | 30+ days, 0 disputes, reputation > 60 | 10,000 msat | Hourly batch | Escrow for obligations > credit line |
-| **Trusted** | 90+ days, ≤1 dispute, reputation > 75 | 100,000 msat | Daily batch | Bilateral netting, escrow for net amount only |
-| **Senior** | 180+ days, 0 disputes in 90d, reputation > 85 | 500,000 msat | Weekly batch | Multilateral netting, minimal escrow |
-| **Founding** | Genesis member or governance-approved | 2,000,000 msat | Weekly batch | Bilateral credit, periodic true-up |
+| **Recognized** | 30+ days, 0 disputes, reputation > 60 | 10,000 sats | Hourly batch | Escrow for obligations > credit line |
+| **Trusted** | 90+ days, ≤1 dispute, reputation > 75 | 50,000 sats | Daily batch | Bilateral netting, escrow for net amount only |
+| **Senior** | 180+ days, 0 disputes in 90d, reputation > 85 | 200,000 sats | Weekly batch | Multilateral netting, minimal escrow |
+| **Founding** | Genesis member or governance-approved | 1,000,000 sats | Weekly batch | Bilateral credit, periodic true-up |
 
 ### Credit Line Mechanics
 
 A credit line means the node can accumulate obligations up to the credit limit before escrow is required:
 
 ```
-If accumulated_obligations(A→B) < credit_line(A, tier):
+If accumulated_obligations(A→B) < credit_line(A, tier) [in sats]:
   No escrow needed — obligation recorded in ledger, settled at window end
 Else:
   Excess must be escrowed immediately via Cashu ticket
@@ -714,7 +809,7 @@ Credit lines are bilateral — Node A's credit with Node B depends on A's tier a
 ### Tier Progression
 
 ```
-Newcomer → Established → Trusted → Senior
+Newcomer → Recognized → Trusted → Senior
    │           │            │          │
    │  30 days  │  90 days   │ 180 days │
    │  no       │  ≤1        │  0 recent│
@@ -854,7 +949,7 @@ Pheromone markers — the hive's stigmergic signaling mechanism — are extended
     "settlement_window": "daily",
     "credit_tiers": {
       "03abc...": "trusted",
-      "03def...": "established",
+      "03def...": "recognized",
       "03ghi...": "newcomer"
     },
     "net_obligations_msat": {
@@ -1061,7 +1156,34 @@ The mint is a fungible ecash issuer — it processes blind signatures and has no
 
 9. **Arbitration incentives:** How do we ensure arbitration panel members are honest? Their compensation comes from the arbitration fee, but they could collude with one party. Should there be a "meta-arbitration" mechanism?
 
-10. **Emergency settlement:** What happens if a node needs to leave the hive urgently (e.g., detected compromise)? How are outstanding obligations settled when one party is rushing for the exit?
+10. **Emergency settlement:** Addressed below in [Emergency Exit Protocol](#emergency-exit-protocol).
+
+---
+
+## Emergency Exit Protocol
+
+When a node needs to leave the hive urgently (detected compromise, operator emergency, catastrophic failure):
+
+### Exit Flow
+
+1. **Broadcast intent-to-leave:** Node signs and broadcasts an `EmergencyExit` message to all hive members containing: DID, reason, timestamp, and a list of all known pending obligations.
+
+2. **Immediate settlement window:** A 4-hour emergency settlement window opens. All pending obligations involving the exiting node are immediately netted and settled via Cashu tickets. Counterparties have 4 hours to submit any missing receipts or dispute claims.
+
+3. **Bond hold period:** The exiting node's bond is held for **7 days** after the exit broadcast, providing a window for late-arriving claims (e.g., routing receipts from the settlement period that haven't propagated yet, or disputes filed by nodes that were offline during the exit).
+
+4. **Bond release:** After the 7-day hold, the bond is released minus any slashing from claims filed during the hold period. If no claims are filed, the full bond is returned via the refund path.
+
+5. **Reputation recording:** The exit event is recorded in the node's `hive:node` reputation profile. Emergency exits are not penalized (they may indicate responsible behavior), but the reason and settlement outcome are recorded for future hive membership evaluation.
+
+### Involuntary Exit
+
+If a node disappears without broadcasting an intent-to-leave (crash, network failure):
+
+1. Hive members detect absence via missed heartbeats (3+ consecutive misses)
+2. The hive initiates a **presumed-exit** procedure: all pending obligations are frozen
+3. A 48-hour grace period allows the node to return and resume
+4. After 48 hours, the exit is treated as involuntary: obligations are settled from the bond, and any remaining bond is held for the full 7-day claim window
 
 ---
 
