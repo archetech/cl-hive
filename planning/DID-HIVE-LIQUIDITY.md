@@ -1280,6 +1280,8 @@ Non-hive nodes that want full liquidity marketplace features (gossip discovery, 
 ## 11A. Nostr Marketplace Protocol
 
 > **Dedicated spec planned:** The Nostr marketplace integration — covering both advisor services and liquidity services — warrants its own specification: `DID-NOSTR-MARKETPLACE.md`. That spec will define the complete Nostr relay strategy, event lifecycle management, spam resistance, cross-NIP compatibility, and integration patterns for Nostr-native clients that aren't running hive software. **This section defines the liquidity-specific event kinds and relay strategy** as the authoritative source until the dedicated spec is written; `DID-NOSTR-MARKETPLACE.md` will extend and formalize these definitions across all marketplace service types.
+>
+> **NIP compatibility requirement:** The future spec MUST ensure compatibility with existing Nostr marketplace NIPs — specifically [NIP-15 (Nostr Marketplace)](https://github.com/nostr-protocol/nips/blob/master/15.md) and [NIP-99 (Classified Listings)](https://github.com/nostr-protocol/nips/blob/master/99.md) — and draw from implementation patterns in [Plebeian Market](https://github.com/PlebeianTech/plebeian-market) and [LNbits NostrMarket](https://github.com/lnbits/nostrmarket). The event kinds defined below are designed for NIP-99 compatibility (shared tag conventions, similar structure) so that liquidity offers can surface in existing Nostr marketplace clients with minimal adaptation. See [NIP Compatibility](#nip-compatibility) below for the mapping.
 
 Nostr serves as the **public, open marketplace layer** for liquidity services. While hive gossip is the internal coordination protocol for members, Nostr is the interface to the entire Lightning Network. Any Nostr client can browse liquidity offers, view provider profiles, and initiate contracts — no hive membership, no custom infrastructure, no platform account.
 
@@ -1364,10 +1366,13 @@ A specific offer of available capacity, published by a provider. Multiple offers
     ["p", "<provider_nostr_pubkey>"],
     ["payment-methods", "cashu", "bolt11", "bolt12"],
     ["mint", "https://mint.hive.lightning"],
+    ["price", "3600", "sat", "month"],
     ["alt", "5M sat inbound lease — 30 days — 3,600 sats"]
   ]
 }
 ```
+
+> **NIP-99 compatibility:** The `price` tag uses NIP-99's format: `["price", "<amount>", "<currency>", "<frequency>"]`. This allows NIP-99-aware clients to parse and display the price without understanding the hive-specific tags. The `alt` tag provides a fallback human-readable summary for clients that don't parse structured tags.
 
 **Usage patterns:**
 - Providers publish offers for specific capacity blocks they want to fill
@@ -1498,6 +1503,94 @@ Aggregated reputation data, published by the provider or by clients who've compl
   ]
 }
 ```
+
+### NIP Compatibility
+
+Liquidity events are designed to interoperate with existing Nostr marketplace infrastructure:
+
+#### NIP-99 (Classified Listings) Compatibility
+
+[NIP-99](https://github.com/nostr-protocol/nips/blob/master/99.md) defines kind `30402` for classified listings with standardized tags (`title`, `summary`, `price`, `location`, `status`, `t`, `image`). Liquidity offers (kind 38901) use **the same tag conventions** so that NIP-99-aware clients can display them with minimal adaptation:
+
+| NIP-99 Tag | Liquidity Equivalent | Mapping |
+|-----------|---------------------|---------|
+| `title` | `alt` tag | Human-readable summary (e.g., "5M sat inbound lease — 30 days") |
+| `summary` | — | Can be added to kind 38901 for NIP-99 clients |
+| `price` | `["price", "3600", "sat", "month"]` | NIP-99 price format with `sat` as currency code |
+| `location` | `regions` tag | Geographic region tags (US, EU, etc.) |
+| `status` | Derived from `expires` | "active" if not expired; expired offers are deleted |
+| `t` | `t` tags | Already used: `hive-liquidity`, `liquidity-leasing`, etc. |
+
+**Dual-kind strategy:** Providers MAY publish liquidity offers as **both** kind 38901 (for hive-aware clients) AND kind 30402 (for general NIP-99 marketplace clients). The kind 30402 version uses NIP-99's standard structure with liquidity-specific content in the markdown body and hive-specific metadata in additional tags:
+
+```json
+{
+  "kind": 30402,
+  "content": "## ⚡ Inbound Liquidity Lease\n\n5,000,000 sats of inbound capacity for 30 days.\n\nConnected to: ACINQ, Kraken, River\nUptime: 99.5%\nPayment: Cashu escrow, Bolt11, Bolt12\n\n**DID-verified provider.** Contract via [hive-client](https://github.com/lightning-goats/cl-hive-client) or direct message.",
+  "tags": [
+    ["d", "<unique_offer_id>"],
+    ["title", "5M sat Inbound Liquidity — 30 days"],
+    ["summary", "Lightning inbound capacity lease from a DID-verified provider with 99.5% uptime"],
+    ["price", "3600", "sat", "month"],
+    ["t", "lightning"],
+    ["t", "liquidity"],
+    ["t", "hive-liquidity-offer"],
+    ["location", "US, EU"],
+    ["status", "active"],
+    ["image", "<provider_avatar_or_network_graph_image>"],
+    ["did", "<provider_did>"],
+    ["capacity", "5000000"],
+    ["service", "leasing"],
+    ["duration-days", "30"],
+    ["alt", "5M sat inbound lease — 30 days — 3,600 sats"]
+  ]
+}
+```
+
+This renders in any NIP-99 marketplace client as a classified listing with title, price, description, and location — while hive-aware clients recognize the `hive-liquidity-offer` tag and `did` tag for full protocol integration.
+
+#### NIP-15 (Nostr Marketplace) Compatibility
+
+[NIP-15](https://github.com/nostr-protocol/nips/blob/master/15.md) defines a structured marketplace with stalls (kind `30017`) and products (kind `30018`), plus a checkout flow via encrypted DMs. The mapping:
+
+| NIP-15 Concept | Liquidity Equivalent |
+|---------------|---------------------|
+| **Stall** (kind 30017) | Liquidity Provider Profile (kind 38900) — a provider's "storefront" listing their services, capacity, and terms |
+| **Product** (kind 30018) | Liquidity Offer (kind 38901) — a specific capacity block available for lease |
+| **Checkout** (NIP-04 DMs) | Contract negotiation (NIP-44 DMs or Bolt 8 custom messages) |
+| **Payment Request** | Bolt11 invoice, Bolt12 offer, or Cashu escrow ticket |
+| **Order Status** | Contract Confirmation (kind 38903) + Lease Heartbeat (kind 38904) |
+
+**Dual-publishing for NIP-15 clients:** Providers MAY additionally publish a NIP-15 stall (kind 30017) representing their liquidity service, and individual offers as NIP-15 products (kind 30018) with `quantity: null` (unlimited/service). This allows NIP-15 marketplace clients (Plebeian Market, LNbits NostrMarket) to display liquidity services alongside physical goods:
+
+```json
+{
+  "kind": 30017,
+  "content": "{\"id\":\"<stall_id>\",\"name\":\"BigNode Liquidity\",\"description\":\"Lightning inbound liquidity — leasing, JIT, turbo channels. DID-verified, Cashu escrow.\",\"currency\":\"sat\",\"shipping\":[{\"id\":\"lightning\",\"name\":\"Lightning Network\",\"cost\":0,\"regions\":[\"worldwide\"]}]}",
+  "tags": [["d", "<stall_id>"], ["t", "lightning"], ["t", "liquidity"]]
+}
+```
+
+```json
+{
+  "kind": 30018,
+  "content": "{\"id\":\"<offer_id>\",\"stall_id\":\"<stall_id>\",\"name\":\"5M Inbound Lease (30 days)\",\"description\":\"5,000,000 sats inbound capacity, heartbeat-verified, Cashu escrow.\",\"currency\":\"sat\",\"price\":3600,\"quantity\":null,\"specs\":[[\"capacity\",\"5000000\"],[\"duration\",\"30 days\"],[\"uptime_sla\",\"99.5%\"],[\"service_type\",\"leasing\"],[\"did\",\"<provider_did>\"]]}",
+  "tags": [["d", "<offer_id>"], ["t", "lightning"], ["t", "liquidity"], ["t", "hive-liquidity-offer"]]
+}
+```
+
+The NIP-15 checkout flow (encrypted DM with order JSON) maps naturally to the liquidity contract negotiation — the "order" is a lease request, the "payment request" is a Bolt11 invoice or Cashu escrow ticket, and the "order status" is the contract confirmation.
+
+#### Compatibility Strategy Summary
+
+| Client Type | What They See | How |
+|------------|--------------|-----|
+| **Hive-aware client** (`cl-hive-client` / `hive-lnd`) | Full liquidity marketplace with escrow, heartbeats, reputation | Native kinds 38900–38905 |
+| **NIP-99 marketplace client** | Classified listings for liquidity services with price, description, tags | Dual-published kind 30402 |
+| **NIP-15 marketplace client** (Plebeian Market, NostrMarket) | Stall + products for liquidity services with structured checkout | Dual-published kinds 30017 + 30018 |
+| **Generic Nostr client** | Notes with `#lightning` and `#liquidity` hashtags | `alt` tag renders as text; `t` tags are searchable |
+
+> **Implementation priority:** Kind 38901 (native) is required. NIP-99 dual-publishing (kind 30402) is recommended. NIP-15 dual-publishing (kinds 30017/30018) is optional and deferred to the `DID-NOSTR-MARKETPLACE.md` spec. The dual-publishing logic should be implemented in the provider's client software (or a dedicated Nostr marketplace bridge), not in the protocol itself.
 
 ### Nostr Relay Selection
 
@@ -1901,7 +1994,7 @@ Hive intelligence      ──────────►  Liquidity Phase 7 (dyn
 
 14. **Nostr vs. Bolt 8 for negotiation:** Should the quote/accept negotiation happen entirely over Nostr (NIP-44 encrypted DMs), entirely over Bolt 8 (custom messages), or hybrid? Nostr is more accessible (no peer connection needed); Bolt 8 is more private (no relay involvement). The current spec supports both — is explicit guidance needed?
 
-15. **Dedicated Nostr marketplace spec:** The Nostr marketplace integration (event kinds, relay strategy, spam resistance, lifecycle management) spans both advisor and liquidity services. A dedicated `DID-NOSTR-MARKETPLACE.md` is planned to consolidate and extend the Nostr-specific protocol definitions currently split across this spec and the [Marketplace spec](./DID-HIVE-MARKETPLACE.md). Priority and timeline TBD.
+15. **Dedicated Nostr marketplace spec:** The Nostr marketplace integration (event kinds, relay strategy, spam resistance, lifecycle management) spans both advisor and liquidity services. A dedicated `DID-NOSTR-MARKETPLACE.md` is planned to consolidate and extend the Nostr-specific protocol definitions currently split across this spec and the [Marketplace spec](./DID-HIVE-MARKETPLACE.md). That spec must ensure full compatibility with [NIP-15](https://github.com/nostr-protocol/nips/blob/master/15.md) and [NIP-99](https://github.com/nostr-protocol/nips/blob/master/99.md), and should draw implementation patterns from [Plebeian Market](https://github.com/PlebeianTech/plebeian-market) and [LNbits NostrMarket](https://github.com/lnbits/nostrmarket). Key questions: should the dual-publishing strategy (native kinds + NIP-15/NIP-99 kinds) be mandatory or optional? Should the NIP-15 checkout flow be extended for liquidity contracting, or is NIP-44 DM negotiation sufficient? Priority and timeline TBD.
 
 16. **Propagation metrics:** How do we measure ecosystem propagation effectiveness? Candidates: DIDs provisioned per month, Cashu wallets created, reputation credentials issued, consumer-to-provider conversion rate. Should these metrics be tracked on-chain, via Nostr event counts, or through hive gossip aggregation?
 
@@ -1917,7 +2010,7 @@ Hive intelligence      ──────────►  Liquidity Phase 7 (dyn
 - [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) — Service advertising, discovery, contracting, reputation
 - [DID Hive Client: Universal Lightning Node Management](./DID-HIVE-CLIENT.md) — Client software for non-hive nodes
 - [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md) — Reputation credential format, profile definitions
-- DID Nostr Marketplace Protocol (`DID-NOSTR-MARKETPLACE.md`) — Planned: dedicated Nostr integration spec for all marketplace services
+- DID Nostr Marketplace Protocol (`DID-NOSTR-MARKETPLACE.md`) — Planned: dedicated Nostr integration spec for all marketplace services; must ensure NIP-15/NIP-99 compatibility and draw from Plebeian Market / LNbits NostrMarket patterns
 
 ### External References
 
@@ -1927,8 +2020,12 @@ Hive intelligence      ──────────►  Liquidity Phase 7 (dyn
 - [Dual-Funding Proposal (BOLT draft)](https://github.com/lightning/bolts/pull/851) — Interactive channel funding protocol
 - [Liquidity Ads (Lisa Neigut / niftynei)](https://github.com/lightning/bolts/pull/878) — In-protocol liquidity advertising
 - [NIP-01: Nostr Basic Protocol](https://github.com/nostr-protocol/nips/blob/master/01.md) — Event kinds, relay protocol, replaceable events
+- [NIP-15: Nostr Marketplace](https://github.com/nostr-protocol/nips/blob/master/15.md) — Stalls (kind 30017) and products (kind 30018); compatibility target for liquidity offers
 - [NIP-44: Encrypted Direct Messages](https://github.com/nostr-protocol/nips/blob/master/44.md) — Encrypted quotes and contract negotiation
 - [NIP-78: Application-Specific Data](https://github.com/nostr-protocol/nips/blob/master/78.md) — Application-specific event kinds
+- [NIP-99: Classified Listings](https://github.com/nostr-protocol/nips/blob/master/99.md) — Kind 30402 classified listings; compatibility target for liquidity offers
+- [Plebeian Market](https://github.com/PlebeianTech/plebeian-market) — NIP-15 marketplace implementation; pattern reference
+- [LNbits NostrMarket](https://github.com/lnbits/nostrmarket) — NIP-15 marketplace implementation; pattern reference
 - [Cashu NUT-10: Spending Conditions](https://github.com/cashubtc/nuts/blob/main/10.md)
 - [Cashu NUT-11: Pay-to-Public-Key (P2PK)](https://github.com/cashubtc/nuts/blob/main/11.md)
 - [Cashu NUT-14: Hashed Timelock Contracts](https://github.com/cashubtc/nuts/blob/main/14.md)
