@@ -10,9 +10,9 @@
 
 ## Abstract
 
-This document specifies lightweight client software — a CLN plugin (`cl-hive-client`) and an LND companion daemon (`hive-lnd`) — that enables **any** Lightning node to contract for professional management services from advisors. The client implements the management interface defined in the [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) spec without requiring hive membership, bonds, gossip participation, or the full `cl-hive` plugin.
+This document specifies lightweight client software — a CLN plugin (`cl-hive-client`) and an LND companion daemon (`hive-lnd`) — that enables **any** Lightning node to contract for professional management services from advisors and access the [liquidity marketplace](./DID-HIVE-LIQUIDITY.md) (leasing, pools, JIT, swaps, insurance). The client implements the management interface defined in the [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) spec without requiring hive membership, bonds, gossip participation, or the full `cl-hive` plugin.
 
-The result: every Lightning node operator — from a hobbyist running a Raspberry Pi to a business with a multi-BTC routing node — can hire AI-powered or human expert advisors for fee optimization, rebalancing, and channel management. **Install the plugin, pick an advisor, approve access, done.** The client enforces local policy as the last line of defense against malicious or incompetent advisors. No trust required.
+The result: every Lightning node operator — from a hobbyist running a Raspberry Pi to a business with a multi-BTC routing node — can hire AI-powered or human expert advisors for fee optimization, rebalancing, and channel management, AND access the full liquidity marketplace for inbound capacity, JIT channels, swaps, and insurance. **Install the plugin, access everything.** The client enforces local policy as the last line of defense against malicious or incompetent advisors and liquidity providers. No trust required.
 
 Two design principles govern the user experience: (1) **cryptographic identity is plumbing** — DIDs, credentials, and signatures are essential infrastructure that operators never see, like TLS certificates; (2) **payment flexibility is mandatory** — advisors accept Bolt11, Bolt12, L402, and Cashu, with Cashu required only for conditional escrow. See [Design Principles](#design-principles) for full details.
 

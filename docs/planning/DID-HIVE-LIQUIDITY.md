@@ -16,6 +16,8 @@ Liquidity is the most valuable resource in the Lightning Network. Without inboun
 
 This spec turns liquidity into a **commodity service** — priced, escrowed, delivered, verified, and settled through cryptographic protocols. It extends [Type 3 (Channel Leasing)](./DID-HIVE-SETTLEMENTS.md#3-channel-leasing--liquidity-rental) from the Settlements spec into a full liquidity marketplace encompassing nine distinct service types, six pricing models, and comprehensive proof/escrow mechanisms.
 
+Liquidity services are delivered through the same client interface as management services — the `cl-hive-client` plugin (CLN) and `hive-lnd` daemon (LND) from the [DID Hive Client](./DID-HIVE-CLIENT.md) spec. **One plugin, all services.** An operator installs the client once and gains access to both advisor management and the full liquidity marketplace. The marketplace itself is discoverable via two complementary layers: **hive gossip** for members and **Nostr** as the open, public marketplace layer — enabling any Nostr client to browse available liquidity without hive infrastructure.
+
 ---
 
 ## Motivation
@@ -50,9 +52,10 @@ Existing liquidity solutions (Lightning Pool, Magma, LNBig) are centralized — 
 | Trust | Platform reputation | Verifiable credentials (cryptographic, cross-platform) |
 | Escrow | Platform custodial | Cashu P2PK+HTLC (non-custodial, trustless) |
 | Matching | Platform algorithm | Peer-to-peer discovery via gossip/Archon/Nostr |
+| Public discovery | Platform website only | Nostr-native (any Nostr client can browse liquidity) |
 | Settlement | Platform ledger | Bilateral/multilateral netting with Cashu tokens |
 | Pricing | Platform-set or opaque auction | Transparent market with multiple pricing models |
-| Implementation | Single implementation | CLN + LND via [DID Hive Client](./DID-HIVE-CLIENT.md) |
+| Client software | Proprietary / single-implementation | Universal client: `cl-hive-client` (CLN) + `hive-lnd` (LND) — same plugin serves management + liquidity |
 
 ---
 
@@ -88,6 +91,46 @@ Liquidity services work at all three Archon tiers:
 ### Graceful Degradation
 
 Non-hive nodes access liquidity services via `cl-hive-client` / `hive-lnd` with simplified contracting (see [Section 11](#11-non-hive-access)). Full hive members get settlement netting, credit tiers, and fleet-coordinated liquidity management.
+
+### Unified Client Architecture
+
+Liquidity services are **not a separate product**. They are delivered through the same [DID Hive Client](./DID-HIVE-CLIENT.md) that handles advisor management. The client's existing components handle liquidity without modification:
+
+| Client Component | Management Use | Liquidity Use |
+|-----------------|---------------|---------------|
+| **Schema Handler** | Processes `hive:fee-policy/*`, `hive:rebalance/*`, etc. | Processes `hive:liquidity/*` schemas (lease, JIT, swap, insurance) |
+| **Credential Verifier** | Validates `HiveManagementCredential` | Validates `LiquidityLeaseCredential`, `LiquidityServiceProfile` |
+| **Payment Manager** | Bolt11/Bolt12/L402/Cashu for advisor fees | Same methods for lease payments, JIT fees, insurance premiums |
+| **Escrow Wallet** | Cashu tickets for task escrow (NUT-10/11/14) | Same wallet for lease milestone tickets, sidecar multisig, insurance bonds |
+| **Policy Engine** | Enforces advisor action limits | Enforces liquidity budget limits, provider blacklists, max lease amounts |
+| **Receipt Store** | Logs management action receipts | Logs lease heartbeats, capacity attestations, payment receipts |
+| **Discovery** | Finds advisors via gossip/Archon/Nostr | Finds liquidity providers via the same channels |
+| **Identity Layer** | Auto-provisioned DID for management auth | Same DID for liquidity contracting |
+
+An operator who has already installed `cl-hive-client` for advisor management needs **zero additional setup** to access the liquidity marketplace. The plugin discovers liquidity providers alongside advisors, contracts using the same credential system, pays via the same payment manager, and escrows via the same Cashu wallet.
+
+```bash
+# Same plugin, both services
+lightning-cli hive-client-discover --type="advisor" --capabilities="fee optimization"
+lightning-cli hive-client-discover --type="liquidity" --service="leasing" --min-capacity=5000000
+
+# Same authorize flow for both
+lightning-cli hive-client-authorize "Hex Fleet Advisor" --access="fee optimization"
+lightning-cli hive-client-lease "BigNode Liquidity" --capacity=5000000 --days=30
+```
+
+### Nostr as Public Marketplace Layer
+
+The liquidity marketplace operates on two complementary layers:
+
+| Layer | Audience | Protocol | Scope |
+|-------|----------|----------|-------|
+| **Hive gossip** | Hive members only | Custom Bolt 8 messages | Full settlement, netting, credit tiers, fleet coordination |
+| **Nostr** | Everyone (open, public) | Nostr events with defined kinds | Discovery, offers, RFPs, contract confirmations |
+
+Nostr is not "optional discovery." It is the **public interface** to the liquidity marketplace — the layer that makes liquidity services accessible to the entire Lightning Network without requiring hive membership or custom infrastructure. Any Nostr client can browse available liquidity, view provider profiles, and initiate contracts. The hive gossip protocol is for members who want the additional benefits of settlement netting and fleet coordination.
+
+See [Section 11A: Nostr Marketplace Protocol](#11a-nostr-marketplace-protocol) for the complete Nostr event specification.
 
 ---
 
@@ -1112,45 +1155,406 @@ The advisor continuously optimizes the node's liquidity position:
 
 ---
 
-## 11. Non-Hive Access
+## 11. Non-Hive Access (via DID Hive Client)
 
-### Discovery
+### One Plugin, All Services
 
-Non-hive nodes discover liquidity providers through the same mechanisms as advisor discovery (see [DID Hive Client — Discovery](./DID-HIVE-CLIENT.md#9-discovery-for-non-hive-nodes)):
+Non-hive nodes access liquidity services through the **same client software** they use for advisor management: `cl-hive-client` (CLN) or `hive-lnd` (LND), as specified in the [DID Hive Client](./DID-HIVE-CLIENT.md) spec.
 
-1. **Archon network** — Query for `LiquidityServiceProfile` credentials
-2. **Nostr events** — Providers publish profiles as Nostr events (kind `38383`, tags: `t:hive-liquidity`, `t:liquidity-leasing`)
-3. **Direct connection** — Operator has a provider's DID from a referral or directory
+There is no separate liquidity client. The client plugin already includes every component needed for liquidity services:
+
+- **Schema Handler** — Extended with `hive:liquidity/*` schemas (same custom message types 49153/49155, same Bolt 8 transport)
+- **Payment Manager** — Handles Bolt11/Bolt12/L402/Cashu for lease payments, JIT fees, insurance premiums (same wallet, same spending limits)
+- **Escrow Wallet** — Mints Cashu milestone tickets for leases, multisig tokens for sidecars, insurance bonds (same NUT-10/11/14 wallet used for management escrow)
+- **Credential Verifier** — Validates `LiquidityServiceProfile` and `LiquidityLeaseCredential` using the same Archon DID resolution pipeline
+- **Policy Engine** — Enforces liquidity-specific limits (`max_liquidity_spend_daily_sats`, `allowed_service_types`, `forbidden_providers`) alongside management limits
+- **Receipt Store** — Logs lease heartbeats and capacity attestations in the same tamper-evident hash chain as management receipts
+- **Discovery** — Searches for liquidity providers via the same Archon/Nostr/directory pipeline used for advisor discovery
+
+### Client CLI Extensions
+
+The existing `hive-client-discover` command supports liquidity queries. New liquidity-specific commands use the same patterns as management commands:
 
 ```bash
-# Discover liquidity providers
+# Discovery — same command, different type filter
 lightning-cli hive-client-discover --type="liquidity" --service="leasing" --min-capacity=5000000
 
-# Or via hive-lnd
-hive-lnd discover --type=liquidity --service=leasing --min-capacity=5000000
+# Result: same ranked list format as advisor discovery
+#  Name                   Type      Capacity     Price         Rating
+#  ────                   ────      ────────     ─────         ──────
+#1 BigNode Liquidity      leasing   100M sats    3.6k/30d      ★★★★★
+#2 FlashChannel           jit       50M sats     2k flat       ★★★★☆
+#3 DeepPool Capital       pool      200M sats    varies        ★★★★★
+
+# Lease — new command, same authorization/escrow patterns
+lightning-cli hive-client-lease 1 --capacity=5000000 --days=30
+
+# Or by name
+lightning-cli hive-client-lease "BigNode Liquidity" --capacity=5000000 --days=30
+
+# JIT request
+lightning-cli hive-client-jit "FlashChannel" --capacity=2000000 --corridor="03exchange..."
+
+# Swap request
+lightning-cli hive-client-swap --partner="PeerNode" --capacity=5000000 --days=90
+
+# Insurance purchase
+lightning-cli hive-client-insure "BigNode Liquidity" --channel="931770x2363x0" --min-inbound=3000000 --days=30
+
+# Portfolio view (all active liquidity contracts)
+lightning-cli hive-client-liquidity-status
+
+# Same status command shows both management and liquidity
+lightning-cli hive-client-status
+
+Hive Client Status
+━━━━━━━━━━━━━━━━━
+Identity: my-node
+
+Active Advisors:
+  Hex Fleet Advisor — fee optimization — 87 actions — 2,340 sats/mo
+
+Active Liquidity:
+  BigNode Liquidity — lease — 5M inbound — 23 days left — 3,600 sats
+  FlashChannel — JIT — 2M channel — active
+
+Payment Balance:
+  Escrow (Cashu): 12,400 sats
+  Liquidity spend this month: 5,600 sats (limit: 50,000)
+  Management spend this month: 2,340 sats (limit: 50,000)
 ```
 
-### Simplified Contracting
+The LND companion daemon (`hive-lnd`) provides identical functionality via its gRPC service and CLI:
+
+```bash
+hive-lnd discover --type=liquidity --service=leasing --min-capacity=5000000
+hive-lnd lease "BigNode Liquidity" --capacity=5000000 --days=30
+hive-lnd liquidity-status
+```
+
+### Schema Translation for Liquidity
+
+The [Schema Translation Layer](./DID-HIVE-CLIENT.md#5-schema-translation-layer) handles liquidity schemas the same way it handles management schemas — translating `hive:liquidity/*` actions to CLN RPC or LND gRPC calls:
+
+| Schema | Action | CLN RPC | LND gRPC | Danger |
+|--------|--------|---------|----------|--------|
+| `hive:liquidity/v1` | `lease_request` | `fundchannel` (on accept) | `lnrpc.OpenChannelSync` | 5 |
+| `hive:liquidity/v1` | `lease_terminate` | `close` (cooperative) | `lnrpc.CloseChannel` | 6 |
+| `hive:liquidity/v1` | `jit_request` | `connect` + `fundchannel` | `lnrpc.ConnectPeer` + `OpenChannelSync` | 5 |
+| `hive:liquidity/v1` | `swap_request` | `fundchannel` (bilateral) | `lnrpc.OpenChannelSync` | 5 |
+| `hive:liquidity/v1` | `heartbeat_verify` | `listpeerchannels` (verify) | `lnrpc.ListChannels` | 1 |
+| `hive:liquidity/v1` | `insurance_claim` | Internal (policy check) | Internal | 3 |
+
+### Simplified Contracting (vs. Full Hive Members)
 
 Non-hive nodes skip settlement protocol integration. All payments use direct escrow:
 
-| Full Hive Member | Non-Hive Client |
-|-----------------|-----------------|
+| Full Hive Member | Non-Hive Client (via `cl-hive-client` / `hive-lnd`) |
+|-----------------|-----------------------------------------------------|
 | Lease payments netted with routing revenue | Lease payments via direct Cashu escrow or Bolt11 |
 | Credit tiers reduce escrow requirements | Full escrow required for all services |
 | Multi-party netting for pools/sidecars | Direct payment to each party |
 | Settlement disputes via arbitration panel | Bilateral dispute → reputation consequences only |
+| Discovery via hive gossip + Nostr | Discovery via Nostr + Archon (no gossip access) |
 
-### Payment Methods
+### Payment Methods for Non-Hive Clients
 
-Non-hive clients use the full payment stack without settlement netting:
+The client's [Payment Manager](./DID-HIVE-CLIENT.md#payment-manager) handles all liquidity payments using the same method-selection logic as management payments:
 
 ```
-Simple lease: Bolt12 recurring offer (provider publishes offer, client auto-pays monthly)
-JIT request: Bolt11 invoice (provider quotes, client pays)
-Escrow lease: Cashu milestone tickets (same as hive members)
-Submarine swap: HTLC-native (same for everyone)
+Is this a conditional payment (escrow)?
+  YES → Cashu (lease milestones, insurance bonds)
+  NO  → Use operator's preferred method:
+        ├─ Recurring lease? → Bolt12 offer (provider publishes, client auto-pays)
+        ├─ JIT flat fee?    → Bolt11 invoice
+        ├─ Submarine swap?  → HTLC-native (no additional payment needed)
+        └─ One-time fee?    → Bolt11 invoice
 ```
+
+### Upgrade Path
+
+Non-hive nodes that want full liquidity marketplace features (gossip discovery, settlement netting, fleet-coordinated liquidity, provider-side pool participation) can upgrade to hive membership via the same [migration process](./DID-HIVE-CLIENT.md#11-hive-membership-upgrade-path) used for management services. All existing liquidity contracts, credentials, and escrow state are preserved.
+
+---
+
+## 11A. Nostr Marketplace Protocol
+
+Nostr serves as the **public, open marketplace layer** for liquidity services. While hive gossip is the internal coordination protocol for members, Nostr is the interface to the entire Lightning Network. Any Nostr client can browse liquidity offers, view provider profiles, and initiate contracts — no hive membership, no custom infrastructure, no platform account.
+
+### Event Kind Allocation
+
+Liquidity marketplace events use **NIP-78 (Application-Specific Data)** with kind `30078` (parameterized replaceable events) for mutable state, and kind `1` notes with specific tags for immutable announcements. A custom kind range (`38900–38909`) is proposed for structured liquidity events, following the pattern established for marketplace profiles in the [Marketplace spec](./DID-HIVE-MARKETPLACE.md#advertising-via-nostr-optional):
+
+| Kind | Purpose | Replaceable? | Lifetime |
+|------|---------|-------------|----------|
+| `38900` | Liquidity Provider Profile | Yes (replaceable by `d` tag) | Until updated/withdrawn |
+| `38901` | Liquidity Offer (available capacity) | Yes (replaceable by `d` tag) | Until filled/expired |
+| `38902` | Liquidity RFP (node requesting liquidity) | Yes (replaceable by `d` tag) | Until filled/expired |
+| `38903` | Contract Confirmation | No (immutable record) | Permanent |
+| `38904` | Lease Heartbeat (public attestation) | Yes (replaceable by `d` tag) | Current period only |
+| `38905` | Provider Reputation Summary | Yes (replaceable by `d` tag) | Until updated |
+
+> **Kind number rationale:** Kinds `38900–38909` are in the parameterized replaceable range (30000–39999 per NIP-01). Using a dedicated sub-range avoids collision with NIP-78 (`30078`) and the marketplace profile kind (`38383`). If the Nostr community adopts a Lightning liquidity NIP, these kinds should be formalized there.
+
+### Kind 38900: Liquidity Provider Profile
+
+The provider's storefront on Nostr. Contains the same information as the `LiquidityServiceProfile` credential, formatted for Nostr consumption.
+
+```json
+{
+  "kind": 38900,
+  "pubkey": "<provider_nostr_pubkey>",
+  "created_at": 1739570400,
+  "content": "<JSON-encoded LiquidityServiceProfile credential>",
+  "tags": [
+    ["d", "<provider_did>"],
+    ["t", "hive-liquidity"],
+    ["t", "liquidity-leasing"],
+    ["t", "liquidity-jit"],
+    ["t", "liquidity-turbo"],
+    ["name", "BigNode Liquidity"],
+    ["capacity", "100000000"],
+    ["min-lease", "1000000"],
+    ["max-lease", "20000000"],
+    ["sat-hour-rate", "0.000001"],
+    ["channels", "85"],
+    ["uptime", "99.5"],
+    ["regions", "US", "EU"],
+    ["connected-to", "ACINQ", "Kraken", "River"],
+    ["did", "<provider_did>"],
+    ["did-nostr-proof", "<did_to_nostr_attestation_credential>"],
+    ["p", "<provider_nostr_pubkey>"],
+    ["alt", "Lightning liquidity provider — leasing, JIT, turbo channels"]
+  ]
+}
+```
+
+**Key design decisions:**
+- **Tags are queryable.** Clients filter by `t` (service type), `capacity` (minimum available), `regions`, `connected-to` (topology), and `sat-hour-rate` (max price). This enables Nostr relay-side filtering without downloading every profile.
+- **`content` carries the full credential.** The credential is cryptographically signed by the provider's DID — any client can verify it independently of the Nostr event signature. The Nostr event is just the transport.
+- **`did-nostr-proof` tag** links the Nostr pubkey to the DID, verified via the [Nostr attestation credential](https://github.com/archetech/archon) binding. This prevents impersonation — publishing a profile under someone else's DID requires their private key.
+- **Replaceable event** (`d` tag = provider DID). Providers update their profile (capacity changes, pricing changes, utilization changes) by publishing a new event with the same `d` tag. Relays replace the old version.
+
+### Kind 38901: Liquidity Offer
+
+A specific offer of available capacity, published by a provider. Multiple offers can exist simultaneously from the same provider (different capacities, durations, corridors).
+
+```json
+{
+  "kind": 38901,
+  "pubkey": "<provider_nostr_pubkey>",
+  "created_at": 1739570400,
+  "content": "",
+  "tags": [
+    ["d", "<unique_offer_id>"],
+    ["t", "hive-liquidity-offer"],
+    ["service", "leasing"],
+    ["capacity", "5000000"],
+    ["duration-days", "30"],
+    ["price-sats", "3600"],
+    ["pricing-model", "sat-hours"],
+    ["channel-type", "public"],
+    ["turbo-available", "true"],
+    ["min-client-reputation", "60"],
+    ["corridor", "03acinq_pubkey...", "03kraken_pubkey..."],
+    ["expires", "1740175200"],
+    ["did", "<provider_did>"],
+    ["p", "<provider_nostr_pubkey>"],
+    ["payment-methods", "cashu", "bolt11", "bolt12"],
+    ["mint", "https://mint.hive.lightning"],
+    ["alt", "5M sat inbound lease — 30 days — 3,600 sats"]
+  ]
+}
+```
+
+**Usage patterns:**
+- Providers publish offers for specific capacity blocks they want to fill
+- Multiple offers can target different corridors or durations
+- The `expires` tag ensures stale offers are automatically filtered
+- Clients subscribe to offers matching their needs via Nostr relay filters: `{"kinds": [38901], "#service": ["leasing"], "#capacity": [{"$gte": "5000000"}]}`
+
+### Kind 38902: Liquidity RFP (Request for Proposals)
+
+A node broadcasts its liquidity needs. Providers respond with quotes.
+
+```json
+{
+  "kind": 38902,
+  "pubkey": "<client_nostr_pubkey_or_anonymous>",
+  "created_at": 1739570400,
+  "content": "<optional_encrypted_details>",
+  "tags": [
+    ["d", "<unique_rfp_id>"],
+    ["t", "hive-liquidity-rfp"],
+    ["service", "leasing"],
+    ["capacity-needed", "10000000"],
+    ["duration-days", "90"],
+    ["max-price-sats", "15000"],
+    ["preferred-corridor", "03exchange_pubkey..."],
+    ["channel-type", "public"],
+    ["turbo-acceptable", "true"],
+    ["bid-deadline", "1739830800"],
+    ["payment-methods", "cashu", "bolt12"],
+    ["did", "<client_did_or_empty>"],
+    ["alt", "Seeking 10M sat inbound — 90 days — max 15k sats"]
+  ]
+}
+```
+
+**Privacy options:**
+- **Public RFP:** Client includes their `did` and `pubkey`. Providers respond via Nostr DM (NIP-04/NIP-44) or Bolt 8 custom message.
+- **Anonymous RFP:** Client omits `did`, uses a throwaway Nostr key. Providers post quotes as replies. Client reviews anonymously and initiates contact with preferred provider only when ready to contract.
+- **Sealed-bid RFP:** Client includes a `bid-pubkey` tag with a one-time key. Providers encrypt bids to this key. Same sealed-bid mechanism as the [Marketplace spec](./DID-HIVE-MARKETPLACE.md#sealed-bid-auctions) but via Nostr transport.
+
+**Response flow:**
+1. Provider sees RFP on Nostr
+2. Provider sends quote via NIP-44 encrypted DM (or Bolt 8 if already connected)
+3. Client evaluates quotes
+4. Client accepts preferred quote → contract formation (Kind 38903)
+
+### Kind 38903: Contract Confirmation
+
+An immutable public record that a liquidity contract was formed. Published by either party (or both). Contains no sensitive terms — just the existence and type of the contract.
+
+```json
+{
+  "kind": 38903,
+  "pubkey": "<publisher_nostr_pubkey>",
+  "created_at": 1739570400,
+  "content": "",
+  "tags": [
+    ["t", "hive-liquidity-contract"],
+    ["service", "leasing"],
+    ["provider-did", "<provider_did>"],
+    ["client-did", "<client_did>"],
+    ["capacity", "5000000"],
+    ["duration-days", "30"],
+    ["contract-hash", "<sha256_of_full_contract_credential>"],
+    ["channel-id", "931770x2363x0"],
+    ["e", "<offer_event_id>", "", "offer"],
+    ["e", "<rfp_event_id>", "", "rfp"],
+    ["alt", "Liquidity lease confirmed — 5M sats — 30 days"]
+  ]
+}
+```
+
+**Purpose:**
+- Creates a public, timestamped record of contract formation
+- Links back to the original offer (`e` tag referencing kind 38901) or RFP (`e` tag referencing kind 38902)
+- Enables marketplace analytics (contract volume, average pricing, provider utilization)
+- The `contract-hash` allows selective verification — anyone with the full contract can verify it matches, but the terms remain private
+- **Optional:** Either party can choose not to publish (contract remains private between the parties)
+
+### Kind 38904: Lease Heartbeat (Public Attestation)
+
+Optional public proof that a lease is being maintained. Providers publish these to build reputation transparently.
+
+```json
+{
+  "kind": 38904,
+  "pubkey": "<provider_nostr_pubkey>",
+  "created_at": 1739574000,
+  "content": "",
+  "tags": [
+    ["d", "<lease_id>"],
+    ["t", "hive-liquidity-heartbeat"],
+    ["channel-id", "931770x2363x0"],
+    ["capacity", "5000000"],
+    ["available-inbound", "4800000"],
+    ["uptime-hours", "720"],
+    ["contract-hash", "<sha256_of_contract>"],
+    ["sig", "<did_signature_over_attestation>"],
+    ["alt", "Lease heartbeat — 5M channel — 4.8M available — 720h uptime"]
+  ]
+}
+```
+
+**Privacy note:** Publishing heartbeats to Nostr is optional. The primary heartbeat mechanism is Bolt 8 custom messages (bilateral, private). Nostr heartbeats are for providers who want transparent, public proof of service delivery — building verifiable reputation that anyone can audit.
+
+### Kind 38905: Provider Reputation Summary
+
+Aggregated reputation data, published by the provider or by clients who've completed contracts.
+
+```json
+{
+  "kind": 38905,
+  "pubkey": "<issuer_nostr_pubkey>",
+  "created_at": 1739570400,
+  "content": "<JSON-encoded DIDReputationCredential with domain hive:liquidity-provider>",
+  "tags": [
+    ["d", "<provider_did>"],
+    ["t", "hive-liquidity-reputation"],
+    ["uptime", "99.2"],
+    ["completion-rate", "0.98"],
+    ["clients-served", "34"],
+    ["tenure-days", "180"],
+    ["force-close-rate", "0.01"],
+    ["total-deployed", "500000000"],
+    ["did", "<provider_did>"],
+    ["did-nostr-proof", "<attestation>"],
+    ["alt", "Liquidity provider reputation — 99.2% uptime — 98% completion"]
+  ]
+}
+```
+
+### Nostr Relay Selection
+
+Liquidity events should be published to relays with broad reach and relay-side filtering support:
+
+| Relay | Purpose | Why |
+|-------|---------|-----|
+| `wss://nos.lol` | Primary general relay | Wide reach, good uptime |
+| `wss://relay.damus.io` | Secondary general relay | Large user base |
+| `wss://relay.nostr.band` | Search-optimized relay | Supports tag-based search queries |
+| `wss://purplepag.es` | Profile relay | For provider profile events |
+| Hive-operated relay (future) | Dedicated liquidity relay | Optimized for liquidity event filtering |
+
+Providers should publish to at least 3 relays for redundancy. Clients should query at least 2 relays and deduplicate by `d` tag.
+
+### Client Integration with Nostr
+
+The `cl-hive-client` / `hive-lnd` [Discovery](./DID-HIVE-CLIENT.md#9-discovery-for-non-hive-nodes) mechanism queries Nostr relays for liquidity events automatically:
+
+```
+hive-client-discover --type="liquidity" --service="leasing" --min-capacity=5000000
+
+Under the hood:
+  1. Query Nostr relays for kind 38900 (profiles) and 38901 (offers)
+     Filter: #service=["leasing"], #capacity >= 5000000
+  2. Query Archon network for LiquidityServiceProfile credentials
+  3. If hive member: also query hive gossip
+  4. Merge results, verify DID signatures, rank by reputation
+  5. Present unified list to operator
+```
+
+The client also publishes RFPs to Nostr when the operator (or advisor) requests liquidity:
+
+```
+hive-client-lease --rfp --capacity=10000000 --days=90 --max-price=15000
+
+Under the hood:
+  1. Create kind 38902 event with liquidity requirements
+  2. Sign with node's Nostr key (derived from DID or configured separately)
+  3. Publish to configured relays
+  4. Monitor for provider responses (NIP-44 DMs)
+  5. Present quotes to operator for selection
+```
+
+### Nostr vs. Hive Gossip: When to Use Each
+
+| Scenario | Nostr | Hive Gossip |
+|----------|-------|-------------|
+| Provider advertising to the public | ✓ (kinds 38900, 38901) | ✓ (for hive-internal priority) |
+| Non-hive node discovering providers | ✓ (only option) | ✗ (no gossip access) |
+| Hive member discovering providers | ✓ (broader search) | ✓ (faster, trusted) |
+| RFP broadcast (public) | ✓ (kind 38902) | ✗ (too sensitive for gossip) |
+| RFP broadcast (hive-only) | ✗ | ✓ (gossip network) |
+| Contract confirmation (public record) | ✓ (kind 38903) | ✗ (gossip is ephemeral) |
+| Heartbeat proof (public reputation) | ✓ (kind 38904, optional) | ✗ (heartbeats are bilateral) |
+| Heartbeat proof (contract enforcement) | ✗ | N/A — uses Bolt 8 (bilateral) |
+| Reputation building | ✓ (kind 38905) | ✓ (via settlement receipts) |
+
+Both layers complement each other. A provider operating within a hive publishes to both: gossip for member-priority matching, Nostr for public visibility. A non-hive operator only has Nostr (and Archon) for discovery.
 
 ---
 
@@ -1169,15 +1573,18 @@ Submarine swap: HTLC-native (same for everyone)
 | **Escrow** | Custodial (Platform holds funds) | Custodial | None (trust-based) | Non-custodial (Cashu P2PK+HTLC) |
 | **Privacy** | Platform sees everything | Platform sees everything | Operator sees everything | Blind signatures; minimal disclosure |
 | **Censorship resistance** | Platform can ban users | Platform can ban users | Single operator | No central authority |
+| **Nostr-native discovery** | No | No | No | Yes — 6 dedicated event kinds; any Nostr client can browse liquidity |
+| **Client software** | LND-specific | LND+CLN (limited) | LND-specific | Universal client (CLN + LND) — same plugin serves management + liquidity |
 | **Settlement** | Platform ledger | Platform ledger | Manual | Bilateral/multilateral netting |
 
 ### Key Differentiators
 
 1. **Trustless escrow:** No custodial intermediary. Cashu tokens with cryptographic spending conditions replace platform custody.
 2. **Verifiable reputation:** Reputation credentials are portable across platforms and cryptographically verifiable, not locked to a single marketplace operator.
-3. **Service diversity:** Nine service types vs. single-type (leasing) offered by existing solutions.
-4. **Multi-implementation:** Full CLN and LND support via [DID Hive Client](./DID-HIVE-CLIENT.md).
-5. **Composability:** Liquidity services compose with fleet management, routing optimization, and intelligence markets through the same protocol suite.
+3. **Nostr-native public marketplace:** Six dedicated Nostr event kinds (38900–38905) make the liquidity marketplace browsable from any Nostr client — no platform website, no account, no proprietary software. Providers publish offers; clients publish RFPs; contracts are publicly attested. No existing liquidity solution has this.
+4. **Universal client:** One plugin (`cl-hive-client` / `hive-lnd`) provides both advisor management AND liquidity services. Install once, access everything. CLN and LND at full parity.
+5. **Service diversity:** Nine service types vs. single-type (leasing) offered by existing solutions.
+6. **Composability:** Liquidity services compose with fleet management, routing optimization, and intelligence markets through the same protocol suite.
 
 ---
 
@@ -1203,7 +1610,7 @@ Clients reveal the minimum necessary at each stage:
 | Contract | Full terms, node pubkey (necessary for channel open) | Other channels, balance distribution, routing patterns |
 | Ongoing | Heartbeat data for contracted channel only | All other channel data |
 
-**Anonymous discovery:** Clients can query the marketplace anonymously (no DID in the query). The provider only learns the client's identity when a contract is formed.
+**Anonymous discovery:** Clients can query Nostr relays and the Archon network anonymously (no DID required). On Nostr, clients browse provider profiles (kind 38900) and offers (kind 38901) without revealing any identity. Anonymous RFPs (kind 38902) use throwaway Nostr keys. The provider only learns the client's identity when a contract is formed.
 
 ### Provider Privacy
 
@@ -1230,8 +1637,8 @@ Partially. The discovery phase can be anonymous. Providers publish profiles; cli
 
 ## 14. Implementation Roadmap
 
-### Phase 1: Channel Leasing (4–6 weeks)
-*Prerequisites: Settlements Type 3 (basic), Task Escrow Phase 1 (milestone tickets)*
+### Phase 1: Channel Leasing + Nostr Marketplace (4–6 weeks)
+*Prerequisites: Settlements Type 3 (basic), Task Escrow Phase 1 (milestone tickets), DID Hive Client Phase 1 (core client)*
 
 - `LiquidityServiceProfile` credential schema
 - Lease request/quote/accept negotiation flow
@@ -1239,15 +1646,21 @@ Partially. The discovery phase can be anonymous. Providers publish profiles; cli
 - Milestone escrow ticket creation for leases
 - Capacity verification (gossip + probing)
 - `hive:liquidity/v1` management schema (lease_request, lease_terminate)
-- Basic provider profile and discovery
+- **Nostr event kinds 38900 (profile) and 38901 (offer)** — publish and query
+- **cl-hive-client / hive-lnd extensions:** `hive-client-discover --type=liquidity`, `hive-client-lease` commands
+- Schema Translation Layer entries for `hive:liquidity/*` (CLN + LND)
+- Provider profile discovery via Nostr + Archon (integrated into existing discovery pipeline)
 
-### Phase 2: JIT & Turbo Channels (3–4 weeks)
+### Phase 2: JIT & Turbo Channels + Nostr Contracting (3–4 weeks)
 *Prerequisites: Phase 1*
 
 - JIT request/response flow with channel-open verification escrow
 - Turbo channel trust model (reputation threshold enforcement)
 - Fast escrow settlement for time-critical operations
 - Integration with fleet management advisor for auto-JIT
+- **Nostr event kinds 38902 (RFP) and 38903 (contract confirmation)**
+- **cl-hive-client extensions:** `hive-client-jit`, `hive-client-lease --rfp` commands
+- Anonymous and sealed-bid RFP support via Nostr
 
 ### Phase 3: Submarine Swaps & Swaps (3–4 weeks)
 *Prerequisites: Phase 1, DID auth infrastructure*
@@ -1283,13 +1696,15 @@ Partially. The discovery phase can be anonymous. Providers publish profiles; cli
 - Premium escrow (daily milestone tickets)
 - Claims processing
 
-### Phase 7: Dynamic Pricing & Auctions (3–4 weeks)
+### Phase 7: Dynamic Pricing, Auctions & Nostr Reputation (3–4 weeks)
 *Prerequisites: Phase 1, hive intelligence infrastructure*
 
 - Dynamic pricing engine (demand/scarcity multipliers)
-- Sealed-bid auction integration
+- Sealed-bid auction integration (Nostr sealed-bid RFPs)
 - Yield curve implementation
 - Market analytics and price discovery tools
+- **Nostr event kinds 38904 (public heartbeat) and 38905 (reputation summary)**
+- Market-wide analytics from aggregated Nostr events
 
 ### Phase 8: Portfolio Management & Advisor Integration (4–6 weeks)
 *Prerequisites: All previous phases, Fleet Management integration*
@@ -1302,17 +1717,23 @@ Partially. The discovery phase can be anonymous. Providers publish profiles; cli
 ### Cross-Spec Integration Timeline
 
 ```
+DID Hive Client Phase 1 ─────────►  Liquidity Phase 1 (client extensions)
+                                         │
 Settlements Type 3     ──────────►  Liquidity Phase 1 (leasing)
                                          │
 Task Escrow Phase 1    ──────────►  Liquidity Phase 1 (milestone tickets)
                                          │
+Nostr relay infra      ──────────►  Liquidity Phase 1 (kinds 38900-38901)
+                                         │
 Fleet Mgmt Phase 4     ──────────►  Liquidity Phase 2 (advisor integration)
+                                         │
+Nostr contracting      ──────────►  Liquidity Phase 2 (kinds 38902-38903)
                                          │
 NUT-11 multisig        ──────────►  Liquidity Phase 4 (sidecar) + Phase 6 (insurance)
                                          │
 Settlements multilateral ─────────►  Liquidity Phase 5 (pools)
                                          │
-Hive intelligence      ──────────►  Liquidity Phase 7 (dynamic pricing)
+Hive intelligence      ──────────►  Liquidity Phase 7 (dynamic pricing + kinds 38904-38905)
 ```
 
 ---
@@ -1339,6 +1760,14 @@ Hive intelligence      ──────────►  Liquidity Phase 7 (dyn
 
 10. **Regulatory considerations:** Liquidity leasing has characteristics of financial lending (capital provided for a period in exchange for yield). Does this create regulatory risk? Jurisdiction-dependent, but the protocol should be designed to avoid creating custodial relationships.
 
+11. **Nostr kind formalization:** The proposed kinds (38900–38909) are in the custom range and work without NIP approval. Should we propose a formal Lightning Liquidity NIP to standardize these kinds across implementations? This would benefit interoperability but adds governance overhead.
+
+12. **Nostr relay spam:** Public liquidity offers (kind 38901) could be spammed to pollute the marketplace. Mitigations: relay-side filtering by DID reputation (relays could verify DID signatures and check reputation before accepting events), proof-of-work on events (NIP-13), or relay allowlists for verified providers.
+
+13. **Client plugin size budget:** Adding liquidity schemas, Nostr event handling, and discovery to `cl-hive-client` increases the plugin size. The [Client spec](./DID-HIVE-CLIENT.md) targets a single-file Python plugin. How much complexity can be added before the plugin needs to be modularized?
+
+14. **Nostr vs. Bolt 8 for negotiation:** Should the quote/accept negotiation happen entirely over Nostr (NIP-44 encrypted DMs), entirely over Bolt 8 (custom messages), or hybrid? Nostr is more accessible (no peer connection needed); Bolt 8 is more private (no relay involvement). The current spec supports both — is explicit guidance needed?
+
 ---
 
 ## 16. References
@@ -1359,6 +1788,9 @@ Hive intelligence      ──────────►  Liquidity Phase 7 (dyn
 - [Boltz Exchange](https://boltz.exchange/) — Non-custodial submarine swap service
 - [Dual-Funding Proposal (BOLT draft)](https://github.com/lightning/bolts/pull/851) — Interactive channel funding protocol
 - [Liquidity Ads (Lisa Neigut / niftynei)](https://github.com/lightning/bolts/pull/878) — In-protocol liquidity advertising
+- [NIP-01: Nostr Basic Protocol](https://github.com/nostr-protocol/nips/blob/master/01.md) — Event kinds, relay protocol, replaceable events
+- [NIP-44: Encrypted Direct Messages](https://github.com/nostr-protocol/nips/blob/master/44.md) — Encrypted quotes and contract negotiation
+- [NIP-78: Application-Specific Data](https://github.com/nostr-protocol/nips/blob/master/78.md) — Application-specific event kinds
 - [Cashu NUT-10: Spending Conditions](https://github.com/cashubtc/nuts/blob/main/10.md)
 - [Cashu NUT-11: Pay-to-Public-Key (P2PK)](https://github.com/cashubtc/nuts/blob/main/11.md)
 - [Cashu NUT-14: Hashed Timelock Contracts](https://github.com/cashubtc/nuts/blob/main/14.md)
