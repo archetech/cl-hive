@@ -264,6 +264,8 @@ For broader discovery beyond hive members, advisors can publish profiles to Nost
 
 Using NIP-78 (application-specific data) or a custom kind. The Nostr event contains the same profile credential, enabling nodes outside the hive gossip network to discover advisors. The DID-to-Nostr link is verified via the advisor's [Nostr attestation credential](https://github.com/archetech/archon) binding their DID to their Nostr pubkey.
 
+> **Liquidity marketplace on Nostr:** The [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md#11a-nostr-marketplace-protocol) extends this Nostr discovery pattern with six dedicated event kinds (38900–38905) for liquidity provider profiles, offers, RFPs, contract confirmations, heartbeat attestations, and reputation summaries. The same Nostr relay infrastructure serves both advisor and liquidity discovery.
+
 ---
 
 ## 2. Discovery
