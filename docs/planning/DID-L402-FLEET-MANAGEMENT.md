@@ -1145,6 +1145,8 @@ Agents can publish their capabilities and reputation to the Archon network:
 
 Node operators discover advisors by querying the Archon network for `HiveAdvisorProfile` credentials, filtering by capabilities, pricing, and verified reputation.
 
+> **Full marketplace protocol:** The [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) defines the complete advisor discovery, negotiation, and contracting flow — including `HiveServiceProfile` credentials, RFP bidding, trial periods, multi-advisor coordination, and termination handoffs. The `HiveAdvisorProfile` above is a simplified view; see the marketplace spec for the full `HiveServiceProfile` schema.
+
 ---
 
 ## Integration with Existing Hive Protocol
@@ -1273,6 +1275,7 @@ Week 20+:   Fleet Management Phase 6 (marketplace) + Task Escrow Phase 5 (genera
 - [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md)
 - [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
 - [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
+- [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [Archon Reputation Schemas (canonical)](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)

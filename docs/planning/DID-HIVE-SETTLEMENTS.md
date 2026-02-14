@@ -363,6 +363,7 @@ Violations require quorum confirmation — at least N/2+1 hive members must inde
 1. **Performance bonuses** — Measured over multi-day windows (e.g., "10% of revenue improvement over 30 days"), these span multiple settlement windows and can't be settled at action time
 2. **Subscription renewals** — Monthly management subscriptions where the obligation accumulates daily but settles at period end
 3. **Multi-operator billing** — An advisor managing 10 nodes across 5 operators needs consolidated fee accounting, netting (operators who also advise each other), and dispute resolution
+4. **Referral fees** — Advisors who refer other advisors receive a percentage of the referred advisor's first contract revenue, settled via this settlement type (see [DID Hive Marketplace Protocol — Referral System](./DID-HIVE-MARKETPLACE.md#8-referral--affiliate-system))
 
 **Obligation calculation:**
 
@@ -1299,6 +1300,7 @@ If a node disappears without broadcasting an intent-to-leave (crash, network fai
 - [DID + L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
 - [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md)
 - [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
+- [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md)
 - [Cashu NUT-10: Spending Conditions](https://github.com/cashubtc/nuts/blob/main/10.md)
 - [Cashu NUT-11: Pay-to-Public-Key (P2PK)](https://github.com/cashubtc/nuts/blob/main/11.md)
 - [Cashu NUT-14: Hashed Timelock Contracts](https://github.com/cashubtc/nuts/blob/main/14.md)
