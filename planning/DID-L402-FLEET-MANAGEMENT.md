@@ -166,6 +166,8 @@ Tiers are enforced both by the credential scope AND by the node's local policy e
 
 #### Per-Action Flow (Cashu)
 
+> **Note:** The simple per-action flow below is suitable for low-risk, unconditional payments. For conditional escrow — where payment is released only on provable task completion — see the full [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md). That spec defines escrow tickets with P2PK + HTLC + timelock conditions for atomic task-completion-equals-payment-release.
+
 ```
 Agent                                    Node
   │                                        │
@@ -214,6 +216,12 @@ Agent                                    Node
   │   instead of per-action payment]       │
   │                                        │
 ```
+
+#### Escrow Model (Conditional Payment)
+
+For tasks where payment should be contingent on provable completion, the protocol uses **Cashu escrow tickets** — tokens with composite spending conditions (P2PK + HTLC + timelock). The operator mints a token locked to the agent's DID-derived pubkey and a hash whose preimage the node reveals only on successful task execution. This makes payment release atomic with task completion.
+
+The full escrow protocol — including ticket types (single-task, batch, milestone, performance), danger-score-based pricing, failure modes, and mint trust considerations — is specified in the [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md).
 
 #### Performance-Based Payment
 
@@ -981,6 +989,8 @@ Schema proposals that grant new permissions require higher quorum thresholds.
 - [Cashu: Chaumian Ecash for Bitcoin](https://cashu.space/)
 - [W3C DID Core 1.0](https://www.w3.org/TR/did-core/)
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
+- [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md)
+- [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 - [CLN Custom Messages](https://docs.corelightning.org/reference/lightning-sendcustommsg)
