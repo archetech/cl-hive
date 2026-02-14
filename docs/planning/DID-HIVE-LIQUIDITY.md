@@ -1279,6 +1279,8 @@ Non-hive nodes that want full liquidity marketplace features (gossip discovery, 
 
 ## 11A. Nostr Marketplace Protocol
 
+> **Dedicated spec planned:** The Nostr marketplace integration — covering both advisor services and liquidity services — warrants its own specification: `DID-NOSTR-MARKETPLACE.md`. That spec will define the complete Nostr relay strategy, event lifecycle management, spam resistance, cross-NIP compatibility, and integration patterns for Nostr-native clients that aren't running hive software. **This section defines the liquidity-specific event kinds and relay strategy** as the authoritative source until the dedicated spec is written; `DID-NOSTR-MARKETPLACE.md` will extend and formalize these definitions across all marketplace service types.
+
 Nostr serves as the **public, open marketplace layer** for liquidity services. While hive gossip is the internal coordination protocol for members, Nostr is the interface to the entire Lightning Network. Any Nostr client can browse liquidity offers, view provider profiles, and initiate contracts — no hive membership, no custom infrastructure, no platform account.
 
 ### Event Kind Allocation
@@ -1635,7 +1637,138 @@ Partially. The discovery phase can be anonymous. Providers publish profiles; cli
 
 ---
 
-## 14. Implementation Roadmap
+## 14. Ecosystem Propagation
+
+### The Protocol Is the Distribution Channel
+
+Every interaction with the liquidity marketplace naturally seeds the sovereignty stack. There is no separation between "using the product" and "adopting the infrastructure" — the protocol itself is the onboarding mechanism for self-sovereign identity, ecash, verifiable reputation, and peer-to-peer markets.
+
+This is not an accident. It is the core strategic property of the protocol design.
+
+### The Adoption Funnel
+
+Each step in the liquidity user journey requires — and therefore provisions — a layer of the sovereignty stack:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        ADOPTION FUNNEL                                    │
+│                                                                           │
+│  STAGE 1: DISCOVERY                                                       │
+│  ────────────────────────────────────────────────────────────────          │
+│  Operator browses Nostr for liquidity offers (kind 38901)                 │
+│  → Zero prerequisites. Any Nostr client works.                            │
+│  → Exposed to: provider profiles, reputation scores, pricing models       │
+│  → Seeds: awareness that a trustless liquidity market exists              │
+│                                                                           │
+│  STAGE 2: FIRST CONTRACT                                                  │
+│  ────────────────────────────────────────────────────────────────          │
+│  Operator wants to lease inbound capacity from a provider                 │
+│  → Installs cl-hive-client / hive-lnd (one plugin, all services)         │
+│  → DID auto-provisioned (invisible) → Archon ecosystem adopted           │
+│  → Cashu wallet auto-created for escrow → ecash infrastructure adopted   │
+│  → Bolt 8 custom messages activated → P2P transport layer adopted        │
+│  → Seeds: self-sovereign identity, ecash wallet, encrypted comms          │
+│                                                                           │
+│  STAGE 3: SERVICE DELIVERY                                                │
+│  ────────────────────────────────────────────────────────────────          │
+│  Lease active, heartbeats flowing, escrow progressively releasing         │
+│  → Milestone tickets redeem automatically → Cashu fluency built           │
+│  → Capacity attestations verified → proof-of-delivery patterns learned    │
+│  → Policy Engine enforced → operator gains confidence in trustless model  │
+│  → Seeds: fluency with bearer ecash, cryptographic proofs, local policy   │
+│                                                                           │
+│  STAGE 4: REPUTATION EARNED                                               │
+│  ────────────────────────────────────────────────────────────────          │
+│  Lease completes successfully                                             │
+│  → Client issues DIDReputationCredential for provider                     │
+│  → Provider issues DIDReputationCredential for client                     │
+│  → Both credentials published to Archon + Nostr                           │
+│  → Operator now has: DID + reputation + Cashu wallet + Nostr presence     │
+│  → Seeds: participation in the verifiable web of trust                    │
+│                                                                           │
+│  STAGE 5: PROVIDER EMERGENCE                                              │
+│  ────────────────────────────────────────────────────────────────          │
+│  Operator realizes: "I have idle capacity. I could offer services too."   │
+│  → Publishes LiquidityServiceProfile (kind 38900) → becomes a provider   │
+│  → Or hires an advisor → enters the management marketplace               │
+│  → Or joins a liquidity pool → becomes a capital contributor              │
+│  → Or joins the hive → gains settlement netting, fleet intelligence       │
+│  → Seeds: transition from consumer to participant to infrastructure       │
+│                                                                           │
+│  STAGE 6: ECOSYSTEM AMPLIFICATION                                         │
+│  ────────────────────────────────────────────────────────────────          │
+│  Now a provider, the operator's services attract new clients              │
+│  → Each new client repeats stages 1-5                                     │
+│  → Provider's reputation credentials reference the operator's DID         │
+│  → The web of trust grows denser                                          │
+│  → More providers → better prices → more clients → more providers         │
+│  → Network effects compound: each participant adds value for all others   │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### What Gets Adopted at Each Touchpoint
+
+| Touchpoint | Stack Component Adopted | Mechanism | User Awareness |
+|-----------|------------------------|-----------|----------------|
+| Browse Nostr for liquidity | Nostr relay network | Already a Nostr user, or becomes one | Full (intentional) |
+| Install client plugin | Bolt 8 custom messages | Lightning peer protocol extension | None (invisible) |
+| First contract formed | **Archon DID** | Auto-provisioned on first run | None (invisible) |
+| Escrow funded | **Cashu ecash wallet** | Auto-created, auto-funded from node wallet | Minimal (sees "escrow balance") |
+| Heartbeats exchanged | Cryptographic proof-of-delivery | Automated by client | None (invisible) |
+| Contract completes | **Verifiable credentials** | Mutual reputation issuance | Low (sees "★★★★★ rating") |
+| Publish provider profile | **DID-signed Nostr events** | Profile creation wizard | Low (sees "list your services") |
+| Join hive | **Full settlement protocol** | Upgrade path from client | Full (intentional) |
+
+The critical design property: **the components with the highest strategic value (DIDs, Cashu, verifiable credentials) are adopted with the lowest user awareness.** They are infrastructure, not features. Like TCP/IP — essential, invisible, and once adopted, deeply embedded.
+
+### Why Centralized Competitors Cannot Match This
+
+Lightning Pool, Magma, and LNBig are **products**. This protocol is an **ecosystem**. The difference:
+
+| Property | Product (Pool/Magma) | Ecosystem (This Protocol) |
+|----------|---------------------|---------------------------|
+| User owns their identity | No (platform account) | Yes (DID — portable, self-sovereign) |
+| User keeps their reputation | No (platform-locked) | Yes (VCs — portable across platforms) |
+| User can become a provider | Only within the platform | On any Nostr relay, any hive, any direct connection |
+| Each new user strengthens the network | Only for the platform | For every participant in the web of trust |
+| Switching cost | Lose all reputation, start over | Zero — DID and credentials travel with you |
+| Distribution channel | Platform marketing budget | The protocol itself (every interaction onboards) |
+| Discovery surface | Platform website + API | Nostr (millions of users) + Archon + hive gossip |
+
+**The network effect asymmetry:** A centralized marketplace has a linear network effect — more users → more liquidity → more users. This protocol has a **compounding** network effect — more users → more DIDs → more reputation credentials → more trust → more service types → more DIDs → more reputation → ... The web of trust itself becomes the competitive moat, and it belongs to no single operator.
+
+### Nostr as Propagation Maximizer
+
+Nostr's role in ecosystem propagation is strategic, not merely technical:
+
+1. **Surface area:** Nostr has millions of users across hundreds of clients. Lightning Pool's discovery surface is one website. Every Nostr relay that serves kind 38900-38905 events is a distribution endpoint for the sovereignty stack.
+
+2. **Zero-cost distribution:** Publishing a liquidity offer to Nostr costs nothing. No platform listing fee. No approval process. The offer is visible to every Nostr client that subscribes to the relevant kinds. This makes the marketplace permissionless in distribution, not just in participation.
+
+3. **Cross-pollination:** A Nostr user who has never heard of Lightning routing sees a liquidity offer in their feed (via a relay that serves kind 38901). They learn that trustless liquidity markets exist. Even if they don't participate today, the awareness propagates. Lightning Pool has no equivalent — its users are already Lightning-aware.
+
+4. **Composability with the Nostr ecosystem:** Liquidity offers can be zapped (NIP-57). Provider profiles can be referenced in long-form content (NIP-23). RFPs can be discussed in Nostr groups. The marketplace events are **native Nostr citizens**, not a walled garden with a Nostr API.
+
+5. **DID-Nostr bridge:** Every provider profile (kind 38900) includes a `did-nostr-proof` tag. This is a seed for DID adoption within the Nostr ecosystem. As more Nostr users encounter DID-attested profiles, the concept of self-sovereign identity propagates beyond the Lightning/hive community into the broader Nostr social graph.
+
+### Design Implications
+
+The propagation dynamics impose specific design constraints:
+
+1. **Auto-provisioning must be frictionless.** Any friction in DID creation, Cashu wallet setup, or credential issuance blocks the funnel. The [DID Hive Client](./DID-HIVE-CLIENT.md) achieves this with zero-config auto-provisioning — but this must be rigorously tested. A single failure in auto-provisioning kills a potential ecosystem participant.
+
+2. **Nostr events must be self-contained.** A kind 38901 liquidity offer must contain enough information for a human to evaluate it without any hive software. The `alt` tag provides a human-readable summary. The tags provide structured data. The credential in `content` provides cryptographic verification. The offer is useful at every layer of sophistication.
+
+3. **The upgrade path must be invisible.** The transition from "browsing Nostr offers" to "client installed" to "DID provisioned" to "first escrow" should feel like a single smooth action, not five separate adoption decisions. Each stage should feel like the obvious next step, not a commitment to new infrastructure.
+
+4. **Reputation must be immediately visible.** New participants need to see the reputation system working before they trust it. Provider profiles on Nostr (kind 38900) should display reputation scores prominently. Contract confirmations (kind 38903) should be linkable. The web of trust must be legible to outsiders, not just participants.
+
+5. **Every consumer is a potential provider.** The client software should surface the "become a provider" option after successful lease completion. The operator already has a DID, a Cashu wallet, reputation credentials, and Nostr presence — they're one profile publication away from being a provider. The software should make this transition as natural as possible.
+
+---
+
+## 15. Implementation Roadmap
 
 ### Phase 1: Channel Leasing + Nostr Marketplace (4–6 weeks)
 *Prerequisites: Settlements Type 3 (basic), Task Escrow Phase 1 (milestone tickets), DID Hive Client Phase 1 (core client)*
@@ -1738,7 +1871,7 @@ Hive intelligence      ──────────►  Liquidity Phase 7 (dyn
 
 ---
 
-## 15. Open Questions
+## 16. Open Questions
 
 1. **Channel ownership:** In a leased channel, who "owns" the routing revenue? If the provider opens a channel to the client and the client routes traffic through it, the client earns the routing fees. The provider earns the lease fee. But what about fees earned on the provider's side of the channel? This needs clear attribution rules per lease terms.
 
@@ -1768,9 +1901,13 @@ Hive intelligence      ──────────►  Liquidity Phase 7 (dyn
 
 14. **Nostr vs. Bolt 8 for negotiation:** Should the quote/accept negotiation happen entirely over Nostr (NIP-44 encrypted DMs), entirely over Bolt 8 (custom messages), or hybrid? Nostr is more accessible (no peer connection needed); Bolt 8 is more private (no relay involvement). The current spec supports both — is explicit guidance needed?
 
+15. **Dedicated Nostr marketplace spec:** The Nostr marketplace integration (event kinds, relay strategy, spam resistance, lifecycle management) spans both advisor and liquidity services. A dedicated `DID-NOSTR-MARKETPLACE.md` is planned to consolidate and extend the Nostr-specific protocol definitions currently split across this spec and the [Marketplace spec](./DID-HIVE-MARKETPLACE.md). Priority and timeline TBD.
+
+16. **Propagation metrics:** How do we measure ecosystem propagation effectiveness? Candidates: DIDs provisioned per month, Cashu wallets created, reputation credentials issued, consumer-to-provider conversion rate. Should these metrics be tracked on-chain, via Nostr event counts, or through hive gossip aggregation?
+
 ---
 
-## 16. References
+## 17. References
 
 ### Protocol Suite
 
@@ -1780,6 +1917,7 @@ Hive intelligence      ──────────►  Liquidity Phase 7 (dyn
 - [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) — Service advertising, discovery, contracting, reputation
 - [DID Hive Client: Universal Lightning Node Management](./DID-HIVE-CLIENT.md) — Client software for non-hive nodes
 - [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md) — Reputation credential format, profile definitions
+- DID Nostr Marketplace Protocol (`DID-NOSTR-MARKETPLACE.md`) — Planned: dedicated Nostr integration spec for all marketplace services
 
 ### External References
 
