@@ -2,7 +2,7 @@
 
 **Date:** 2026-02-14  
 **Auditor:** Hex  
-**Scope:** DID-HIVE-CLIENT.md (new), DID-HIVE-MARKETPLACE.md (updated), cross-references across all 6 specs
+**Scope:** DID-HIVE-CLIENT.md (new + revised), DID-HIVE-MARKETPLACE.md (updated), cross-references across all 6 specs
 
 ---
 
@@ -10,89 +10,77 @@
 
 **Result: PASS — Zero blocking issues remaining**
 
-All findings from the initial audit and self-audit have been addressed.
+All findings from the initial audit, self-audit, and design revision (DID abstraction + payment flexibility) have been addressed.
 
 ---
 
-## Audit 1: Initial Review
+## Revision 2: Design Requirements (2026-02-14 15:57 MST)
 
-### Findings and Resolutions
+Two major design requirements incorporated throughout the spec:
 
-| # | Category | Finding | Severity | Resolution |
-|---|----------|---------|----------|------------|
-| 1 | Cross-ref | DID-REPUTATION-SCHEMA.md had no reference to DID-HIVE-CLIENT.md | Low | Added reference |
-| 2 | Cross-ref | DID-CASHU-TASK-ESCROW.md had no reference to DID-HIVE-CLIENT.md | Low | Added reference |
-| 3 | Cross-ref | DID-HIVE-SETTLEMENTS.md had no reference to DID-HIVE-CLIENT.md | Low | Added reference |
-| 4 | Cross-ref | DID-L402-FLEET-MANAGEMENT.md open question 5 (cross-implementation) didn't reference Client spec | Low | Added reference |
-| 5 | Numbering | DID-HIVE-MARKETPLACE.md section numbering was broken after Public Marketplace insertion | Medium | Renumbered sections 12-15 |
-| 6 | Consistency | Custom message types (49153/49155) consistent across Fleet Management and Client specs | N/A | Verified — no issue |
-| 7 | Consistency | Bond amounts consistent between Client and Settlements specs | N/A | Verified — no issue |
-| 8 | Consistency | Schema names (14) map correctly to Fleet Management's 15 categories | N/A | Verified — categories 2-4 share `hive:fee-policy/v1`, category 12 shares `hive:config/v1` |
-| 9 | Consistency | Danger scores in Client translation table match Fleet Management taxonomy | N/A | Verified — no issue |
-| 10 | Consistency | Credential format in Client matches Fleet Management `HiveManagementCredential` | N/A | Verified — no issue |
+### 1. DID Abstraction Layer
 
-## Audit 2: Self-Audit (Fresh Read)
+| Requirement | Implementation |
+|-------------|---------------|
+| Auto-generate DID on first run | `IdentityLayer.ensure_identity()` — bundled Keymaster, zero user action |
+| Never expose DIDs in user interface | Alias resolution system, all CLI uses names/indices |
+| Credential management feels like "authorize this advisor" | `hive-client-authorize "Hex Advisor" --access="fees"` |
+| Onboarding = "install, pick, approve" | Three-command quickstart + interactive wizard |
+| DIDs like TLS certificates | Design Principles section establishes this pattern |
+| Abstraction Layer section | Full section added: auto-provisioning, alias resolution, simplified CLI, discovery output |
 
-### Findings and Resolutions
+Sections updated: Abstract, Design Principles, DID Abstraction Layer (new), Architecture Overview, CLN Plugin (config, install, RPC), LND Daemon (config, install), Credential Management, Discovery, Onboarding Flow, Comparison tables, Implementation Roadmap Phase 1.
 
-| # | Category | Finding | Severity | Resolution |
-|---|----------|---------|----------|------------|
-| 1 | Game theory | Malicious advisor could issue rapid-fire low-danger commands to probe node state | N/A | Addressed — rate limits in Policy Engine (actions per hour/day) |
-| 2 | Game theory | Advisor could slowly escalate fees to drain channel liquidity via unfavorable routing | N/A | Addressed — max_fee_change_per_24h_pct constraint in Policy Engine |
-| 3 | Game theory | Advisor could open channels to colluding peers to extract routing fees | N/A | Addressed — expansion proposals always queued for operator approval (never auto-executed) |
-| 4 | Game theory | Client node could issue credential then refuse to fund escrow (waste advisor time) | N/A | Addressed — advisors verify token validity via NUT-07 pre-flight check before starting work |
-| 5 | Game theory | Advisor could use monitoring access to front-run routing opportunities | Low | Noted in open questions — inherent tradeoff of granting monitoring access. Policy Engine quiet hours and rate limits partially mitigate. |
-| 6 | Technical | LND `HtlcInterceptor` requires intercepting all HTLCs, not just stuck ones | N/A | Addressed — noted as open question #3 with performance implications |
-| 7 | Technical | CLN `dev-fail-htlc` requires `--developer` flag | N/A | Addressed — noted in translation table and capability advertisement |
-| 8 | Style | Matches existing specs' formatting: headers, tables, code blocks, JSON examples, danger callouts | N/A | Verified |
+### 2. Payment Flexibility
 
-## Cross-Spec Consistency Check
+| Requirement | Implementation |
+|-------------|---------------|
+| Support Bolt11, Bolt12, L402, Cashu | Payment Manager section with all four methods |
+| Cashu only for escrow | Explicit: "conditional escrow requires Cashu, everything else accepts any method" |
+| Payment method negotiation | Operator preference + advisor accepted → negotiated method |
+| Update HiveServiceProfile | `acceptedPayment`, `preferredPayment`, `escrowMinDangerScore` fields added |
+| Payment Manager not just Cashu wallet | Renamed component from "Escrow Manager" to "Payment & Escrow Manager" with full stack |
 
-### Reference Completeness
+Sections updated: Abstract, Design Principles, Architecture Overview (diagram), Payment Manager (new), CLN Plugin (component renamed), Section 7 (renamed to "Payment & Escrow Management"), Onboarding Flow, Comparison tables (payment methods row), Implementation Roadmap Phase 2, Open Questions (#11-13), References (Bolt12, L402).
 
-All 6 specs now reference each other where appropriate:
+---
 
-| Spec | References DID-HIVE-CLIENT? | DID-HIVE-CLIENT References It? |
-|------|---------------------------|-------------------------------|
-| DID-L402-FLEET-MANAGEMENT.md | ✓ (references section + open question) | ✓ (transport, schemas, danger scores, credentials) |
-| DID-CASHU-TASK-ESCROW.md | ✓ (references section) | ✓ (escrow protocol, ticket types, danger integration) |
-| DID-HIVE-MARKETPLACE.md | ✓ (Public Marketplace section + upgrade path) | ✓ (discovery, multi-advisor, trial periods, referrals) |
-| DID-HIVE-SETTLEMENTS.md | ✓ (references section) | ✓ (bond system, credit tiers) |
-| DID-REPUTATION-SCHEMA.md | ✓ (references section) | ✓ (hive:advisor and hive:client profiles) |
+## Audit 1: Initial Review (from v0.1.0)
 
-### Terminology Consistency
+All 10 findings resolved. See previous audit for details.
 
-| Term | Usage Across Specs | Consistent? |
-|------|-------------------|-------------|
-| `HiveManagementCredential` | Fleet Management, Client | ✓ |
-| `HiveServiceProfile` | Marketplace, Client | ✓ |
-| Danger scores 1-10 | Fleet Management, Escrow, Client | ✓ |
-| Permission tiers (monitor/standard/advanced/admin) | Fleet Management, Client | ✓ |
-| Custom message types 49153/49155 | Fleet Management, Client | ✓ |
-| Settlement types 1-9 | Settlements, Marketplace, Client | ✓ |
-| NUT-10/11/14 | Escrow, Settlements, Client | ✓ |
-| Bond amounts (50k-500k) | Settlements, Client | ✓ |
-| Credit tiers (Newcomer→Founding) | Settlements, Client | ✓ |
+## Audit 2: Self-Audit (from v0.1.0)
 
-### Roadmap Alignment
+All 8 findings resolved. See previous audit for details.
 
-Client roadmap phases align with prerequisite specs:
-- Client Phase 1 requires Fleet Mgmt Phase 1-2 ✓
-- Client Phase 2 requires Task Escrow Phase 1 ✓
-- Client Phase 4 (LND) requires Client Phase 1-3 ✓
-- Client Phase 5 requires Marketplace Phase 1 ✓
+## Audit 3: Design Revision Consistency Check
+
+| # | Finding | Severity | Resolution |
+|---|---------|----------|------------|
+| 1 | Duplicate "Design Principles" heading (abstract subsection + standalone section) | Low | Removed abstract subsection, kept reference to standalone section |
+| 2 | Marketplace spec `HiveServiceProfile` missing `preferredPayment` and `escrowMinDangerScore` | Medium | Added both fields |
+| 3 | Marketplace Public Marketplace section referenced "Cashu only" | Medium | Updated to mention all four payment methods |
+| 4 | Onboarding still had DID-manual steps | Medium | Replaced with three-command quickstart + wizard |
+| 5 | Architecture diagram showed "Cashu Wallet" instead of "Payment Manager" | Low | Updated to show full payment stack |
+| 6 | Old RPC examples used `--advisor-did` as primary arg | Medium | Changed to name/index-based primary, `--advisor-did` as advanced fallback |
+| 7 | Installation required separate Keymaster install | Medium | Simplified to download+start; Keymaster bundled |
+
+## Cross-Spec Consistency (Final)
+
+All 6 specs verified for:
+- ✓ Cross-references to DID-HIVE-CLIENT.md
+- ✓ Consistent terminology (DIDs, credentials, schemas, danger scores)
+- ✓ Payment method references (Marketplace spec updated)
+- ✓ Roadmap alignment
+- ✓ Section numbering
 
 ---
 
 ## Files Modified
 
-1. **Created:** `DID-HIVE-CLIENT.md` — New spec (66KB, 16 sections)
-2. **Updated:** `DID-HIVE-MARKETPLACE.md` — Added Section 11 (Public Marketplace), renumbered 12-15
-3. **Updated:** `DID-L402-FLEET-MANAGEMENT.md` — Added client reference + open question cross-ref
-4. **Updated:** `DID-CASHU-TASK-ESCROW.md` — Added client reference
-5. **Updated:** `DID-HIVE-SETTLEMENTS.md` — Added client reference
-6. **Updated:** `DID-REPUTATION-SCHEMA.md` — Added client reference
-7. **Created:** `AUDIT-CLIENT-FINAL.md` — This report
+1. **Revised:** `DID-HIVE-CLIENT.md` — Added DID Abstraction Layer, Payment Manager, simplified UX throughout
+2. **Updated:** `DID-HIVE-MARKETPLACE.md` — Payment methods in HiveServiceProfile, Public Marketplace payment flexibility
+3. **Updated:** `AUDIT-CLIENT-FINAL.md` — This report (revision 2)
 
 ---
 
