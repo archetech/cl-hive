@@ -28,6 +28,18 @@ The schema is designed for the Archon decentralized identity network but is port
 
 ---
 
+## Design Principles
+
+### DID Transparency
+
+While this schema references DIDs as subject and issuer identifiers (necessary for implementers), **end users interact with reputation through human-readable interfaces**: star ratings, trust badges, advisor rankings, and performance summaries. Raw DID strings never appear in user-facing displays. Client software (see [DID Hive Client](./DID-HIVE-CLIENT.md)) resolves DIDs to display names and presents reputation as intuitive scores.
+
+### Payment Context
+
+Reputation credentials themselves are non-monetary. However, they influence payment terms throughout the protocol suite — reputation scores modulate escrow durations, pricing tiers, and credit lines. The payment flexibility across the suite (Cashu, Bolt11, Bolt12, L402) means reputation benefits apply regardless of which payment method is used.
+
+---
+
 ## Motivation
 
 Reputation is the missing primitive in decentralized identity. DIDs give us verifiable identity; Verifiable Credentials give us verifiable claims. But there is no standard way to say:

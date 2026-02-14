@@ -16,6 +16,29 @@ The result is a decentralized, peer-to-peer marketplace where AI advisors and hu
 
 ---
 
+## Design Principles
+
+### DID Transparency
+
+Throughout this spec, marketplace interactions are described using DID references for implementers. **End users never see raw DID strings.** The user experience is:
+
+- "Browse advisors" → not "query `HiveServiceProfile` credentials by DID"
+- "Hire Hex Fleet Advisor" → not "issue `HiveManagementCredential` to `did:cid:bagaaiera...`"
+- "Rate your advisor ★★★★☆" → not "issue `DIDReputationCredential` with `outcome: renew`"
+
+Advisors are identified by `displayName`, profile pictures, and reputation badges. DIDs are resolved transparently by the client software. See [DID Hive Client](./DID-HIVE-CLIENT.md) for the user-facing abstraction layer.
+
+### Payment Flexibility
+
+The marketplace supports the full payment stack. Each pricing model specifies which payment methods it uses:
+
+- **Per-action fees:** Bolt11 (simple), Cashu (escrow), or L402 (API-gated)
+- **Subscriptions:** Bolt12 offers (recurring) or L402 macaroons (access-scoped)
+- **Performance bonuses:** Cashu escrow (conditional on metrics) with Bolt11/Bolt12 for the base fee
+- **Trial fees:** Bolt11 (one-time flat fee)
+
+---
+
 ## Motivation
 
 ### The Gap Between Protocols and Markets
@@ -121,23 +144,28 @@ An advisor advertises their services by publishing a `HiveServiceProfile` — a 
         {
           "type": "per_action",
           "baseFeeRange": { "min": 5, "max": 100, "currency": "sats" },
-          "dangerScoreMultiplier": true
+          "dangerScoreMultiplier": true,
+          "paymentMethods": ["bolt11", "cashu", "l402"],
+          "escrowMethod": "cashu"
         },
         {
           "type": "subscription",
           "monthlyRate": 5000,
           "currency": "sats",
           "includedActions": 500,
-          "overageRate": 15
+          "overageRate": 15,
+          "paymentMethods": ["bolt12", "l402", "bolt11"]
         },
         {
           "type": "performance",
           "baseMonthlySats": 2000,
           "performanceSharePct": 10,
-          "measurementWindowDays": 30
+          "measurementWindowDays": 30,
+          "basePaymentMethod": "bolt12",
+          "bonusEscrowMethod": "cashu"
         }
       ],
-      "acceptedPayment": ["cashu", "l402"],
+      "acceptedPayment": ["cashu", "bolt11", "bolt12", "l402"],
       "acceptableMints": ["https://mint.hive.lightning", "https://mint.minibits.cash"],
       "escrowRequired": true
     },
@@ -412,6 +440,9 @@ Node                                  Advisor
       "model": "performance",
       "baseMonthlySats": 3000,
       "performanceSharePct": 10,
+      "basePaymentMethod": "bolt12",
+      "bonusEscrowMethod": "cashu",
+      "acceptedMethods": ["cashu", "bolt11", "bolt12", "l402"],
       "escrowMint": "https://mint.hive.lightning"
     },
     "sla": {
@@ -628,6 +659,9 @@ A contract is formalized as a signed Verifiable Credential binding both parties 
       "model": "performance",
       "baseMonthlySats": 3000,
       "performanceSharePct": 10,
+      "basePaymentMethod": "bolt12",
+      "bonusEscrowMethod": "cashu",
+      "acceptedMethods": ["cashu", "bolt11", "bolt12", "l402"],
       "escrowMint": "https://mint.hive.lightning",
       "settlementType": "Type 9 (Advisor Fee Settlement)"
     },

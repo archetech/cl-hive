@@ -10,9 +10,92 @@
 
 ## Abstract
 
-This document specifies lightweight client software — a CLN plugin (`cl-hive-client`) and an LND companion daemon (`hive-lnd`) — that enables **any** Lightning node to contract for professional management services from advisors authenticated via Archon DIDs. The client implements the management interface defined in the [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) spec without requiring hive membership, bonds, gossip participation, or the full `cl-hive` plugin.
+This document specifies lightweight client software — a CLN plugin (`cl-hive-client`) and an LND companion daemon (`hive-lnd`) — that enables **any** Lightning node to contract for professional management services from advisors. The client implements the management interface defined in the [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) spec without requiring hive membership, bonds, gossip participation, or the full `cl-hive` plugin.
 
-The result: every Lightning node operator — from a hobbyist running a Raspberry Pi to a business with a multi-BTC routing node — can hire AI-powered or human expert advisors for fee optimization, rebalancing, and channel management. The advisor authenticates with a DID credential, gets paid via Cashu escrow, and builds verifiable reputation. The client enforces local policy as the last line of defense against malicious or incompetent advisors. No trust required.
+The result: every Lightning node operator — from a hobbyist running a Raspberry Pi to a business with a multi-BTC routing node — can hire AI-powered or human expert advisors for fee optimization, rebalancing, and channel management. **Install the plugin, pick an advisor, approve access, done.** The client enforces local policy as the last line of defense against malicious or incompetent advisors. No trust required.
+
+### Design Principles
+
+Two principles govern the user experience:
+
+1. **Cryptographic identity is plumbing.** The protocol uses Archon DIDs for authentication, W3C Verifiable Credentials for authorization, and secp256k1 signatures for everything. The operator never sees any of it. DIDs are auto-provisioned on first run. Credentials are issued by clicking "authorize." Signatures happen silently. Like TLS — essential infrastructure that users never think about.
+
+2. **Payment flexibility is mandatory.** Advisors accept payment via standard Lightning invoices (Bolt11), recurring offers (Bolt12), API-gated access (L402), and conditional escrow (Cashu). The operator picks their preferred method. Only conditional escrow (payment-on-completion) specifically requires Cashu tokens. Everything else uses whatever Lightning payment method the operator and advisor agree on.
+
+---
+
+## Design Principles
+
+### DID Transparency
+
+DIDs are the cryptographic foundation but **must be invisible to end users**. The onboarding experience is "install plugin, pick an advisor, approve" — not "create a DID, resolve credentials, issue a VC." Specifically:
+
+- **Auto-provisioning:** On first run, if no DID exists, the client automatically creates one via the configured Archon gateway. Zero user action required.
+- **Human-readable names:** Advisors are shown by `displayName` (e.g., "Hex Fleet Advisor"), not DID strings. Node identity uses the Lightning node's alias.
+- **Alias system:** The client maintains a local alias map (`advisor_name → DID`). All CLI commands accept aliases: `hive-client-authorize --advisor="Hex Fleet Advisor"`.
+- **Transparent credential management:** "Authorize this advisor" and "revoke access" — not "issue VC" or "revoke credential."
+- **Technical details hidden by default:** `hive-client-status` shows advisor names, contract status, and escrow balance. DID strings only appear with `--verbose` or `--technical` flags.
+
+### Archon Integration Tiers
+
+The client supports three Archon deployment tiers with graceful degradation:
+
+#### Tier 1: No Archon Node (Default)
+
+- **Setup:** Zero. DID auto-provisioned via public gatekeeper (`archon.technology`).
+- **How it works:** On first run, the client calls the public Archon gateway to create a DID. All DID resolution, credential verification, and revocation checks go through the public gateway.
+- **Tradeoffs:** Depends on public infrastructure availability; slightly slower operations; trusts the public gatekeeper for DID resolution.
+- **Best for:** Non-technical operators, quick start, hobbyists.
+
+```ini
+# Default config — no Archon node needed
+hive-client-archon-gateway=https://archon.technology
+hive-client-archon-auto-provision=true
+```
+
+#### Tier 2: Own Archon Node (Encouraged)
+
+- **Setup:** Run local Archon node (`docker compose up` in `~/bin/archon`).
+- **How it works:** All DID operations are local. No external dependency for identity management.
+- **Tradeoffs:** Requires running 14 Docker containers; more infrastructure to maintain; full sovereignty.
+- **Best for:** Serious operators, businesses, privacy-focused users.
+
+```ini
+# Local Archon node
+hive-client-archon-gateway=http://localhost:4224
+hive-client-archon-auto-provision=true
+```
+
+#### Tier 3: Archon Behind L402 (Future)
+
+- **Setup:** Same as Tier 1, but the public gatekeeper gates services behind L402.
+- **How it works:** DID operations require L402 payment. The client's `L402AccessCredential` (from the [Fleet Management spec](./DID-L402-FLEET-MANAGEMENT.md)) applies here too — the same payment infrastructure that gates fleet management API access can gate identity services.
+- **Tradeoffs:** Per-operation cost; ensures sustainable public infrastructure; natural upgrade incentive to Tier 2.
+- **Best for:** Scaling public infrastructure sustainably.
+
+```ini
+# Public gateway with L402
+hive-client-archon-gateway=https://archon.technology
+hive-client-archon-l402=true
+hive-client-archon-l402-budget-sats=1000
+```
+
+#### Graceful Degradation
+
+The client tries Archon endpoints in order: local node → public gateway → cached credentials. If all fail, the client operates in **degraded mode**: existing credentials are honored (cached), but new credential issuance and revocation checks fail-closed (deny new commands from unverifiable credentials).
+
+### Payment Flexibility
+
+The client handles the full payment stack, not just Cashu:
+
+| Method | Use Case | Client Component |
+|--------|----------|-----------------|
+| **Cashu tokens** | Escrow (conditional payments), bearer micropayments | Built-in Cashu wallet (NUT-10/11/14) |
+| **Bolt11 invoices** | Simple per-action payments, one-time fees | Lightning node's native invoice handling |
+| **Bolt12 offers** | Recurring subscriptions | Lightning node's offer handling (CLN native, LND experimental) |
+| **L402** | API-style access, subscription macaroons | Built-in L402 client |
+
+The Escrow Manager described in this spec handles Cashu-specific operations. The broader Payment Manager coordinates across all four methods based on the advisor's accepted payment methods and the contract terms.
 
 ---
 
@@ -85,7 +168,7 @@ Building both `cl-hive-client` (Python, CLN plugin) and `hive-lnd` (Go, LND daem
 │  │              cl-hive-client (CLN) / hive-lnd (LND)              │ │
 │  │                                                                  │ │
 │  │  ┌──────────┐ ┌────────────┐ ┌──────────┐ ┌──────────────────┐ │ │
-│  │  │ Schema   │ │ Credential │ │ Escrow   │ │ Policy Engine    │ │ │
+│  │  │ Schema   │ │ Credential │ │ Payment  │ │ Policy Engine    │ │ │
 │  │  │ Handler  │ │ Verifier   │ │ Manager  │ │ (local overrides)│ │ │
 │  │  └────┬─────┘ └─────┬──────┘ └────┬─────┘ └───────┬──────────┘ │ │
 │  │       │              │              │               │            │ │
@@ -93,19 +176,21 @@ Building both `cl-hive-client` (Python, CLN plugin) and `hive-lnd` (Go, LND daem
 │  │  │                    Receipt Store                             │ │ │
 │  │  │  (tamper-evident log of all management actions)             │ │ │
 │  │  └─────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                  │ │
+│  │  ┌───────────────────────────────────────────────────┐          │ │
+│  │  │  Identity Layer (auto-provisioned, invisible)     │          │ │
+│  │  │  Archon Keymaster — DID generation, credential    │          │ │
+│  │  │  signing, alias resolution (bundled, no user      │          │ │
+│  │  │  interaction required)                            │          │ │
+│  │  └───────────────────────────────────────────────────┘          │ │
 │  └──────────────────────────────┬──────────────────────────────────┘ │
 │                                 │                                     │
 │                    Custom Messages (49153/49155)                      │
 │                                 │                                     │
 │  ┌──────────────────────────────▼──────────────────────────────────┐ │
 │  │                   Lightning Node (CLN / LND)                    │ │
+│  │               (Bolt11 / Bolt12 / L402 / Cashu)                  │ │
 │  └─────────────────────────────────────────────────────────────────┘ │
-│                                                                       │
-│  ┌────────────┐   ┌─────────────────┐                                │
-│  │ Archon     │   │ Cashu Wallet    │                                │
-│  │ Keymaster  │   │ (escrow tickets)│                                │
-│  │ (DID)      │   │                 │                                │
-│  └────────────┘   └─────────────────┘                                │
 └──────────────────────────────────────────────────────────────────────┘
 
                               ▲
@@ -116,11 +201,13 @@ Building both `cl-hive-client` (Python, CLN plugin) and `hive-lnd` (Go, LND daem
 ┌──────────────────────────────────────────────────────────────────────┐
 │                         ADVISOR                                       │
 │                                                                       │
-│  ┌────────────┐  ┌───────────────────┐  ┌────────────┐              │
-│  │ Archon     │  │ Management Engine │  │ Lightning  │              │
-│  │ Keymaster  │  │ (AI / human)      │  │ Wallet     │              │
-│  │ (DID)      │  │                   │  │ (Cashu)    │              │
-│  └────────────┘  └───────────────────┘  └────────────┘              │
+│  ┌───────────────────┐  ┌────────────────────────────────┐          │
+│  │ Management Engine │  │ Payment Receiver               │          │
+│  │ (AI / human)      │  │ (Bolt11/Bolt12/L402/Cashu)     │          │
+│  └───────────────────┘  └────────────────────────────────┘          │
+│  ┌────────────────────────────────────────────────────────┐          │
+│  │ Identity Layer (Archon DID — advisor's storefront)     │          │
+│  └────────────────────────────────────────────────────────┘          │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -138,19 +225,418 @@ Building both `cl-hive-client` (Python, CLN plugin) and `hive-lnd` (Go, LND daem
 | Fleet rebalancing | ✗ | ✗ | ✓ (intra-hive paths) |
 | Pheromone routing | ✗ | ✗ | ✓ |
 | Intelligence market | ✗ | ✗ (buy from advisor directly) | ✓ (full market access) |
+| Payment methods | N/A | Bolt11, Bolt12, L402, Cashu escrow | Same + settlement netting |
 | Bond requirement | None | None | 50,000–500,000 sats |
-| Infrastructure | Node only | Node + plugin/daemon + keymaster | Node + cl-hive + full PKI |
+| Infrastructure | Node only | Node + plugin/daemon (auto-configuring) | Node + cl-hive + full PKI |
 | Cost model | Free | Per-action or subscription | Bond + discounted per-action |
 
 ### Minimal Dependencies
 
-The client has three dependencies:
+The client has two dependencies:
 
 1. **Lightning node** — CLN ≥ v24.08 or LND ≥ v0.18.0 (custom message support required)
-2. **Archon Keymaster** — For DID identity. Lightweight: single binary or npm package. No full Archon node required.
-3. **The client plugin/daemon itself** — Single file (CLN) or single binary (LND)
+2. **The client plugin/daemon itself** — Single file (CLN) or single binary (LND)
 
-A built-in Cashu wallet handles escrow ticket creation and management. No external Cashu wallet software needed.
+That's it. The Archon Keymaster (for DID identity) is **bundled** — the client auto-provisions a DID on first run. No separate installation, no manual key management. A built-in Cashu wallet handles conditional escrow. The node's existing Lightning wallet handles Bolt11/Bolt12/L402 payments.
+
+---
+
+## DID Abstraction Layer
+
+### Principle: DIDs Are Plumbing
+
+Archon DIDs are the cryptographic backbone of the entire protocol — identity, credentials, escrow, reputation. But operators should **never interact with DIDs directly**. The abstraction layer ensures that all DID operations happen invisibly, like TLS certificates in a web browser.
+
+### Auto-Provisioning
+
+On first run, the client:
+
+1. Checks if a DID is configured
+2. If not, **automatically generates one** using the bundled Archon Keymaster library
+3. Stores the DID and key material in the client's data directory (encrypted at rest)
+4. Registers the DID with the configured Archon gateway (default: `https://archon.technology`)
+5. Logs: `"Hive client initialized. Your node identity has been created."`
+
+The operator never sees `did:cid:bagaaiera...`. They see "your node identity."
+
+```bash
+# What the operator types:
+lightning-cli plugin start cl_hive_client.py
+
+# What happens internally:
+# 1. Plugin starts
+# 2. No DID found → auto-generate
+# 3. DID stored in ~/.lightning/hive-client/identity.json (encrypted)
+# 4. Ready to go
+```
+
+For operators who already have an Archon DID (e.g., from another application), the client can import it:
+
+```bash
+lightning-cli hive-client-import-identity --file=/path/to/wallet.json
+```
+
+### Alias Resolution
+
+Every DID in the system gets a human-readable alias. The client maintains a local alias registry:
+
+| Internal | User Sees |
+|----------|-----------|
+| `did:cid:bagaaierajrr7k...` | `"Hex Fleet Advisor"` |
+| `did:cid:bagaaierawhtw...` | `"RoutingBot Pro"` |
+| `did:cid:bagaaierabnbx...` | `"my-node"` (auto-assigned) |
+
+Aliases come from three sources (priority order):
+1. **Local aliases** — Operator assigns names: `lightning-cli hive-client-alias set hex-advisor "did:cid:..."`
+2. **Profile display names** — From the advisor's `HiveServiceProfile.displayName`
+3. **Auto-generated** — `"advisor-1"`, `"advisor-2"` for unnamed entities
+
+Aliases are used in **all** user-facing output:
+
+```bash
+$ lightning-cli hive-client-status
+
+Hive Client Status
+━━━━━━━━━━━━━━━━━
+Identity: my-node (auto-provisioned)
+Policy: moderate
+
+Active Advisors:
+  Hex Fleet Advisor
+    Access: fee optimization
+    Since: 2026-02-14 (30 days remaining)
+    Actions: 87 taken, 0 rejected
+    Spending: 2,340 sats this month
+
+  RoutingBot Pro
+    Access: monitoring only
+    Since: 2026-02-10 (24 days remaining)
+    Actions: 12 taken, 0 rejected
+    Spending: 120 sats this month
+
+Payment Balance:
+  Escrow (Cashu): 7,660 sats
+  This month's spend: 2,460 sats (limit: 50,000)
+```
+
+No DIDs anywhere. No credential IDs. No hashes. Just names, numbers, and plain English.
+
+### Simplified CLI Commands
+
+Every CLI command uses aliases, not DIDs:
+
+```bash
+# What the spec defines (internal/advanced):
+lightning-cli hive-client-authorize --advisor-did="did:cid:bagaaiera..." --template="fee_optimization"
+
+# What operators actually type:
+lightning-cli hive-client-authorize "Hex Fleet Advisor" --access="fee optimization"
+
+# Or even simpler, from discovery results:
+lightning-cli hive-client-authorize --advisor=1 --access="fee optimization"
+# (where "1" is the index from the last discovery query)
+```
+
+The `--access` parameter maps to credential templates using natural language:
+
+| User Types | Maps To Template |
+|-----------|-----------------|
+| `"monitoring"` or `"read only"` | `monitor_only` |
+| `"fee optimization"` or `"fees"` | `fee_optimization` |
+| `"full routing"` or `"routing"` | `full_routing` |
+| `"full management"` or `"everything"` | `complete_management` |
+
+Similarly for revocation:
+
+```bash
+# Instead of:
+lightning-cli hive-client-revoke --advisor-did="did:cid:badactor..."
+
+# Operators type:
+lightning-cli hive-client-revoke "Hex Fleet Advisor"
+
+# Or emergency lockdown:
+lightning-cli hive-client-revoke --all
+```
+
+### Discovery Output
+
+Discovery results hide all cryptographic details:
+
+```bash
+$ lightning-cli hive-client-discover --capabilities="fee optimization"
+
+Found 5 advisors:
+
+#  Name                  Rating  Nodes  Price         Specialties
+─  ────                  ──────  ─────  ─────         ───────────
+1  Hex Fleet Advisor     ★★★★★   12     3k sats/mo    fee optimization, rebalancing
+2  RoutingBot Pro        ★★★★☆   8      5k sats/mo    fee optimization
+3  LightningTuner        ★★★☆☆   3      2k sats/mo    fee optimization, monitoring
+4  NodeWhisperer         ★★★★☆   22     8k sats/mo    full-stack management
+5  FeeHawk AI            ★★★☆☆   5      per-action    fee optimization
+
+Payment methods: All accept Lightning (Bolt11). #1, #4 also accept Bolt12 recurring.
+Trial available: #1, #2, #3, #5
+
+Use: lightning-cli hive-client-authorize <number> --access="fee optimization"
+```
+
+No DIDs. No credential schemas. No Archon queries visible. Just a ranked list with actionable next steps.
+
+### What Stays Visible (Advanced Mode)
+
+For power users and developers, raw DID/credential data is always accessible:
+
+```bash
+# Show full identity details (advanced)
+lightning-cli hive-client-identity --verbose
+
+# Show raw credential for an advisor
+lightning-cli hive-client-credential "Hex Fleet Advisor" --raw
+
+# Manually specify DID (bypasses alias resolution)
+lightning-cli hive-client-authorize --advisor-did="did:cid:bagaaiera..." --template="fee_optimization"
+```
+
+The `--verbose` and `--raw` flags expose the cryptographic layer for debugging, auditing, and integration with other DID-aware tools. But the default output is always human-readable.
+
+### Implementation Notes
+
+The abstraction layer is implemented as a thin wrapper around the Archon Keymaster library:
+
+```python
+class IdentityLayer:
+    """Invisible DID management. Users never interact with this directly."""
+
+    def __init__(self, data_dir):
+        self.keymaster = BundledKeymaster(data_dir)
+        self.aliases = AliasRegistry(data_dir / "aliases.json")
+
+    def ensure_identity(self):
+        """Auto-provision DID on first run. No user action needed."""
+        if not self.keymaster.has_identity():
+            did = self.keymaster.create_identity()
+            self.aliases.set("my-node", did)
+            log.info("Node identity created.")
+        return self.keymaster.get_identity()
+
+    def resolve_advisor(self, name_or_index):
+        """Resolve human input to a DID. Accepts names, indices, or raw DIDs."""
+        if isinstance(name_or_index, int):
+            return self.last_discovery_results[name_or_index - 1].did
+        if name_or_index.startswith("did:"):
+            return name_or_index  # passthrough for advanced users
+        return self.aliases.resolve(name_or_index)
+
+    def display_name(self, did):
+        """Convert DID to human-readable name."""
+        alias = self.aliases.get(did)
+        if alias:
+            return alias
+        profile = self.profile_cache.get(did)
+        if profile and profile.display_name:
+            return profile.display_name
+        return did[:20] + "..."  # last resort: truncated DID
+```
+
+---
+
+## Payment Manager
+
+### Overview
+
+The Payment Manager handles all payment flows between operator and advisor. It supports **four payment methods**, choosing the right one based on the payment context:
+
+| Method | Use Case | Conditional? | Requires |
+|--------|----------|-------------|----------|
+| **Bolt11** | Simple per-action payments, one-time subscription fees | No | Node's Lightning wallet |
+| **Bolt12** | Recurring subscriptions, reusable payment codes | No | Bolt12-capable node (CLN native, LND via plugin) |
+| **L402** | API-gated access, subscription macaroons | No | L402 middleware (bundled) |
+| **Cashu** | Conditional escrow (payment-on-completion) | Yes (NUT-10/11/14) | Built-in Cashu wallet |
+
+### Payment Method Selection
+
+The client selects the payment method based on the situation:
+
+```
+Is this a conditional payment (escrow)?
+  YES → Cashu (only option for conditional spending conditions)
+  NO  → Use operator's preferred method:
+        ├─ Subscription? → Bolt12 offer (if supported) or Bolt11 invoice
+        ├─ Per-action?   → Bolt11 invoice or L402 macaroon
+        └─ Flat fee?     → Bolt11 invoice
+```
+
+**Configuration:**
+
+```ini
+# Operator's preferred payment methods (in priority order)
+hive-client-payment-methods=bolt11,bolt12,cashu
+
+# For escrow specifically (danger score ≥ 3)
+hive-client-escrow-method=cashu
+hive-client-escrow-mint=https://mint.minibits.cash
+```
+
+```yaml
+# hive-lnd.yaml
+payments:
+  preferred_methods: ["bolt11", "bolt12"]
+  escrow_method: "cashu"
+  escrow_mint: "https://mint.minibits.cash"
+```
+
+### Bolt11 Payments (Standard Lightning Invoices)
+
+The simplest and most widely supported payment method. Used for:
+- Per-action fees (advisor presents invoice, client pays automatically within spending limits)
+- Flat-fee trial periods
+- One-time subscription payments
+
+```
+Advisor                          Client                    Node Wallet
+  │                                │                          │
+  │  1. Management command +       │                          │
+  │     Bolt11 invoice (10 sats)   │                          │
+  │  ──────────────────────────►   │                          │
+  │                                │                          │
+  │     2. Verify credential       │                          │
+  │     3. Verify invoice matches  │                          │
+  │        expected pricing        │                          │
+  │     4. Check spending limits   │                          │
+  │                                │                          │
+  │                                │  5. Pay invoice          │
+  │                                │  ──────────────────────► │
+  │                                │                          │
+  │                                │  6. Payment confirmed    │
+  │                                │  ◄────────────────────── │
+  │                                │                          │
+  │     7. Execute action          │                          │
+  │     8. Return signed receipt   │                          │
+  │  ◄────────────────────────────  │                          │
+```
+
+**Advantage:** Works with every Lightning node. No Cashu wallet needed for simple payments.
+
+**Limitation:** Not conditional — once paid, the payment is final regardless of task outcome. Suitable for low-danger actions (score 1–4) where the cost of failure is low.
+
+### Bolt12 Payments (Recurring Offers)
+
+For subscription-based management contracts. The advisor publishes a Bolt12 offer; the client pays it on a recurring schedule.
+
+```
+Advisor                          Client
+  │                                │
+  │  1. Contract includes          │
+  │     Bolt12 offer string        │
+  │  ──────────────────────────►   │
+  │                                │
+  │     2. Client stores offer     │
+  │     3. Auto-pays monthly       │
+  │        (within spending limits) │
+  │                                │
+  │  [Each month:]                 │
+  │  4. Client fetches invoice     │
+  │     from offer                 │
+  │  ──────────────────────────►   │
+  │                                │
+  │  5. Invoice returned           │
+  │  ◄────────────────────────────  │
+  │                                │
+  │  6. Client pays               │
+  │  ──────────────────────────►   │
+  │                                │
+```
+
+**Advantage:** Recurring payments without manual intervention. Reusable — same offer for the entire contract duration. Privacy-preserving (Bolt12 blinded paths).
+
+**Limitation:** Requires Bolt12 support. CLN has native support. LND support via experimental flag or plugin. Not conditional.
+
+### L402 Payments (API-Gated Access)
+
+For API-style access patterns where the advisor provides an HTTP endpoint:
+
+```
+Advisor (HTTP API)               Client
+  │                                │
+  │  1. Request resource           │
+  │  ◄────────────────────────────  │
+  │                                │
+  │  2. HTTP 402 + Lightning       │
+  │     invoice + macaroon stub    │
+  │  ──────────────────────────►   │
+  │                                │
+  │     3. Pay invoice             │
+  │     4. Receive L402 macaroon   │
+  │        (valid for N actions    │
+  │         or T time period)      │
+  │                                │
+  │  5. Subsequent requests with   │
+  │     L402 macaroon              │
+  │  ◄────────────────────────────  │
+  │                                │
+```
+
+**Advantage:** Familiar HTTP API pattern. Macaroon caveats can encode permission scope (mirroring credential constraints). Efficient for high-frequency monitoring queries.
+
+**Limitation:** Requires HTTP connectivity to advisor (not P2P Bolt 8). Best suited for monitoring-heavy advisors with web dashboards.
+
+### Cashu Escrow (Conditional Payments)
+
+Used exclusively for conditional payments where payment must be contingent on task completion. See [Section 7: Escrow Management](#7-escrow-management-client-side) for the full protocol.
+
+**When Cashu escrow is required:**
+- Danger score ≥ 3 (configurable, default: 3)
+- Performance-based compensation (bonus payments)
+- Any action where the operator wants payment-on-completion guarantees
+
+**When Cashu escrow is optional:**
+- Danger score 1–2 (monitoring, read-only)
+- Flat-fee subscriptions
+- Trusted advisors with established reputation (operator can configure to skip escrow)
+
+### Payment in the HiveServiceProfile
+
+Advisors advertise accepted payment methods in their service profile (extending the [Marketplace spec](./DID-HIVE-MARKETPLACE.md#hiveserviceprofile-credential)):
+
+```json
+{
+  "pricing": {
+    "models": [
+      {
+        "type": "per_action",
+        "baseFeeRange": { "min": 5, "max": 100, "currency": "sats" }
+      },
+      {
+        "type": "subscription",
+        "monthlyRate": 5000,
+        "bolt12Offer": "lno1qgsq...",
+        "currency": "sats"
+      }
+    ],
+    "acceptedPayment": ["bolt11", "bolt12", "cashu", "l402"],
+    "preferredPayment": "bolt12",
+    "escrowRequired": true,
+    "escrowMinDangerScore": 3,
+    "acceptableMints": ["https://mint.minibits.cash"]
+  }
+}
+```
+
+### Payment Method Negotiation
+
+When operator and advisor connect, they negotiate a payment method:
+
+```
+Operator preferred:  [bolt11, bolt12]
+Advisor accepted:    [bolt11, bolt12, cashu, l402]
+Negotiated:          bolt12 (first match in operator's preference that advisor accepts)
+
+Exception: escrow payments always use Cashu regardless of preference
+```
+
+If no common non-escrow method exists, the client falls back to Cashu for all payments (since both parties must support Cashu for escrow anyway).
 
 ---
 
@@ -158,7 +644,7 @@ A built-in Cashu wallet handles escrow ticket creation and management. No extern
 
 ### Overview
 
-A Python plugin following CLN's plugin architecture. Single file (`cl_hive_client.py`), no Docker, no complex setup. Registers custom message handlers for management schemas (types 49153/49155) and exposes RPC commands for operator interaction.
+A Python plugin following CLN's plugin architecture. Single file (`cl_hive_client.py`), no Docker, no complex setup. Registers custom message handlers for management schemas (types 49153/49155) and exposes RPC commands for operator interaction. **Auto-provisions identity on first run** — no manual DID setup needed.
 
 ### Components
 
@@ -194,26 +680,18 @@ Validates the Archon DID credential attached to each management command:
 5. **Revocation check** — Queries Archon revocation status. **Fail-closed**: if Archon is unreachable, deny. Cache with 1-hour TTL per the [Fleet Management spec](./DID-L402-FLEET-MANAGEMENT.md#credential-lifecycle).
 6. **Replay protection** — Monotonic nonce check per agent DID. Timestamp within ±5 minutes.
 
-#### Escrow Manager
+#### Payment & Escrow Manager
 
-Built-in Cashu wallet for escrow ticket handling. Manages the operator's side of the [Task Escrow protocol](./DID-CASHU-TASK-ESCROW.md):
+Handles all payment flows. Delegates to the [Payment Manager](#payment-manager) for method selection, and manages the Cashu escrow wallet for conditional payments per the [Task Escrow protocol](./DID-CASHU-TASK-ESCROW.md):
 
-- **Ticket creation** — Mints Cashu tokens with P2PK + HTLC + timelock conditions
+- **Method selection** — Chooses Bolt11/Bolt12/L402/Cashu based on context and preferences
+- **Bolt11/Bolt12 payments** — Routes through the node's existing Lightning wallet
+- **Cashu escrow tickets** — Mints tokens with P2PK + HTLC + timelock conditions for conditional payments
 - **Secret management** — Generates and stores HTLC secrets, reveals on task completion
-- **Auto-replenishment** — When ticket balance drops below threshold, auto-mints new tokens (configurable)
-- **Spending limits** — Enforces daily/weekly caps on escrow expenditure
+- **Auto-replenishment** — When escrow balance drops below threshold, auto-mints new tokens
+- **Spending limits** — Enforces daily/weekly caps across all payment methods
 - **Mint management** — Configurable trusted mints, multi-mint support
 - **Receipt tracking** — Stores all completed task receipts locally
-
-```python
-# Example: auto-replenishment check
-def check_escrow_balance(self):
-    balance = self.cashu_wallet.get_balance()
-    if balance < self.config['escrow_replenish_threshold']:
-        amount = self.config['escrow_replenish_amount']
-        self.cashu_wallet.mint(amount, mint_url=self.config['preferred_mint'])
-        log.info(f"Auto-replenished escrow: +{amount} sats")
-```
 
 #### Policy Engine
 
@@ -245,48 +723,49 @@ Tamper-evident: modifying any receipt breaks the hash chain. Receipts are stored
 
 ### RPC Commands
 
-| Command | Description | Args |
-|---------|-------------|------|
-| `hive-client-status` | Show client status: active advisors, credential expiry, escrow balance, policy mode | None |
-| `hive-client-authorize` | Issue a management credential to an advisor | `advisor_did`, `template` (or custom scope), `duration_days` |
-| `hive-client-revoke` | Immediately revoke an advisor's credential | `advisor_did` or `credential_id` |
-| `hive-client-receipts` | List management action receipts | `advisor_did` (optional), `since` (optional), `limit` (optional) |
-| `hive-client-discover` | Find advisors via Archon/Nostr/direct | `capabilities` (optional), `max_results` (optional) |
-| `hive-client-policy` | View or modify local policy | `preset` (optional), `rule` (optional) |
-| `hive-client-escrow` | View escrow balance, mint status, spending history | `action` (`balance`/`mint`/`history`/`limits`) |
-| `hive-client-trial` | Start or review a trial period | `advisor_did`, `duration_days`, `scope` |
+All commands accept **advisor names, aliases, or discovery indices** — not DIDs. DIDs are accepted via `--advisor-did` for advanced use.
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `hive-client-status` | Active advisors, spending, policy | `lightning-cli hive-client-status` |
+| `hive-client-authorize` | Grant an advisor access to your node | `lightning-cli hive-client-authorize "Hex Advisor" --access="fees"` |
+| `hive-client-revoke` | Immediately revoke an advisor's access | `lightning-cli hive-client-revoke "Hex Advisor"` |
+| `hive-client-receipts` | List management action receipts | `lightning-cli hive-client-receipts --advisor="Hex Advisor"` |
+| `hive-client-discover` | Find advisors | `lightning-cli hive-client-discover --capabilities="fee optimization"` |
+| `hive-client-policy` | View or modify local policy | `lightning-cli hive-client-policy --preset=moderate` |
+| `hive-client-payments` | View payment balance and spending | `lightning-cli hive-client-payments` |
+| `hive-client-trial` | Start or review a trial period | `lightning-cli hive-client-trial "Hex Advisor" --days=14` |
+| `hive-client-alias` | Set a friendly name for an advisor | `lightning-cli hive-client-alias set "Hex" "did:cid:..."` |
+| `hive-client-identity` | View or manage node identity | `lightning-cli hive-client-identity` (shows name, not DID) |
 
 ### Configuration
 
+Most settings have sensible defaults. **Zero configuration is required for first run** — the plugin auto-provisions identity and uses defaults for everything else.
+
 ```ini
 # ~/.lightning/config (CLN config file)
+# All settings are optional — defaults work out of the box.
 
-# cl-hive-client configuration
-hive-client-did=did:cid:bagaaiera...
-hive-client-keymaster-path=/usr/local/bin/keymaster
-hive-client-archon-gateway=https://archon.technology
+# Identity (auto-provisioned if not set — see Archon Integration Tiers)
+# hive-client-did=did:cid:bagaaiera...    # Only set if importing existing DID
+# hive-client-archon-gateway=https://archon.technology  # Tier 1 default
+# hive-client-archon-gateway=http://localhost:4224      # Tier 2: own Archon node
 
-# Escrow settings
+# Payment methods (in preference order)
+hive-client-payment-methods=bolt11,bolt12
 hive-client-escrow-mint=https://mint.minibits.cash
-hive-client-escrow-replenish-threshold=1000
-hive-client-escrow-replenish-amount=5000
-hive-client-escrow-daily-limit=50000
-hive-client-escrow-weekly-limit=200000
+
+# Spending limits
+hive-client-daily-limit=50000
+hive-client-weekly-limit=200000
 
 # Policy preset (conservative | moderate | aggressive)
 hive-client-policy-preset=moderate
 
-# Credential defaults
-hive-client-credential-duration=30
-hive-client-credential-max-renewals=12
-
-# Alert integration
-hive-client-alert-webhook=https://hooks.example.com/hive
-hive-client-alert-nostr-dm=npub1abc...
-hive-client-alert-email=operator@example.com
-
-# Discovery
-hive-client-nostr-relays=wss://nos.lol,wss://relay.damus.io
+# Alerts (optional — enables notifications for advisor actions)
+# hive-client-alert-webhook=https://hooks.example.com/hive
+# hive-client-alert-nostr-dm=npub1abc...
+# hive-client-alert-email=operator@example.com
 ```
 
 ### Installation
@@ -295,26 +774,17 @@ hive-client-nostr-relays=wss://nos.lol,wss://relay.damus.io
 # 1. Download the plugin
 curl -O https://github.com/lightning-goats/cl-hive-client/releases/latest/cl_hive_client.py
 
-# 2. Make executable
-chmod +x cl_hive_client.py
-
-# 3. Add to CLN config
-echo "plugin=/path/to/cl_hive_client.py" >> ~/.lightning/config
-
-# 4. Install Archon Keymaster (if not already present)
-npm install -g @didcid/keymaster
-
-# 5. Create or import DID
-npx @didcid/keymaster create-id --name my-node
-
-# 6. Add DID to config
-echo "hive-client-did=$(npx @didcid/keymaster show-id my-node)" >> ~/.lightning/config
-
-# 7. Restart CLN (or load plugin dynamically)
+# 2. Start it
 lightning-cli plugin start /path/to/cl_hive_client.py
 ```
 
-No Docker. No database setup. No complex dependencies. One plugin file, one config block, one DID.
+That's it. On first run, the plugin auto-provisions a node identity, creates its data directory, and is ready to accept advisor connections. No DID setup. No key management. No configuration file edits required.
+
+For permanent installation, add to your CLN config:
+
+```ini
+plugin=/path/to/cl_hive_client.py
+```
 
 ### Relationship to Full `cl-hive`
 
@@ -436,70 +906,49 @@ service HiveClientService {
 
 ### Configuration
 
-```yaml
-# hive-lnd.yaml
+Auto-detected defaults for most settings. Only the LND connection needs explicit configuration (and `hive-lnd init` auto-detects the standard LND paths).
 
-identity:
-  did: "did:cid:bagaaiera..."
-  keymaster_path: "/usr/local/bin/keymaster"
-  archon_gateway: "https://archon.technology"
+```yaml
+# hive-lnd.yaml (generated by `hive-lnd init`)
+# Identity is auto-provisioned on first run — no DID setup needed.
 
 lnd:
-  rpc_host: "localhost:10009"
-  tls_cert: "/home/user/.lnd/tls.cert"
-  macaroon: "/home/user/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
+  rpc_host: "localhost:10009"       # auto-detected
+  tls_cert: "~/.lnd/tls.cert"      # auto-detected
+  macaroon: "~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"  # auto-detected
 
-escrow:
-  preferred_mint: "https://mint.minibits.cash"
-  replenish_threshold: 1000
-  replenish_amount: 5000
+payments:
+  preferred_methods: ["bolt11", "bolt12"]
+  escrow_mint: "https://mint.minibits.cash"
   daily_limit: 50000
   weekly_limit: 200000
 
 policy:
   preset: "moderate"
 
-credentials:
-  default_duration_days: 30
-  max_renewals: 12
-
-alerts:
-  webhook: "https://hooks.example.com/hive"
-  nostr_dm: "npub1abc..."
-  email: "operator@example.com"
-
-discovery:
-  nostr_relays:
-    - "wss://nos.lol"
-    - "wss://relay.damus.io"
+# alerts:                           # optional
+#   webhook: "https://hooks.example.com/hive"
+#   email: "operator@example.com"
 ```
 
 ### Installation
 
 ```bash
-# 1. Download binary
+# 1. Download and install
 curl -LO https://github.com/lightning-goats/hive-lnd/releases/latest/hive-lnd-linux-amd64
-chmod +x hive-lnd-linux-amd64
-mv hive-lnd-linux-amd64 /usr/local/bin/hive-lnd
+chmod +x hive-lnd-linux-amd64 && mv hive-lnd-linux-amd64 /usr/local/bin/hive-lnd
 
-# 2. Create config
-hive-lnd init  # generates hive-lnd.yaml with defaults
+# 2. Initialize (auto-detects LND paths, generates config)
+hive-lnd init
 
-# 3. Set up DID (if not already present)
-npm install -g @didcid/keymaster
-npx @didcid/keymaster create-id --name my-node
+# 3. Run
+hive-lnd
 
-# 4. Edit config with DID and LND connection details
-vim ~/.hive-lnd/hive-lnd.yaml
-
-# 5. Run
-hive-lnd --config ~/.hive-lnd/hive-lnd.yaml
-
-# Optional: systemd service
-hive-lnd install-service  # creates and enables systemd unit
+# Optional: install as system service
+hive-lnd install-service
 ```
 
-Single binary + config file. No Docker, no complex setup.
+On first run, `hive-lnd` auto-provisions a node identity and connects to LND. No DID setup, no key management.
 
 ---
 
@@ -632,25 +1081,25 @@ The advisor queries capabilities before sending commands. Commands for unsupport
 
 ## 6. Credential Management (Client Side)
 
-### Issuing a Management Credential
+### Issuing Access (Management Credential)
 
-The operator issues a `HiveManagementCredential` (per the [Fleet Management spec](./DID-L402-FLEET-MANAGEMENT.md#management-credentials)) to an advisor's DID:
+The operator grants an advisor access to their node. Under the hood, this issues a `HiveManagementCredential` (per the [Fleet Management spec](./DID-L402-FLEET-MANAGEMENT.md#management-credentials)) — but the operator never sees the credential format.
 
 ```bash
-# CLN
-lightning-cli hive-client-authorize \
-  --advisor-did="did:cid:bagaaiera..." \
-  --template="fee_optimization" \
-  --duration-days=30
+# CLN — authorize by name (from discovery results)
+lightning-cli hive-client-authorize "Hex Fleet Advisor" --access="fee optimization"
+
+# CLN — authorize by discovery index
+lightning-cli hive-client-authorize 1 --access="full routing" --days=30
 
 # LND (via hive-lnd CLI)
-hive-lnd authorize \
-  --advisor-did="did:cid:bagaaiera..." \
-  --template="fee_optimization" \
-  --duration-days=30
+hive-lnd authorize "Hex Fleet Advisor" --access="fee optimization"
+
+# Advanced: authorize by DID directly
+lightning-cli hive-client-authorize --advisor-did="did:cid:bagaaiera..." --template="fee_optimization"
 ```
 
-The credential is signed by the operator's DID and delivered to the advisor via Bolt 8 custom message, Archon Dmail, or Nostr DM.
+The credential is signed by the operator's auto-provisioned identity and delivered to the advisor automatically via the Bolt 8 peer connection.
 
 ### Credential Templates
 
@@ -665,14 +1114,18 @@ Pre-configured permission sets for common scenarios. Operators can use templates
 
 #### Custom Scope
 
+For advanced users who need fine-grained control beyond templates:
+
 ```bash
-lightning-cli hive-client-authorize \
-  --advisor-did="did:cid:bagaaiera..." \
-  --permissions='{"monitor":true,"fee_policy":true,"rebalance":true}' \
-  --schemas='["hive:monitor/*","hive:fee-policy/*","hive:rebalance/circular_*"]' \
-  --constraints='{"max_fee_change_pct":25,"max_rebalance_sats":500000}' \
-  --duration-days=14
+lightning-cli hive-client-authorize "Hex Fleet Advisor" \
+  --access="custom" \
+  --allow="monitoring,fees,rebalancing" \
+  --max-fee-change=25 \
+  --max-rebalance=500000 \
+  --days=14
 ```
+
+Under the hood, this maps to the full credential schema (`permissions`, `constraints`, `allowed_schemas`) — but the operator interface uses plain English and sensible parameter names.
 
 ### Credential Lifecycle
 
@@ -696,15 +1149,13 @@ Operators can issue credentials to multiple advisors with non-overlapping scopes
 
 ```bash
 # Advisor A: fee expert
-lightning-cli hive-client-authorize --advisor-did="did:cid:A..." --template="fee_optimization"
+lightning-cli hive-client-authorize "Hex Fleet Advisor" --access="fee optimization"
 
 # Advisor B: rebalance specialist
-lightning-cli hive-client-authorize --advisor-did="did:cid:B..." \
-  --permissions='{"monitor":true,"rebalance":true}' \
-  --schemas='["hive:monitor/*","hive:rebalance/*"]'
+lightning-cli hive-client-authorize "RoutingBot Pro" --access="custom" --allow="monitoring,rebalancing"
 
 # Advisor C: monitoring only (dashboard provider)
-lightning-cli hive-client-authorize --advisor-did="did:cid:C..." --template="monitor_only"
+lightning-cli hive-client-authorize "NodeWatch" --access="monitoring"
 ```
 
 The Policy Engine enforces scope isolation — Advisor A cannot send `hive:rebalance/*` commands even if their credential somehow includes that scope, because the operator configured them for fee optimization only.
@@ -715,7 +1166,7 @@ For multi-advisor coordination details (conflict detection, shared state, action
 
 ```bash
 # Immediate revocation — all pending commands rejected
-lightning-cli hive-client-revoke --advisor-did="did:cid:badactor..."
+lightning-cli hive-client-revoke "Bad Advisor"
 
 # Revoke ALL advisors (emergency lockdown)
 lightning-cli hive-client-revoke --all
@@ -731,13 +1182,17 @@ The advisor's pending legitimate compensation (escrow tickets for completed work
 
 ---
 
-## 7. Escrow Management (Client Side)
+## 7. Payment & Escrow Management (Client Side)
 
-### Built-in Cashu Wallet
+The client handles all payments to advisors through the [Payment Manager](#payment-manager). This section covers the operator-facing payment experience and the Cashu escrow subsystem.
 
-The client includes a lightweight Cashu wallet implementing NUT-10 (structured secrets), NUT-11 (P2PK), NUT-14 (HTLCs), and NUT-07 (token state checks). This wallet handles all escrow operations without requiring external wallet software.
+### Payment Overview
 
-### Ticket Creation Workflow
+Most advisor payments are simple Lightning transactions — the operator's node pays a Bolt11 invoice or subscribes via a Bolt12 offer. The client automates this within configured spending limits. **No special wallet or token management needed for standard payments.**
+
+Cashu escrow is used only for **conditional payments** (danger score ≥ 3 by default) where payment must be contingent on task completion. The built-in Cashu wallet (NUT-10/11/14/07) handles escrow automatically.
+
+### Ticket Creation Workflow (Escrow Only)
 
 ```
 Operator                     Client Plugin               Cashu Mint
@@ -812,8 +1267,8 @@ All completed tasks generate receipts stored in the local Receipt Store:
 # View recent receipts
 lightning-cli hive-client-receipts --limit=10
 
-# View receipts for a specific advisor
-lightning-cli hive-client-receipts --advisor-did="did:cid:A..."
+# View receipts for a specific advisor (by name)
+lightning-cli hive-client-receipts --advisor="Hex Fleet Advisor"
 
 # Export receipts for auditing
 lightning-cli hive-client-receipts --since="2026-02-01" --format=json > receipts.json
@@ -974,68 +1429,33 @@ Overrides auto-expire after the specified duration. This prevents "forgot to und
 
 Non-hive nodes cannot use hive gossip for advisor discovery. Four alternative mechanisms are supported, ordered by decentralization:
 
-### Archon Network Discovery
-
-Query the Archon network for `HiveServiceProfile` credentials:
+Non-hive nodes cannot use hive gossip for advisor discovery. The client searches multiple sources automatically and presents unified results. **The operator just types what they need — the client figures out where to look.**
 
 ```bash
-lightning-cli hive-client-discover --source=archon --capabilities="fee-optimization"
+# Simple search — client queries all available sources automatically
+lightning-cli hive-client-discover --capabilities="fee optimization"
 ```
 
-Under the hood:
-1. Client queries the Archon gateway for credentials of type `HiveServiceProfile`
-2. Filters by requested capabilities, pricing, availability
-3. Fetches linked reputation credentials
-4. Ranks results using the [Marketplace ranking algorithm](./DID-HIVE-MARKETPLACE.md#filtering--ranking-algorithm)
-5. Returns sorted advisor list
+### Discovery Sources (Under the Hood)
 
-**Trust level:** High — profiles are signed VCs, reputation is verifiable, DID resolution is cryptographic.
+The client searches multiple sources in parallel and merges results:
 
-### Nostr Discovery
+**1. Archon Network** — Queries for `HiveServiceProfile` credentials. Highest trust — profiles are cryptographically signed, reputation is verifiable.
 
-Advisors publish service profiles to Nostr (as defined in the [Marketplace spec](./DID-HIVE-MARKETPLACE.md#advertising-via-nostr-optional)):
+**2. Nostr** — Subscribes to advisor profile events (kind `38383`, tag `t:hive-advisor`). Medium trust — the client verifies the embedded credential signature and DID-to-Nostr binding.
+
+**3. Curated Directories** — Optional web directories that aggregate profiles. Low trust for the directory; high trust for the verified credentials it surfaces.
+
+**4. Direct Connection** — Operator has an advisor's contact info (from a website, conference, or recommendation):
 
 ```bash
-lightning-cli hive-client-discover --source=nostr --capabilities="rebalancing"
+# Add an advisor directly by their public identifier
+lightning-cli hive-client-authorize --advisor-did="did:cid:bagaaiera..." --access="fee optimization"
 ```
 
-The client subscribes to Nostr events with kind `38383` and tag `t:hive-advisor`, filters by capability tags, and verifies the embedded `HiveServiceProfile` credential signature.
+**5. Referrals** — An existing client or advisor refers someone. Referral reputation is tracked per the [Marketplace spec, Section 8](./DID-HIVE-MARKETPLACE.md#8-referral--affiliate-system).
 
-**Trust level:** Medium — Nostr events are signed by Nostr keys, but the DID-to-Nostr binding must be verified via the advisor's attestation credential.
-
-### Directory Discovery
-
-Optional curated directories — web services that aggregate and vet advisor profiles:
-
-```bash
-lightning-cli hive-client-discover --source=directory --url="https://hive-advisors.example.com"
-```
-
-Directories are not trusted — they're convenience tools. The client always verifies the underlying DID credentials independently.
-
-**Trust level:** Low for the directory itself (could be biased); high for the verified credentials it surfaces.
-
-### Direct Connection
-
-The operator already has the advisor's DID (e.g., from a personal recommendation, a website, or a conference):
-
-```bash
-lightning-cli hive-client-authorize --advisor-did="did:cid:bagaaiera..." --template="fee_optimization"
-```
-
-No discovery needed. The operator directly issues a credential.
-
-### Referral Discovery
-
-An existing client refers an advisor via a signed referral credential (per the [Marketplace spec, Section 8](./DID-HIVE-MARKETPLACE.md#8-referral--affiliate-system)):
-
-```bash
-# Advisor A refers Advisor B to the operator
-# Operator receives referral credential and reviews
-lightning-cli hive-client-discover --source=referral --referral-cred="did:cid:referral..."
-```
-
-**Trust level:** Proportional to the referrer's reputation.
+All discovery results are ranked using the [Marketplace ranking algorithm](./DID-HIVE-MARKETPLACE.md#filtering--ranking-algorithm) and presented as a simple numbered list (see [Discovery Output](#discovery-output) in the Abstraction Layer section).
 
 ---
 
@@ -1055,15 +1475,16 @@ curl -LO https://github.com/lightning-goats/hive-lnd/releases/latest/hive-lnd-li
 hive-lnd init && hive-lnd --config ~/.hive-lnd/hive-lnd.yaml
 ```
 
-### Step 2: Create or Import DID
+### Step 2: Identity (Automatic)
 
-```bash
-npm install -g @didcid/keymaster
-npx @didcid/keymaster create-id --name my-node
-# Add DID to config
+On first run, the client automatically provisions a DID identity via the configured Archon gateway. **No user action required.** The operator sees:
+
+```
+✓ Node identity created (via archon.technology)
+✓ Ready to discover advisors
 ```
 
-If the operator already has an Archon DID, import it instead.
+> **Advanced users** who already run an Archon node or have an existing DID can configure it manually in the config file. For most operators, auto-provisioning is the right choice. See [Archon Integration Tiers](#archon-integration-tiers) for details.
 
 ### Step 3: Discover Advisors
 

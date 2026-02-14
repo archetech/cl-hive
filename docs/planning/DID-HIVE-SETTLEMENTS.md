@@ -16,6 +16,28 @@ The result is a system where nodes operated by different parties can participate
 
 ---
 
+## Design Principles
+
+### DID Transparency
+
+While this spec references DIDs throughout for implementers, all user-facing interactions abstract away raw DID strings. Node operators "join the hive," "post a bond," and "settle with peers" — never "resolve `did:cid:...`". See [DID Hive Client](./DID-HIVE-CLIENT.md) for the user-facing abstraction layer.
+
+### Payment Method Flexibility
+
+Settlement payments use the most appropriate method for each context:
+
+| Settlement Context | Payment Method | Why |
+|-------------------|---------------|-----|
+| Conditional escrow (task-dependent) | **Cashu** (NUT-10/11/14) | Atomic task-completion-equals-payment via spending conditions |
+| Routine bilateral settlements | **Cashu** (unconditional) or **Bolt11** | Bearer tokens for netting efficiency; Bolt11 for simple transfers |
+| Lease payments (recurring) | **Bolt12 offers** or milestone Cashu tickets | Recurring reusable payment codes |
+| Advisor subscriptions | **Bolt12** or **L402** | Recurring billing without per-payment coordination |
+| Penalty deductions | **Bond slashing** (Cashu multisig) | Direct deduction from posted bonds |
+
+Cashu remains the primary settlement mechanism due to its netting compatibility, offline capability, and privacy properties. Bolt11 and Bolt12 are available as alternatives where their properties are advantageous.
+
+---
+
 ## Motivation
 
 ### The Trust Problem at Scale
