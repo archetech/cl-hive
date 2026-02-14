@@ -822,7 +822,7 @@ Moving sats between channels. Costs fees and can fail, but funds stay within the
 | Circular rebalance (large) | Self-pay to move > 100k sats | **5** | standard | `hive:rebalance/v1` | Higher fee exposure; failed partial routes can leave stuck HTLCs temporarily |
 | Submarine swap (loop out) | Move on-chain → off-chain liquidity via swap service | **5** | standard | `hive:rebalance/v1` | Involves third-party swap provider; fees + timing risk; funds temporarily in-flight |
 | Submarine swap (loop in) | Move off-chain → on-chain | **5** | standard | `hive:rebalance/v1` | Same as loop out, opposite direction |
-| Liquidity marketplace (Pool/Magma) | Buy/sell inbound liquidity via marketplace | **5** | advanced | `hive:rebalance/v1` | Commits funds to contracts with third parties; terms are binding |
+| Liquidity marketplace (Pool/Magma) | Buy/sell inbound liquidity via marketplace (see [DID Hive Liquidity](./DID-HIVE-LIQUIDITY.md)) | **5** | advanced | `hive:rebalance/v1` | Commits funds to contracts with third parties; terms are binding |
 | Peer-assisted rebalance | Coordinate rebalance with a hive peer | **4** | standard | `hive:rebalance/v1` | Requires trust in peer; lower fee than circular but depends on coordination |
 | Auto-rebalance rules | Configure automated rebalancing triggers | **6** | advanced | `hive:config/v1` | Autonomous spending of routing fees; mistakes compound without human oversight |
 
@@ -1349,6 +1349,7 @@ Week 20+:   Fleet Management Phase 6 (marketplace) + Task Escrow Phase 5 (genera
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [Archon Reputation Schemas (canonical)](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
+- [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md) — Liquidity-as-a-service marketplace; advisor-driven liquidity management
 - [DID Hive Client: Universal Lightning Node Management](./DID-HIVE-CLIENT.md)
 - [CLN Custom Messages](https://docs.corelightning.org/reference/lightning-sendcustommsg)
 
