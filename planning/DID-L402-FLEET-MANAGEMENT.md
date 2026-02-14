@@ -1,6 +1,7 @@
 # DID + L402 Remote Fleet Management
 
 **Status:** Proposal / Design Draft  
+**Version:** 0.1.0  
 **Author:** Hex (`did:cid:bagaaierajrr7k6izcrdfwqxpgtrobflsv5oibymfnthjazkkokaugszyh4ka`)  
 **Date:** 2026-02-14  
 **Feedback:** Open — file issues or comment in #singularity
@@ -102,7 +103,7 @@ A node operator issues a **Management Credential** to an agent's DID. This is a 
 
 ```json
 {
-  "@context": ["https://www.w3.org/2018/credentials/v1", "https://hive.lightning/management/v1"],
+  "@context": ["https://www.w3.org/ns/credentials/v2", "https://hive.lightning/management/v1"],
   "type": ["VerifiableCredential", "HiveManagementCredential"],
   "issuer": "did:cid:<node_operator_did>",
   "credentialSubject": {
@@ -130,8 +131,8 @@ A node operator issues a **Management Credential** to an agent's DID. This is a 
       "currency": "L402|cashu"
     }
   },
-  "issuanceDate": "2026-02-14T00:00:00Z",
-  "expirationDate": "2026-03-14T00:00:00Z"
+  "validFrom": "2026-02-14T00:00:00Z",
+  "validUntil": "2026-03-14T00:00:00Z"
 }
 ```
 
@@ -146,12 +147,25 @@ A node operator issues a **Management Credential** to an agent's DID. This is a 
 
 Tiers are enforced both by the credential scope AND by the node's local policy engine. Even if a credential grants `channel_close`, the node can reject it based on local policy.
 
+#### Permission Tier ↔ Settlement Privilege Mapping
+
+The permission tiers defined above (for agent credentials) map to the [settlement privilege levels](./DID-HIVE-SETTLEMENTS.md#bond-sizing) (for hive membership) as follows:
+
+| Agent Permission Tier | Minimum Settlement Privilege | Minimum Bond Required | Rationale |
+|----------------------|-----------------------------|-----------------------|-----------|
+| `monitor` | Observer (0 sats) | None | Read-only access needs no economic commitment |
+| `standard` | Basic routing (10,000 sats) | 10,000 sats | Fee/rebalance ops require routing participation |
+| `advanced` | Full member (50,000 sats) | 50,000 sats | Channel lifecycle ops need full settlement access |
+| `admin` | Liquidity provider (100,000 sats) | 100,000 sats | Emergency/nuclear ops need maximum commitment |
+
+An agent's management credential tier is constrained by their node's settlement privilege level. A node with an Observer-level bond cannot issue `standard` or higher credentials to agents.
+
 #### Credential Lifecycle
 
 1. **Issuance:** Operator creates credential via Archon Keymaster, specifying scope and duration
 2. **Presentation:** Agent includes credential with each management command
 3. **Verification:** Node verifies credential against Archon network (DID resolution + signature check)
-4. **Revocation:** Operator can revoke at any time via Archon. Node checks revocation status before executing commands
+4. **Revocation:** Operator can revoke at any time via Archon. Node checks revocation status before executing commands. **Revocation check strategy:** Cache with 1-hour TTL. If the Archon network is unreachable, deny all commands from the credential (fail-closed). Nodes should subscribe to revocation events via Archon's websocket feed for near-real-time revocation propagation.
 5. **Renewal:** Credentials have expiration dates. Auto-renewal possible if both parties agree
 
 ### 2. Payment Layer (L402 / Cashu)
@@ -225,7 +239,7 @@ The full escrow protocol — including ticket types (single-task, batch, milesto
 
 #### Performance-Based Payment
 
-For performance-based pricing, the node tracks a baseline metric (e.g., 7-day average routing revenue) at the start of the management period. At settlement:
+For performance-based pricing, the node operator establishes a baseline metric (e.g., 7-day average routing revenue) **before** the management credential is issued. The baseline measurement period must end before the credential's `validFrom` date to prevent agents from manipulating pre-management performance. At settlement:
 
 ```
 bonus = max(0, (current_revenue - baseline_revenue)) × performance_share
@@ -255,30 +269,32 @@ Settlement happens via the hive's existing distributed settlement protocol, with
 
 #### Message Format
 
-Management messages use a custom Lightning message type in the odd (experimental) range:
+Management messages use a custom Lightning message type in the odd (experimental) range. Per BOLT 1, **odd message types are optional** — peers that don't understand them simply ignore the message. Even types are required-to-understand and would cause non-hive peers to disconnect.
 
 ```
-Type: 49152 (0xC000) — Hive Management Message
+Type: 49153 (0xC001) — Hive Management Message [odd = optional]
 
-TLV Payload:
+TLV Payload (internal to the custom message, not BOLT-level TLVs):
   [1] schema_type    : utf8     (e.g., "hive:fee-policy/v1")
-  [2] schema_payload : json     (the actual command)
-  [3] credential     : bytes    (serialized Archon VC)
-  [4] payment_proof  : bytes    (L402 macaroon OR Cashu token)
-  [5] signature      : bytes    (agent's DID signature over [1]+[2])
-  [6] nonce          : u64      (replay protection)
-  [7] timestamp      : u64      (unix epoch seconds)
+  [3] schema_payload : json     (the actual command)
+  [5] credential     : bytes    (serialized Archon VC)
+  [7] payment_proof  : bytes    (L402 macaroon OR Cashu token)
+  [9] signature      : bytes    (agent's DID signature over [1]+[3])
+  [11] nonce         : u64      (replay protection)
+  [13] timestamp     : u64      (unix epoch seconds)
 
-Response Type: 49153 (0xC001) — Hive Management Response
+Response Type: 49155 (0xC003) — Hive Management Response [odd = optional]
 
-TLV Payload:
+TLV Payload (internal to the custom message, not BOLT-level TLVs):
   [1] request_nonce  : u64      (echo of request nonce)
-  [2] status         : u8       (0=success, 1=rejected, 2=error)
-  [3] result         : json     (action result or error details)
-  [4] state_hash     : bytes32  (hash of node state after action)
-  [5] signature      : bytes    (node's signature over response)
-  [6] receipt        : bytes    (signed receipt for audit trail)
+  [3] status         : u8       (0=success, 1=rejected, 2=error)
+  [5] result         : json     (action result or error details)
+  [7] state_hash     : bytes32  (hash of node state after action)
+  [9] signature      : bytes    (node's signature over response)
+  [11] receipt       : bytes    (signed receipt for audit trail)
 ```
+
+> **Note:** Internal TLV keys use odd numbers following Lightning convention (odd = optional fields). These are internal to the custom message payload, not BOLT-level TLVs. The outer message type (49153/49155) is what matters for peer compatibility.
 
 #### Replay Protection
 
@@ -419,6 +435,155 @@ Propose channel opens or topology changes.
 **Required tier:** `advanced`  
 **Danger score:** 6 (commits on-chain funds; see [Task Taxonomy](#task-taxonomy--danger-scoring))  
 **Constraints:** Creates a pending action for operator approval; does NOT auto-execute
+
+##### `hive:channel/v1`
+
+Channel lifecycle operations (open, close, force-close). Used by Categories 6 and 14.
+
+```json
+{
+  "schema": "hive:channel/v1",
+  "action": "close_cooperative",
+  "params": {
+    "channel_id": "931770x2363x0",
+    "destination_address": "bc1q...",
+    "reason": "Underperforming peer, low forward volume"
+  }
+}
+```
+
+**Required tier:** `admin`  
+**Danger score:** 6–10 (see Task Taxonomy)
+
+##### `hive:splice/v1`
+
+In-place channel resizing operations. Used by Category 7.
+
+```json
+{
+  "schema": "hive:splice/v1",
+  "action": "splice_in",
+  "params": {
+    "channel_id": "931770x2363x0",
+    "amount_sats": 1000000,
+    "feerate_perkw": 2500
+  }
+}
+```
+
+**Required tier:** `advanced`  
+**Danger score:** 5–7
+
+##### `hive:peer/v1`
+
+Peer connection management. Used by Category 8.
+
+```json
+{
+  "schema": "hive:peer/v1",
+  "action": "connect",
+  "params": {
+    "node_id": "03abc...",
+    "address": "127.0.0.1:9735"
+  }
+}
+```
+
+**Required tier:** `standard`  
+**Danger score:** 2–5
+
+##### `hive:payment/v1`
+
+Invoice creation and payment operations. Used by Category 9.
+
+```json
+{
+  "schema": "hive:payment/v1",
+  "action": "pay_invoice",
+  "params": {
+    "bolt11": "lnbc...",
+    "max_fee_ppm": 1000,
+    "timeout_seconds": 60
+  }
+}
+```
+
+**Required tier:** `standard` / `advanced` (amount-dependent)  
+**Danger score:** 1–6
+
+##### `hive:wallet/v1`
+
+On-chain wallet operations. Used by Category 10.
+
+```json
+{
+  "schema": "hive:wallet/v1",
+  "action": "send_onchain",
+  "params": {
+    "destination": "bc1q...",
+    "amount_sats": 50000,
+    "feerate_perkw": 2500,
+    "min_confirmations": 1
+  }
+}
+```
+
+**Required tier:** `advanced` / `admin` (amount-dependent)  
+**Danger score:** 1–9
+
+##### `hive:plugin/v1`
+
+Plugin lifecycle management. Used by Category 11.
+
+```json
+{
+  "schema": "hive:plugin/v1",
+  "action": "start",
+  "params": {
+    "plugin_name": "cl-revenue-ops",
+    "approved": true
+  }
+}
+```
+
+**Required tier:** `advanced` / `admin`  
+**Danger score:** 1–9
+
+##### `hive:backup/v1`
+
+Backup and recovery operations. Used by Category 13.
+
+```json
+{
+  "schema": "hive:backup/v1",
+  "action": "trigger_backup",
+  "params": {
+    "backup_type": "full",
+    "include_scb": true
+  }
+}
+```
+
+**Required tier:** `monitor` / `standard` / `admin` (action-dependent)  
+**Danger score:** 1–10
+
+##### `hive:emergency/v1`
+
+Emergency operations. Used by Category 14.
+
+```json
+{
+  "schema": "hive:emergency/v1",
+  "action": "disable_forwarding",
+  "params": {
+    "reason": "Suspected compromise",
+    "notify_operator": true
+  }
+}
+```
+
+**Required tier:** `advanced` / `admin`  
+**Danger score:** 3–10
 
 #### Schema Versioning
 
@@ -673,14 +838,19 @@ Pricing is modulated by **mutual reputation** — both the agent's track record 
 effective_price = base_price × agent_trust_modifier × operator_trust_modifier
 
 agent_trust_modifier:
-  - New agent (no history):       1.5x  (premium for unknown risk)
+  - Novice agent (no history):    1.5x  (premium for unknown risk)
   - Established (>30 days):       1.0x  (baseline)
   - Proven (>90 days, good metrics): 0.7x  (discount for reliability)
 
 operator_trust_modifier:
   - New operator:                 1.0x  (baseline)
-  - History of disputes:          1.3x  (agent charges more for difficult clients)
+  - History of arbitrated disputes: 1.3x  (agent charges more for difficult clients)
   - Clean history:                0.9x  (discount for easy clients)
+
+Note: Only disputes resolved through formal arbitration (see DID-HIVE-SETTLEMENTS.md
+Dispute Resolution) affect the operator modifier. Self-reported or unverified
+disputes are not counted — this prevents agents from fabricating dispute history
+to justify higher pricing.
 ```
 
 For **performance-based pricing**, the danger score sets the floor: even if performance bonuses drive the bulk of compensation, agents should receive minimum per-action fees proportional to the risk they're managing.
@@ -707,12 +877,18 @@ Note that a `standard` credential with tight constraints (low `max_rebalance_sat
 The approval flow for each action is determined by `danger_score × agent_reputation_inverse`:
 
 ```
-approval_level = danger_score × (1 / agent_reputation_score)
+approval_level = max(
+  danger_score × (1 / agent_reputation_score),
+  danger_score × 0.5   // floor: even the best agent can't auto-execute nuclear ops
+)
 
 where agent_reputation_score ∈ [0.5, 2.0]:
   0.5 = brand new, untested agent
   1.0 = baseline established agent
   2.0 = highly proven, long-tenure agent
+
+Additionally, danger scores 9–10 ALWAYS require multi-sig confirmation regardless
+of the computed approval_level. This is a hard floor, not overridable by reputation.
 ```
 
 #### Workflow Definitions
@@ -746,15 +922,15 @@ where agent_reputation_score ∈ [0.5, 2.0]:
 | Task | Danger | Agent Rep | Approval Level | Workflow |
 |------|--------|-----------|---------------|----------|
 | Set fee rate (single) | 3 | Proven (2.0) | 1.5 | Auto-execute |
-| Set fee rate (single) | 3 | New (0.5) | 6.0 | Queue for review |
+| Set fee rate (single) | 3 | Novice (0.5) | 6.0 | Queue for review |
 | Circular rebalance (large) | 5 | Established (1.0) | 5.0 | Queue for review |
 | Circular rebalance (large) | 5 | Proven (2.0) | 2.5 | Auto-execute |
 | Open channel (large) | 6 | Proven (2.0) | 3.0 | Auto-execute |
-| Open channel (large) | 6 | New (0.5) | 12.0 | Multi-sig |
-| Force close all | 10 | Proven (2.0) | 5.0 | Queue for review |
+| Open channel (large) | 6 | Novice (0.5) | 12.0 | Multi-sig |
+| Force close all | 10 | Proven (2.0) | 5.0 → **Multi-sig** | Multi-sig (hard floor: danger ≥ 9) |
 | Force close all | 10 | Established (1.0) | 10.0 | Multi-sig |
 
-Note that even a proven agent gets "Queue for review" for nuclear operations. The system is intentionally conservative — the maximum damage a compromised proven-agent can cause is bounded by the approval_level floor.
+Note that danger 9–10 operations **always** require multi-sig confirmation, regardless of the computed approval_level. Even a perfectly reputed agent cannot auto-execute nuclear operations. This hard floor ensures that no single compromised credential can cause catastrophic damage.
 
 #### Configurable Override
 
@@ -832,7 +1008,7 @@ The `HiveAdvisorReputationCredential` is a `DIDReputationCredential` with `domai
 ```json
 {
   "@context": [
-    "https://www.w3.org/2018/credentials/v1",
+    "https://www.w3.org/ns/credentials/v2",
     "https://archon.technology/schemas/reputation/v1"
   ],
   "type": ["VerifiableCredential", "DIDReputationCredential"],
@@ -951,7 +1127,7 @@ Schema proposals that grant new permissions require higher quorum thresholds.
 - Payment accounting and receipt generation
 
 ### Phase 4: Bolt 8 Transport (2-4 weeks)
-- Custom message type registration (49152/49153)
+- Custom message type registration (49153/49155)
 - Message serialization/deserialization
 - Replay protection (nonce tracking)
 - CLN custom message handler integration
@@ -966,6 +1142,28 @@ Schema proposals that grant new permissions require higher quorum thresholds.
 - Advisor onboarding flow
 - Multi-advisor support per node
 - Conflict resolution (multiple advisors, competing recommendations)
+
+### Cross-Spec Critical Path
+
+The four protocol specs have sequential dependencies. The critical path for full implementation:
+
+```
+Week 1-4:   DID Reputation Schema (standalone base)
+            ↓
+Week 3-8:   Fleet Management Phases 1-2 (schemas + DID auth)
+            ↓
+Week 5-12:  Task Escrow Phases 1-3 (tickets + mint integration)
+            ↓
+Week 8-16:  Fleet Management Phases 3-5 (payment + transport + reputation)
+            ↓
+Week 10-20: Settlements Phases 1-4 (receipts + netting + bonds + escrow)
+            ↓
+Week 16-26: Settlements Phases 5-8 (credit tiers + multilateral + disputes + markets)
+            ↓
+Week 20+:   Fleet Management Phase 6 (marketplace) + Task Escrow Phase 5 (general SDK)
+```
+
+**Parallel tracks:** Reputation Schema development and Fleet Management Phase 1 (schema definition) can begin simultaneously. Settlements Phase 1 (receipt infrastructure) can overlap with Task Escrow Phase 2.
 - Economic optimization (advisor fee competition)
 
 ---
@@ -999,7 +1197,6 @@ Schema proposals that grant new permissions require higher quorum thresholds.
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 - [CLN Custom Messages](https://docs.corelightning.org/reference/lightning-sendcustommsg)
-- [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
 
 ---
 

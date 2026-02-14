@@ -1,6 +1,7 @@
 # DID + Cashu Task Escrow Protocol
 
 **Status:** Proposal / Design Draft  
+**Version:** 0.1.0  
 **Author:** Hex (`did:cid:bagaaierajrr7k6izcrdfwqxpgtrobflsv5oibymfnthjazkkokaugszyh4ka`)  
 **Date:** 2026-02-14  
 **Feedback:** Open — file issues or comment in #singularity
@@ -9,7 +10,7 @@
 
 ## Abstract
 
-This document defines a protocol for conditional Cashu ecash tokens that act as escrow "tickets" for agent task execution. Each ticket is a Cashu token with composite spending conditions: locked to an agent's DID-derived public key (NUT-11 P2PK), hash-locked to a secret held by the managed node (NUT-10 HTLC), and time-locked with a refund path back to the operator (NUT-14). Payment is released if and only if the agent completes the task and the node reveals the HTLC preimage — making task completion and payment release atomic.
+This document defines a protocol for conditional Cashu ecash tokens that act as escrow "tickets" for agent task execution. Each ticket is a Cashu token with composite spending conditions: locked to an agent's DID-derived public key (NUT-11 P2PK), hash-locked and time-locked with a refund path (NUT-14 HTLC), all encoded using the structured secret format (NUT-10). Payment is released if and only if the agent completes the task and the node reveals the HTLC preimage — making task completion and payment release atomic.
 
 The protocol is general-purpose. While motivated by Lightning fleet management, it applies to any scenario where one party wants to pay another party contingent on provable work: code review, research tasks, monitoring, content generation, or any agent service market.
 
@@ -115,11 +116,32 @@ For higher-value operations (large rebalances, channel opens, performance-based 
 
 This protocol composes three Cashu NUT specifications to create conditional escrow tokens:
 
-#### NUT-10: Spending Conditions (Secret Structure)
+#### NUT-10: Structured Secret Format
 
-[NUT-10](https://github.com/cashubtc/nuts/blob/main/10.md) defines a structured secret format for Cashu tokens that enables conditional spending. Instead of a random secret, the token's secret encodes a **well-known secret kind** with associated data.
+[NUT-10](https://github.com/cashubtc/nuts/blob/main/10.md) defines the **spending condition framework** for Cashu tokens. Instead of a random secret, the token's secret is a structured JSON array: `[kind, {nonce, data, tags}]`. NUT-10 itself defines no spending semantics — it provides the **container format** that higher-level NUTs (NUT-11, NUT-14) populate with specific condition types.
 
-For escrow tickets, we use the **HTLC kind** (P2PK with hash lock):
+**How it's used:** All escrow ticket conditions are encoded in the NUT-10 structured secret format. The `kind` field identifies which spending rules apply (e.g., `"P2PK"` for NUT-11/14 conditions). The `data` field carries the primary condition (a public key), and `tags` carry additional conditions (hash locks, timelocks, refund paths).
+
+#### NUT-11: Pay-to-Public-Key (P2PK)
+
+[NUT-11](https://github.com/cashubtc/nuts/blob/main/11.md) defines **signature-based spending conditions** using the NUT-10 format. A token with kind `"P2PK"` requires a valid secp256k1 signature from the public key specified in `data`. NUT-11 also introduces the `tags` system for additional conditions (`sigflag`, `n_sigs`, `pubkeys` for multisig, `locktime`, `refund`).
+
+**How it's used:** The agent's DID-derived secp256k1 public key is the P2PK lock. This ensures only the authorized agent — the one whose DID credential grants management permission — can redeem the escrow ticket. Even if the HTLC preimage leaks, no one else can spend the token. NUT-11 also supports multisig via the `n_sigs` and `pubkeys` tags, used for bond multisig in the [settlements protocol](./DID-HIVE-SETTLEMENTS.md#bond-system).
+
+#### NUT-14: Hashed Timelock Contracts (HTLCs)
+
+[NUT-14](https://github.com/cashubtc/nuts/blob/main/14.md) **extends NUT-11 P2PK** with hash-lock conditions, composing P2PK signatures + hash preimage verification + timelocks into a single spending condition. A NUT-14 HTLC token uses kind `"P2PK"` (same as NUT-11) but adds a `hash` tag containing the lock hash. The token can be spent in two ways:
+
+1. **Normal spend:** Provide the hash preimage AND a valid P2PK signature (before the timelock)
+2. **Refund spend:** After the timelock expires, any pubkey listed in the `refund` tag can claim the token without the preimage
+
+**How it's used:** The HTLC hash is `H(secret)` where the node generates and holds `secret`. The timelock is set to the task deadline. If the agent completes the task, the node reveals `secret` in the signed receipt. If the task isn't completed before the deadline, the operator reclaims via the refund path.
+
+> **Note:** The `refund` tag accepts a *list* of pubkeys. For single-operator refund, one pubkey suffices. For multi-party escrow (e.g., hive bonds), multiple refund pubkeys can be specified.
+
+#### NUT-14 HTLC Secret Structure (using NUT-10 format)
+
+The complete escrow ticket secret, encoded per NUT-10's structured format with NUT-14 HTLC conditions:
 
 ```json
 [
@@ -128,7 +150,7 @@ For escrow tickets, we use the **HTLC kind** (P2PK with hash lock):
     "nonce": "<unique_nonce>",
     "data": "<agent_did_pubkey_hex>",
     "tags": [
-      ["hash", "SHA256", "<H(secret)>"],
+      ["hash", "<hex_encoded_sha256_hash>"],
       ["locktime", "<unix_timestamp>"],
       ["refund", "<operator_pubkey_hex>"],
       ["sigflag", "SIG_ALL"]
@@ -137,22 +159,20 @@ For escrow tickets, we use the **HTLC kind** (P2PK with hash lock):
 ]
 ```
 
-**How it's used:** The secret structure encodes the composite condition — who can spend (P2PK data), what proof they need (hash tag), when it expires (locktime tag), and who gets the refund (refund tag).
+> **Implementation note:** The `hash` tag contains only the hex-encoded SHA-256 hash value. The hash algorithm is always SHA-256 per NUT-14 — do not include an algorithm identifier in the tag.
 
-#### NUT-11: Pay-to-Public-Key (P2PK)
+#### Mint Requirements
 
-[NUT-11](https://github.com/cashubtc/nuts/blob/main/11.md) locks a Cashu token to a specific public key. Only the holder of the corresponding private key can create a valid signature to redeem the token.
+Mints used for escrow tickets **must** support the following NUTs:
 
-**How it's used:** The agent's DID-derived secp256k1 public key is the P2PK lock. This ensures only the authorized agent — the one whose DID credential grants management permission — can redeem the escrow ticket. Even if the HTLC preimage leaks, no one else can spend the token.
+| NUT | Requirement | Purpose |
+|-----|------------|---------|
+| NUT-10 | Required | Structured secret format |
+| NUT-11 | Required | P2PK signature conditions |
+| NUT-14 | Required | HTLC hash-lock + timelock |
+| NUT-07 | Required | Token state check (`POST /v1/checkstate`) |
 
-#### NUT-14: Hashed Timelock Contracts (HTLCs)
-
-[NUT-14](https://github.com/cashubtc/nuts/blob/main/14.md) combines hash locks with timelocks. A token locked with an HTLC can be spent in two ways:
-
-1. **Normal spend:** Provide the preimage to the hash AND a valid P2PK signature (before the timelock)
-2. **Refund spend:** After the timelock expires, the refund pubkey can claim the token without the preimage
-
-**How it's used:** The HTLC hash is `H(secret)` where the node generates and holds `secret`. The timelock is set to the task deadline. If the agent completes the task, the node reveals `secret` in the signed receipt. If the task isn't completed before the deadline, the operator reclaims via the refund path.
+Not all Cashu mints support NUT-14. Agents and operators **must** verify mint capabilities before creating escrow tickets. Mint capabilities can be queried via `GET /v1/info` (NUT-06).
 
 ### DID-to-Pubkey Derivation
 
@@ -195,6 +215,30 @@ Metadata is included in the token's `memo` field or as an additional tag in the 
 ---
 
 ## Detailed Protocol Flow
+
+### Secret Generation Protocol
+
+The HTLC preimage (`secret`) must be generated before the escrow ticket is minted. Three models are supported depending on the trust topology:
+
+| Model | Flow | Best For |
+|-------|------|----------|
+| **Operator-generated** | Operator generates `secret` locally, configures the node to release it on task completion via a `secret_map` entry in the cl-hive plugin config | Single-operator fleets where operator controls the node directly |
+| **Node API** | Operator calls `POST /hive/escrow/generate-secret` on the node's cl-hive RPC, receiving `H(secret)`. The node stores the secret internally and reveals it upon task completion. | Multi-operator fleets where the operator has RPC access |
+| **Credential-delegated** | The management credential includes an `escrow_secret_generation` capability. The agent requests secret generation from the node as part of the task negotiation handshake. | Open marketplaces where the agent and operator coordinate remotely |
+
+**For single-operator fleets** (the common case), the operator generates the secret locally:
+
+```bash
+# Generate a 32-byte random secret
+secret=$(openssl rand -hex 32)
+hash=$(echo -n "$secret" | sha256sum | cut -d' ' -f1)
+
+# Configure the node to release this secret on task completion
+# (via cl-hive plugin RPC or config file)
+lightning-cli hive-escrow-register --task-id <id> --secret "$secret"
+```
+
+The operator then uses `$hash` as the HTLC lock when minting the escrow ticket.
 
 ### Happy Path: Successful Task Execution
 
@@ -384,6 +428,14 @@ Maximum payout: 250 sats (task done + measurable improvement)
 
 **Performance measurement:** The node measures the performance metric over a defined window after task completion. If the threshold is met, it publishes the performance secret (e.g., via a Nostr event, Dmail, or the next Bolt 8 message exchange).
 
+> **⚠️ Trust assumption:** Performance tickets are NOT fully trustless. The node/operator measures and reports performance metrics — they could refuse to reveal the performance secret even if the threshold was met. The agent's recourse is limited to reputation damage (issuing a `revoke` outcome credential against the operator). For this reason, performance tickets should only be used with operators who have established reputation, and the base ticket should provide adequate compensation for the work performed regardless of bonus.
+
+**Baseline integrity:** The performance baseline **must** be established by the node operator independently, using data from **before** the agent had any access. Specifically:
+- Baseline measurement period must end before the management credential's `validFrom` date
+- Baseline data must be signed by the node and included in the escrow ticket metadata
+- A rolling 7-day average from the pre-credential period is recommended
+- Agents must not have monitor-tier or higher access during baseline measurement
+
 **Use case:** Performance-based management contracts where the advisor's incentives align with the node's outcomes. Maps directly to the [performance-based payment model](./DID-L402-FLEET-MANAGEMENT.md#payment-models) in the fleet management spec.
 
 ---
@@ -431,7 +483,7 @@ Higher-reputation agents get shorter escrow windows (faster payment):
 
 | Agent Reputation | Escrow Duration Modifier | Rationale |
 |-----------------|-------------------------|-----------|
-| New (no history) | 1.5× base duration | More time for operator oversight |
+| Novice (no history) | 1.5× base duration | More time for operator oversight |
 | Established (>30 days) | 1.0× base duration | Standard terms |
 | Proven (>90 days, good metrics) | 0.5× base duration | Trusted to execute quickly |
 
@@ -441,7 +493,7 @@ Performance ticket bonus amounts scale with reputation:
 
 | Agent Reputation | Bonus Multiplier | Rationale |
 |-----------------|-----------------|-----------|
-| New | 1.0× | Standard bonus available |
+| Novice | 1.0× | Standard bonus available |
 | Established | 1.5× | Higher bonus rewards proven track record |
 | Proven | 2.0× | Maximum bonus for top performers |
 
@@ -578,7 +630,7 @@ Both tickets share the same HTLC hash and timelock. The agent redeems both with 
 
 **Scenario 3: Operator mints a ticket but the backing funds aren't real.**
 - The agent can verify the token with the mint before accepting the task assignment.
-- **Pre-flight check:** Agent calls `POST /v1/check` on the mint to verify the token is valid and unspent before starting work.
+- **Pre-flight check:** Agent calls `POST /v1/checkstate` (NUT-07) on the mint to verify the token is valid and unspent before starting work.
 
 ---
 
@@ -744,9 +796,9 @@ The three roles (Delegator, Executor, Verifier) may collapse — e.g., the Deleg
 
 ## Open Questions
 
-1. **Secret generation timing:** Should the node generate the HTLC secret at ticket creation time (operator must coordinate with node) or at task presentation time (agent trusts that the secret exists)? The former is more secure; the latter reduces coordination overhead.
+1. **Secret generation timing:** The node should generate the HTLC secret at ticket creation time (see [Secret Generation Protocol](#secret-generation-protocol)). Task-presentation-time generation introduces a trust gap where the agent works without knowing whether a valid secret exists.
 
-2. **Multi-node tasks:** What if a task spans multiple nodes? (e.g., a rebalance requires coordination between two nodes.) Who generates the HTLC secret? Options: the destination node, a designated coordinator, or a chained HTLC where each node reveals a component.
+2. **Multi-node tasks:** For tasks spanning multiple nodes (e.g., a two-node rebalance), the **destination node** generates the HTLC secret. This mirrors Lightning's receiver-generates-preimage pattern. The flow: (a) operator requests secret from destination node, (b) mints ticket with H(secret), (c) agent coordinates both nodes, (d) destination node reveals secret upon successful completion. For N-node tasks, a single designated verifier node generates the secret. The verifier is specified in the ticket metadata as `verifier_node_id`.
 
 3. **Token denomination:** Should escrow tickets use fixed denominations (powers of 2, like standard Cashu) or exact amounts? Fixed denominations improve privacy at the cost of over/under-payment. Exact amounts improve accounting at the cost of privacy.
 

@@ -1,6 +1,7 @@
 # DID Reputation Schema
 
 **Status:** Proposal / Design Draft  
+**Version:** 0.1.0  
 **Author:** Hex (`did:cid:bagaaierajrr7k6izcrdfwqxpgtrobflsv5oibymfnthjazkkokaugszyh4ka`)  
 **Date:** 2026-02-14  
 **Feedback:** Open — file issues or comment in #singularity
@@ -40,12 +41,12 @@ Existing approaches are domain-specific and siloed. A Lightning routing node's r
 ```json
 {
   "@context": [
-    "https://www.w3.org/2018/credentials/v1",
+    "https://www.w3.org/ns/credentials/v2",
     "https://archon.technology/schemas/reputation/v1"
   ],
   "type": ["VerifiableCredential", "DIDReputationCredential"],
   "issuer": "did:cid:<issuer_did>",
-  "issuanceDate": "2026-03-14T00:00:00Z",
+  "validFrom": "2026-03-14T00:00:00Z",
   "credentialSubject": {
     "id": "did:cid:<subject_did>",
     "domain": "hive:advisor",
@@ -87,8 +88,8 @@ Existing approaches are domain-specific and siloed. A Lightning routing node's r
 | `credentialSubject.outcome` | enum | Yes | One of: `renew` (positive — continued engagement), `revoke` (negative — termination), `neutral` (informational, no recommendation). |
 | `credentialSubject.evidence` | array | No | References to signed receipts, attestations, or snapshots that back the metrics. Each entry has `type`, `id` (DID or URI), and `description`. |
 | `issuer` | DID | Yes | The DID issuing the reputation credential. Typically the entity that directly observed the subject's performance. |
-| `issuanceDate` | datetime | Yes | When this credential was created. |
-| `expirationDate` | datetime | No | When this credential should no longer be considered current. If omitted, the credential is valid indefinitely (but `period.end` still bounds the evaluation window). |
+| `validFrom` | datetime | Yes | When this credential becomes valid (VC 2.0 replaces `issuanceDate`). |
+| `validUntil` | datetime | No | When this credential should no longer be considered current (VC 2.0 replaces `expirationDate`). If omitted, the credential is valid indefinitely (but `period.end` still bounds the evaluation window). |
 
 ### Outcome Semantics
 
@@ -200,7 +201,7 @@ Any entity can propose a new profile by publishing a `DIDReputationProfile` cred
 ```json
 {
   "@context": [
-    "https://www.w3.org/2018/credentials/v1",
+    "https://www.w3.org/ns/credentials/v2",
     "https://archon.technology/schemas/reputation/v1"
   ],
   "type": ["VerifiableCredential", "DIDReputationProfile"],
@@ -371,6 +372,19 @@ A key design goal is enabling reputation to compose across domains. An entity's 
 
 Cross-domain aggregation normalizes domain-specific metrics to a 0–100 score using the profile's defined ranges, then combines with equal or configurable domain weights.
 
+### Score Threshold Interpretation
+
+This schema produces 0–100 aggregate scores but does **not** prescribe threshold meanings. Consumers apply domain-specific interpretations. For reference, the [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md#credit-and-trust-tiers) uses these thresholds for node trust tiers:
+
+| Score Range | Tier | Meaning |
+|-------------|------|---------|
+| 0–59 | Newcomer | Insufficient history for trust |
+| 60–74 | Recognized | Basic track record established |
+| 75–84 | Trusted | Consistent positive performance |
+| 85–100 | Senior | Exceptional long-term reliability |
+
+Other consumers may define different thresholds appropriate to their risk tolerance. The schema intentionally leaves this to domain-specific policy.
+
 ---
 
 ## Relationship to Existing Specs
@@ -384,7 +398,9 @@ The fleet management spec's reputation system implements this schema's base stru
 ### W3C Verifiable Credentials
 
 This schema follows [VC Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/):
-- Standard `@context`, `type`, `issuer`, `issuanceDate`, `credentialSubject` structure
+- Context URL: `https://www.w3.org/ns/credentials/v2` (VC 2.0)
+- Standard `@context`, `type`, `issuer`, `validFrom`, `credentialSubject` structure
+- `validFrom`/`validUntil` replace the 1.1-era `issuanceDate`/`expirationDate`
 - Evidence references follow the VC evidence property pattern
 - Revocation uses the issuer's DID method's native revocation mechanism (Archon credential revocation)
 
@@ -472,7 +488,29 @@ When verifying a `DIDReputationCredential`:
 
 5. **Interoperability:** How do reputation credentials from non-Archon DID methods integrate? The schema is DID-method-agnostic, but discovery and revocation depend on the method.
 
-6. **Incentive to issue:** Why would an operator spend effort issuing reputation credentials for their advisor? Possible answers: automated issuance at credential renewal, reputation-for-reputation reciprocity, protocol requirement for performance-based payment settlement.
+6. **Incentive to issue:** See [Issuance Incentives](#issuance-incentives) below for analysis.
+
+---
+
+## Issuance Incentives
+
+A reputation system only works if participants issue credentials. Why would an operator spend effort issuing reputation credentials for their advisor?
+
+### Automated Issuance at Credential Renewal
+
+The primary mechanism: reputation credential issuance is **automated** as part of the management credential lifecycle. When a management credential (per [DID+L402 Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)) expires or renews, the node's cl-hive plugin automatically generates a `DIDReputationCredential` (with `domain: "hive:advisor"`) based on measured metrics (actions taken, revenue delta, uptime). The operator need only approve the renewal — the reputation credential is a byproduct, not extra work.
+
+### Protocol Requirement for Performance Settlement
+
+Performance-based payment (see [Task Escrow — Performance Ticket](./DID-CASHU-TASK-ESCROW.md#performance-ticket)) requires a signed metric attestation to trigger bonus release. This attestation **is** a reputation credential. Operators who use performance-based pricing are already issuing reputation data as part of the payment flow.
+
+### Reputation Reciprocity
+
+Operators benefit from having reputable advisors — it signals to the network that their node is well-managed. An operator who issues honest reputation credentials for good advisors attracts better advisors in the future (advisors prefer operators who build their track record). Conversely, operators who refuse to issue credentials for good work will find it harder to attract talent.
+
+### Negative Reputation as Defense
+
+Operators are incentivized to issue `revoke` credentials against bad advisors to protect the ecosystem. This is self-interested: warning other operators about a bad actor prevents that actor from damaging the hive network that the operator depends on.
 
 ---
 
