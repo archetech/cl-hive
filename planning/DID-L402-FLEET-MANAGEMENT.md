@@ -154,9 +154,9 @@ The permission tiers defined above (for agent credentials) map to the [settlemen
 | Agent Permission Tier | Minimum Settlement Privilege | Minimum Bond Required | Rationale |
 |----------------------|-----------------------------|-----------------------|-----------|
 | `monitor` | Observer (0 sats) | None | Read-only access needs no economic commitment |
-| `standard` | Basic routing (10,000 sats) | 10,000 sats | Fee/rebalance ops require routing participation |
-| `advanced` | Full member (50,000 sats) | 50,000 sats | Channel lifecycle ops need full settlement access |
-| `admin` | Liquidity provider (100,000 sats) | 100,000 sats | Emergency/nuclear ops need maximum commitment |
+| `standard` | Basic routing (50,000 sats) | 50,000 sats | Fee/rebalance ops require routing participation |
+| `advanced` | Full member (150,000 sats) | 150,000 sats | Channel lifecycle ops need full settlement access |
+| `admin` | Liquidity provider (300,000 sats) | 300,000 sats | Emergency/nuclear ops need maximum commitment |
 
 An agent's management credential tier is constrained by their node's settlement privilege level. A node with an Observer-level bond cannot issue `standard` or higher credentials to agents.
 
