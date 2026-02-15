@@ -9773,7 +9773,7 @@ def mcf_optimization_loop():
     3. Broadcast solution to fleet
     4. Process our assignments from latest solution
 
-    Cycle interval: 10 minutes (MCF_CYCLE_INTERVAL)
+    Cycle interval: 30 minutes (MCF_CYCLE_INTERVAL)
     """
     from modules.mcf_solver import MCF_CYCLE_INTERVAL, MAX_SOLUTION_AGE
 

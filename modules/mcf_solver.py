@@ -42,7 +42,7 @@ from collections import defaultdict
 # =============================================================================
 
 # MCF solver configuration
-MCF_CYCLE_INTERVAL = 600           # 10 minutes between optimization cycles
+MCF_CYCLE_INTERVAL = 1800          # 30 minutes between optimization cycles
 MAX_GOSSIP_AGE_FOR_MCF = 900       # 15 minutes max gossip age for fresh data
 MAX_SOLUTION_AGE = 1200            # 20 minutes max solution validity
 MIN_MCF_DEMAND = 100000            # 100k sats minimum to trigger MCF
