@@ -1589,6 +1589,254 @@ The Receipt Store serves as a tamper-evident audit log:
 
 ---
 
+## 12a. Backup & Recovery (cl-hive-archon)
+
+### Overview
+
+`cl-hive-archon` manages critical state: the node's DID, issued credentials, advisor authorizations, receipt chains, and Cashu escrow tokens. Loss of this state means loss of identity, loss of verifiable history, and potential loss of escrowed funds. The backup system uses **Archon group vaults** with an optional **Shamir threshold** layer for multi-operator recovery.
+
+### What Gets Backed Up
+
+| Data | Priority | Location | Notes |
+|------|----------|----------|-------|
+| DID wallet (identity + keys) | **Critical** | Archon vault | Without this, the node loses its identity |
+| Credential store | **Critical** | Archon vault | Active advisor authorizations |
+| Receipt chain (hash-linked log) | High | Archon vault + local SQLite | Tamper-evident audit trail |
+| Nostr keypair | High | Archon vault | Transport identity; regenerable but loses continuity |
+| Cashu escrow tokens | High | Archon vault | Unspent tokens = real sats |
+| Policy configuration | Medium | Archon vault | Recreatable but tedious |
+| Alias registry | Low | Archon vault | Convenience only |
+
+### Vault Architecture
+
+Backups use Archon's group vault primitive. A **group vault** is a DID-addressed container where members can store and retrieve encrypted items. `cl-hive-archon` creates a vault per node identity:
+
+```
+Node DID: did:cid:bagaaiera...
+  └── Vault: hive-backup-<node-short-id>
+       ├── Member: node DID (owner)
+       ├── Member: operator DID (recovery)
+       ├── Member: trusted-peer DID (optional)
+       │
+       ├── Item: wallet-backup-<timestamp>.enc
+       ├── Item: credentials-<timestamp>.enc
+       ├── Item: receipts-<timestamp>.enc
+       ├── Item: escrow-tokens-<timestamp>.enc
+       └── Item: config-<timestamp>.enc
+```
+
+### Backup Schedule
+
+```ini
+# cl-hive-archon config
+hive-archon-backup-interval=daily       # daily | hourly | manual
+hive-archon-backup-retention=30         # days to keep old backups
+hive-archon-backup-vault=auto           # auto-create vault on first run
+```
+
+Backups are triggered:
+1. **On schedule** (default: daily at 3 AM local)
+2. **On critical state change** (new credential issued, credential revoked, escrow token created)
+3. **On demand** (`lightning-cli hive-archon-backup`)
+
+### Shamir Threshold Recovery
+
+For operators who want distributed trust, `cl-hive-archon` supports **Shamir Secret Sharing** on top of the vault backup. The DID wallet encryption key is split into `n` shares with a threshold of `k`:
+
+```ini
+# Enable threshold recovery (optional)
+hive-archon-threshold-enabled=true
+hive-archon-threshold-k=2              # shares needed to recover
+hive-archon-threshold-n=3              # total shares distributed
+hive-archon-threshold-holders=did:cid:operator,did:cid:peer1,did:cid:peer2
+```
+
+**How it works:**
+
+1. `cl-hive-archon` encrypts the wallet backup with a random symmetric key
+2. The symmetric key is split into `n` Shamir shares
+3. Each share is encrypted to a specific holder's DID (using Archon's DID-to-DID encryption)
+4. Shares are stored as separate vault items, each readable only by its designated holder
+5. The encrypted backup itself is stored in the vault (readable by any member)
+
+**Recovery requires `k` holders to contribute their shares** — no single party (including the operator) can recover alone unless `k=1`.
+
+```
+Vault: hive-backup-<node>
+  ├── wallet-backup-<ts>.enc          ← encrypted with random key K
+  ├── share-1-<operator-did>.enc      ← Shamir share 1, encrypted to operator
+  ├── share-2-<peer1-did>.enc         ← Shamir share 2, encrypted to peer 1
+  └── share-3-<peer2-did>.enc         ← Shamir share 3, encrypted to peer 2
+```
+
+### CLI Commands
+
+| Command | Description |
+|---------|-------------|
+| `hive-archon-backup` | Trigger immediate backup to vault |
+| `hive-archon-backup-status` | Show last backup time, vault health, share holders |
+| `hive-archon-restore` | Restore from vault (interactive — prompts for shares if threshold) |
+| `hive-archon-rotate-shares` | Re-split and redistribute Shamir shares (e.g., after removing a holder) |
+| `hive-archon-export` | Export backup locally (for offline/cold storage) |
+
+### Recovery Scenarios
+
+#### Scenario 1: Routine Backup Restore (Single Operator)
+
+**Situation:** Operator's node disk failed. They have a new machine with CLN installed.
+
+**Prerequisites:** Operator controls their own DID (has their Archon wallet).
+
+```bash
+# 1. Install plugins
+lightning-cli plugin start cl_hive_comms.py
+lightning-cli plugin start cl_hive_archon.py
+
+# 2. Import operator's Archon identity
+lightning-cli hive-archon-import-identity --file=/path/to/operator-wallet.json
+
+# 3. Restore from vault
+lightning-cli hive-archon-restore
+# → Finds vault by node DID
+# → Decrypts backup with operator's DID key
+# → Restores: DID wallet, credentials, receipts, escrow tokens, config
+# → Re-establishes Nostr identity and advisor connections
+
+# 4. Verify
+lightning-cli hive-client-status
+# → Shows restored advisors, active credentials, escrow balance
+```
+
+**Time to recovery:** ~5 minutes (excluding CLN sync).
+
+#### Scenario 2: Single-Operator Recovery (No Threshold)
+
+**Situation:** Operator lost their node AND their local Archon wallet backup, but their DID is still valid on the Archon network (not revoked).
+
+**Prerequisites:** Operator remembers their Archon passphrase or has a recovery seed.
+
+```bash
+# 1. Recover Archon identity from seed/passphrase
+npx @didcid/keymaster recover-id --seed="..."
+
+# 2. Install plugins and restore (same as Scenario 1, steps 1-4)
+lightning-cli hive-archon-restore
+```
+
+**If operator has no seed/passphrase:** → Scenario 4 (Lost DID Recovery).
+
+#### Scenario 3: Threshold Recovery (k-of-n Shamir)
+
+**Situation:** Operator cannot access the vault alone (threshold enabled, operator's share alone is insufficient, or operator lost their share entirely).
+
+**Prerequisites:** `k` share holders are available and willing to participate.
+
+```bash
+# 1. Operator initiates recovery request
+lightning-cli hive-archon-restore --threshold
+
+# 2. Plugin sends recovery request via Nostr DM to all share holders
+#    (or via Archon dmail if available)
+# → "Node <alias> is requesting threshold recovery. Please run:
+#    lightning-cli hive-archon-contribute-share --request=<request-id>"
+
+# 3. Each participating holder decrypts their share and sends it back
+#    (encrypted to the operator's current session key)
+
+# 4. Once k shares are collected, plugin reconstructs the symmetric key
+# 5. Decrypts and restores the backup
+
+# Alternative: manual share collection (offline)
+lightning-cli hive-archon-restore --threshold --manual
+# → Prompts operator to paste k shares (base64-encoded)
+```
+
+**Security:** Shares are never transmitted in plaintext. Each share is encrypted to the requester's ephemeral session key. Share holders can verify the request originated from a known node DID (if still resolvable) or operator DID.
+
+#### Scenario 4: Lost DID Recovery
+
+**Situation:** Operator has lost their DID entirely — no wallet, no seed, no passphrase. The old DID exists on the Archon network but is inaccessible.
+
+**This is the hardest scenario.** The old identity is cryptographically dead.
+
+```bash
+# 1. Create a new DID
+lightning-cli plugin start cl_hive_archon.py
+# → Auto-provisions new DID
+
+# 2. If threshold was configured: request threshold recovery using new DID
+#    Share holders can verify operator identity out-of-band (phone call, in-person)
+#    and authorize recovery to the new DID
+lightning-cli hive-archon-restore --threshold --new-identity
+
+# 3. If no threshold: manual recovery
+#    - Contact each advisor to re-issue credentials to new DID
+#    - Receipt chain: old chain is lost (new chain starts fresh)
+#    - Escrow tokens: if Cashu tokens were backed up to vault and
+#      threshold recovery succeeds, they can be reclaimed
+#    - If escrow tokens are unrecoverable: negotiate with advisors
+#      for token replacement or refund
+
+# 4. Publish DID rotation notice (optional)
+lightning-cli hive-archon-rotate-did --old="did:cid:old..." --new="did:cid:new..."
+# → Issues a signed rotation credential (signed by new DID)
+# → Advisors can verify if they trust the out-of-band identity proof
+```
+
+**Mitigation:** Operators should always keep an offline backup of their Archon wallet or seed phrase. Threshold recovery is insurance, not a replacement for basic key hygiene.
+
+#### Scenario 5: Contested Recovery
+
+**Situation:** A threshold recovery request is made, but some share holders suspect it's unauthorized (e.g., compromised operator machine, social engineering).
+
+**Protections:**
+1. **Share holders can refuse.** Each holder independently decides whether to contribute their share. No automated share release.
+2. **Verification challenge.** Share holders can require out-of-band identity verification before contributing (e.g., video call, signed message from known channel, physical meeting).
+3. **Time delay.** Operators can configure a mandatory delay between recovery request and share release (`hive-archon-threshold-delay=24h`), giving time for contested cases to be flagged.
+4. **Revocation race.** If the real operator detects an unauthorized recovery attempt, they can:
+   - Revoke the node DID immediately (`hive-archon-revoke-identity`)
+   - Notify share holders to deny the request
+   - Issue new credentials from a new DID
+
+```ini
+# Contested recovery protections
+hive-archon-threshold-delay=24h        # mandatory wait before shares can be submitted
+hive-archon-threshold-notify=all       # notify ALL holders when any recovery starts
+```
+
+#### Scenario 6: Partial Recovery (Degraded State)
+
+**Situation:** Backup exists but is incomplete or corrupted. Some components restore, others don't.
+
+| Component | If Missing | Impact | Mitigation |
+|-----------|-----------|--------|------------|
+| DID wallet | Identity lost | → Scenario 4 | Keep offline backup |
+| Credentials | Advisors can't verify | Re-issue from advisors | Advisors retain copies |
+| Receipt chain | Audit trail broken | New chain starts; gap noted | Receipts are append-only, partial chain still valuable |
+| Nostr keypair | Transport identity lost | Regenerate; advisors re-add new npub | Publish key rotation on Nostr |
+| Cashu tokens | Escrowed sats lost | Negotiate with advisors/mints | Small escrow balances; mints may have records |
+| Policy config | Manual reconfiguration | Apply preset, customize | Export policy separately |
+| Aliases | Convenience names lost | Re-add manually | Low impact |
+
+**Partial restore command:**
+
+```bash
+# Restore only specific components
+lightning-cli hive-archon-restore --components=wallet,credentials
+lightning-cli hive-archon-restore --components=escrow
+lightning-cli hive-archon-restore --skip=receipts  # skip corrupted component
+```
+
+### Design Principles
+
+1. **Backups are automatic.** No operator action required after initial setup. `cl-hive-archon` backs up on state change and on schedule.
+2. **Recovery is interactive.** Restoring always prompts for confirmation. No silent overwrites.
+3. **Threshold is optional.** Single-operator vault access is the default. Shamir is for operators who want distributed trust.
+4. **Archon is the vault, not the encryption.** Archon stores encrypted blobs. The encryption key is controlled by the operator (or split via Shamir). Archon never sees plaintext state.
+5. **Fail-safe over fail-fast.** Partial recovery is always attempted. The system reports what succeeded and what failed, rather than aborting on first error.
+
+---
+
 ## 13. Comparison: Client vs Hive Member vs Unmanaged
 
 ### Feature Comparison
