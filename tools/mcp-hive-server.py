@@ -53,6 +53,7 @@ import re
 import ssl
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1863,6 +1864,31 @@ Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
                     }
                 },
                 "required": ["node", "from_channel", "to_channel", "amount_sats"]
+            }
+        ),
+        Tool(
+            name="askrene_constraints_summary",
+            description="Summarize AskRene liquidity constraints for a given layer (default: xpay). Useful routing intelligence for why rebalances fail.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "layer": {"type": "string", "description": "AskRene layer name (default: xpay)"},
+                    "max_age_sec": {"type": "integer", "description": "Only include constraints newer than this (default: 900)"},
+                    "top_n": {"type": "integer", "description": "Return top N most constrained edges (default: 25)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="askrene_reservations",
+            description="List current AskRene reservations (paths reserved). Useful for diagnosing liquidity locks.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"}
+                },
+                "required": ["node"]
             }
         ),
         Tool(
@@ -7737,6 +7763,92 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
                 logger.warning(f"Failed to mark rebalance decision failed in advisor_db: {ee}")
 
         raise
+
+
+async def handle_askrene_constraints_summary(args: Dict) -> Dict:
+    node_name = args.get("node")
+    layer = args.get("layer", "xpay")
+    max_age_sec = int(args.get("max_age_sec", 900) or 900)
+    top_n = int(args.get("top_n", 25) or 25)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    now = int(time.time())
+    try:
+        res = await node.call("askrene-listlayers", {"layer": layer})
+    except Exception as e:
+        return {"error": f"askrene-listlayers failed: {e}"}
+
+    layers = res.get("layers", []) or []
+    constraints = []
+    for l in layers:
+        if l.get("layer") != layer:
+            continue
+        constraints = l.get("constraints", []) or []
+        break
+
+    by_scid_dir: Dict[str, Dict[str, Any]] = {}
+    by_scid: Dict[str, Dict[str, Any]] = {}
+
+    def scid_from(scid_dir: str) -> str:
+        return scid_dir.split("/")[0]
+
+    for c in constraints:
+        scid_dir = c.get("short_channel_id_dir")
+        ts = int(c.get("timestamp") or 0)
+        max_msat = int(c.get("maximum_msat") or 0)
+        if not scid_dir or max_msat <= 0:
+            continue
+        if ts and (now - ts) > max_age_sec:
+            continue
+
+        cur = by_scid_dir.get(scid_dir)
+        if cur is None or max_msat < cur["maximum_msat"]:
+            by_scid_dir[scid_dir] = {
+                "short_channel_id_dir": scid_dir,
+                "timestamp": ts,
+                "maximum_msat": max_msat,
+                "maximum_sats": max_msat // 1000,
+                "age_sec": (now - ts) if ts else None,
+            }
+
+        scid = scid_from(scid_dir)
+        cur2 = by_scid.get(scid)
+        if cur2 is None or max_msat < cur2["maximum_msat"]:
+            by_scid[scid] = {
+                "short_channel_id": scid,
+                "timestamp": ts,
+                "maximum_msat": max_msat,
+                "maximum_sats": max_msat // 1000,
+                "age_sec": (now - ts) if ts else None,
+            }
+
+    tight_scid = sorted(by_scid.values(), key=lambda x: x["maximum_msat"])[:top_n]
+    tight_scid_dir = sorted(by_scid_dir.values(), key=lambda x: x["maximum_msat"])[:top_n]
+
+    return {
+        "layer": layer,
+        "constraint_count": len(constraints),
+        "fresh_scid_count": len(by_scid),
+        "tightest_scid": tight_scid,
+        "tightest_scid_dir": tight_scid_dir,
+    }
+
+
+async def handle_askrene_reservations(args: Dict) -> Dict:
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        res = await node.call("askrene-listreservations")
+        return res
+    except Exception as e:
+        return {"error": f"askrene-listreservations failed: {e}"}
 
 
 async def handle_revenue_report(args: Dict) -> Dict:
@@ -14074,6 +14186,8 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_set_fee": handle_revenue_set_fee,
     "revenue_fee_anchor": handle_revenue_fee_anchor,
     "revenue_rebalance": handle_revenue_rebalance,
+    "askrene_constraints_summary": handle_askrene_constraints_summary,
+    "askrene_reservations": handle_askrene_reservations,
     "revenue_report": handle_revenue_report,
     "revenue_config": handle_revenue_config,
     "config_adjust": handle_config_adjust,
