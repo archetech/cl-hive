@@ -7600,6 +7600,12 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
     try:
         result = await node.call("revenue-rebalance", params)
 
+        # Some CLN/REST wrappers return structured error objects instead of raising.
+        # Detect those and treat them as failures for learning.
+        if isinstance(result, dict):
+            if result.get("ok") is False or result.get("success") is False or result.get("status") == "error" or result.get("error"):
+                raise RuntimeError(str(result.get("error") or result))
+
         # Mark executed
         if decision_id is not None:
             with db._get_conn() as conn:
