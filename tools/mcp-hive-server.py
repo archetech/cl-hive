@@ -7668,7 +7668,17 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
             except Exception as e:
                 logger.debug(f"action_outcomes insert (success) failed: {e}")
 
-        return result
+        # Verification: ask sling-stats whether sats actually moved (vs job accepted)
+        sling_stats = None
+        try:
+            sling_stats = await node.call("sling-stats", {"scid": to_channel, "json": True})
+        except Exception:
+            sling_stats = None
+
+        return {
+            "rebalance_result": result,
+            "sling_stats": sling_stats,
+        }
 
     except Exception as e:
         err = str(e)
@@ -7723,7 +7733,18 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
                             )
                     except Exception as eee:
                         logger.debug(f"action_outcomes insert (success_after_clear) failed: {eee}")
-                return retry_result
+
+                sling_stats = None
+                try:
+                    sling_stats = await node.call("sling-stats", {"scid": to_channel, "json": True})
+                except Exception:
+                    sling_stats = None
+
+                return {
+                    "rebalance_result": retry_result,
+                    "sling_stats": sling_stats,
+                    "note": "success after clearing stale sling job locks",
+                }
             except Exception as clear_err:
                 # Retry failed; fall through to record failure
                 err = f"{err} | retry_after_sling_deletejob_failed: {clear_err}"
