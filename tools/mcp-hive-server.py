@@ -475,7 +475,10 @@ class HiveFleet:
 fleet = HiveFleet()
 
 # Global advisor database instance
-ADVISOR_DB_PATH = os.environ.get('ADVISOR_DB_PATH', str(Path.home() / ".lightning" / "advisor.db"))
+# Prefer production advisor DB if present (keeps manual mcporter calls consistent with advisor runs)
+_default_prod_db = Path.home() / "bin" / "cl-hive" / "production" / "data" / "advisor.db"
+_default_db = str(_default_prod_db) if _default_prod_db.exists() else str(Path.home() / ".lightning" / "advisor.db")
+ADVISOR_DB_PATH = os.environ.get('ADVISOR_DB_PATH', _default_db)
 advisor_db: Optional[AdvisorDB] = None
 
 
