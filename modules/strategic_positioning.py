@@ -1424,6 +1424,8 @@ class PhysarumChannelManager:
             self._log("Physarum cycle skipped: no database", level="debug")
             return result
 
+        now = int(time.time())
+
         # Periodic cleanup: remove flow history entries not seen in > 7 days
         seven_days_ago = now - 7 * 86400
         stale_channels = [
@@ -1436,8 +1438,6 @@ class PhysarumChannelManager:
         # Get all recommendations
         recommendations = self.get_all_recommendations()
         result["evaluated_channels"] = len(self._get_channel_data())
-
-        now = int(time.time())
 
         for rec in recommendations:
             action_created = None
