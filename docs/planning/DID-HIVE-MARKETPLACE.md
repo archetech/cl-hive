@@ -1,8 +1,9 @@
 # DID Hive Marketplace Protocol
 
 **Status:** Proposal / Design Draft  
-**Version:** 0.1.0  
+**Version:** 0.1.1  
 **Author:** Hex (`did:cid:bagaaierajrr7k6izcrdfwqxpgtrobflsv5oibymfnthjazkkokaugszyh4ka`)  
+**Updated:** 2026-02-15 — Client references updated for cl-hive-comms plugin architecture  
 **Date:** 2026-02-14  
 **Feedback:** Open — file issues or comment in #singularity
 
@@ -407,13 +408,15 @@ Node                                  Advisor
   │                                      │
   │  3. Contract Proposal                │
   │     (encrypted to advisor DID)       │
-  │  ──────────(Bolt 8/Dmail)────────►   │
+  │  ───────(Nostr DM / REST/rune)────►  │
+  │      (Bolt 8 / Dmail deferred)       │
   │                                      │
   │     4. Review proposal               │
   │     5. Accept / Counter / Reject     │
   │                                      │
   │  6. Response                         │
-  │  ◄──────────(Bolt 8/Dmail)────────   │
+  │  ◄───────(Nostr DM / REST/rune)────   │
+  │      (Bolt 8 / Dmail deferred)       │
   │                                      │
   │  [If accepted or counter-accepted:]  │
   │                                      │
@@ -1339,7 +1342,7 @@ New advisors bootstrap reputation through:
 
 The marketplace described in sections 1–10 assumes hive membership — advisors and nodes discover each other through hive gossip, contract through hive PKI, and settle through the hive settlement protocol. But the real market is every Lightning node operator, most of whom will never join a hive.
 
-This section defines how non-hive nodes participate in the marketplace via lightweight client software (`cl-hive-client` for CLN, `hive-lnd` for LND) as specified in the [DID Hive Client](./DID-HIVE-CLIENT.md) spec.
+This section defines how non-hive nodes participate in the marketplace via the `cl-hive-comms` plugin (the entry point for all commercial customers) as specified in the [DID Hive Client](./DID-HIVE-CLIENT.md) spec. Non-hive nodes install `cl-hive-comms` — not the full `cl-hive` plugin — to get advisor management, marketplace access, and Nostr-based discovery.
 
 ### Hive Marketplace vs Public Marketplace
 
@@ -1407,9 +1410,11 @@ Non-hive nodes participate fully in the reputation system:
 
 ### Client Software Requirements
 
-Non-hive nodes must run:
-- `cl-hive-client` (CLN) or `hive-lnd` (LND) — provides Schema Handler, Credential Verifier, Escrow Manager, Policy Engine
-- Archon Keymaster — for DID identity (lightweight, no full Archon node)
+Non-hive nodes install:
+- **`cl-hive-comms`** (minimum) — provides transport (Nostr DM + REST/rune), Schema Handler, Escrow Manager, Policy Engine, Nostr marketplace publishing
+- **`cl-hive-archon`** (optional) — adds DID identity and credential verification via Archon network
+
+`cl-hive-comms` auto-generates a Nostr keypair on first run — no DID or Archon node required. Add `cl-hive-archon` later for DID verification if desired.
 
 See the [DID Hive Client](./DID-HIVE-CLIENT.md) spec for full architecture, installation, and configuration details.
 
@@ -1489,7 +1494,7 @@ Phased delivery, aligned with the other specs' roadmaps. The marketplace builds 
 - Anonymous RFP support
 
 ### Phase 4: Multi-Advisor Coordination (2–3 weeks)
-*Prerequisites: Fleet Management Phase 4 (Bolt 8 transport)*
+*Prerequisites: Fleet Management Phase 4 (transport implementation)*
 
 - Scope partitioning enforcement in cl-hive policy engine
 - Conflict detection engine (cross-advisor action monitoring)

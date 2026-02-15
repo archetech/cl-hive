@@ -1,9 +1,10 @@
 # DID Nostr Marketplace Protocol
 
 **Status:** Proposal / Design Draft  
-**Version:** 0.1.0  
+**Version:** 0.1.1  
 **Author:** Hex (`did:cid:bagaaierajrr7k6izcrdfwqxpgtrobflsv5oibymfnthjazkkokaugszyh4ka`)  
 **Date:** 2026-02-15  
+**Updated:** 2026-02-15 — Client integration updated for cl-hive-comms plugin architecture  
 **Feedback:** Open — file issues or comment in #singularity
 
 ---
@@ -23,7 +24,7 @@ This spec defines:
 - Dual-publishing strategy for maximum interoperability
 - Privacy mechanisms for anonymous browsing, sealed bids, and throwaway identities
 - DID-to-Nostr binding and impersonation prevention
-- Client integration patterns for `cl-hive-client` (CLN) and `hive-lnd` (LND)
+- Client integration patterns for `cl-hive-comms` (CLN plugin — handles all Nostr publishing/subscribing)
 - Guidance for Nostr-native clients displaying hive services with zero hive-specific code
 
 ---
@@ -86,8 +87,8 @@ This spec does **not** duplicate content from companion specifications. It refer
               │ Clients    │  │ Clients   │  │ Clients   │
               │            │  │           │  │           │
               │ cl-hive-   │  │ Generic   │  │ Plebeian  │
-              │ client /   │  │ Nostr     │  │ Market /  │
-              │ hive-lnd   │  │ clients   │  │ NostrMkt  │
+              │ comms      │  │ Nostr     │  │ Market /  │
+              │ (plugin)   │  │ clients   │  │ NostrMkt  │
               └────────────┘  └───────────┘  └───────────┘
 ```
 
@@ -406,7 +407,7 @@ The dedicated relay is **not required** — all hive marketplace functionality w
 
 ### Creation
 
-Events are created by the provider/client software (`cl-hive-client` / `hive-lnd`) and signed with the operator's Nostr key (derived from DID or configured separately — see [Section 9](#9-did-nostr-binding)).
+Events are created by `cl-hive-comms` and signed with the operator's Nostr key (auto-generated on first run or configured separately — see [Section 9](#9-did-nostr-binding)). If `cl-hive-archon` is installed, DID-Nostr binding is created automatically.
 
 ### Update
 
@@ -488,7 +489,7 @@ Hive marketplace events share tag conventions with NIP-99 for maximum interopera
 ```json
 {
   "kind": 30402,
-  "content": "## ⚡ Lightning Node Management\n\nExperienced AI advisor specializing in fee optimization and channel rebalancing.\n\n- **Capabilities:** Fee optimization, rebalancing, channel expansion\n- **Track Record:** 18 nodes managed, +22.4% avg revenue improvement\n- **Uptime:** 99.8%\n- **DID-verified.** Contract via [hive-client](https://github.com/lightning-goats/cl-hive-client) or direct message.",
+  "content": "## ⚡ Lightning Node Management\n\nExperienced AI advisor specializing in fee optimization and channel rebalancing.\n\n- **Capabilities:** Fee optimization, rebalancing, channel expansion\n- **Track Record:** 18 nodes managed, +22.4% avg revenue improvement\n- **Uptime:** 99.8%\n- **DID-verified.** Contract via cl-hive-comms or direct message.",
   "tags": [
     ["d", "<unique_offer_id>"],
     ["title", "Lightning Node Advisor — Fee Optimization + Rebalancing"],
@@ -810,7 +811,7 @@ The dual-publishing strategy (Section 6) ensures that hive services appear in ex
 | **Any Nostr client** | `alt` tag text for native kinds | NIP-31 (alt tag) fallback | Zero |
 | **NIP-99 clients** | Classified listings with title, price, description | Kind 30402 dual-publish | Zero |
 | **NIP-15 clients** (Plebeian Market, NostrMarket) | Stalls + products with checkout | Kinds 30017/30018 dual-publish | Zero |
-| **Hive-aware clients** (`cl-hive-client`, `hive-lnd`) | Full marketplace with escrow, heartbeats, reputation | Native kinds 383xx/389xx | Full integration |
+| **Hive-aware clients** (`cl-hive-comms`) | Full marketplace with escrow, heartbeats, reputation | Native kinds 383xx/389xx | Full integration |
 
 ### Tag Conventions for Generic Discovery
 
@@ -845,7 +846,7 @@ A Nostr user searching `#lightning` will discover hive services organically.
 │  └─ Sees: Stall + product catalog with checkout flow         │
 │  └─ Can: Initiate purchase via encrypted DMs                 │
 │                                                               │
-│  Level 3: Hive-aware client (cl-hive-client / hive-lnd)     │
+│  Level 3: Hive-aware client (cl-hive-comms)                  │
 │  └─ Sees: Full marketplace with all metadata                 │
 │  └─ Can: Escrow, heartbeat verification, reputation scoring  │
 │  └─ Can: Automated discovery, contracting, and settlement    │
@@ -856,38 +857,42 @@ A Nostr user searching `#lightning` will discover hive services organically.
 
 ## 11. Client Integration
 
+> **Key architecture note:** All Nostr publishing and subscribing is handled by the `cl-hive-comms` plugin, which is the entry point for the hive's CLN plugin architecture. Since `cl-hive-comms` already manages the Nostr connection (for DM transport), key management, and relay configuration, marketplace event publishing **shares the same Nostr connection** as the DM transport layer. This means zero additional Nostr configuration is needed — installing `cl-hive-comms` gives you both advisor communication and marketplace access.
+
 ### Publishing (Provider Side)
 
-The `cl-hive-client` / `hive-lnd` plugin handles Nostr publishing for providers:
+The `cl-hive-comms` plugin handles Nostr publishing for providers:
 
 ```
-hive-client marketplace publish --type advisor
+lightning-cli hive-client-marketplace-publish --type advisor
 
 Under the hood:
   1. Read HiveServiceProfile credential from local store
-  2. Derive Nostr key from DID (or use configured Nostr key)
+  2. Use Nostr key from cl-hive-comms (auto-generated or configured)
+     — same key used for DM transport
   3. Build kind 38380 event with profile data
   4. Build kind 30402 event (NIP-99 dual-publish, if enabled)
   5. Build kind 30017 + 30018 events (NIP-15 dual-publish, if enabled)
   6. Add PoW (NIP-13, target: 20 bits)
   7. Sign all events
-  8. Publish to configured relays (≥3)
+  8. Publish to configured relays (≥3) — same relays used for DM transport
   9. Store event IDs locally for update/deletion tracking
 ```
 
 ### Discovery (Consumer Side)
 
 ```
-hive-client discover --type advisor --capability fee_optimization
+lightning-cli hive-client-discover --type advisor --capability fee_optimization
 
 Under the hood:
   1. Query Nostr relays for kind 38380 (profiles)
      Filter: #capability includes "fee_optimization"
+     — uses same Nostr connection as DM transport
   2. Query for kind 38381 (offers) matching criteria
-  3. Query Archon network for HiveServiceProfile credentials
-  4. If hive member: query hive gossip
-  5. Merge results, deduplicate by DID
-  6. Verify DID-Nostr bindings
+  3. If cl-hive-archon installed: query Archon network for HiveServiceProfile credentials
+  4. If hive member (cl-hive installed): query hive gossip
+  5. Merge results, deduplicate by DID or npub
+  6. Verify DID-Nostr bindings (if cl-hive-archon installed)
   7. Fetch reputation summaries (kind 38385)
   8. Score and rank (reputation + PoW + DID verification + tenure)
   9. Present unified list to operator
@@ -911,7 +916,7 @@ Clients maintain persistent WebSocket subscriptions to Nostr relays for real-tim
 ### Configuration
 
 ```yaml
-# cl-hive-client Nostr configuration
+# cl-hive-comms Nostr configuration (shared between DM transport and marketplace)
 nostr:
   enabled: true
   relays:
@@ -947,7 +952,7 @@ nostr:
 ### Dependencies
 
 - **Archon attestation credentials** — Required for DID-Nostr binding (already functional)
-- **cl-hive-client Nostr integration** — WebSocket client, event signing, relay management
+- **cl-hive-comms Nostr integration** — WebSocket client, event signing, relay management (shared with DM transport)
 - **NIP-13 PoW library** — For spam resistance
 - **NIP-44 encryption** — For negotiation DMs (preferred over NIP-04)
 

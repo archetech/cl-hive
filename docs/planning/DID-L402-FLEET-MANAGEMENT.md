@@ -1,9 +1,10 @@
 # DID + L402 Remote Fleet Management
 
 **Status:** Proposal / Design Draft  
-**Version:** 0.1.0  
+**Version:** 0.1.1  
 **Author:** Hex (`did:cid:bagaaierajrr7k6izcrdfwqxpgtrobflsv5oibymfnthjazkkokaugszyh4ka`)  
 **Date:** 2026-02-14  
+**Updated:** 2026-02-15 — Transport priorities updated (Nostr DM primary, REST/rune secondary, Bolt 8 deferred)  
 **Feedback:** Open — file issues or comment in #singularity
 
 ---
@@ -14,9 +15,11 @@ This document proposes a protocol for authenticated, paid remote fleet managemen
 
 - **Archon DIDs** for agent identity and authorization
 - **L402 / Cashu** for micropayment-gated access
-- **Bolt 8** (Lightning P2P transport) for encrypted command delivery
+- **Nostr DM (NIP-44)** as primary transport for encrypted command delivery
+- **REST/rune** as secondary transport for direct low-latency control and fallback
+- **Bolt 8** (deferred) as a future P2P transport option
 
-The result is a system where agents can manage Lightning nodes they don't own — authenticated by verifiable credentials, paid per action or subscription, communicating over the existing Lightning peer network. No new infrastructure required.
+The result is a system where agents can manage Lightning nodes they don't own — authenticated by verifiable credentials, paid per action or subscription, communicating over Nostr relays (primary) or direct REST connections (secondary). The transport layer is abstracted via `cl-hive-comms` so new transports (Bolt 8, Archon Dmail, etc.) can be added without touching other components.
 
 ---
 
@@ -106,8 +109,9 @@ Cashu is **required** for escrow (conditional spending conditions make it unique
 │              └───────┬────────┘                       │
 └──────────────────────┼────────────────────────────────┘
                        │
-                 Bolt 8 Transport
-              (Custom TLV Messages)
+           Nostr DM (NIP-44) — Primary
+           REST/rune — Secondary
+           Bolt 8 — Deferred
                        │
 ┌──────────────────────┼────────────────────────────────┐
 │              ┌───────▼────────┐                       │
@@ -120,10 +124,10 @@ Cashu is **required** for escrow (conditional spending conditions make it unique
 │       ┌──────────────┼──────────────────┐             │
 │       │              │                  │             │
 │  ┌────▼─────┐  ┌─────▼────┐  ┌─────────▼──────────┐ │
-│  │ Archon   │  │ Payment  │  │ CLN Plugin          │ │
-│  │Gatekeeper│  │ Verifier │  │ (cl-hive /          │ │
-│  │ (DID     │  │ (L402 /  │  │  cl-revenue-ops)    │ │
-│  │  verify) │  │  Cashu)  │  │                     │ │
+│  │ Archon   │  │ Payment  │  │ CLN Plugins          │ │
+│  │Gatekeeper│  │ Verifier │  │ (cl-hive-comms +     │ │
+│  │ (DID     │  │ (L402 /  │  │  cl-hive /           │ │
+│  │  verify) │  │  Cashu)  │  │  cl-revenue-ops)     │ │
 │  └──────────┘  └──────────┘  └─────────────────────┘ │
 │                                                       │
 │                   NODE (Managed)                       │
@@ -325,21 +329,21 @@ Settlement happens via the hive's existing distributed settlement protocol, with
 - **Private** — Blind signatures mean the mint can't correlate tokens to commands
 - **Offline-capable** — Agent can hold tokens and spend them without real-time Lightning connectivity
 
-### 3. Transport Layer (Bolt 8 + Custom Messages)
+### 3. Transport Layer
 
-#### Why Bolt 8
+All management traffic flows through `cl-hive-comms`, which provides a **pluggable transport abstraction**. The initial implementation supports two transports:
 
-| Property | Benefit |
-|----------|---------|
-| Already deployed | Every Lightning node has it on port 9735 |
-| Encrypted | Noise_XK with forward secrecy — management commands are invisible to observers |
-| Authenticated | Both sides prove node key ownership during handshake |
-| NAT-friendly | Uses existing Lightning peer connection, no extra ports |
-| Extensible | Custom message types (odd TLV, type ≥ 32768) supported by CLN and LND |
+| Transport | Role | Properties |
+|-----------|------|-----------|
+| **Nostr DM (NIP-44)** | Primary | End-to-end encrypted, relay-based, works across NATs, no peer connection required |
+| **REST/rune** | Secondary | Direct low-latency control, relay-down fallback, CLN rune authentication |
+| **Bolt 8** | Deferred | P2P encrypted via Lightning peer connection — future transport option |
+
+The transport abstraction means new transports (Bolt 8, Archon Dmail, etc.) can be added later by registering with `cl-hive-comms` without touching other plugins or the protocol layer.
 
 #### Message Format
 
-Management messages use a custom Lightning message type in the odd (experimental) range. Per BOLT 1, **odd message types are optional** — peers that don't understand them simply ignore the message. Even types are required-to-understand and would cause non-hive peers to disconnect.
+Management messages use the same TLV payload format regardless of transport. When sent via Nostr DM, the payload is NIP-44 encrypted. When sent via REST/rune, it's delivered as a JSON-RPC call authenticated by CLN runes. When sent via Bolt 8 (future), it uses custom Lightning message types in the odd (experimental) range.
 
 ```
 Type: 49153 (0xC001) — Hive Management Message [odd = optional]
@@ -375,7 +379,7 @@ TLV Payload (internal to the custom message, not BOLT-level TLVs):
 
 #### Message Size
 
-Bolt 8 messages have a 65535-byte limit. A typical management command (schema + credential + payment) is ~2-4 KB, well within limits. For batch operations, the agent sends multiple messages sequentially.
+A typical management command (schema + credential + payment) is ~2-4 KB. Nostr DM and REST/rune have generous size limits. For Bolt 8 (future), the 65535-byte limit is well within range. For batch operations, the agent sends multiple messages sequentially.
 
 ### 4. Schema Layer
 
@@ -1120,7 +1124,7 @@ All three must pass. An agent with a valid credential and payment proof can stil
 | Replay attack | Monotonic nonce + timestamp window. Node tracks per-agent nonce state. |
 | Malicious fee manipulation | Local policy engine enforces bounds. Credential constraints limit change magnitude. |
 | Payment fraud | Cashu tokens are verified with mint before execution. L402 macaroons are cryptographically bound. |
-| Man-in-the-middle | Bolt 8 provides authenticated encryption. Management messages are additionally signed by agent DID. |
+| Man-in-the-middle | Nostr DM (NIP-44) provides end-to-end encryption. REST/rune uses CLN rune authentication. Management messages are additionally signed by agent DID or Nostr key. |
 | Agent compromise | Credential scope limits blast radius. `monitor` tier can't modify anything. Operator can revoke immediately. |
 | Denial of service | Rate limiting per DID. Daily action cap in credential constraints. |
 
@@ -1232,7 +1236,7 @@ The existing hive PKI handshake is extended to include management credential exc
 1. Node joins the hive (existing PKI handshake)
 2. Node operator generates a `HiveManagementCredential` for the fleet advisor's DID
 3. Credential is shared during the next hive gossip round
-4. Advisor's node detects the credential and establishes a Bolt 8 management channel
+4. Advisor's node detects the credential and establishes a Nostr DM management channel (REST/rune fallback)
 5. Advisor begins sending management commands
 
 ### Relationship to Existing Advisor
@@ -1242,7 +1246,7 @@ The current centralized advisor (Claude-based, running on fleet operator's infra
 **Migration path:**
 1. **Phase 1:** Current advisor continues with direct RPC. Schemas are defined and tested.
 2. **Phase 2:** Advisor communicates via schemas over local RPC (same machine, but using the schema format)
-3. **Phase 3:** Advisor communicates via Bolt 8 transport (can now run on any machine)
+3. **Phase 3:** Advisor communicates via Nostr DM transport (can now run on any machine)
 4. **Phase 4:** Third-party advisors can offer management services
 
 ### Governance
@@ -1277,11 +1281,13 @@ Schema proposals that grant new permissions require higher quorum thresholds.
 - Per-action and subscription payment models
 - Payment accounting and receipt generation
 
-### Phase 4: Bolt 8 Transport (2-4 weeks)
-- Custom message type registration (49153/49155)
+### Phase 4: Transport Implementation (2-4 weeks)
+- **Nostr DM (NIP-44)** — Primary transport via cl-hive-comms
+- **REST/rune** — Secondary transport via cl-hive-comms
+- Transport abstraction layer in cl-hive-comms (pluggable interface)
 - Message serialization/deserialization
 - Replay protection (nonce tracking)
-- CLN custom message handler integration
+- *Bolt 8 custom message transport deferred to a future phase*
 
 ### Phase 5: Reputation & Discovery (4-6 weeks)
 - Reputation credential schema
@@ -1327,7 +1333,7 @@ Week 20+:   Fleet Management Phase 6 (marketplace) + Task Escrow Phase 5 (genera
 
 3. **Mint trust:** For Cashu payments, which mint(s) are trusted? Node operator's choice? Hive-endorsed mints?
 
-4. **Latency:** Bolt 8 custom messages add a round trip per command. For time-sensitive actions (velocity alerts), is this acceptable? Should critical schemas have a "pre-authorized" mode?
+4. **Latency:** Nostr DM transport depends on relay latency. REST/rune provides direct low-latency fallback for time-sensitive actions. Should critical schemas prefer REST/rune automatically?
 
 5. **Cross-implementation:** This design assumes CLN. How portable is it to LND/Eclair/LDK? Custom messages are supported but implementations vary. See the [DID Hive Client spec](./DID-HIVE-CLIENT.md) for the full CLN/LND schema translation layer.
 
