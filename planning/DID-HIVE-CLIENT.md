@@ -1,18 +1,31 @@
 # DID Hive Client: Universal Lightning Node Management
 
 **Status:** Proposal / Design Draft  
-**Version:** 0.1.0  
+**Version:** 0.2.0  
 **Author:** Hex (`did:cid:bagaaierajrr7k6izcrdfwqxpgtrobflsv5oibymfnthjazkkokaugszyh4ka`)  
 **Date:** 2026-02-14  
+**Updated:** 2026-02-15 — Plugin architecture refactored (3-plugin split: cl-hive-comms, cl-hive-archon, cl-hive)  
 **Feedback:** Open — file issues or comment in #singularity
 
 ---
 
 ## Abstract
 
-This document specifies lightweight client software — a CLN plugin (`cl-hive-client`) and an LND companion daemon (`hive-lnd`) — that enables **any** Lightning node to contract for professional management services from advisors and access the [liquidity marketplace](./DID-HIVE-LIQUIDITY.md) (leasing, pools, JIT, swaps, insurance). The client implements the management interface defined in the [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) spec without requiring hive membership, bonds, gossip participation, or the full `cl-hive` plugin.
+This document specifies the client-side architecture for Lightning node management — a set of independently installable CLN plugins that enable **any** Lightning node to contract for professional management services from advisors and access the [liquidity marketplace](./DID-HIVE-LIQUIDITY.md) (leasing, pools, JIT, swaps, insurance). The client implements the management interface defined in the [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) spec without requiring hive membership, bonds, gossip participation, or the full `cl-hive` plugin.
 
-The result: every Lightning node operator — from a hobbyist running a Raspberry Pi to a business with a multi-BTC routing node — can hire AI-powered or human expert advisors for fee optimization, rebalancing, and channel management, AND access the full liquidity marketplace for inbound capacity, JIT channels, swaps, and insurance. **Install the plugin, access everything.** The client enforces local policy as the last line of defense against malicious or incompetent advisors and liquidity providers. No trust required.
+The CLN implementation is structured as **three separate, independently installable plugins**:
+
+| Plugin | Purpose | Standalone? |
+|--------|---------|-------------|
+| **`cl-hive-comms`** | Nostr DM + REST/rune transport, subscription management, Nostr marketplace publishing | ✓ Entry point for commercial customers |
+| **`cl-hive-archon`** | DID identity, credentials, dmail, vault | Requires cl-hive-comms |
+| **`cl-hive`** | Coordination (gossip, topology, settlements, advisor) | Requires cl-hive-comms |
+
+A fourth plugin, **`cl-revenue-ops`**, handles local fee policy and profitability and already exists as a standalone tool.
+
+The result: every Lightning node operator — from a hobbyist running a Raspberry Pi to a business with a multi-BTC routing node — can hire AI-powered or human expert advisors for fee optimization, rebalancing, and channel management, AND access the full liquidity marketplace for inbound capacity, JIT channels, swaps, and insurance. **Install cl-hive-comms, access everything.** The client enforces local policy as the last line of defense against malicious or incompetent advisors and liquidity providers. No trust required.
+
+> **LND support** is deferred to a future project. The architecture principles apply equally to an LND companion daemon (`hive-lnd`), but the initial implementation focuses exclusively on CLN plugins.
 
 Two design principles govern the user experience: (1) **cryptographic identity is plumbing** — DIDs, credentials, and signatures are essential infrastructure that operators never see, like TLS certificates; (2) **payment flexibility is mandatory** — advisors accept Bolt11, Bolt12, L402, and Cashu, with Cashu required only for conditional escrow. See [Design Principles](#design-principles) for full details.
 
@@ -32,51 +45,42 @@ DIDs are the cryptographic foundation but **must be invisible to end users**. Th
 
 ### Archon Integration Tiers
 
-The client supports three Archon deployment tiers with graceful degradation:
+The Archon integration tiers map directly to **which plugins you install**:
 
-#### Tier 1: No Archon Node (Default)
+| Tier | Plugins Installed | Identity | DID Verification | Features |
+|------|------------------|----------|-----------------|----------|
+| **None** (default) | `cl-hive-comms` only | Nostr keypair (auto-generated) | None | Nostr DM transport, REST/rune, marketplace publishing |
+| **Lightweight** | `cl-hive-comms` + `cl-hive-archon` | DID via public Archon network | ✓ (public gateway) | DID verification, credential issuance |
+| **Full** | `cl-hive-comms` + `cl-hive-archon` (local node) | DID via local Archon node | ✓ (local) | Dmail, vault, credential issuance, full sovereignty |
+| **Hive Member** | `cl-hive-comms` + `cl-hive-archon` + `cl-hive` | Full hive identity | ✓ | Gossip, topology, settlements, fleet coordination |
 
-- **Setup:** Zero. DID auto-provisioned via public gatekeeper (`archon.technology`).
-- **How it works:** On first run, the client calls the public Archon gateway to create a DID. All DID resolution, credential verification, and revocation checks go through the public gateway.
-- **Tradeoffs:** Depends on public infrastructure availability; slightly slower operations; trusts the public gatekeeper for DID resolution.
-- **Best for:** Non-technical operators, quick start, hobbyists.
+#### Identity Auto-Provisioning (Zero-Config)
+
+On first run, `cl-hive-comms` handles identity automatically:
+
+- **No npub configured?** Plugin generates a Nostr keypair on first run, stores in plugin datadir. Ready immediately.
+- **No DID configured?** Works fine without one (Nostr-only mode). Full transport and marketplace features available.
+- **DID configured later?** (via `cl-hive-archon`) DID↔npub binding auto-created.
+- **Upgrade path:** Nostr-only → install `cl-hive-archon` → add DID → binding auto-created. No reconfiguration needed.
 
 ```ini
-# Default config — no Archon node needed
-hive-client-archon-gateway=https://archon.technology
-hive-client-archon-auto-provision=true
+# Default config — just cl-hive-comms, zero config required
+# npub auto-generated on first run, stored in plugin datadir
 ```
 
-#### Tier 2: Own Archon Node (Encouraged)
-
-- **Setup:** Run local Archon node (`docker compose up` in `~/bin/archon`).
-- **How it works:** All DID operations are local. No external dependency for identity management.
-- **Tradeoffs:** Requires running 14 Docker containers; more infrastructure to maintain; full sovereignty.
-- **Best for:** Serious operators, businesses, privacy-focused users.
-
 ```ini
-# Local Archon node
-hive-client-archon-gateway=http://localhost:4224
-hive-client-archon-auto-provision=true
+# With cl-hive-archon — public Archon gateway (Tier: Lightweight)
+hive-archon-gateway=https://archon.technology
 ```
 
-#### Tier 3: Archon Behind L402 (Future)
-
-- **Setup:** Same as Tier 1, but the public gatekeeper gates services behind L402.
-- **How it works:** DID operations require L402 payment. The client's `L402AccessCredential` (from the [Fleet Management spec](./DID-L402-FLEET-MANAGEMENT.md)) applies here too — the same payment infrastructure that gates fleet management API access can gate identity services.
-- **Tradeoffs:** Per-operation cost; ensures sustainable public infrastructure; natural upgrade incentive to Tier 2.
-- **Best for:** Scaling public infrastructure sustainably.
-
 ```ini
-# Public gateway with L402
-hive-client-archon-gateway=https://archon.technology
-hive-client-archon-l402=true
-hive-client-archon-l402-budget-sats=1000
+# With cl-hive-archon — local Archon node (Tier: Full)
+hive-archon-gateway=http://localhost:4224
 ```
 
 #### Graceful Degradation
 
-The client tries Archon endpoints in order: local node → public gateway → cached credentials. If all fail, the client operates in **degraded mode**: existing credentials are honored (cached), but new credential issuance and revocation checks fail-closed (deny new commands from unverifiable credentials).
+The client tries Archon endpoints in order: local node → public gateway → cached credentials. If all fail, the client operates in **degraded mode**: existing credentials are honored (cached), but new credential issuance and revocation checks fail-closed (deny new commands from unverifiable credentials). If no Archon plugin is installed, the system operates in Nostr-only mode (no DID verification, but all transport and marketplace features work).
 
 ### Payment Flexibility
 
@@ -136,19 +140,16 @@ The hive targets the professional tier (~2,000 nodes). The client targets **ever
 - Revenue from client management fees funds hive development
 - Network effects: more managed nodes → better routing intelligence → better management → more nodes
 
-### Why Two Implementations
+### Implementation Focus: CLN First
 
-Lightning has two dominant implementations: CLN and LND. They share the Lightning protocol but differ in everything else — language, architecture, API surface, plugin model, configuration format. A single client implementation cannot serve both.
+The initial implementation targets CLN exclusively. CLN's dynamic plugin model makes it ideal for the modular, independently installable plugin architecture described here. LND support (via a Go companion daemon) is deferred to a future project — see [LND Support (Deferred)](#lnd-support-deferred) for details.
 
-| Property | CLN | LND |
-|----------|-----|-----|
-| Language | C (core), Python (plugins) | Go |
-| Plugin model | Dynamic plugins via JSON-RPC | Companion daemons via gRPC |
-| Custom messages | `sendcustommsg` / `custommsg` hook | `SendCustomMessage` / `SubscribeCustomMessages` |
-| Configuration | `config` file, command-line flags | `lnd.conf`, command-line flags |
-| Extension convention | Python plugin, single file | Go binary, YAML/TOML config |
-
-Building both `cl-hive-client` (Python, CLN plugin) and `hive-lnd` (Go, LND daemon) ensures the entire Lightning network can participate.
+| Property | CLN (initial) | LND (future) |
+|----------|---------------|--------------|
+| Language | Python (plugins) | Go (companion daemon) |
+| Plugin model | Dynamic plugins via JSON-RPC | Companion daemon via gRPC |
+| Configuration | `config` file, command-line flags | YAML config |
+| Status | **Active development** | **Deferred** |
 
 ---
 
@@ -158,38 +159,47 @@ Building both `cl-hive-client` (Python, CLN plugin) and `hive-lnd` (Go, LND daem
 ┌──────────────────────────────────────────────────────────────────────┐
 │                         CLIENT NODE                                   │
 │                                                                       │
-│  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │              cl-hive-client (CLN) / hive-lnd (LND)              │ │
-│  │                                                                  │ │
-│  │  ┌──────────┐ ┌────────────┐ ┌──────────┐ ┌──────────────────┐ │ │
-│  │  │ Schema   │ │ Credential │ │ Payment  │ │ Policy Engine    │ │ │
-│  │  │ Handler  │ │ Verifier   │ │ Manager  │ │ (local overrides)│ │ │
-│  │  └────┬─────┘ └─────┬──────┘ └────┬─────┘ └───────┬──────────┘ │ │
-│  │       │              │              │               │            │ │
-│  │  ┌────▼──────────────▼──────────────▼───────────────▼──────────┐ │ │
-│  │  │                    Receipt Store                             │ │ │
-│  │  │  (tamper-evident log of all management actions)             │ │ │
-│  │  └─────────────────────────────────────────────────────────────┘ │ │
-│  │                                                                  │ │
-│  │  ┌───────────────────────────────────────────────────┐          │ │
-│  │  │  Identity Layer (auto-provisioned, invisible)     │          │ │
-│  │  │  Archon Keymaster — DID generation, credential    │          │ │
-│  │  │  signing, alias resolution (bundled, no user      │          │ │
-│  │  │  interaction required)                            │          │ │
-│  │  └───────────────────────────────────────────────────┘          │ │
-│  └──────────────────────────────┬──────────────────────────────────┘ │
-│                                 │                                     │
-│                    Custom Messages (49153/49155)                      │
-│                                 │                                     │
-│  ┌──────────────────────────────▼──────────────────────────────────┐ │
-│  │                   Lightning Node (CLN / LND)                    │ │
-│  │               (Bolt11 / Bolt12 / L402 / Cashu)                  │ │
-│  └─────────────────────────────────────────────────────────────────┘ │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │  cl-hive-comms (entry point — installable standalone)        │    │
+│  │                                                               │    │
+│  │  ┌─────────────┐  ┌────────────┐  ┌───────────────────────┐ │    │
+│  │  │ Transport    │  │ Nostr Mkt  │  │ Subscription Manager │ │    │
+│  │  │ Abstraction  │  │ Publisher  │  │                      │ │    │
+│  │  │              │  │ (38380+/   │  │                      │ │    │
+│  │  │ ┌──────────┐ │  │  38900+)   │  │                      │ │    │
+│  │  │ │Nostr DM  │ │  └────────────┘  └───────────────────────┘ │    │
+│  │  │ │(primary) │ │                                             │    │
+│  │  │ ├──────────┤ │  ┌──────────┐  ┌──────────────────┐       │    │
+│  │  │ │REST/rune │ │  │ Payment  │  │ Policy Engine    │       │    │
+│  │  │ │(secondary│ │  │ Manager  │  │ (local overrides)│       │    │
+│  │  │ ├──────────┤ │  └──────────┘  └──────────────────┘       │    │
+│  │  │ │Bolt 8    │ │                                             │    │
+│  │  │ │(deferred)│ │  ┌──────────────────────────────────────┐  │    │
+│  │  │ └──────────┘ │  │ Receipt Store (tamper-evident log)   │  │    │
+│  │  └─────────────┘  └──────────────────────────────────────┘  │    │
+│  └───────────────────────────┬──────────────────────────────────┘    │
+│                               │                                       │
+│  ┌───────────────────────────┴──────────────────────────────────┐    │
+│  │  cl-hive-archon (optional — DID identity plugin)             │    │
+│  │  DID generation, credentials, dmail, vault                    │    │
+│  │  (install for DID verification, Archon integration)           │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+│                                                                       │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │  cl-hive (optional — full hive coordination)                  │    │
+│  │  Gossip, topology, settlements, fleet advisor                 │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+│                                                                       │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │                   Lightning Node (CLN)                        │    │
+│  │               (Bolt11 / Bolt12 / L402 / Cashu)                │    │
+│  └──────────────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────────────┘
 
                               ▲
-                              │ Bolt 8 Transport
-                              │ (Custom TLV Messages)
+                              │ Nostr DM (NIP-44) — Primary Transport
+                              │ REST/rune — Secondary (low-latency / fallback)
+                              │ Bolt 8 — Deferred (future transport option)
                               ▼
 
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -205,34 +215,46 @@ Building both `cl-hive-client` (Python, CLN plugin) and `hive-lnd` (Go, LND daem
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-### Comparison with Full Hive Membership
+### Transport Architecture
 
-| Feature | Unmanaged | Client (`cl-hive-client` / `hive-lnd`) | Full Hive Member (`cl-hive`) |
-|---------|-----------|----------------------------------------|------------------------------|
-| Professional management | ✗ | ✓ | ✓ |
-| Fee optimization | Manual | Via advisor | Via advisor + fleet intelligence |
-| Rebalancing | Manual | Via advisor | Via advisor + fleet paths (97% cheaper) |
-| Channel expansion | Manual | Via advisor proposal | Via advisor + hive coordination |
-| Monitoring & alerts | DIY | Via advisor | Via advisor + hive health gossip |
-| Gossip participation | ✗ | ✗ | ✓ |
-| Settlement protocol | ✗ | ✗ (direct escrow only) | ✓ (netting, credit tiers) |
-| Fleet rebalancing | ✗ | ✗ | ✓ (intra-hive paths) |
-| Pheromone routing | ✗ | ✗ | ✓ |
-| Liquidity marketplace | ✗ | ✓ (direct escrow with providers) | ✓ (full market + settlement netting) |
-| Intelligence market | ✗ | ✗ (buy from advisor directly) | ✓ (full market access) |
-| Payment methods | N/A | Bolt11, Bolt12, L402, Cashu escrow | Same + settlement netting |
-| Bond requirement | None | None | 50,000–500,000 sats |
-| Infrastructure | Node only | Node + plugin/daemon (auto-configuring) | Node + cl-hive + full PKI |
-| Cost model | Free | Per-action or subscription | Bond + discounted per-action |
+`cl-hive-comms` implements a **pluggable transport abstraction** so new transports can be added without touching other plugins:
+
+| Transport | Role | Status |
+|-----------|------|--------|
+| **Nostr DM (NIP-44)** | Primary transport for all node↔advisor communication | ✓ Initial implementation |
+| **REST/rune** | Secondary — direct low-latency control and relay-down fallback | ✓ Initial implementation |
+| **Bolt 8** | Future transport option for P2P encrypted messaging | Deferred |
+| **Archon Dmail** | Future transport option via DID messaging | Deferred (requires cl-hive-archon) |
+
+The transport abstraction means `cl-hive-archon` and `cl-hive` never interact with transport directly — they register handlers with `cl-hive-comms`, which routes messages through the appropriate transport.
+
+### Comparison: Plugin Compositions
+
+| Feature | Unmanaged | `cl-hive-comms` only | + `cl-hive-archon` | + `cl-hive` (full member) |
+|---------|-----------|---------------------|-------------------|--------------------------|
+| Professional management | ✗ | ✓ | ✓ | ✓ |
+| Fee optimization | Manual | Via advisor | Via advisor | Via advisor + fleet intelligence |
+| Nostr DM transport | ✗ | ✓ (primary) | ✓ | ✓ |
+| REST/rune transport | ✗ | ✓ (secondary) | ✓ | ✓ |
+| Marketplace publishing | ✗ | ✓ (kinds 38380+/38900+) | ✓ | ✓ |
+| DID verification | ✗ | ✗ | ✓ | ✓ |
+| Dmail / vault | ✗ | ✗ | ✓ | ✓ |
+| Gossip participation | ✗ | ✗ | ✗ | ✓ |
+| Settlement protocol | ✗ | ✗ (direct escrow only) | ✗ (direct escrow only) | ✓ (netting, credit tiers) |
+| Fleet rebalancing | ✗ | ✗ | ✗ | ✓ (intra-hive paths) |
+| Bond requirement | None | None | None | 50,000–500,000 sats |
+| Identity | None | Nostr keypair (auto) | Nostr + DID | Nostr + DID + hive PKI |
 
 ### Minimal Dependencies
 
-The client has two dependencies:
+The minimum viable setup has two dependencies:
 
-1. **Lightning node** — CLN ≥ v24.08 or LND ≥ v0.18.0 (custom message support required)
-2. **The client plugin/daemon itself** — Single file (CLN) or single binary (LND)
+1. **Lightning node** — CLN ≥ v24.08
+2. **`cl-hive-comms`** — Single plugin file
 
-That's it. The Archon Keymaster (for DID identity) is **bundled** — the client auto-provisions a DID on first run. No separate installation, no manual key management. A built-in Cashu wallet handles conditional escrow. The node's existing Lightning wallet handles Bolt11/Bolt12/L402 payments.
+That's it. On first run, `cl-hive-comms` auto-generates a Nostr keypair (no configuration required), connects to Nostr relays for DM transport, and is ready to receive advisor commands. No DID setup, no Archon node, no manual key management. A built-in Cashu wallet handles conditional escrow. The node's existing Lightning wallet handles Bolt11/Bolt12/L402 payments.
+
+Add `cl-hive-archon` later for DID identity and credential verification. Add `cl-hive` for full hive membership. Each plugin is independently installable.
 
 ---
 
@@ -244,31 +266,41 @@ Archon DIDs are the cryptographic backbone of the entire protocol — identity, 
 
 ### Auto-Provisioning
 
-On first run, the client:
+On first run, `cl-hive-comms`:
 
+1. Checks if an npub/Nostr keypair is configured
+2. If not, **automatically generates a Nostr keypair** and stores it in the plugin datadir
+3. Connects to configured Nostr relays for DM transport
+4. Logs: `"Hive comms initialized. Nostr identity created."`
+
+No DID is required at this stage. The node operates in **Nostr-only mode** — full transport and marketplace features, no DID verification.
+
+If `cl-hive-archon` is installed later:
 1. Checks if a DID is configured
-2. If not, **automatically generates one** using the bundled Archon Keymaster library
-3. Stores the DID and key material in the client's data directory (encrypted at rest)
-4. Registers the DID with the configured Archon gateway (default: `https://archon.technology`)
-5. Logs: `"Hive client initialized. Your node identity has been created."`
-
-The operator never sees `did:cid:bagaaiera...`. They see "your node identity."
+2. If not, auto-provisions a DID via the configured Archon gateway
+3. Creates a DID↔npub binding automatically
+4. Logs: `"DID identity created and bound to Nostr key."`
 
 ```bash
-# What the operator types:
-lightning-cli plugin start cl_hive_client.py
+# Minimal setup — just cl-hive-comms:
+lightning-cli plugin start cl_hive_comms.py
+# → Nostr keypair generated, stored in ~/.lightning/cl-hive-comms/
+# → Ready for advisor connections via Nostr DM
 
-# What happens internally:
-# 1. Plugin starts
-# 2. No DID found → auto-generate
-# 3. DID stored in ~/.lightning/hive-client/identity.json (encrypted)
-# 4. Ready to go
+# Later, add DID identity:
+lightning-cli plugin start cl_hive_archon.py
+# → DID auto-provisioned, bound to existing npub
+# → DID verification now available
 ```
 
-For operators who already have an Archon DID (e.g., from another application), the client can import it:
+For operators who already have a Nostr key or Archon DID:
 
 ```bash
-lightning-cli hive-client-import-identity --file=/path/to/wallet.json
+# Import existing Nostr key
+lightning-cli hive-comms-import-key --nsec="nsec1..."
+
+# Import existing DID (requires cl-hive-archon)
+lightning-cli hive-archon-import-identity --file=/path/to/wallet.json
 ```
 
 ### Alias Resolution
@@ -467,21 +499,14 @@ Is this a conditional payment (escrow)?
 
 ```ini
 # Operator's preferred payment methods (in priority order)
-hive-client-payment-methods=bolt11,bolt12,cashu
+hive-comms-payment-methods=bolt11,bolt12,cashu
 
 # For escrow specifically (danger score ≥ 3)
-hive-client-escrow-method=cashu
-hive-client-escrow-mint=https://mint.minibits.cash
+hive-comms-escrow-method=cashu
+hive-comms-escrow-mint=https://mint.minibits.cash
 ```
 
-```yaml
-# hive-lnd.yaml
-payments:
-  preferred_methods: ["bolt11", "bolt12"]
-  escrow_method: "cashu"
-  escrow_mint: "https://mint.minibits.cash"
-```
-
+> **Note:** LND configuration examples are deferred along with the LND implementation.
 ### Bolt11 Payments (Standard Lightning Invoices)
 
 The simplest and most widely supported payment method. Used for:
@@ -575,7 +600,7 @@ Advisor (HTTP API)               Client
 
 **Advantage:** Familiar HTTP API pattern. Macaroon caveats can encode permission scope (mirroring credential constraints). Efficient for high-frequency monitoring queries.
 
-**Limitation:** Requires HTTP connectivity to advisor (not P2P Bolt 8). Best suited for monitoring-heavy advisors with web dashboards.
+**Limitation:** Requires HTTP connectivity to advisor (not P2P). Best suited for monitoring-heavy advisors with web dashboards.
 
 ### Cashu Escrow (Conditional Payments)
 
@@ -635,39 +660,57 @@ If no common non-escrow method exists, the client falls back to Cashu for all pa
 
 ---
 
-## CLN Plugin (`cl-hive-client`)
+## CLN Plugins
 
 ### Overview
 
-A Python plugin following CLN's plugin architecture. Single file (`cl_hive_client.py`), no Docker, no complex setup. Registers custom message handlers for management schemas (types 49153/49155) and exposes RPC commands for operator interaction. **Auto-provisions identity on first run** — no manual DID setup needed.
+The CLN implementation consists of three independently installable Python plugins:
 
-### Components
+| Plugin | File | Purpose |
+|--------|------|---------|
+| **`cl-hive-comms`** | `cl_hive_comms.py` | Transport (Nostr DM + REST/rune), subscription management, marketplace publishing |
+| **`cl-hive-archon`** | `cl_hive_archon.py` | DID identity, credentials, dmail, vault |
+| **`cl-hive`** | `cl_hive.py` | Full hive coordination (gossip, topology, settlements) |
+
+**`cl-hive-comms` is the entry point.** It can be installed standalone without the other plugins and is sufficient for commercial customers who want advisor management and marketplace access.
+
+### cl-hive-comms Components
 
 #### Schema Handler
 
-Receives incoming management commands via custom message type 49153, validates the TLV payload structure per the [Fleet Management transport spec](./DID-L402-FLEET-MANAGEMENT.md#3-transport-layer-bolt-8--custom-messages), and dispatches to the appropriate CLN RPC.
+Receives incoming management commands via **Nostr DM (NIP-44)** (primary transport) or **REST/rune** (secondary transport), validates the payload structure per the [Fleet Management spec](./DID-L402-FLEET-MANAGEMENT.md), and dispatches to the appropriate CLN RPC.
 
 ```python
-@plugin.hook("custommsg")
-def on_custommsg(peer_id, payload, plugin, **kwargs):
-    msg_type = int.from_bytes(payload[:2], 'big')
-    if msg_type == 0xC001:  # 49153 — Hive Management Message
-        return handle_management_message(peer_id, payload[2:])
-    return {"result": "continue"}
+# Primary transport: Nostr DM (NIP-44)
+async def on_nostr_dm(sender_pubkey, decrypted_payload):
+    msg = parse_management_message(decrypted_payload)
+    return await handle_management_message(sender_pubkey, msg)
+
+# Secondary transport: REST/rune (direct low-latency control, relay-down fallback)
+@plugin.method("hive-comms-rpc")
+def on_rpc_command(plugin, request, **kwargs):
+    return handle_management_message(request["sender"], request["payload"])
 ```
 
 The handler:
-1. Deserializes the TLV payload (schema_type, schema_payload, credential, payment_proof, signature, nonce, timestamp)
-2. Passes to Credential Verifier
+1. Deserializes the payload (schema_type, schema_payload, credential, payment_proof, signature, nonce, timestamp)
+2. Passes to Credential Verifier (if `cl-hive-archon` installed, verifies DID; otherwise, verifies Nostr signature)
 3. Passes to Policy Engine
 4. If both pass, executes the schema action via CLN RPC
 5. Generates signed receipt
-6. Sends response via custom message type 49155
+6. Sends response via the same transport
 
 #### Credential Verifier
 
-Validates the Archon DID credential attached to each management command:
+Validates the credential attached to each management command. Verification level depends on installed plugins:
 
+**Nostr-only mode** (cl-hive-comms only):
+1. **Nostr signature verification** — Verifies the command is signed by the advisor's Nostr pubkey
+2. **Scope check** — Confirms the credential grants the required permission tier
+3. **Constraint check** — Validates parameters against credential constraints
+4. **Replay protection** — Monotonic nonce check per agent pubkey. Timestamp within ±5 minutes.
+
+**DID mode** (cl-hive-archon installed):
 1. **DID resolution** — Resolves the agent's DID via local Archon Keymaster or remote Archon gateway
 2. **Signature verification** — Verifies the credential's proof against the issuer's DID document
 3. **Scope check** — Confirms the credential grants the required permission tier for the requested schema
@@ -735,72 +778,93 @@ All commands accept **advisor names, aliases, or discovery indices** — not DID
 
 ### Configuration
 
-Most settings have sensible defaults. **Zero configuration is required for first run** — the plugin auto-provisions identity and uses defaults for everything else.
+Most settings have sensible defaults. **Zero configuration is required for first run** — `cl-hive-comms` auto-generates a Nostr keypair and uses defaults for everything else.
 
 ```ini
 # ~/.lightning/config (CLN config file)
-# All settings are optional — defaults work out of the box.
+# All cl-hive-comms settings are optional — defaults work out of the box.
 
-# Identity (auto-provisioned if not set — see Archon Integration Tiers)
-# hive-client-did=did:cid:bagaaiera...    # Only set if importing existing DID
-# hive-client-archon-gateway=https://archon.technology  # Tier 1 default
-# hive-client-archon-gateway=http://localhost:4224      # Tier 2: own Archon node
+# Nostr transport (primary)
+# hive-comms-nostr-relays=wss://nos.lol,wss://relay.damus.io   # defaults
+# hive-comms-nsec=nsec1...           # Only set if importing existing key
+                                      # Otherwise, auto-generated on first run
+
+# REST/rune transport (secondary — for direct low-latency control)
+# hive-comms-rest-enabled=true        # default: true
+# hive-comms-rest-port=9737           # default: 9737
 
 # Payment methods (in preference order)
-hive-client-payment-methods=bolt11,bolt12
-hive-client-escrow-mint=https://mint.minibits.cash
+hive-comms-payment-methods=bolt11,bolt12
+hive-comms-escrow-mint=https://mint.minibits.cash
 
 # Spending limits
-hive-client-daily-limit=50000
-hive-client-weekly-limit=200000
+hive-comms-daily-limit=50000
+hive-comms-weekly-limit=200000
 
 # Policy preset (conservative | moderate | aggressive)
-hive-client-policy-preset=moderate
+hive-comms-policy-preset=moderate
 
-# Alerts (optional — enables notifications for advisor actions)
-# hive-client-alert-webhook=https://hooks.example.com/hive
-# hive-client-alert-nostr-dm=npub1abc...
-# hive-client-alert-email=operator@example.com
+# Marketplace publishing
+hive-comms-marketplace-publish=true   # Publish Nostr marketplace events (38380+/38900+)
+
+# Alerts (optional)
+# hive-comms-alert-nostr-dm=npub1abc...
+
+# --- cl-hive-archon settings (only if installed) ---
+# hive-archon-gateway=https://archon.technology   # Lightweight tier
+# hive-archon-gateway=http://localhost:4224        # Full tier (local node)
 ```
 
 ### Installation
 
 ```bash
-# 1. Download the plugin
-curl -O https://github.com/lightning-goats/cl-hive-client/releases/latest/cl_hive_client.py
+# Minimal: just cl-hive-comms (entry point for commercial customers)
+lightning-cli plugin start /path/to/cl_hive_comms.py
 
-# 2. Start it
-lightning-cli plugin start /path/to/cl_hive_client.py
+# Add DID identity later:
+lightning-cli plugin start /path/to/cl_hive_archon.py
+
+# Full hive membership:
+lightning-cli plugin start /path/to/cl_hive.py
 ```
 
-That's it. On first run, the plugin auto-provisions a node identity, creates its data directory, and is ready to accept advisor connections. No DID setup. No key management. No configuration file edits required.
+On first run, `cl-hive-comms` auto-generates a Nostr keypair, creates its data directory, and is ready to accept advisor connections. No DID setup. No key management. No configuration file edits required.
 
 For permanent installation, add to your CLN config:
 
 ```ini
-plugin=/path/to/cl_hive_client.py
+# Minimum viable setup:
+plugin=/path/to/cl_hive_comms.py
+
+# With DID identity (optional):
+plugin=/path/to/cl_hive_archon.py
+
+# Full hive member (optional):
+plugin=/path/to/cl_hive.py
 ```
 
-### Relationship to Full `cl-hive`
+### Plugin Composition
 
-`cl-hive-client` is a **strict subset** of `cl-hive`. If you're already running `cl-hive`, you don't need `cl-hive-client` — the full plugin includes all client functionality plus gossip, settlement, pheromone, and fleet coordination.
+The plugins form a layered architecture where each layer adds capabilities:
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                      cl-hive (full)                   │
-│                                                       │
-│  ┌────────────────────────────────────────────────┐  │
-│  │              cl-hive-client (subset)            │  │
-│  │                                                 │  │
-│  │  Schema Handler    Credential Verifier          │  │
-│  │  Escrow Manager    Policy Engine                │  │
-│  │  Receipt Store     RPC Commands                 │  │
-│  └─────────────────────────────────────────────────┘  │
-│                                                       │
-│  Gossip Protocol        Settlement Protocol           │
-│  Pheromone System       Bond Management               │
-│  Fleet Coordination     Hive PKI                      │
-│  Intelligence Market    Stigmergic Signals            │
+│                    cl-hive (coordination)              │
+│  Gossip, topology, settlements, fleet advisor         │
+│  Requires: cl-hive-comms                              │
+├──────────────────────────────────────────────────────┤
+│                    cl-hive-archon (identity)           │
+│  DID generation, credentials, dmail, vault            │
+│  Requires: cl-hive-comms                              │
+├──────────────────────────────────────────────────────┤
+│                    cl-hive-comms (transport)           │
+│  Nostr DM + REST/rune transport, subscriptions,       │
+│  marketplace publishing, payment, policy engine       │
+│  Standalone — no dependencies on other hive plugins   │
+├──────────────────────────────────────────────────────┤
+│                    cl-revenue-ops (existing)           │
+│  Local fee policy, profitability analysis             │
+│  Standalone — independent of hive plugins             │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -808,142 +872,9 @@ plugin=/path/to/cl_hive_client.py
 
 ---
 
-## LND Companion Daemon (`hive-lnd`)
+## LND Support (Deferred)
 
-### Overview
-
-A Go daemon that connects to LND via gRPC and provides the same management interface as `cl-hive-client`. Runs as a standalone process alongside LND, similar to other LND companion tools (Loop, Pool, Faraday, Lightning Terminal).
-
-### Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│                       hive-lnd                        │
-│                                                       │
-│  ┌──────────┐ ┌────────────┐ ┌──────────┐           │
-│  │ Schema   │ │ Credential │ │ Escrow   │           │
-│  │ Handler  │ │ Verifier   │ │ Manager  │           │
-│  └────┬─────┘ └────────────┘ └──────────┘           │
-│       │                                               │
-│  ┌────▼──────────────────────────────────┐           │
-│  │     Schema Translation Layer          │           │
-│  │                                       │           │
-│  │  hive:fee-policy → UpdateChannelPolicy│           │
-│  │  hive:monitor    → GetInfo, ListChans │           │
-│  │  hive:rebalance  → SendPaymentV2     │           │
-│  │  hive:channel    → OpenChannel, Close │           │
-│  │  ...                                  │           │
-│  └────┬──────────────────────────────────┘           │
-│       │                                               │
-│  ┌────▼─────────────────────────┐                    │
-│  │   LND gRPC Client           │                    │
-│  │   (lnrpc, routerrpc, etc.)  │                    │
-│  └──────────────────────────────┘                    │
-│                                                       │
-│  ┌──────────────────────────────┐                    │
-│  │   Policy Engine + Receipt   │                    │
-│  │   Store + Alert Manager     │                    │
-│  └──────────────────────────────┘                    │
-│                                                       │
-│  ┌──────────────────────────────┐                    │
-│  │   HiveClientService (gRPC)  │                    │
-│  │   (local management API)    │                    │
-│  └──────────────────────────────┘                    │
-└──────────────────────────────────────────────────────┘
-          │                    ▲
-          │ gRPC               │ Custom Messages
-          ▼                    │ (SubscribeCustomMessages)
-     ┌─────────┐          ┌───┴───┐
-     │  LND    │          │  LND  │
-     │  (RPC)  │          │ (P2P) │
-     └─────────┘          └───────┘
-```
-
-### Custom Message Handling
-
-LND exposes custom message handling via gRPC:
-
-```go
-// Subscribe to incoming custom messages
-stream, err := client.SubscribeCustomMessages(ctx, &lnrpc.SubscribeCustomMessagesRequest{})
-for {
-    msg, err := stream.Recv()
-    if msg.Type == 49153 { // Hive Management Message
-        handleManagementMessage(msg.Peer, msg.Data)
-    }
-}
-
-// Send custom message response
-_, err = client.SendCustomMessage(ctx, &lnrpc.SendCustomMessageRequest{
-    Peer: peerPubkey,
-    Type: 49155, // Hive Management Response
-    Data: responsePayload,
-})
-```
-
-### Local gRPC Service
-
-`hive-lnd` exposes a local gRPC service for operator interaction (equivalent to `cl-hive-client`'s RPC commands):
-
-```protobuf
-service HiveClientService {
-  rpc Status(StatusRequest) returns (StatusResponse);
-  rpc Authorize(AuthorizeRequest) returns (AuthorizeResponse);
-  rpc Revoke(RevokeRequest) returns (RevokeResponse);
-  rpc ListReceipts(ListReceiptsRequest) returns (ListReceiptsResponse);
-  rpc Discover(DiscoverRequest) returns (DiscoverResponse);
-  rpc GetPolicy(GetPolicyRequest) returns (PolicyResponse);
-  rpc SetPolicy(SetPolicyRequest) returns (PolicyResponse);
-  rpc EscrowInfo(EscrowInfoRequest) returns (EscrowInfoResponse);
-  rpc StartTrial(StartTrialRequest) returns (TrialResponse);
-}
-```
-
-### Configuration
-
-Auto-detected defaults for most settings. Only the LND connection needs explicit configuration (and `hive-lnd init` auto-detects the standard LND paths).
-
-```yaml
-# hive-lnd.yaml (generated by `hive-lnd init`)
-# Identity is auto-provisioned on first run — no DID setup needed.
-
-lnd:
-  rpc_host: "localhost:10009"       # auto-detected
-  tls_cert: "~/.lnd/tls.cert"      # auto-detected
-  macaroon: "~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"  # auto-detected
-
-payments:
-  preferred_methods: ["bolt11", "bolt12"]
-  escrow_mint: "https://mint.minibits.cash"
-  daily_limit: 50000
-  weekly_limit: 200000
-
-policy:
-  preset: "moderate"
-
-# alerts:                           # optional
-#   webhook: "https://hooks.example.com/hive"
-#   email: "operator@example.com"
-```
-
-### Installation
-
-```bash
-# 1. Download and install
-curl -LO https://github.com/lightning-goats/hive-lnd/releases/latest/hive-lnd-linux-amd64
-chmod +x hive-lnd-linux-amd64 && mv hive-lnd-linux-amd64 /usr/local/bin/hive-lnd
-
-# 2. Initialize (auto-detects LND paths, generates config)
-hive-lnd init
-
-# 3. Run
-hive-lnd
-
-# Optional: install as system service
-hive-lnd install-service
-```
-
-On first run, `hive-lnd` auto-provisions a node identity and connects to LND. No DID setup, no key management.
+> **LND implementation is deferred.** The initial implementation focuses exclusively on CLN plugins. An LND companion daemon (`hive-lnd`) is planned as a future, effectively separate project. The architecture principles, schema definitions, and protocol formats defined in this spec apply equally to LND — only the implementation layer differs (Go daemon with gRPC instead of Python plugin with JSON-RPC). The Schema Translation Layer in [Section 5](#5-schema-translation-layer) documents both CLN and LND RPC mappings for future reference.
 
 ---
 
@@ -1094,7 +1025,7 @@ hive-lnd authorize "Hex Fleet Advisor" --access="fee optimization"
 lightning-cli hive-client-authorize --advisor-did="did:cid:bagaaiera..." --template="fee_optimization"
 ```
 
-The credential is signed by the operator's auto-provisioned identity and delivered to the advisor automatically via the Bolt 8 peer connection.
+The credential is signed by the operator's identity (Nostr key or DID) and delivered to the advisor automatically via Nostr DM or REST/rune.
 
 ### Credential Templates
 
@@ -1206,7 +1137,7 @@ Operator                     Client Plugin               Cashu Mint
     │                      ◄───────────────────────────────  │
     │                             │                          │
     │  3. Ticket sent to advisor  │                          │
-    │     via Bolt 8              │                          │
+    │     via Nostr DM            │                          │
     │  ──────────────────────►    │                          │
     │                             │                          │
 ```
@@ -1437,7 +1368,7 @@ The client searches multiple sources in parallel and merges results:
 
 **1. Archon Network** — Queries for `HiveServiceProfile` credentials. Highest trust — profiles are cryptographically signed, reputation is verifiable.
 
-**2. Nostr** — Subscribes to advisor profile events (kind `38383`, tag `t:hive-advisor`). Medium trust — the client verifies the embedded credential signature and DID-to-Nostr binding.
+**2. Nostr** — `cl-hive-comms` subscribes to advisor profile events (kind `38383`, tag `t:hive-advisor`) using the same Nostr connection it uses for DM transport. Medium trust — the client verifies the embedded credential signature and DID-to-Nostr binding (if cl-hive-archon is installed) or Nostr signature (Nostr-only mode). `cl-hive-comms` also handles **marketplace event publishing** (kinds 38380+/38900+) — see the [Nostr Marketplace spec](./DID-NOSTR-MARKETPLACE.md).
 
 **3. Curated Directories** — Optional web directories that aggregate profiles. Low trust for the directory; high trust for the verified credentials it surfaces.
 
@@ -1461,8 +1392,8 @@ The entire flow from zero to managed node, as the operator experiences it:
 ### The Three-Command Quickstart
 
 ```bash
-# 1. Install
-lightning-cli plugin start /path/to/cl_hive_client.py
+# 1. Install cl-hive-comms
+lightning-cli plugin start /path/to/cl_hive_comms.py
 
 # 2. Find an advisor
 lightning-cli hive-client-discover --capabilities="fee optimization"
@@ -1484,7 +1415,7 @@ Done. Your node is now professionally managed. Here's what happened behind the s
 | Install plugin | `plugin start cl_hive_client.py` | DID auto-provisioned, Keymaster initialized, data directory created |
 | Discover | `hive-client-discover` | Parallel queries to Archon + Nostr + directories, credential verification, reputation aggregation, ranking |
 | Review | Read the results list | (Nothing — results already verified and ranked) |
-| Authorize | `hive-client-authorize 1 --access="fees"` | Credential created and signed, payment method negotiated with advisor, credential delivered via Bolt 8, trial period started |
+| Authorize | `hive-client-authorize 1 --access="fees"` | Credential created and signed, payment method negotiated with advisor, credential delivered via Nostr DM, trial period started |
 | Trial (automatic) | Wait 7–14 days | Advisor operates with reduced scope, client measures baseline, flat-fee payment via Bolt11 |
 | Review trial | `hive-client-trial --review` | Metrics computed: actions taken, revenue delta, uptime, response time |
 | Full access | `hive-client-authorize "Hex Advisor" --access="full routing"` | New credential with expanded scope, escrow auto-funded for conditional payments, full management begins |
@@ -1492,13 +1423,15 @@ Done. Your node is now professionally managed. Here's what happened behind the s
 
 ### What the Operator Never Does
 
-- ~~Create a DID~~ (auto-provisioned)
-- ~~Install Archon Keymaster~~ (bundled)
+- ~~Create a Nostr key~~ (auto-generated by cl-hive-comms)
+- ~~Create a DID~~ (auto-provisioned by cl-hive-archon if installed)
+- ~~Install Archon Keymaster~~ (bundled in cl-hive-archon, optional)
 - ~~Configure credential schemas~~ (templates handle this)
 - ~~Fund a Cashu wallet manually~~ (auto-replenishment from node wallet)
 - ~~Verify cryptographic signatures~~ (automatic)
 - ~~Resolve DID documents~~ (abstraction layer)
 - ~~Manage payment tokens~~ (Payment Manager handles routing to Bolt11/Bolt12/Cashu)
+- ~~Configure transport~~ (Nostr DM works out of the box, REST/rune auto-enabled)
 
 ### Interactive Onboarding Wizard (Optional)
 
@@ -1541,10 +1474,11 @@ Client-only nodes can upgrade to full hive membership when they want the benefit
 
 ### What Changes
 
-| Aspect | Client | Full Hive Member |
-|--------|--------|-----------------|
-| Software | `cl-hive-client` | `cl-hive` (full plugin) |
-| Bond | None | 50,000–500,000 sats (per [Settlements spec](./DID-HIVE-SETTLEMENTS.md#bond-sizing)) |
+| Aspect | `cl-hive-comms` only | + `cl-hive-archon` | + `cl-hive` (full member) |
+|--------|---------------------|-------------------|--------------------------|
+| Software | Single plugin | Two plugins | Three plugins |
+| Identity | Nostr keypair | Nostr + DID | Nostr + DID + hive PKI |
+| Bond | None | None | 50,000–500,000 sats (per [Settlements spec](./DID-HIVE-SETTLEMENTS.md#bond-sizing)) |
 | Gossip | No participation | Full gossip network access |
 | Settlement | Direct escrow only | Netting, credit tiers, bilateral/multilateral |
 | Fleet rebalancing | N/A | Intra-hive paths (97% fee savings) |
@@ -1563,17 +1497,23 @@ Client-only nodes can upgrade to full hive membership when they want the benefit
 ### Migration Process
 
 ```bash
-# 1. Upgrade plugin (replaces cl-hive-client automatically)
-lightning-cli hive-upgrade
+# Starting from cl-hive-comms only:
 
-# 2. Join a hive and post bond
+# 1. Add DID identity (optional but recommended before hive membership)
+lightning-cli plugin start /path/to/cl_hive_archon.py
+# → DID auto-provisioned, bound to existing Nostr key
+
+# 2. Add full hive coordination
+lightning-cli plugin start /path/to/cl_hive.py
+
+# 3. Join a hive and post bond
 lightning-cli hive-join --bond=50000
 
-# 3. Existing advisor relationships continue unchanged
+# 4. Existing advisor relationships continue unchanged
 lightning-cli hive-client-status  # same advisors, same credentials
 ```
 
-Under the hood: the upgrade installs `cl-hive`, migrates the identity and credential store, joins the hive PKI, and posts the bond via the Cashu escrow wallet.
+Under the hood: each plugin layer adds capabilities without disrupting existing connections. The Nostr keypair generated by cl-hive-comms persists through the upgrade. DID binding is created automatically when cl-hive-archon is added.
 
 ### Incentives to Upgrade
 
@@ -1642,9 +1582,10 @@ The Receipt Store serves as a tamper-evident audit log:
 
 ### Network-Level Security
 
-- **Bolt 8 encryption** — All management traffic uses Noise_XK with forward secrecy. Management commands are invisible to network observers.
+- **Nostr DM encryption (NIP-44)** — Primary transport uses NIP-44 encryption. Management commands are encrypted end-to-end between node and advisor.
+- **REST/rune authentication** — Secondary transport uses CLN rune-based authentication for direct connections.
 - **No cleartext management traffic** — The client never sends management commands over unencrypted channels.
-- **Custom message types are odd** (49153, 49155) — Per BOLT 1, non-hive peers simply ignore these messages. No information leakage to uninvolved peers.
+- **Bolt 8 encryption** — When Bolt 8 transport is added (deferred), it will use Noise_XK with forward secrecy.
 
 ---
 
@@ -1706,17 +1647,19 @@ Bond is recoverable (minus any slashing) on hive exit.
 
 Phased delivery, aligned with the other specs' roadmaps. The client is designed to be useful early — even Phase 1 provides value.
 
-### Phase 1: Core Client (4–6 weeks)
+### Phase 1: cl-hive-comms Core (4–6 weeks)
 *Prerequisites: Fleet Management Phase 1–2 (schemas + DID auth)*
 
-- `cl-hive-client` Python plugin with Schema Handler and Credential Verifier
-- **Identity auto-provisioning** (bundled Keymaster, DID generation on first run)
-- **DID Abstraction Layer** (alias registry, human-readable CLI output)
-- Custom message handling (types 49153/49155)
+- `cl-hive-comms` Python plugin with Schema Handler
+- **Nostr DM transport (NIP-44)** — primary transport implementation
+- **REST/rune transport** — secondary transport for direct control and fallback
+- **Transport abstraction layer** — pluggable interface for future transports
+- **Nostr keypair auto-generation** on first run (zero-config)
+- **Nostr marketplace event publishing** (kinds 38380+/38900+)
 - Basic Policy Engine (presets only)
 - Receipt Store (SQLite, hash-chained)
 - Bolt11 payment support (simple per-action via node wallet)
-- RPC commands with name-based addressing (no DIDs in default output)
+- RPC commands with name-based addressing
 - CLN schema translation for categories 1–4 (monitor, fee-policy, HTLC policy, forwarding)
 
 ### Phase 2: Payment Manager (3–4 weeks)
@@ -1736,22 +1679,22 @@ Phased delivery, aligned with the other specs' roadmaps. The client is designed 
 - Feature capability advertisement
 - Danger score integration with Policy Engine
 
-### Phase 4: LND Daemon (4–6 weeks)
-*Prerequisites: Phase 1–3 (proven design from CLN)*
+### Phase 4: cl-hive-archon Plugin (3–4 weeks)
+*Prerequisites: Phase 1 (cl-hive-comms)*
 
-- `hive-lnd` Go daemon with all components
-- LND gRPC integration for all schema categories
-- Schema translation layer (CLN → LND equivalents)
-- `HiveClientService` gRPC API
-- CLI tool and systemd integration
+- `cl-hive-archon` Python plugin for DID identity
+- DID auto-provisioning with DID↔npub binding
+- Credential issuance and verification via Archon
+- Dmail transport integration (registered with cl-hive-comms transport abstraction)
+- Vault integration for encrypted backup
 
 ### Phase 5: Discovery & Onboarding (3–4 weeks)
 *Prerequisites: Marketplace Phase 1 (service profiles)*
 
-- `hive-client-discover` with Archon, Nostr, and directory sources
+- `hive-client-discover` with Nostr, Archon (if archon installed), and directory sources
 - Human-readable discovery output (ranked list with names, ratings, prices)
-- `hive-client-trial` for trial period management
-- Interactive onboarding wizard (`hive-client-setup`)
+- Trial period management
+- Interactive onboarding wizard
 - Referral discovery support
 
 ### Phase 6: Advanced Policy & Alerts (2–3 weeks)
@@ -1759,7 +1702,7 @@ Phased delivery, aligned with the other specs' roadmaps. The client is designed 
 
 - Custom policy rules (beyond presets)
 - Confirmation flow for high-danger actions
-- Alert integration (webhook, Nostr DM, email)
+- Alert integration (Nostr DM, webhook)
 - Quiet hours, protected channels, forbidden peers
 - Policy overrides with auto-expiry
 
@@ -1768,21 +1711,33 @@ Phased delivery, aligned with the other specs' roadmaps. The client is designed 
 
 - Multi-advisor scope isolation
 - Conflict detection
-- Hive membership upgrade flow
-- Migration tooling (client → full member)
+- Hive membership upgrade flow (cl-hive-comms → + archon → + cl-hive)
+
+### Phase 8: Bolt 8 Transport (Deferred)
+
+- Bolt 8 custom message transport registered with cl-hive-comms transport abstraction
+- Custom message types 49153/49155
+- Requires Lightning peer connection (more restrictive than Nostr DM)
+- Timeline TBD — depends on demand for P2P transport option
+
+### Phase 9: LND Support (Deferred — Separate Project)
+
+- `hive-lnd` Go daemon with equivalent functionality
+- LND gRPC integration for all schema categories
+- Timeline TBD — effectively a separate project
 
 ### Cross-Spec Integration
 
 ```
-Fleet Mgmt Phase 1-2  ──────────►  Client Phase 1 (core client)
+Fleet Mgmt Phase 1-2  ──────────►  Phase 1 (cl-hive-comms)
                                          │
-Task Escrow Phase 1    ──────────►  Client Phase 2 (escrow)
+Task Escrow Phase 1    ──────────►  Phase 2 (payment manager)
                                          │
-Fleet Mgmt Phase 3     ──────────►  Client Phase 3 (full schemas)
+Fleet Mgmt Phase 3     ──────────►  Phase 3 (full schemas)
                                          │
-Client Phase 1-3       ──────────►  Client Phase 4 (LND daemon)
+Phase 1 (cl-hive-comms) ─────────►  Phase 4 (cl-hive-archon)
                                          │
-Marketplace Phase 1    ──────────►  Client Phase 5 (discovery)
+Marketplace Phase 1    ──────────►  Phase 5 (discovery)
 ```
 
 ---
@@ -1811,7 +1766,7 @@ Marketplace Phase 1    ──────────►  Client Phase 5 (discov
 
 11. **Bolt12 adoption curve:** Bolt12 support varies across implementations. CLN has native support; LND's is experimental. Should the client gracefully degrade Bolt12 subscriptions to repeated Bolt11 invoices when Bolt12 isn't available?
 
-12. **L402 vs Bolt 8:** L402 requires HTTP connectivity; the primary management channel is Bolt 8 P2P. Should L402 be limited to advisor web dashboards and monitoring APIs, or should there be a Bolt 8 equivalent of L402 macaroon-gated access?
+12. **L402 vs Nostr DM:** L402 requires HTTP connectivity; the primary management channel is Nostr DM. Should L402 be limited to advisor web dashboards and monitoring APIs, or should there be a Nostr DM equivalent of L402 macaroon-gated access?
 
 13. **Alias collision:** Two advisors could have the same display name. How should the alias system handle collisions? Auto-suffix (`"Hex Advisor"` → `"Hex Advisor (2)"`)? Require unique local aliases?
 
