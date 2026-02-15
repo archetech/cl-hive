@@ -2757,6 +2757,146 @@ Call this BEFORE making adjustments to get data-driven suggestions.""",
             }
         ),
         # =====================================================================
+        # Revenue Predictor & ML Tools
+        # =====================================================================
+        Tool(
+            name="revenue_predict_optimal_fee",
+            description="""Get the revenue predictor's recommended fee for a channel.
+
+Uses a log-linear model trained on historical channel_history data to predict
+expected forwards/day and revenue/day at various fee levels.
+
+**Returns:** optimal_fee_ppm, expected_revenue_per_day, fee_curve (revenue at each fee level),
+bayesian_posteriors (posterior distribution per fee), confidence, reasoning.
+
+**When to use:** Before setting fee anchors, to get a data-driven fee target.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel SCID"
+                    }
+                },
+                "required": ["node", "channel_id"]
+            }
+        ),
+        Tool(
+            name="channel_cluster_analysis",
+            description="""Show channel clusters and per-cluster strategies.
+
+Groups channels by behavior (capacity, forward frequency, balance, fee level)
+using k-means clustering. Each cluster gets a recommended strategy.
+
+**Returns:** clusters with labels, channel counts, avg metrics, and strategies.
+
+**When to use:** For fleet-wide strategy overview.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (optional, shows all if omitted)"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="temporal_routing_patterns",
+            description="""Show time-of-day and day-of-week routing patterns for a channel.
+
+Analyzes forward_count history to find peak/low hours and days.
+
+**Returns:** hourly and daily forward rates, peak/low hours, pattern_strength (0-1).
+
+**When to use:** Before setting time-based fee anchors.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel SCID"
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Days of history to analyze (default: 14)"
+                    }
+                },
+                "required": ["node", "channel_id"]
+            }
+        ),
+        Tool(
+            name="learning_engine_insights",
+            description="""Summary of what the learning engine and revenue predictor have learned.
+
+**Returns:** model training stats, R² scores, feature weights, channel clusters,
+learned confidence multipliers, opportunity success rates, and recommendations.
+
+**When to use:** At cycle start to review what's working.""",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        Tool(
+            name="rebalance_cost_benefit",
+            description="""Estimate revenue benefit of rebalancing a channel.
+
+Compares historical revenue when the channel was balanced (0.3-0.7) vs imbalanced (<0.2 or >0.8).
+Returns estimated weekly gain and max justified rebalance cost.
+
+**When to use:** Before market-routed rebalances to determine if the cost is justified.
+Hive rebalances are free and don't need cost-benefit analysis.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Channel SCID"
+                    },
+                    "target_ratio": {
+                        "type": "number",
+                        "description": "Target balance ratio (default: 0.5)"
+                    }
+                },
+                "required": ["node", "channel_id"]
+            }
+        ),
+        Tool(
+            name="counterfactual_analysis",
+            description="""Compare impact of advisor fee anchors vs no-action baseline.
+
+Groups channels into treatment (anchored) and control (not anchored), compares revenue change.
+Shows whether fee anchors are actually helping or if the optimizer does better alone.
+
+**When to use:** In Phase 3 (Learning) to evaluate overall strategy effectiveness.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "action_type": {
+                        "type": "string",
+                        "description": "Action type to analyze (default: fee_change)"
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Days to look back (default: 14)"
+                    }
+                }
+            }
+        ),
+        # =====================================================================
         # Phase 3: Automation Tools - Autonomous Fleet Management
         # =====================================================================
         Tool(
@@ -4777,13 +4917,29 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
     now = int(time.time())
     since_24h = now - 86400
 
-    info, peers, channels_result, pending, forwards = await asyncio.gather(
+    info, peers, channels_result, pending, forwards, profitability = await asyncio.gather(
         node.call("getinfo"),
         node.call("listpeers"),
         node.call("listpeerchannels"),
         node.call("hive-pending-actions"),
         node.call("listforwards", {"status": "settled"}),
+        node.call("revenue-profitability"),
+        return_exceptions=True,
     )
+    # Handle exceptions from gather
+    if isinstance(info, Exception):
+        info = {}
+    if isinstance(peers, Exception):
+        peers = {"peers": []}
+    if isinstance(channels_result, Exception):
+        channels_result = {"channels": []}
+    if isinstance(pending, Exception):
+        pending = {"actions": []}
+    if isinstance(forwards, Exception):
+        forwards = {"forwards": []}
+    if isinstance(profitability, Exception):
+        profitability = None
+
     forward_count = 0
     total_volume_msat = 0
     total_revenue_msat = 0
@@ -4819,8 +4975,7 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
 
     # Issues (bleeders, zombies) from revenue-profitability if available
     issues = []
-    try:
-        profitability = await node.call("revenue-profitability")
+    if profitability and isinstance(profitability, dict) and "error" not in profitability:
         channels_by_class = profitability.get("channels_by_class", {})
         for class_name in ("underwater", "zombie", "stagnant_candidate"):
             severity = "warning" if class_name == "underwater" else "info"
@@ -4835,8 +4990,6 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
                         "flow_profile": ch.get("flow_profile"),
                     }
                 })
-    except Exception as e:
-        logger.debug(f"Could not fetch profitability issues: {e}")
 
     for ch in low_balance_channels:
         issues.append({
@@ -4913,8 +5066,21 @@ async def _node_anomalies(node: NodeConnection) -> Dict[str, Any]:
     anomalies: List[Dict[str, Any]] = []
     now = int(time.time())
 
+    # Fetch all three data sources in parallel
+    forwards, channels, peers = await asyncio.gather(
+        node.call("listforwards", {"status": "settled"}),
+        node.call("listpeerchannels"),
+        node.call("listpeers"),
+        return_exceptions=True,
+    )
+    if isinstance(forwards, Exception):
+        forwards = {"forwards": []}
+    if isinstance(channels, Exception):
+        channels = {"channels": []}
+    if isinstance(peers, Exception):
+        peers = {"peers": []}
+
     # Revenue velocity drop: last 24h vs 7-day daily average
-    forwards = await node.call("listforwards", {"status": "settled"})
     forwards_list = forwards.get("forwards", [])
     last_24h = _forward_stats(forwards_list, now - 86400, now)
     last_7d = _forward_stats(forwards_list, now - (7 * 86400), now)
@@ -4936,7 +5102,6 @@ async def _node_anomalies(node: NodeConnection) -> Dict[str, Any]:
     # Drain patterns: channels losing >10% balance per day (requires advisor DB velocity)
     try:
         db = ensure_advisor_db()
-        channels = await node.call("listpeerchannels")
         for ch in channels.get("channels", []):
             scid = ch.get("short_channel_id")
             if not scid:
@@ -4962,7 +5127,6 @@ async def _node_anomalies(node: NodeConnection) -> Dict[str, Any]:
         pass
 
     # Peer connectivity: frequent disconnects (best-effort heuristics)
-    peers = await node.call("listpeers")
     for peer in peers.get("peers", []):
         peer_id = peer.get("id")
         num_disconnects = peer.get("num_disconnects") or peer.get("disconnects")
@@ -5957,8 +6121,15 @@ async def handle_node_info(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    info = await node.call("getinfo")
-    funds = await node.call("listfunds")
+    info, funds = await asyncio.gather(
+        node.call("getinfo"),
+        node.call("listfunds"),
+        return_exceptions=True,
+    )
+    if isinstance(info, Exception):
+        return {"error": f"Failed to get node info: {info}"}
+    if isinstance(funds, Exception):
+        funds = {"outputs": [], "channels": []}
 
     return {
         "info": info,
@@ -5981,13 +6152,15 @@ async def handle_channels(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    # Get raw channel data
-    channels_result = await node.call("listpeerchannels")
-
-    # Try to get profitability data from revenue-ops
-    try:
-        profitability = await node.call("revenue-profitability")
-    except Exception:
+    # Get raw channel data and profitability in parallel
+    channels_result, profitability = await asyncio.gather(
+        node.call("listpeerchannels"),
+        node.call("revenue-profitability"),
+        return_exceptions=True,
+    )
+    if isinstance(channels_result, Exception):
+        return {"error": f"Failed to get channels: {channels_result}"}
+    if isinstance(profitability, Exception) or (isinstance(profitability, dict) and "error" in profitability):
         profitability = None
 
     # Enhance channels with flow data from listpeerchannels fields
@@ -7342,8 +7515,12 @@ async def handle_revenue_fee_anchor(args: Dict) -> Dict:
             return {"error": "channel_id is required for set"}
         if target_fee_ppm is None:
             return {"error": "target_fee_ppm is required for set"}
+        if not isinstance(target_fee_ppm, (int, float)) or target_fee_ppm < 25:
+            return {"error": f"target_fee_ppm must be >= 25 (got {target_fee_ppm}). Use 0 ppm only via hive_set_fees for hive-internal channels."}
+        if target_fee_ppm > 5000:
+            return {"error": f"target_fee_ppm must be <= 5000 (got {target_fee_ppm})"}
         params["channel_id"] = channel_id
-        params["target_fee_ppm"] = target_fee_ppm
+        params["target_fee_ppm"] = int(target_fee_ppm)
         if args.get("confidence") is not None:
             params["confidence"] = args["confidence"]
         if args.get("base_weight") is not None:
@@ -7384,7 +7561,126 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
     if force:
         params["force"] = True
 
-    return await node.call("revenue-rebalance", params)
+    # ------------------------------------------------------------------------
+    # Learning: record BOTH successes and failures.
+    # We create a decision record first, then update status + execution_result.
+    # This lets advisor_measure_outcomes learn from failures (e.g. job locks,
+    # no routes, budget issues) instead of silently dropping them.
+    # ------------------------------------------------------------------------
+    db = ensure_advisor_db()
+    decision_id = None
+    try:
+        recommendation = (
+            f"Market rebalance {amount_sats} sats: {from_channel} -> {to_channel}"
+            + (f" (max_fee_sats={max_fee_sats})" if max_fee_sats is not None else "")
+            + (" [force]" if force else "")
+        )
+        decision_id = db.record_decision(
+            decision_type="rebalance",
+            node_name=node_name,
+            channel_id=to_channel,
+            peer_id=None,
+            recommendation=recommendation,
+            reasoning="Triggered via revenue_rebalance tool. Capture success/failure for learning.",
+            confidence=0.5,
+            snapshot_metrics=json.dumps({
+                "from_channel": from_channel,
+                "to_channel": to_channel,
+                "amount_sats": amount_sats,
+                "max_fee_sats": max_fee_sats,
+                "force": bool(force),
+            }),
+        )
+    except Exception as e:
+        logger.warning(f"advisor_db record_decision failed for revenue_rebalance: {e}")
+
+    try:
+        result = await node.call("revenue-rebalance", params)
+
+        # Mark executed
+        if decision_id is not None:
+            with db._get_conn() as conn:
+                conn.execute(
+                    "UPDATE ai_decisions SET status='executed', executed_at=?, execution_result=? WHERE id=?",
+                    (int(datetime.now().timestamp()), json.dumps({"status": "success", "result": result}), decision_id),
+                )
+
+            # Also record outcome immediately as success (benefit measured later separately)
+            try:
+                with db._get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO action_outcomes (
+                            decision_id, action_type, opportunity_type, channel_id, node_name,
+                            decision_confidence, predicted_benefit, actual_benefit, success,
+                            prediction_error, measured_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            decision_id,
+                            "rebalance",
+                            "market",
+                            to_channel,
+                            node_name,
+                            0.5,
+                            None,
+                            None,
+                            1,
+                            0.0,
+                            int(datetime.now().timestamp()),
+                        ),
+                    )
+            except Exception as e:
+                logger.debug(f"action_outcomes insert (success) failed: {e}")
+
+        return result
+
+    except Exception as e:
+        err = str(e)
+        failure_type = "unknown"
+        lower = err.lower()
+        if "already a job" in lower and "scid" in lower:
+            failure_type = "job_locked"
+        elif "no route" in lower or "route" in lower and "fail" in lower:
+            failure_type = "no_route"
+        elif "budget" in lower:
+            failure_type = "budget"
+
+        if decision_id is not None:
+            try:
+                with db._get_conn() as conn:
+                    conn.execute(
+                        "UPDATE ai_decisions SET status='failed', executed_at=?, execution_result=? WHERE id=?",
+                        (int(datetime.now().timestamp()), json.dumps({"status": "error", "failure_type": failure_type, "error": err}), decision_id),
+                    )
+                # Record outcome failure immediately
+                with db._get_conn() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO action_outcomes (
+                            decision_id, action_type, opportunity_type, channel_id, node_name,
+                            decision_confidence, predicted_benefit, actual_benefit, success,
+                            prediction_error, measured_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            decision_id,
+                            "rebalance",
+                            "market",
+                            to_channel,
+                            node_name,
+                            0.5,
+                            None,
+                            None,
+                            0,
+                            0.0,
+                            int(datetime.now().timestamp()),
+                        ),
+                    )
+            except Exception as ee:
+                logger.warning(f"Failed to mark rebalance decision failed in advisor_db: {ee}")
+
+        raise
 
 
 async def handle_revenue_report(args: Dict) -> Dict:
@@ -7479,7 +7775,7 @@ async def handle_config_adjust(args: Dict) -> Dict:
         days=2,  # Look back 48 hours
         limit=10
     )
-    
+
     # Define related parameter groups that shouldn't be changed together
     PARAM_GROUPS = {
         "fee_bounds": ["min_fee_ppm", "max_fee_ppm"],
@@ -7491,18 +7787,26 @@ async def handle_config_adjust(args: Dict) -> Dict:
         "sling_params": ["sling_chunk_size_sats", "sling_max_hops", "sling_parallel_jobs"],
         "algorithm": ["vegas_decay_rate", "ema_smoothing_alpha", "kelly_fraction", "hive_prior_weight"],
     }
-    
+
     # Find which group this param belongs to
     param_group = None
     for group_name, params in PARAM_GROUPS.items():
         if config_key in params:
             param_group = group_name
             break
-    
-    # Check for recent changes to related params
+
+    # Adaptive isolation: shorter window when revenue is very low
     import time
     now = int(time.time())
-    isolation_hours = 24  # Minimum hours between related param changes
+    isolation_hours = 24  # Default: 24h between related param changes
+
+    # Check recent revenue to determine if we should iterate faster
+    try:
+        recent_revenue = context_metrics.get("revenue_24h", None)
+        if recent_revenue is not None and recent_revenue < 100:
+            isolation_hours = 12  # Iterate faster when revenue is near-zero
+    except (TypeError, AttributeError):
+        pass
     
     for adj in recent_adjustments:
         adj_key = adj.get("config_key")
@@ -8772,10 +9076,11 @@ async def handle_advisor_get_channel_history(args: Dict) -> Dict:
     }
 
     for h in history:
+        br = h["balance_ratio"]
         result["history"].append({
             "timestamp": datetime.fromtimestamp(h["timestamp"]).isoformat(),
             "local_sats": h["local_sats"],
-            "balance_ratio": round(h["balance_ratio"], 4),
+            "balance_ratio": round(br, 4) if br is not None else None,
             "fee_ppm": h["fee_ppm"],
             "flow_state": h["flow_state"]
         })
@@ -8793,16 +9098,46 @@ async def handle_advisor_get_channel_history(args: Dict) -> Dict:
 
 
 async def handle_advisor_record_decision(args: Dict) -> Dict:
-    """Record an AI decision to the audit trail."""
+    """Record an AI decision to the audit trail with full reasoning context.
+
+    The 'reasoning' field is critical — it stores the LLM's explanation of WHY
+    the action was taken, which becomes cross-session context for future runs.
+    Always include model predictions, cluster analysis, and strategy rationale.
+    """
     decision_type = args.get("decision_type")
     node_name = args.get("node")
     recommendation = args.get("recommendation")
-    reasoning = args.get("reasoning")
+    reasoning = args.get("reasoning", "")
     channel_id = args.get("channel_id")
     peer_id = args.get("peer_id")
     confidence = args.get("confidence")
     predicted_benefit = args.get("predicted_benefit")
     snapshot_metrics = args.get("snapshot_metrics")
+
+    # Merge model_predictions into snapshot_metrics if provided separately
+    model_predictions = args.get("model_predictions")
+    # Normalize model_predictions — could be JSON string or dict
+    if isinstance(model_predictions, str):
+        try:
+            model_predictions = json.loads(model_predictions)
+        except (json.JSONDecodeError, TypeError):
+            model_predictions = None
+    if model_predictions:
+        if snapshot_metrics is None:
+            snapshot_metrics = {}
+        elif isinstance(snapshot_metrics, str):
+            try:
+                snapshot_metrics = json.loads(snapshot_metrics)
+            except (json.JSONDecodeError, TypeError):
+                snapshot_metrics = {}
+        snapshot_metrics["model_predictions"] = model_predictions
+
+    # Ensure snapshot_metrics is JSON-serialized for DB storage
+    if snapshot_metrics is not None and not isinstance(snapshot_metrics, str):
+        try:
+            snapshot_metrics = json.dumps(snapshot_metrics)
+        except (TypeError, ValueError):
+            snapshot_metrics = json.dumps({"error": "metrics not serializable"})
 
     db = ensure_advisor_db()
 
@@ -8822,7 +9157,8 @@ async def handle_advisor_record_decision(args: Dict) -> Dict:
         "success": True,
         "decision_id": decision_id,
         "decision_type": decision_type,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "note": "Include detailed reasoning (model predictions, cluster strategy, rationale) — this becomes future context"
     }
 
 
@@ -9129,7 +9465,7 @@ async def handle_advisor_get_peer_intel(args: Dict) -> Dict:
 
 
 async def handle_advisor_measure_outcomes(args: Dict) -> Dict:
-    """Measure outcomes for past decisions."""
+    """Measure outcomes for past decisions with narrative summary."""
     db = ensure_advisor_db()
 
     min_hours = args.get("min_hours", 24)
@@ -9137,9 +9473,46 @@ async def handle_advisor_measure_outcomes(args: Dict) -> Dict:
 
     outcomes = db.measure_decision_outcomes(min_hours, max_hours)
 
+    # Generate narrative summary
+    if not outcomes:
+        narrative = (
+            f"No decisions found in the {min_hours}-{max_hours}h window to measure. "
+            f"Either no decisions were made recently, or they're too new to measure."
+        )
+    else:
+        successes = sum(1 for o in outcomes if o.get("outcome_success", 0) > 0)
+        failures = len(outcomes) - successes
+        by_type = {}
+        for o in outcomes:
+            dt = o.get("decision_type", "unknown")
+            if dt not in by_type:
+                by_type[dt] = {"success": 0, "fail": 0}
+            if o.get("outcome_success", 0) > 0:
+                by_type[dt]["success"] += 1
+            else:
+                by_type[dt]["fail"] += 1
+
+        type_summaries = []
+        for dt, counts in by_type.items():
+            total = counts["success"] + counts["fail"]
+            rate = counts["success"] / total if total > 0 else 0
+            type_summaries.append(f"{dt}: {rate:.0%} success ({counts['success']}/{total})")
+
+        narrative = (
+            f"Measured {len(outcomes)} decisions: {successes} succeeded, {failures} failed. "
+            f"Breakdown: {'; '.join(type_summaries)}. "
+        )
+        if failures > successes:
+            narrative += "More failures than successes — consider changing approach."
+        elif successes > 0 and failures == 0:
+            narrative += "All successful — continue current strategy."
+        else:
+            narrative += "Mixed results — focus on what's working, abandon what's not."
+
     return {
         "measured_count": len(outcomes),
-        "outcomes": outcomes
+        "outcomes": outcomes,
+        "narrative": narrative,
     }
 
 
@@ -9345,20 +9718,39 @@ async def handle_advisor_set_goal(args: Dict) -> Dict:
 
 
 async def handle_advisor_get_learning(args: Dict) -> Dict:
-    """Get learned parameters."""
-    advisor = _get_proactive_advisor()
-    if not advisor:
-        # Fallback to raw database query
-        db = ensure_advisor_db()
-        params = db.get_learning_params()
-        return {
-            "action_type_confidence": params.get("action_type_confidence", {}),
-            "opportunity_success_rates": params.get("opportunity_success_rates", {}),
-            "total_outcomes_measured": params.get("total_outcomes_measured", 0),
-            "overall_success_rate": params.get("overall_success_rate", 0.5)
-        }
+    """Get learned parameters with strategy memo for cross-session context."""
+    try:
+        from learning_engine import LearningEngine
+    except ImportError as e:
+        return {"error": f"Learning engine not available: {str(e)}"}
 
-    return advisor.learning_engine.get_learning_summary()
+    try:
+        db = ensure_advisor_db()
+        engine = LearningEngine(db)
+        summary = engine.get_learning_summary()
+    except Exception as e:
+        return {"error": f"Failed to load learning state: {str(e)}"}
+
+    # Generate strategy memo (LLM cross-session memory)
+    try:
+        strategy_memo = engine.generate_strategy_memo()
+        summary["strategy_memo"] = strategy_memo.get("memo", "")
+        summary["working_strategies"] = strategy_memo.get("working_strategies", [])
+        summary["failing_strategies"] = strategy_memo.get("failing_strategies", [])
+        summary["untested_areas"] = strategy_memo.get("untested_areas", [])
+        summary["recommended_focus"] = strategy_memo.get("recommended_focus", "")
+    except Exception as e:
+        summary["strategy_memo"] = f"Strategy memo generation failed: {str(e)}"
+        summary["recommended_focus"] = "Use revenue_predict_optimal_fee for data-driven anchors"
+
+    # Add improvement gradient
+    try:
+        gradient = engine.measure_improvement_gradient(hours_window=48)
+        summary["improvement_gradient"] = gradient
+    except Exception:
+        pass
+
+    return summary
 
 
 async def handle_advisor_get_status(args: Dict) -> Dict:
@@ -9392,6 +9784,235 @@ async def handle_advisor_get_cycle_history(args: Dict) -> Dict:
     }
 
 
+# =============================================================================
+# Revenue Predictor & ML Handlers
+# =============================================================================
+
+_revenue_predictor = None
+
+def ensure_revenue_predictor():
+    """Get or create the revenue predictor singleton."""
+    global _revenue_predictor
+    if _revenue_predictor is None:
+        from revenue_predictor import RevenuePredictor
+        _revenue_predictor = RevenuePredictor(ADVISOR_DB_PATH)
+        stats = _revenue_predictor.train()
+        logger.info(f"Revenue predictor trained: {stats}")
+    return _revenue_predictor
+
+
+async def handle_revenue_predict_optimal_fee(args: Dict) -> Dict:
+    """Get model's recommended fee for a channel."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    if not node_name or not channel_id:
+        return {"error": "node and channel_id required"}
+
+    try:
+        predictor = ensure_revenue_predictor()
+        rec = predictor.predict_optimal_fee(channel_id, node_name)
+    except Exception as e:
+        logger.warning(f"Revenue predictor failed for {channel_id}: {e}")
+        return {"error": f"Revenue predictor unavailable: {str(e)}"}
+
+    # Also get Bayesian posteriors
+    try:
+        posteriors = predictor.bayesian_fee_posterior(channel_id, node_name)
+    except Exception:
+        posteriors = {}
+
+    # Build actionable recommendation narrative
+    if rec.confidence > 0.5 and abs(rec.optimal_fee_ppm - rec.current_fee_ppm) > rec.current_fee_ppm * 0.15:
+        recommendation = (
+            f"SET FEE ANCHOR at {rec.optimal_fee_ppm} ppm (model confidence {rec.confidence:.0%}). "
+            f"Current fee {rec.current_fee_ppm} ppm is suboptimal — model predicts "
+            f"{rec.expected_revenue_per_day:.1f} sats/day at optimal fee."
+        )
+    elif rec.confidence < 0.5:
+        # Get MAB recommendation for low-confidence channels
+        try:
+            mab = predictor.get_mab_recommendation(channel_id, node_name)
+            recommendation = (
+                f"LOW CONFIDENCE ({rec.confidence:.0%}) — use MAB exploration instead. "
+                f"Try {mab['recommended_fee_ppm']} ppm ({mab['strategy']}). "
+                f"{mab['reasoning']}"
+            )
+        except Exception:
+            recommendation = (
+                f"LOW CONFIDENCE ({rec.confidence:.0%}) — model needs more data. "
+                f"Try exploring different fee levels manually."
+            )
+    else:
+        recommendation = (
+            f"Current fee {rec.current_fee_ppm} ppm is near optimal ({rec.optimal_fee_ppm} ppm). "
+            f"No anchor needed — let the optimizer fine-tune."
+        )
+
+    try:
+        model_stats = predictor.get_training_stats()
+    except Exception:
+        model_stats = {}
+
+    return {
+        "channel_id": rec.channel_id,
+        "node_name": rec.node_name,
+        "current_fee_ppm": rec.current_fee_ppm,
+        "optimal_fee_ppm": rec.optimal_fee_ppm,
+        "expected_forwards_per_day": rec.expected_forwards_per_day,
+        "expected_revenue_per_day": rec.expected_revenue_per_day,
+        "confidence": rec.confidence,
+        "reasoning": rec.reasoning,
+        "recommendation": recommendation,
+        "fee_curve": rec.fee_curve,
+        "bayesian_posteriors": {str(k): v for k, v in posteriors.items()},
+        "model_stats": model_stats,
+    }
+
+
+async def handle_rebalance_cost_benefit(args: Dict) -> Dict:
+    """Estimate revenue benefit of rebalancing a channel."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    target_ratio = args.get("target_ratio", 0.5)
+
+    if not node_name or not channel_id:
+        return {"error": "node and channel_id required"}
+
+    try:
+        predictor = ensure_revenue_predictor()
+        result = predictor.estimate_rebalance_benefit(channel_id, node_name, target_ratio)
+    except Exception as e:
+        logger.warning(f"Rebalance cost-benefit analysis failed for {channel_id}: {e}")
+        return {"error": f"Analysis unavailable: {str(e)}"}
+
+    # Add recommendation narrative
+    if result.get("estimated_weekly_gain", 0) > 0:
+        result["recommendation"] = (
+            f"Rebalancing is worth up to {result['max_rebalance_cost']} sats in fees. "
+            f"Prefer hive routes (zero cost). For market routes, only proceed if "
+            f"fee cost is below {result['max_rebalance_cost']} sats."
+        )
+    else:
+        result["recommendation"] = (
+            "Rebalancing this channel may not improve revenue based on historical data. "
+            "Consider fee exploration instead, or rebalance only via free hive routes."
+        )
+
+    return result
+
+
+async def handle_counterfactual_analysis(args: Dict) -> Dict:
+    """Compare impact of advisor actions vs no-action baseline."""
+    action_type = args.get("action_type", "fee_change")
+    days = args.get("days", 14)
+
+    try:
+        from learning_engine import LearningEngine
+        db = ensure_advisor_db()
+        engine = LearningEngine(db)
+        return engine.counterfactual_analysis(action_type=action_type, days=days)
+    except Exception as e:
+        return {"error": f"Counterfactual analysis failed: {str(e)}"}
+
+
+async def handle_channel_cluster_analysis(args: Dict) -> Dict:
+    """Show channel clusters and per-cluster strategies."""
+    node_name = args.get("node")  # Optional filter
+
+    try:
+        predictor = ensure_revenue_predictor()
+        clusters = predictor.get_clusters()
+    except Exception as e:
+        logger.warning(f"Channel cluster analysis failed: {e}")
+        return {"error": f"Revenue predictor unavailable: {str(e)}"}
+
+    result = []
+    for c in clusters:
+        result.append({
+            "cluster_id": c.cluster_id,
+            "label": c.label,
+            "channel_count": len(c.channel_ids),
+            "channels": c.channel_ids[:10],  # First 10
+            "avg_fee_ppm": c.avg_fee_ppm,
+            "avg_balance_ratio": c.avg_balance_ratio,
+            "avg_capacity_sats": c.avg_capacity,
+            "avg_forwards_per_day": c.avg_forwards_per_day,
+            "avg_revenue_per_day": c.avg_revenue_per_day,
+            "recommended_strategy": c.recommended_strategy,
+        })
+
+    try:
+        model_stats = predictor.get_training_stats()
+    except Exception:
+        model_stats = {"error": "could not retrieve training stats"}
+
+    return {
+        "cluster_count": len(result),
+        "clusters": result,
+        "model_stats": model_stats,
+    }
+
+
+async def handle_temporal_routing_patterns(args: Dict) -> Dict:
+    """Show time-based routing patterns for a channel."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+    days = args.get("days", 14)
+
+    if not node_name or not channel_id:
+        return {"error": "node and channel_id required"}
+
+    try:
+        predictor = ensure_revenue_predictor()
+        pattern = predictor.get_temporal_patterns(channel_id, node_name, days=days)
+    except Exception as e:
+        logger.warning(f"Temporal routing patterns failed for {channel_id}: {e}")
+        return {"error": f"Revenue predictor unavailable: {str(e)}"}
+
+    if not pattern:
+        return {
+            "channel_id": channel_id,
+            "node_name": node_name,
+            "error": "Insufficient data for temporal analysis (need 10+ readings)"
+        }
+
+    return {
+        "channel_id": pattern.channel_id,
+        "node_name": pattern.node_name,
+        "pattern_strength": pattern.pattern_strength,
+        "peak_hours": pattern.peak_hours,
+        "low_hours": pattern.low_hours,
+        "peak_days": pattern.peak_days,
+        "hourly_forward_rate": {str(k): round(v, 3) for k, v in pattern.hourly_forward_rate.items()},
+        "daily_forward_rate": {str(k): round(v, 3) for k, v in pattern.daily_forward_rate.items()},
+    }
+
+
+async def handle_learning_engine_insights(args: Dict) -> Dict:
+    """Summary of what the learning engine and revenue predictor have learned."""
+    result = {}
+
+    # Revenue predictor insights
+    try:
+        predictor = ensure_revenue_predictor()
+        result["revenue_predictor"] = predictor.get_insights()
+    except Exception as e:
+        logger.warning(f"Revenue predictor insights failed: {e}")
+        result["revenue_predictor_error"] = str(e)
+
+    # Learning engine insights
+    try:
+        from learning_engine import LearningEngine
+        db = ensure_advisor_db()
+        engine = LearningEngine(db)
+        result["learning_engine"] = engine.get_learning_summary()
+        result["action_recommendations"] = engine.get_action_type_recommendations()
+    except Exception as e:
+        result["learning_engine_error"] = str(e)
+
+    return result
+
+
 async def handle_advisor_scan_opportunities(args: Dict) -> Dict:
     """Scan for optimization opportunities without executing."""
     node_name = args.get("node")
@@ -9415,12 +10036,30 @@ async def handle_advisor_scan_opportunities(args: Dict) -> Dict:
         # Classify
         auto, queue, require = advisor.scanner.filter_safe_opportunities(scored)
 
+        # Generate focus recommendation
+        if scored:
+            top = scored[0]
+            focus = (
+                f"Top priority: {top.description} (score: {top.final_score:.2f}, "
+                f"confidence: {top.confidence_score:.0%}). "
+            )
+            # Count by type
+            type_counts = {}
+            for opp in scored[:10]:
+                t = opp.opportunity_type.value
+                type_counts[t] = type_counts.get(t, 0) + 1
+            dominant = max(type_counts, key=type_counts.get)
+            focus += f"Most common opportunity type: {dominant} ({type_counts[dominant]} of top 10)."
+        else:
+            focus = "No significant opportunities detected. Fleet may be well-optimized."
+
         return {
             "node": node_name,
             "total_opportunities": len(opportunities),
             "auto_execute_safe": len(auto),
             "queue_for_review": len(queue),
             "require_approval": len(require),
+            "focus_recommendation": focus,
             "opportunities": [opp.to_dict() for opp in scored[:20]],  # Top 20
             "state_summary": state.get("summary", {})
         }
@@ -9433,8 +10072,14 @@ async def handle_advisor_scan_opportunities(args: Dict) -> Dict:
 # Phase 3: Automation Tool Handlers
 # =============================================================================
 
-async def handle_auto_evaluate_proposal(args: Dict) -> Dict:
-    """Evaluate a pending proposal against automated criteria and optionally execute."""
+async def handle_auto_evaluate_proposal(args: Dict, _action_data: Dict = None) -> Dict:
+    """Evaluate a pending proposal against automated criteria and optionally execute.
+
+    Args:
+        args: Standard MCP args dict with node, action_id, dry_run.
+        _action_data: Optional pre-fetched action dict to skip redundant
+                      hive-pending-actions RPC call (used by batch processor).
+    """
     node_name = args.get("node")
     action_id = args.get("action_id")
     dry_run = args.get("dry_run", True)
@@ -9446,17 +10091,20 @@ async def handle_auto_evaluate_proposal(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    # Get the specific pending action
-    pending_result = await node.call("hive-pending-actions")
-    if "error" in pending_result:
-        return pending_result
+    # Use pre-fetched action data if available, otherwise fetch from node
+    if _action_data is not None:
+        action = _action_data
+    else:
+        pending_result = await node.call("hive-pending-actions")
+        if "error" in pending_result:
+            return pending_result
 
-    actions = pending_result.get("actions", [])
-    action = None
-    for a in actions:
-        if a.get("action_id") == action_id or a.get("id") == action_id:
-            action = a
-            break
+        actions = pending_result.get("actions", [])
+        action = None
+        for a in actions:
+            if a.get("action_id") == action_id or a.get("id") == action_id:
+                action = a
+                break
 
     if not action:
         return {"error": f"Action {action_id} not found in pending actions"}
@@ -9620,7 +10268,7 @@ async def handle_process_all_pending(args: Dict) -> Dict:
     """Batch process all pending actions across the fleet."""
     dry_run = args.get("dry_run", True)
 
-    # Get pending actions from all nodes
+    # Get pending actions from all nodes (already parallel via call_all)
     all_pending = await fleet.call_all("hive-pending-actions")
 
     approved = []
@@ -9629,40 +10277,58 @@ async def handle_process_all_pending(args: Dict) -> Dict:
     errors = []
     by_node = {}
 
-    for node_name, pending_result in all_pending.items():
-        by_node[node_name] = {
-            "approved": [],
-            "rejected": [],
-            "escalated": [],
-            "errors": []
-        }
+    async def _process_node(node_name, pending_result):
+        """Process all pending actions for a single node in parallel.
+
+        Returns (node_name, approved, rejected, escalated, top_errors, by_node_errors)
+        where top_errors is list of dicts for the top-level errors list, and
+        by_node_errors is list of strings for by_node[node]["errors"] (matching
+        the original sequential code's output shape).
+        """
+        node_approved = []
+        node_rejected = []
+        node_escalated = []
+        top_errors = []      # dicts with node/action_id/error keys
+        bynode_errors = []   # plain strings for by_node compatibility
 
         if "error" in pending_result:
-            errors.append({"node": node_name, "error": pending_result["error"]})
-            by_node[node_name]["errors"].append(pending_result["error"])
-            continue
+            top_errors.append({"node": node_name, "error": pending_result["error"]})
+            bynode_errors.append(pending_result["error"])
+            return node_name, node_approved, node_rejected, node_escalated, top_errors, bynode_errors
 
         actions = pending_result.get("actions", [])
 
+        # Build parallel evaluation tasks, passing _action_data to skip
+        # redundant hive-pending-actions re-fetch per action
+        eval_tasks = []
+        action_ids = []
         for action in actions:
             action_id = action.get("action_id") or action.get("id")
             if action_id is None:
                 continue
+            action_ids.append(action_id)
+            eval_tasks.append(handle_auto_evaluate_proposal(
+                {"node": node_name, "action_id": action_id, "dry_run": dry_run},
+                _action_data=action
+            ))
 
-            # Evaluate each action
-            eval_result = await handle_auto_evaluate_proposal({
-                "node": node_name,
-                "action_id": action_id,
-                "dry_run": dry_run
-            })
+        if not eval_tasks:
+            return node_name, node_approved, node_rejected, node_escalated, top_errors, bynode_errors
 
+        # Evaluate all actions in parallel
+        eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
+
+        for action_id, eval_result in zip(action_ids, eval_results):
+            if isinstance(eval_result, Exception):
+                err_str = str(eval_result)
+                top_errors.append({"node": node_name, "action_id": action_id,
+                                   "error": err_str})
+                bynode_errors.append(err_str)
+                continue
             if "error" in eval_result:
-                errors.append({
-                    "node": node_name,
-                    "action_id": action_id,
-                    "error": eval_result["error"]
-                })
-                by_node[node_name]["errors"].append(eval_result["error"])
+                top_errors.append({"node": node_name, "action_id": action_id,
+                                   "error": eval_result["error"]})
+                bynode_errors.append(eval_result["error"])
                 continue
 
             decision = eval_result.get("decision", "escalate")
@@ -9676,14 +10342,40 @@ async def handle_process_all_pending(args: Dict) -> Dict:
             }
 
             if decision == "approve":
-                approved.append(entry)
-                by_node[node_name]["approved"].append(entry)
+                node_approved.append(entry)
             elif decision == "reject":
-                rejected.append(entry)
-                by_node[node_name]["rejected"].append(entry)
+                node_rejected.append(entry)
             else:
-                escalated.append(entry)
-                by_node[node_name]["escalated"].append(entry)
+                node_escalated.append(entry)
+
+        return node_name, node_approved, node_rejected, node_escalated, top_errors, bynode_errors
+
+    # Process all nodes in parallel
+    node_names_list = list(all_pending.keys())
+    node_tasks = [
+        _process_node(node_name, all_pending[node_name])
+        for node_name in node_names_list
+    ]
+    node_results = await asyncio.gather(*node_tasks, return_exceptions=True)
+
+    for idx, result in enumerate(node_results):
+        if isinstance(result, Exception):
+            nname = node_names_list[idx]
+            errors.append({"node": nname, "error": str(result)})
+            by_node[nname] = {"approved": [], "rejected": [], "escalated": [],
+                              "errors": [str(result)]}
+            continue
+        node_name, node_approved, node_rejected, node_escalated, top_errors, bynode_errors = result
+        approved.extend(node_approved)
+        rejected.extend(node_rejected)
+        escalated.extend(node_escalated)
+        errors.extend(top_errors)
+        by_node[node_name] = {
+            "approved": node_approved,
+            "rejected": node_rejected,
+            "escalated": node_escalated,
+            "errors": bynode_errors
+        }
 
     return {
         "dry_run": dry_run,
@@ -12252,6 +12944,34 @@ async def handle_run_settlement_cycle(args: Dict) -> Dict:
 # Phase 5: Monitoring & Health Handlers (Hex Automation)
 # =============================================================================
 
+async def _fleet_health_for_node(node: "NodeConnection") -> Dict[str, Any]:
+    """Gather health data for a single node (7 parallel RPCs)."""
+    try:
+        info, channels, dashboard, prof, mcf, nnlb, conn_alerts = await asyncio.gather(
+            node.call("getinfo"),
+            node.call("listpeerchannels"),
+            node.call("revenue-dashboard", {"window_days": 1}),
+            node.call("revenue-profitability", {}),
+            node.call("hive-mcf-status", {}),
+            node.call("hive-nnlb-status", {}),
+            node.call("hive-connectivity-alerts", {}),
+            return_exceptions=True,
+        )
+    except Exception as e:
+        return {"node_name": node.name, "error": str(e)}
+
+    return {
+        "node_name": node.name,
+        "info": info,
+        "channels": channels,
+        "dashboard": dashboard,
+        "prof": prof,
+        "mcf": mcf,
+        "nnlb": nnlb,
+        "conn_alerts": conn_alerts,
+    }
+
+
 async def handle_fleet_health_summary(args: Dict) -> Dict:
     """Quick fleet health overview for monitoring."""
     node_name = args.get("node")
@@ -12264,6 +12984,12 @@ async def handle_fleet_health_summary(args: Dict) -> Dict:
     else:
         nodes_to_check = list(fleet.nodes.values())
 
+    # Query ALL nodes in parallel
+    node_results = await asyncio.gather(
+        *[_fleet_health_for_node(n) for n in nodes_to_check],
+        return_exceptions=True,
+    )
+
     nodes_status = {}
     channel_stats = {"profitable": 0, "underwater": 0, "stagnant": 0, "total": 0}
     routing_24h = {"volume_sats": 0, "revenue_sats": 0, "forward_count": 0}
@@ -12272,22 +12998,23 @@ async def handle_fleet_health_summary(args: Dict) -> Dict:
     nnlb_struggling = []
     seen_struggling_peers = set()  # For deduplication across nodes
 
-    for node in nodes_to_check:
-        # Gather data for this node in parallel
-        try:
-            info, channels, dashboard, prof, mcf, nnlb, conn_alerts = await asyncio.gather(
-                node.call("getinfo"),
-                node.call("listpeerchannels"),
-                node.call("revenue-dashboard", {"window_days": 1}),
-                node.call("revenue-profitability", {}),
-                node.call("hive-mcf-status", {}),
-                node.call("hive-nnlb-status", {}),
-                node.call("hive-connectivity-alerts", {}),
-                return_exceptions=True,
-            )
-        except Exception as e:
-            nodes_status[node.name] = {"status": "error", "error": str(e)}
+    for idx, result in enumerate(node_results):
+        if isinstance(result, Exception):
+            nname = nodes_to_check[idx].name if idx < len(nodes_to_check) else f"node_{idx}"
+            nodes_status[nname] = {"status": "error", "error": str(result)}
             continue
+        if "error" in result and "info" not in result:
+            nodes_status[result["node_name"]] = {"status": "error", "error": result["error"]}
+            continue
+
+        nname = result["node_name"]
+        info = result["info"]
+        channels = result["channels"]
+        dashboard = result["dashboard"]
+        prof = result["prof"]
+        mcf = result["mcf"]
+        nnlb = result["nnlb"]
+        conn_alerts = result["conn_alerts"]
 
         # Node status
         node_status = {"status": "online"}
@@ -12305,7 +13032,7 @@ async def handle_fleet_health_summary(args: Dict) -> Dict:
             total_cap = sum(_channel_totals(ch)["total_msat"] for ch in ch_list) // 1000
             node_status["total_capacity_sats"] = total_cap
 
-        nodes_status[node.name] = node_status
+        nodes_status[nname] = node_status
 
         # Profitability distribution - use summary from revenue-profitability
         if not isinstance(prof, Exception) and "error" not in prof:
@@ -12362,7 +13089,7 @@ async def handle_fleet_health_summary(args: Dict) -> Dict:
                         "peer_id": peer_id[:16] + "...",  # Truncated for readability
                         "health": health,
                         "issue": issue,
-                        "reporting_node": node.name
+                        "reporting_node": nname
                     })
 
         # Connectivity alerts
@@ -13331,6 +14058,13 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "advisor_get_status": handle_advisor_get_status,
     "advisor_get_cycle_history": handle_advisor_get_cycle_history,
     "advisor_scan_opportunities": handle_advisor_scan_opportunities,
+    # Revenue Predictor & ML
+    "revenue_predict_optimal_fee": handle_revenue_predict_optimal_fee,
+    "channel_cluster_analysis": handle_channel_cluster_analysis,
+    "temporal_routing_patterns": handle_temporal_routing_patterns,
+    "learning_engine_insights": handle_learning_engine_insights,
+    "rebalance_cost_benefit": handle_rebalance_cost_benefit,
+    "counterfactual_analysis": handle_counterfactual_analysis,
     # Phase 3: Automation Tools
     "auto_evaluate_proposal": handle_auto_evaluate_proposal,
     "process_all_pending": handle_process_all_pending,
