@@ -7655,6 +7655,53 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
         elif "budget" in lower:
             failure_type = "budget"
 
+        # Upgrade: if we hit a stale job lock, try clearing sling job registry ONCE and retry.
+        retry_result = None
+        if failure_type == "job_locked":
+            try:
+                await node.call("sling-deletejob", {"job": "all"})
+                retry_result = await node.call("revenue-rebalance", params)
+                if isinstance(retry_result, dict):
+                    if retry_result.get("ok") is False or retry_result.get("success") is False or retry_result.get("status") == "error" or retry_result.get("error"):
+                        raise RuntimeError(str(retry_result.get("error") or retry_result))
+                # If we got here, retry succeeded: mark executed + outcome success
+                if decision_id is not None:
+                    with db._get_conn() as conn:
+                        conn.execute(
+                            "UPDATE ai_decisions SET status='executed', executed_at=?, execution_result=? WHERE id=?",
+                            (int(datetime.now().timestamp()), json.dumps({"status": "success_after_clear", "result": retry_result}), decision_id),
+                        )
+                    try:
+                        with db._get_conn() as conn:
+                            conn.execute(
+                                """
+                                INSERT INTO action_outcomes (
+                                    decision_id, action_type, opportunity_type, channel_id, node_name,
+                                    decision_confidence, predicted_benefit, actual_benefit, success,
+                                    prediction_error, measured_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    decision_id,
+                                    "rebalance",
+                                    "market",
+                                    to_channel,
+                                    node_name,
+                                    0.5,
+                                    None,
+                                    None,
+                                    1,
+                                    0.0,
+                                    int(datetime.now().timestamp()),
+                                ),
+                            )
+                    except Exception as eee:
+                        logger.debug(f"action_outcomes insert (success_after_clear) failed: {eee}")
+                return retry_result
+            except Exception as clear_err:
+                # Retry failed; fall through to record failure
+                err = f"{err} | retry_after_sling_deletejob_failed: {clear_err}"
+
         if decision_id is not None:
             try:
                 with db._get_conn() as conn:
