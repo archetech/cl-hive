@@ -477,7 +477,8 @@ class TestRpcWrapperAudit:
         block = source[start:end] if end != -1 else source[start:]
 
         assert 'node.call("revenue-set-fee"' in block
-        assert "TODO(phase4-audit)" in block
+        # Base fee fallback now routes through hive-setchannel wrapper (audit fix)
+        assert 'node.call("hive-setchannel"' in block
 
     def test_mcf_optimized_path_uses_plugin_signature(self):
         """hive_mcf_optimized_path should pass from_channel/to_channel to cl-hive."""

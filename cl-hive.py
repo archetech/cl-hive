@@ -11126,6 +11126,210 @@ def _broadcast_liquidity_needs():
 # RPC COMMANDS
 # =============================================================================
 
+
+def _require_safe_rpc(plugin: Plugin):
+    if safe_plugin is None:
+        return None, {"error": "safe_plugin not initialized"}
+    return safe_plugin.rpc, None
+
+
+@plugin.method("hive-getinfo")
+def hive_getinfo(plugin: Plugin):
+    """Proxy to CLN getinfo via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    return rpc.getinfo()
+
+
+@plugin.method("hive-listpeers")
+def hive_listpeers(plugin: Plugin, id: str = None, level: str = None):
+    """Proxy to CLN listpeers via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    params = {}
+    if id:
+        params["id"] = id
+    if level:
+        params["level"] = level
+    return rpc.listpeers(**params) if params else rpc.listpeers()
+
+
+@plugin.method("hive-listpeerchannels")
+def hive_listpeerchannels(plugin: Plugin, id: str = None):
+    """Proxy to CLN listpeerchannels via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    return rpc.listpeerchannels(id=id) if id else rpc.listpeerchannels()
+
+
+@plugin.method("hive-listforwards")
+def hive_listforwards(plugin: Plugin, status: str = None):
+    """Proxy to CLN listforwards via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    return rpc.listforwards(status=status) if status else rpc.listforwards()
+
+
+@plugin.method("hive-listchannels")
+def hive_listchannels(plugin: Plugin, source: str = None):
+    """Proxy to CLN listchannels via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    return rpc.listchannels(source=source) if source else rpc.listchannels()
+
+
+@plugin.method("hive-listfunds")
+def hive_listfunds(plugin: Plugin):
+    """Proxy to CLN listfunds via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    return rpc.listfunds()
+
+
+@plugin.method("hive-listnodes")
+def hive_listnodes(plugin: Plugin, id: str = None):
+    """Proxy to CLN listnodes via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    return rpc.listnodes(id=id) if id else rpc.listnodes()
+
+
+@plugin.method("hive-plugin-list")
+def hive_plugin_list(plugin: Plugin):
+    """Proxy to CLN plugin list via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    try:
+        return rpc.plugin("list")
+    except Exception:
+        return rpc.listplugins()
+
+
+@plugin.method("hive-connect")
+def hive_connect(plugin: Plugin, peer_id: str):
+    """Connect to a peer via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    if not peer_id:
+        return {"error": "peer_id is required"}
+    return rpc.connect(peer_id)
+
+
+@plugin.method("hive-open-channel")
+def hive_open_channel(plugin: Plugin, peer_id: str, amount_sats: int, feerate: str = "normal", announce: bool = True):
+    """Open a channel via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    if not peer_id:
+        return {"error": "peer_id is required"}
+    if not amount_sats or amount_sats < 20000:
+        return {"error": "amount_sats must be at least 20,000"}
+    try:
+        rpc.connect(peer_id)
+    except Exception:
+        pass
+    return rpc.fundchannel(peer_id, amount_sats, feerate=feerate, announce=announce)
+
+
+@plugin.method("hive-close-channel")
+def hive_close_channel(plugin: Plugin, peer_id: str = None, channel_id: str = None, unilateraltimeout: int = None):
+    """Close a channel via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    if not peer_id and not channel_id:
+        return {"error": "peer_id or channel_id is required"}
+    params = {}
+    if peer_id:
+        params["id"] = peer_id
+    if channel_id:
+        params["short_channel_id"] = channel_id
+    if unilateraltimeout is not None:
+        params["unilateraltimeout"] = unilateraltimeout
+    return rpc.close(**params)
+
+
+@plugin.method("hive-setchannel")
+def hive_setchannel(plugin: Plugin, id: str = None, feebase: int = None, feeppm: int = None):
+    """Proxy to CLN setchannel via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    if not id:
+        return {"error": "id is required"}
+    params = {"id": id}
+    if feebase is not None:
+        params["feebase"] = feebase
+    if feeppm is not None:
+        params["feeppm"] = feeppm
+    return rpc.setchannel(**params)
+
+
+@plugin.method("hive-sling-stats")
+def hive_sling_stats(plugin: Plugin, scid: str = None, json: bool = True):
+    """Proxy to sling-stats via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    params = {}
+    if scid:
+        params["scid"] = scid
+    if json:
+        params["json"] = json
+    return rpc.call("sling-stats", params) if params else rpc.call("sling-stats")
+
+
+@plugin.method("hive-sling-status")
+def hive_sling_status(plugin: Plugin):
+    """Proxy to sling-status via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    return rpc.call("sling-status")
+
+
+@plugin.method("hive-sling-deletejob")
+def hive_sling_deletejob(plugin: Plugin, job: str = None):
+    """Proxy to sling-deletejob via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    if not job:
+        return {"error": "job is required"}
+    return rpc.call("sling-deletejob", {"job": job})
+
+
+@plugin.method("hive-askrene-listlayers")
+def hive_askrene_listlayers(plugin: Plugin, layer: str = None):
+    """Proxy to askrene-listlayers via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    params = {}
+    if layer:
+        params["layer"] = layer
+    return rpc.call("askrene-listlayers", params) if params else rpc.call("askrene-listlayers")
+
+
+@plugin.method("hive-askrene-listreservations")
+def hive_askrene_listreservations(plugin: Plugin):
+    """Proxy to askrene-listreservations via plugin (native RPC)."""
+    rpc, err = _require_safe_rpc(plugin)
+    if err:
+        return err
+    return rpc.call("askrene-listreservations")
+
+
 @plugin.method("hive-status")
 def hive_status(plugin: Plugin):
     """

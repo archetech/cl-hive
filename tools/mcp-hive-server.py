@@ -176,8 +176,11 @@ def _validate_node_config(node_config: Dict, node_mode: str) -> Optional[str]:
         return "Node missing required 'name' field."
 
     if node_mode == "docker":
-        if not node_config.get("docker_container"):
+        container = node_config.get("docker_container", "")
+        if not container:
             return f"Node '{name}' is docker mode but missing docker_container."
+        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$', container):
+            return f"Node '{name}' has invalid docker_container name: must be alphanumeric with ._- only."
         return None
 
     rest_url = node_config.get("rest_url")
@@ -6636,8 +6639,10 @@ async def handle_set_fees(args: Dict) -> Dict:
                             "hint": "Hive channels must have 0 fees. Use force=true to override."
                         }
                     break
-        except Exception:
-            pass  # Fail open on guard check — RPC path below still validates
+        except Exception as e:
+            # Fail closed: if we can't verify the peer isn't a hive member, block unless forced
+            if not force:
+                return {"error": f"Cannot verify hive membership for fee guard check: {e}. Use force=true to override."}
 
     # Prefer plugin wrapper for fee updates so clboss/revenue policy coordination remains consistent.
     fee_result = await node.call("revenue-set-fee", {
@@ -6648,9 +6653,8 @@ async def handle_set_fees(args: Dict) -> Dict:
     if isinstance(fee_result, dict) and "error" in fee_result:
         return fee_result
 
-    # TODO(phase4-audit): Add a hive-/revenue-ops wrapper for base fee updates and remove this raw fallback.
     if base_fee_msat != 0:
-        base_result = await node.call("setchannel", {
+        base_result = await node.call("hive-setchannel", {
             "id": channel_id,
             "feebase": base_fee_msat
         })
@@ -8055,7 +8059,7 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
         # Verification: ask sling-stats whether sats actually moved (vs job accepted)
         sling_stats = None
         try:
-            sling_stats = await node.call("sling-stats", {"scid": to_channel, "json": True})
+            sling_stats = await node.call("hive-sling-stats", {"scid": to_channel, "json": True})
         except Exception:
             sling_stats = None
 
@@ -8079,7 +8083,7 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
         retry_result = None
         if failure_type == "job_locked":
             try:
-                await node.call("sling-deletejob", {"job": "all"})
+                await node.call("hive-sling-deletejob", {"job": "all"})
                 retry_result = await node.call("revenue-rebalance", params)
                 if isinstance(retry_result, dict):
                     if retry_result.get("ok") is False or retry_result.get("success") is False or retry_result.get("status") == "error" or retry_result.get("error"):
@@ -8120,7 +8124,7 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
 
                 sling_stats = None
                 try:
-                    sling_stats = await node.call("sling-stats", {"scid": to_channel, "json": True})
+                    sling_stats = await node.call("hive-sling-stats", {"scid": to_channel, "json": True})
                 except Exception:
                     sling_stats = None
 
@@ -8182,7 +8186,7 @@ async def handle_askrene_constraints_summary(args: Dict) -> Dict:
 
     now = int(time.time())
     try:
-        res = await node.call("askrene-listlayers", {"layer": layer})
+        res = await node.call("hive-askrene-listlayers", {"layer": layer})
     except Exception as e:
         return {"error": f"askrene-listlayers failed: {e}"}
 
@@ -8250,7 +8254,7 @@ async def handle_askrene_reservations(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     try:
-        res = await node.call("askrene-listreservations")
+        res = await node.call("hive-askrene-listreservations")
         return res
     except Exception as e:
         return {"error": f"askrene-listreservations failed: {e}"}
@@ -9065,7 +9069,7 @@ async def handle_hive_node_diagnostic(args: Dict) -> Dict:
 
     # Sling status
     try:
-        sling = await node.call("sling-status")
+        sling = await node.call("hive-sling-status")
         result["sling_status"] = sling
     except Exception as e:
         result["sling_status"] = {"error": str(e), "note": "sling plugin may not be installed"}
@@ -9399,7 +9403,7 @@ async def handle_rebalance_diagnostic(args: Dict) -> Dict:
     # Try sling-status for active jobs
     if sling_available:
         try:
-            sling = await node.call("sling-status")
+            sling = await node.call("hive-sling-status")
             result["sling_status"] = sling
         except Exception as e:
             result["sling_status"] = {"error": str(e)}
