@@ -1,0 +1,10 @@
+{
+  "generated_at": "2026-02-15T16:14:00-07:00",
+  "source": "mcporter call hive.hive_members",
+  "policy": "These peer_ids are hive members/backbone. Channels to them must never be closed/splice-out.",
+  "peer_ids": [
+    "0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3",
+    "03fe48e8a64f14fa0aa7d9d16500754b3b906c729acfb867c00423fd4b0b9b56c2",
+    "03796a3c5b18080db99b0b880e2e326db9f5eb6bf3d7394b924f633da3eae31412"
+  ]
+}

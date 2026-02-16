@@ -1012,9 +1012,10 @@ class AdvisorDB:
                         outcome_success,
                         CASE
                             WHEN outcome_success = 1 THEN 'improved'
-                            WHEN outcome_success = 0 THEN 'worsened'
-                            WHEN outcome_measured_at IS NOT NULL THEN 'unchanged'
-                            ELSE 'unknown'
+                            WHEN outcome_success = -1 THEN 'worsened'
+                            WHEN outcome_success = 0 THEN 'unchanged'
+                            WHEN outcome_measured_at IS NOT NULL THEN 'unknown'
+                            ELSE 'pending'
                         END as outcome
                     FROM ai_decisions
                     WHERE node_name = ? AND channel_id = ? AND timestamp > ?
@@ -1035,9 +1036,10 @@ class AdvisorDB:
                         outcome_success,
                         CASE
                             WHEN outcome_success = 1 THEN 'improved'
-                            WHEN outcome_success = 0 THEN 'worsened'
-                            WHEN outcome_measured_at IS NOT NULL THEN 'unchanged'
-                            ELSE 'unknown'
+                            WHEN outcome_success = -1 THEN 'worsened'
+                            WHEN outcome_success = 0 THEN 'unchanged'
+                            WHEN outcome_measured_at IS NOT NULL THEN 'unknown'
+                            ELSE 'pending'
                         END as outcome
                     FROM ai_decisions
                     WHERE node_name = ? AND channel_id = ?
@@ -1046,8 +1048,6 @@ class AdvisorDB:
                 """, (node_name, channel_id, limit)).fetchall()
 
             return [dict(row) for row in rows]
-            conn.commit()
-            return cursor.rowcount
 
     def get_stats(self) -> Dict[str, Any]:
         """Get database statistics."""

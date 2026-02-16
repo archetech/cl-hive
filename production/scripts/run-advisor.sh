@@ -32,12 +32,18 @@ echo "==========================================================================
 echo "=== Proactive AI Advisor Run: $(date) ===" | tee -a "$LOG_FILE"
 echo "================================================================================" >> "$LOG_FILE"
 
-# Load system prompt from file
-if [[ -f "${PROD_DIR}/strategy-prompts/system_prompt.md" ]]; then
-    SYSTEM_PROMPT=$(cat "${PROD_DIR}/strategy-prompts/system_prompt.md")
-else
-    echo "WARNING: System prompt file not found, using default" | tee -a "$LOG_FILE"
-    SYSTEM_PROMPT="You are an AI advisor for a Lightning node. Run the proactive advisor cycle and summarize results."
+# Verify strategy prompt files exist
+SYSTEM_PROMPT_FILE="${PROD_DIR}/strategy-prompts/system_prompt.md"
+APPROVAL_CRITERIA_FILE="${PROD_DIR}/strategy-prompts/approval_criteria.md"
+
+if [[ ! -f "$SYSTEM_PROMPT_FILE" ]]; then
+    echo "ERROR: System prompt file not found: ${SYSTEM_PROMPT_FILE}" | tee -a "$LOG_FILE"
+    exit 1
+fi
+
+if [[ ! -f "$APPROVAL_CRITERIA_FILE" ]]; then
+    echo "WARNING: Approval criteria file not found: ${APPROVAL_CRITERIA_FILE}" | tee -a "$LOG_FILE"
+    echo "WARNING: Advisor will run without approval criteria guardrails!" | tee -a "$LOG_FILE"
 fi
 
 # Advisor database location
@@ -71,68 +77,79 @@ export NODE_OPTIONS="--max-old-space-size=2048"
 # Run Claude with MCP server
 # The advisor uses enhanced automation tools for efficient fleet management
 
-# Build the prompt - pipe via stdin to avoid all shell escaping issues
-# NOTE: System prompt is embedded in user prompt to avoid shell escaping issues with --append-system-prompt
+# Build the prompt by concatenating system prompt + approval criteria + action directive.
+# All content is written to a temp file and piped via stdin to avoid shell escaping issues.
 ADVISOR_PROMPT_FILE=$(mktemp)
-cat > "$ADVISOR_PROMPT_FILE" << 'PROMPTEOF'
-You are the AI Advisor for the Lightning Hive fleet (hive-nexus-01 and hive-nexus-02).
+trap 'rm -f "$ADVISOR_PROMPT_FILE"' EXIT
+{
+    # Include the full system prompt (strategy, toolset, safety constraints, workflow)
+    cat "$SYSTEM_PROMPT_FILE"
+    echo ""
+    echo "---"
+    echo ""
 
-## CRITICAL RULES (MANDATORY)
-- Call each tool FIRST, then report its EXACT output values
-- Copy numbers exactly - do not round, estimate, or paraphrase
-- If a tool fails, say "Tool call failed" - never fabricate data
-- Volume=0 with Revenue>0 is IMPOSSIBLE - verify data consistency
+    # Include approval criteria
+    if [[ -f "$APPROVAL_CRITERIA_FILE" ]]; then
+        cat "$APPROVAL_CRITERIA_FILE"
+        echo ""
+        echo "---"
+        echo ""
+    fi
 
-## WORKFLOW
-1. Quick Assessment: Call fleet_health_summary, membership_dashboard, routing_intelligence_health (BOTH nodes)
-2. Process Pending: process_all_pending(dry_run=true), then process_all_pending(dry_run=false)  
-3. Health Analysis: critical_velocity, stagnant_channels, advisor_get_trends (BOTH nodes)
-4. Generate Report: Use EXACT values from tool outputs
+    # Action directive — tells the advisor to execute the workflow defined above
+    cat << 'PROMPTEOF'
+## Action Directive
 
-## FORBIDDEN ACTIONS
-- Do NOT call execute_safe_opportunities
-- Do NOT call remediate_stagnant with dry_run=false
-- Do NOT execute any fee changes
-- Report recommendations for HUMAN REVIEW only
+Run the complete advisor workflow now on BOTH nodes (hive-nexus-01 and hive-nexus-02).
 
-## AUTO-APPROVE CRITERIA
-- Channel opens: Target has >=15 channels, median fee <500ppm, on-chain <20 sat/vB, size 2-10M sats
-- Fee changes: Change <=25% from current, new fee 50-1500 ppm range
-- Rebalances: Amount <=500k sats, EV-positive
+Follow the Every Run Workflow phases defined above exactly:
 
-## AUTO-REJECT CRITERIA  
-- Channel opens: Target <10 channels, on-chain >30 sat/vB, amount <1M or >10M sats
-- Any action on "avoid" rated peers
+**Phase 0**: Call advisor_get_context_brief, advisor_get_goals, advisor_get_learning — establish memory and context
+**Phase 1**: Call fleet_health_summary, membership_dashboard, routing_intelligence_health on BOTH nodes
+**Phase 2**: Call process_all_pending(dry_run=true), review, then process_all_pending(dry_run=false)
+**Phase 3**: Call advisor_measure_outcomes, config_measure_outcomes, config_effectiveness — learn from past decisions, make config adjustments if warranted
+**Phase 4**: On BOTH nodes:
+  - critical_velocity → identify urgent channels
+  - stagnant_channels, remediate_stagnant(dry_run=true) → analyze stagnation
+  - Review and SET fee anchors for channels needing fee guidance
+  - rebalance_recommendations → identify rebalance needs
+  - For needed rebalances: fleet_rebalance_path (check hive route), execute_hive_circular_rebalance (prefer zero-fee), revenue_rebalance (fallback)
+  - advisor_scan_opportunities → find additional opportunities
+  - advisor_get_trends → revenue/capacity trends
+  - advisor_record_decision for EVERY action taken (fee anchors, rebalances, config changes)
+**Phase 5**: Call advisor_record_snapshot, then generate ONE structured report
 
-## ESCALATE TO HUMAN
-- Channel open >5M sats
-- Conflicting signals
-- Repeated failures (3+ similar rejections)
-- Any close/splice operation
-
-Run the complete advisor workflow now. Call tools on BOTH nodes.
-
-IMPORTANT: Generate ONE report only. After writing "End of Report", STOP. Do not continue or regenerate.
+## Reminders
+- Call tools FIRST, report EXACT values — never fabricate data
+- Use revenue_fee_anchor to set soft fee targets for channels that need attention
+- PREFER hive routes for rebalancing (zero-fee) — use revenue_rebalance only as fallback
+- Use config_adjust to tune cl-revenue-ops parameters with tracking
+- Record EVERY decision with advisor_record_decision for learning
+- Do NOT call revenue_set_fee, hive_set_fees (non-hive), execute_safe_opportunities, or remediate_stagnant(dry_run=false)
+- Hive-internal channels MUST stay at 0 ppm — never anchor them
+- After writing "End of Report", STOP. Do not continue or regenerate.
 PROMPTEOF
+} > "$ADVISOR_PROMPT_FILE"
 
 # Pipe prompt via stdin - avoids all command-line escaping issues
-cat "$ADVISOR_PROMPT_FILE" | claude -p \
+# Capture exit code so post-run cleanup (summary, wake event) still runs
+CLAUDE_EXIT=0
+claude -p \
     --mcp-config "$MCP_CONFIG_TMP" \
     --model sonnet \
     --allowedTools "mcp__hive__*" \
     --output-format text \
-    2>&1 | tee -a "$LOG_FILE"
+    < "$ADVISOR_PROMPT_FILE" \
+    2>&1 | tee -a "$LOG_FILE" || CLAUDE_EXIT=$?
 
-rm -f "$ADVISOR_PROMPT_FILE"
+if [[ $CLAUDE_EXIT -ne 0 ]]; then
+    echo "WARNING: Claude exited with code ${CLAUDE_EXIT}" | tee -a "$LOG_FILE"
+fi
 
 echo "=== Run completed: $(date) ===" | tee -a "$LOG_FILE"
 
 # Cleanup old logs (keep last 7 days)
 find "$LOG_DIR" -name "advisor_*.log" -mtime +7 -delete 2>/dev/null || true
-
-# Extract summary from the run and send to Hex via OpenClaw
-# Get the last run's output (between the last two "===" markers)
-SUMMARY=$(tail -200 "$LOG_FILE" | grep -v "^===" | head -100 | tr '\n' ' ' | cut -c1-2000)
 
 # Write summary to a file for Hex to pick up on next heartbeat
 SUMMARY_FILE="${PROD_DIR}/data/last-advisor-summary.txt"

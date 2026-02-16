@@ -17,11 +17,14 @@ Usage:
 """
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -36,6 +39,9 @@ class OpportunityType(Enum):
     COMPETITOR_UNDERCUT = "competitor_undercut"
     BLEEDER_FIX = "bleeder_fix"
     STAGNANT_CHANNEL = "stagnant_channel"
+
+    # Hive internal
+    HIVE_INTERNAL_REBALANCE = "hive_internal_rebalance"
 
     # Balance-related
     CRITICAL_DEPLETION = "critical_depletion"
@@ -235,6 +241,8 @@ class OpportunityScanner:
 
         # Scan each data source in parallel
         results = await asyncio.gather(
+            # Hive internal channel (highest priority, runs first)
+            self._scan_hive_internal_channel(node_name, state),
             # Core scanners
             self._scan_velocity_alerts(node_name, state),
             self._scan_profitability(node_name, state),
@@ -266,13 +274,193 @@ class OpportunityScanner:
         # Collect all opportunities
         for result in results:
             if isinstance(result, Exception):
-                # Log but don't fail
+                logger.warning(f"Scanner failed: {result}")
                 continue
             if result:
                 opportunities.extend(result)
 
-        # Sort by priority
-        opportunities.sort(key=lambda x: x.priority_score, reverse=True)
+        # Apply EV-based scoring with diminishing returns
+        opportunities = self._apply_ev_scoring(opportunities, node_name)
+
+        # Sort by final EV score
+        opportunities.sort(key=lambda x: x.final_score, reverse=True)
+
+        return opportunities
+
+    def _apply_ev_scoring(
+        self,
+        opportunities: List[Opportunity],
+        node_name: str,
+    ) -> List[Opportunity]:
+        """
+        Apply Expected Value scoring: EV = P(success) × expected_revenue - cost.
+        
+        Also applies diminishing returns for similar actions and urgency weighting.
+        """
+        # Track action type counts for diminishing returns
+        action_counts: Dict[str, int] = {}
+        channel_action_counts: Dict[str, int] = {}
+        
+        for opp in opportunities:
+            # Base EV calculation
+            p_success = opp.confidence_score
+            expected_benefit = opp.predicted_benefit
+            
+            # Estimate cost based on action type
+            if opp.action_type == ActionType.REBALANCE:
+                cost = expected_benefit * 0.01  # ~1% rebalance cost
+            elif opp.action_type == ActionType.CHANNEL_OPEN:
+                cost = 5000  # On-chain fees + opportunity cost
+            elif opp.action_type == ActionType.CHANNEL_CLOSE:
+                cost = 2000  # On-chain fees
+            else:
+                cost = 0  # Fee changes are free
+            
+            ev = p_success * expected_benefit - cost
+            
+            # Diminishing returns: each additional action of same type is worth less
+            action_key = opp.action_type.value
+            action_counts[action_key] = action_counts.get(action_key, 0) + 1
+            diminish_factor = 1.0 / (1.0 + 0.2 * (action_counts[action_key] - 1))
+            
+            # Per-channel diminishing returns (don't stack actions on same channel)
+            if opp.channel_id:
+                channel_action_counts[opp.channel_id] = channel_action_counts.get(opp.channel_id, 0) + 1
+                if channel_action_counts[opp.channel_id] > 1:
+                    diminish_factor *= 0.5  # Heavy penalty for duplicate channel actions
+            
+            # Urgency weighting for depleting channels
+            urgency_mult = 1.0
+            if opp.opportunity_type in (OpportunityType.CRITICAL_DEPLETION, OpportunityType.CRITICAL_SATURATION):
+                hours_depleted = opp.current_state.get("hours_until_depleted")
+                hours_full = opp.current_state.get("hours_until_full")
+                hours = hours_depleted if hours_depleted is not None else (hours_full if hours_full is not None else 48)
+                if hours < 6:
+                    urgency_mult = 3.0
+                elif hours < 12:
+                    urgency_mult = 2.0
+                elif hours < 24:
+                    urgency_mult = 1.5
+            
+            opp.final_score = max(0, ev * opp.priority_score * diminish_factor * urgency_mult)
+            opp.adjusted_confidence = p_success
+        
+        return opportunities
+
+    async def _scan_hive_internal_channel(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """
+        Detect hive internal channel imbalance — blocks all circular rebalancing.
+
+        The channel between fleet nodes is the backbone. If imbalanced >70/30,
+        no zero-fee rebalances work for ANY channel in the fleet.
+        """
+        opportunities = []
+
+        channels = state.get("channels", [])
+        hive_members = state.get("hive_members", {})
+        members_list = hive_members.get("members", [])
+
+        # Get fleet member pubkeys
+        member_pubkeys = set()
+        for member in members_list:
+            pk = member.get("pubkey") or member.get("peer_id")
+            if pk:
+                member_pubkeys.add(pk)
+
+        if not member_pubkeys:
+            return opportunities
+
+        # Find channels to fleet members (hive internal channels)
+        for ch in channels:
+            peer_id = ch.get("peer_id")
+            if not peer_id or peer_id not in member_pubkeys:
+                continue
+
+            channel_id = ch.get("short_channel_id") or ch.get("channel_id")
+            if not channel_id:
+                continue
+
+            # Calculate balance ratio
+            local_msat = ch.get("to_us_msat", 0)
+            if isinstance(local_msat, str):
+                local_msat = int(local_msat.replace("msat", ""))
+            capacity_msat = ch.get("total_msat", 0)
+            if isinstance(capacity_msat, str):
+                capacity_msat = int(capacity_msat.replace("msat", ""))
+
+            if capacity_msat == 0:
+                continue
+
+            balance_ratio = local_msat / capacity_msat
+
+            # Check if severely imbalanced (>70/30)
+            if 0.30 <= balance_ratio <= 0.70:
+                continue  # Balanced enough
+
+            direction = "local-heavy" if balance_ratio > 0.70 else "remote-heavy"
+            imbalance_pct = max(balance_ratio, 1 - balance_ratio) * 100
+
+            # Count how many non-hive channels could benefit from rebalancing
+            total_non_hive = sum(
+                1 for c in channels
+                if (c.get("peer_id") not in member_pubkeys and c.get("peer_id"))
+            )
+            imbalanced_non_hive = 0
+            for c in channels:
+                c_peer = c.get("peer_id")
+                if not c_peer or c_peer in member_pubkeys:
+                    continue
+                c_local = c.get("to_us_msat", 0)
+                if isinstance(c_local, str):
+                    c_local = int(c_local.replace("msat", ""))
+                c_cap = c.get("total_msat", 0)
+                if isinstance(c_cap, str):
+                    c_cap = int(c_cap.replace("msat", ""))
+                if c_cap > 0:
+                    c_ratio = c_local / c_cap
+                    if c_ratio < 0.15 or c_ratio > 0.85:
+                        imbalanced_non_hive += 1
+
+            opp = Opportunity(
+                opportunity_type=OpportunityType.HIVE_INTERNAL_REBALANCE,
+                action_type=ActionType.REBALANCE,
+                channel_id=channel_id,
+                peer_id=peer_id,
+                node_name=node_name,
+                priority_score=0.99,  # Highest possible
+                confidence_score=0.95,
+                roi_estimate=0.95,
+                description=(
+                    f"CRITICAL: Hive internal channel {channel_id} is {imbalance_pct:.0f}% "
+                    f"{direction} — blocks ALL circular rebalancing"
+                ),
+                reasoning=(
+                    f"Balance: {balance_ratio:.1%} local. "
+                    f"{imbalanced_non_hive} of {total_non_hive} external channels are also "
+                    f"critically imbalanced and cannot be rebalanced via hive while this "
+                    f"channel is blocked. Fixing this unlocks zero-fee rebalancing for the "
+                    f"entire fleet."
+                ),
+                recommended_action=(
+                    f"Rebalance hive internal channel to ~50% via hive circular route (zero fee). "
+                    f"If no pure hive route, try hybrid route. Market fallback only as last resort."
+                ),
+                predicted_benefit=imbalanced_non_hive * 2000 if imbalanced_non_hive > 0 else 5000,  # Value of unblocked rebalances, or 5k baseline for future blocking prevention
+                classification=ActionClassification.AUTO_EXECUTE,
+                auto_execute_safe=True,
+                current_state={
+                    "balance_ratio": round(balance_ratio, 4),
+                    "direction": direction,
+                    "imbalanced_channels_blocked": imbalanced_non_hive,
+                    "total_external_channels": total_non_hive,
+                    "is_hive_internal": True,
+                }
+            )
+            opportunities.append(opp)
 
         return opportunities
 
@@ -290,10 +478,12 @@ class OpportunityScanner:
         for ch in critical_channels:
             channel_id = ch.get("channel_id")
             trend = ch.get("trend")
-            hours_until = ch.get("hours_until_depleted") or ch.get("hours_until_full")
+            h_depleted = ch.get("hours_until_depleted")
+            h_full = ch.get("hours_until_full")
+            hours_until = h_depleted if h_depleted is not None else (h_full if h_full is not None else None)
             urgency = ch.get("urgency", "low")
 
-            if not hours_until or hours_until > 48:
+            if hours_until is None or hours_until > 48:
                 continue
 
             # Critical depletion
@@ -451,7 +641,7 @@ class OpportunityScanner:
             # Get channel history to detect patterns
             history = self.db.get_channel_history(node_name, channel_id, hours=168)  # 1 week
 
-            if len(history) < 24:  # Need at least 24 data points
+            if not history or len(history) < 24:  # Need at least 24 data points
                 continue
 
             # Simple pattern detection - look for consistent flow at certain hours
@@ -462,7 +652,7 @@ class OpportunityScanner:
                     hour = datetime.fromtimestamp(ts).hour
                     if hour not in hour_flows:
                         hour_flows[hour] = []
-                    hour_flows[hour].append(h.get("forward_count", 0))
+                    hour_flows[hour].append(h.get("forward_count") or 0)
 
             # Check if current hour is typically high or low activity
             if current_hour in hour_flows and len(hour_flows[current_hour]) >= 3:
@@ -567,7 +757,17 @@ class OpportunityScanner:
 
         channels = state.get("channels", [])
 
+        # Skip hive member channels (handled by _scan_hive_internal_channel)
+        hive_members = state.get("hive_members", {})
+        member_pubkeys = set()
+        for member in hive_members.get("members", []):
+            pk = member.get("pubkey") or member.get("peer_id")
+            if pk:
+                member_pubkeys.add(pk)
+
         for ch in channels:
+            if ch.get("peer_id") in member_pubkeys:
+                continue
             channel_id = ch.get("short_channel_id") or ch.get("channel_id")
             if not channel_id:
                 continue
@@ -593,7 +793,7 @@ class OpportunityScanner:
                     channel_id=channel_id,
                     peer_id=ch.get("peer_id"),
                     node_name=node_name,
-                    priority_score=0.55 if 0.15 <= balance_ratio <= 0.85 else 0.7,
+                    priority_score=0.7,
                     confidence_score=0.85,
                     roi_estimate=0.5,
                     description=f"Channel {channel_id} is {direction} ({balance_ratio:.0%} local)",
