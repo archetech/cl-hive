@@ -32,11 +32,14 @@ License: MIT
 """
 
 import json
+import multiprocessing
 import os
+import queue
 import signal
 import threading
 import time
 import secrets
+import uuid
 from typing import Dict, Optional, Any, List
 
 from pyln.client import Plugin, RpcError
@@ -211,105 +214,289 @@ plugin = Plugin()
 shutdown_event = threading.Event()
 
 # =============================================================================
-# THREAD-SAFE RPC WRAPPER
+# RPC THREAD SAFETY NOTE
 # =============================================================================
-# pyln-client's RPC is not inherently thread-safe for concurrent calls.
-# This lock serializes all RPC calls to prevent race conditions.
-
-RPC_LOCK = threading.Lock()
-
-# X-01: Timeout for RPC lock acquisition to prevent global stalls
-RPC_LOCK_TIMEOUT_SECONDS = 10
+# pyln-client's UnixDomainSocketRpc.call() opens a NEW socket per call,
+# making calls inherently isolated and thread-safe. No global locking is needed.
+# This was confirmed during the nexus-01 hang investigation (57 failures in 16 days)
+# which traced to the unnecessary global RPC_LOCK causing serialization bottlenecks.
 
 
 class RpcLockTimeoutError(TimeoutError):
-    """Raised when RPC lock cannot be acquired within timeout."""
+    """
+    DEPRECATED: This exception is no longer raised by cl-hive.
+
+    Previously raised when RPC lock could not be acquired. Kept for backwards
+    compatibility with code that may catch this exception type.
+
+    pyln-client is inherently thread-safe (opens new socket per call),
+    so global RPC locking was removed.
+    """
     pass
 
 
-class ThreadSafeRpcProxy:
+# =============================================================================
+# RPC POOL (Phase 3 — bounded execution via subprocess isolation)
+# =============================================================================
+# While pyln-client is thread-safe, it can hang indefinitely on certain
+# transport / plugin interactions. The pool provides hard timeout guarantees
+# by isolating RPC calls in worker subprocesses.
+
+class RpcPool:
     """
-    A thread-safe proxy for the plugin's RPC interface.
+    A pool of RPC worker processes with hard timeout guarantees.
 
-    Ensures all RPC calls are serialized through a lock, preventing
-    race conditions when multiple background threads make concurrent
-    calls to lightningd.
-
-    X-01: Uses timeout on lock acquisition to prevent global stalls.
+    Design:
+    - N worker processes share one request queue and one response queue
+    - A dispatcher thread routes responses to per-request Event slots
+    - Callers block only on their own Event — not on each other
+    - Dead workers are auto-respawned by the dispatcher's health check
     """
 
-    def __init__(self, rpc):
-        """Wrap the original RPC object."""
-        self._rpc = rpc
+    def __init__(self, socket_path: str, log_fn, pool_size: int = 3):
+        self.socket_path = socket_path
+        self._log = log_fn
+        self._pool_size = max(1, min(pool_size, 8))
 
-    def __getattr__(self, name):
-        """Intercept attribute access to wrap RPC method calls."""
-        original_method = getattr(self._rpc, name)
+        self._ctx = multiprocessing.get_context("spawn")
 
-        if callable(original_method):
-            def thread_safe_method(*args, **kwargs):
-                # X-01: Use timeout to prevent indefinite blocking
-                acquired = RPC_LOCK.acquire(timeout=RPC_LOCK_TIMEOUT_SECONDS)
-                if not acquired:
-                    raise RpcLockTimeoutError(
-                        f"RPC lock acquisition timed out after {RPC_LOCK_TIMEOUT_SECONDS}s"
+        self._workers: list = []
+        self._req_q: Any = None
+        self._resp_q: Any = None
+
+        self._pending: Dict[str, dict] = {}
+        self._pending_lock = threading.Lock()
+
+        self._dispatcher: Optional[threading.Thread] = None
+        self._dispatcher_stop = threading.Event()
+
+        self._lifecycle_lock = threading.Lock()
+
+        self.start()
+
+    @staticmethod
+    def _worker_main(socket_path: str, req_q, resp_q):
+        """Runs in a separate process — each worker has its own LightningRpc."""
+        from pyln.client import LightningRpc, RpcError as _RpcError
+        import traceback as _tb
+
+        rpc = LightningRpc(socket_path)
+
+        while True:
+            req = req_q.get()
+            if not req:
+                continue
+            if req.get("op") == "stop":
+                break
+
+            req_id = req.get("id")
+            method = req.get("method")
+            args = req.get("args") or []
+            kwargs = req.get("kwargs") or {}
+            payload = req.get("payload")
+            kind = req.get("kind", "attr")
+
+            try:
+                if kind == "call":
+                    result = rpc.call(method, {} if payload is None else payload)
+                else:
+                    result = getattr(rpc, method)(*args, **kwargs)
+                resp_q.put({"id": req_id, "ok": True, "result": result})
+            except _RpcError as e:
+                resp_q.put({
+                    "id": req_id, "ok": False,
+                    "error_type": "RpcError",
+                    "error": getattr(e, "error", None),
+                    "message": str(e),
+                })
+            except Exception as e:
+                resp_q.put({
+                    "id": req_id, "ok": False,
+                    "error_type": "Exception",
+                    "message": str(e),
+                    "traceback": _tb.format_exc(),
+                })
+
+    def _dispatch_loop(self):
+        """Read resp_q, route to per-request Event slots."""
+        health_check_interval = 10.0
+        last_health_check = time.time()
+
+        while not self._dispatcher_stop.is_set():
+            try:
+                resp = self._resp_q.get(timeout=1.0)
+            except (queue.Empty, OSError):
+                resp = None
+
+            if resp is not None:
+                req_id = resp.get("id")
+                if req_id:
+                    with self._pending_lock:
+                        slot = self._pending.get(req_id)
+                    if slot is not None:
+                        slot["resp"] = resp
+                        slot["event"].set()
+
+            now = time.time()
+            if now - last_health_check >= health_check_interval:
+                last_health_check = now
+                self._check_worker_health()
+
+    def _check_worker_health(self):
+        with self._lifecycle_lock:
+            if not self._req_q or self._dispatcher_stop.is_set():
+                return
+            for i, w in enumerate(self._workers):
+                if not w.is_alive():
+                    try:
+                        w.join(timeout=0.1)
+                    except Exception:
+                        pass
+                    new_w = self._ctx.Process(
+                        target=RpcPool._worker_main,
+                        args=(self.socket_path, self._req_q, self._resp_q),
+                        daemon=True, name=f"hive_rpc_pool_{i}",
                     )
-                try:
-                    return original_method(*args, **kwargs)
-                finally:
-                    RPC_LOCK.release()
-            return thread_safe_method
-        else:
-            return original_method
+                    new_w.start()
+                    self._workers[i] = new_w
+                    self._log(f"RPC pool: respawned dead worker {i}", "warn")
 
-    def call(self, method_name, payload=None, **kwargs):
-        """Thread-safe wrapper for the generic RPC call method.
-
-        Supports both positional payload dict and keyword arguments.
-        If kwargs are provided, they are merged with payload (kwargs take precedence).
-        """
-        # X-01: Use timeout to prevent indefinite blocking
-        acquired = RPC_LOCK.acquire(timeout=RPC_LOCK_TIMEOUT_SECONDS)
-        if not acquired:
-            raise RpcLockTimeoutError(
-                f"RPC lock acquisition timed out after {RPC_LOCK_TIMEOUT_SECONDS}s"
+    def start(self):
+        with self._lifecycle_lock:
+            self._req_q = self._ctx.Queue()
+            self._resp_q = self._ctx.Queue()
+            self._workers = []
+            for i in range(self._pool_size):
+                w = self._ctx.Process(
+                    target=RpcPool._worker_main,
+                    args=(self.socket_path, self._req_q, self._resp_q),
+                    daemon=True, name=f"hive_rpc_pool_{i}",
+                )
+                w.start()
+                self._workers.append(w)
+            self._dispatcher_stop.clear()
+            self._dispatcher = threading.Thread(
+                target=self._dispatch_loop, daemon=True, name="hive_rpc_dispatcher",
             )
+            self._dispatcher.start()
+
+    def stop(self):
+        with self._lifecycle_lock:
+            self._dispatcher_stop.set()
+            for _ in self._workers:
+                try:
+                    if self._req_q:
+                        self._req_q.put_nowait({"op": "stop"})
+                except Exception:
+                    pass
+            for w in self._workers:
+                try:
+                    if w.is_alive():
+                        w.terminate()
+                        w.join(timeout=1.0)
+                except Exception:
+                    pass
+            self._workers = []
+            if self._dispatcher and self._dispatcher.is_alive():
+                self._dispatcher.join(timeout=2.0)
+            self._dispatcher = None
+            self._req_q = None
+            self._resp_q = None
+            with self._pending_lock:
+                for slot in self._pending.values():
+                    slot["event"].set()
+                self._pending.clear()
+
+    def restart(self, reason: str):
+        self._log(f"RPC pool restart ({self._pool_size} workers): {reason}", "warn")
+        self.stop()
+        self.start()
+
+    def request(self, *, kind: str = "attr", method: str,
+                payload: Any = None, args: list = None, kwargs: dict = None,
+                timeout: int = 30):
+        """Send an RPC request through the pool. Blocks only this caller."""
+        req_id = uuid.uuid4().hex
+        slot = {"event": threading.Event(), "resp": None}
+
+        with self._pending_lock:
+            self._pending[req_id] = slot
+
+        req = {
+            "id": req_id, "kind": kind, "method": method,
+            "payload": payload, "args": args or [], "kwargs": kwargs or {},
+        }
+
         try:
-            # Merge payload dict with kwargs
-            if kwargs:
-                merged = {**(payload or {}), **kwargs}
-                return self._rpc.call(method_name, merged)
-            elif payload:
-                return self._rpc.call(method_name, payload)
-            return self._rpc.call(method_name)
-        finally:
-            RPC_LOCK.release()
+            if self._req_q is None:
+                self.restart("pool not running")
+            self._req_q.put(req)
+            if not slot["event"].wait(timeout=timeout):
+                with self._pending_lock:
+                    self._pending.pop(req_id, None)
+                self.restart(f"timeout ({timeout}s) on {method}")
+                raise TimeoutError(f"RPC pool timeout on {method}")
+        except (OSError, ValueError):
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+            self.restart(f"queue error on {method}")
+            raise TimeoutError(f"RPC pool queue error on {method}")
 
-    def get_socket_path(self) -> Optional[str]:
-        """Expose the underlying Lightning RPC socket path if available."""
-        return getattr(self._rpc, "socket_path", None)
+        with self._pending_lock:
+            self._pending.pop(req_id, None)
+
+        resp = slot["resp"]
+        if resp is None:
+            raise TimeoutError(f"RPC pool shutdown during {method}")
+
+        if resp.get("ok"):
+            return resp.get("result")
+
+        if resp.get("traceback"):
+            self._log(
+                f"RPC pool exception in {method}: {resp.get('message')}\n{resp.get('traceback')}",
+                "error"
+            )
+
+        err = resp.get("error")
+        msg = resp.get("message") or "RPC error"
+        raise RpcError(method, {} if payload is None else payload,
+                       err if err is not None else msg)
 
 
-class ThreadSafePluginProxy:
+class RpcPoolProxy:
     """
-    A proxy for the Plugin object that provides thread-safe RPC access.
-    
-    Allows modules to use the same interface (self.plugin.rpc.method())
-    while ensuring all RPC calls are serialized through the lock.
+    Transparent proxy that behaves like plugin.rpc but routes through RpcPool.
+
+    Supports both styles:
+    - proxy.getinfo()              → attribute-style (kind="attr")
+    - proxy.call("method", {})     → explicit call-style (kind="call")
     """
-    
-    def __init__(self, plugin):
-        """Wrap the original plugin with a thread-safe RPC proxy."""
-        self._plugin = plugin
-        self.rpc = ThreadSafeRpcProxy(plugin.rpc)
-    
-    def log(self, message, level='info'):
-        """Delegate logging to the original plugin."""
-        self._plugin.log(message, level=level)
-    
-    def __getattr__(self, name):
-        """Delegate all other attribute access to the original plugin."""
-        return getattr(self._plugin, name)
+
+    def __init__(self, pool: RpcPool, timeout: int = 30):
+        self._pool = pool
+        self._timeout = timeout
+
+    def call(self, method: str, payload: Any = None) -> Any:
+        return self._pool.request(kind="call", method=method,
+                                  payload=payload, timeout=self._timeout)
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        def _method_proxy(*args, **kwargs):
+            return self._pool.request(
+                kind="attr", method=name,
+                args=list(args), kwargs=kwargs,
+                timeout=self._timeout,
+            )
+
+        return _method_proxy
+
+
+# Global RPC pool instance (initialized in init)
+_rpc_pool: Optional[RpcPool] = None
 
 
 # =============================================================================
@@ -318,7 +505,8 @@ class ThreadSafePluginProxy:
 
 database: Optional[HiveDatabase] = None
 config: Optional[HiveConfig] = None
-safe_plugin: Optional[ThreadSafePluginProxy] = None
+# Note: We use the global 'plugin' object directly for RPC calls.
+# pyln-client is inherently thread-safe (opens new socket per call).
 handshake_mgr: Optional[HandshakeManager] = None
 state_manager: Optional[StateManager] = None
 gossip_mgr: Optional[GossipManager] = None
@@ -351,6 +539,9 @@ splice_mgr: Optional[SpliceManager] = None
 relay_mgr: Optional[RelayManager] = None
 outbox_mgr: Optional[OutboxManager] = None
 our_pubkey: Optional[str] = None
+
+# Startup timestamp for lightweight health endpoint (Phase 4)
+_start_time: float = time.time()
 
 # Fee tracking for real-time gossip (Settlement Phase)
 _local_fees_earned_sats: int = 0
@@ -404,20 +595,18 @@ def _load_fee_tracking_state() -> None:
             _local_fees_last_broadcast = saved.get("last_broadcast_ts", 0)
             _local_fees_last_broadcast_amount = saved.get("last_broadcast_amount", 0)
 
-            if safe_plugin:
-                safe_plugin.log(
-                    f"cl-hive: Restored fee tracking - {_local_fees_earned_sats} sats, "
-                    f"{_local_fees_forward_count} forwards from period {saved_period_start}",
-                    level="info"
-                )
+            plugin.log(
+                f"cl-hive: Restored fee tracking - {_local_fees_earned_sats} sats, "
+                f"{_local_fees_forward_count} forwards from period {saved_period_start}",
+                level="info"
+            )
         else:
             # New settlement period - start fresh but log the old data
-            if safe_plugin:
-                safe_plugin.log(
-                    f"cl-hive: Fee tracking from previous period "
-                    f"({saved.get('earned_sats', 0)} sats) - starting new period",
-                    level="info"
-                )
+            plugin.log(
+                f"cl-hive: Fee tracking from previous period "
+                f"({saved.get('earned_sats', 0)} sats) - starting new period",
+                level="info"
+            )
 
 
 def _save_fee_tracking_state() -> None:
@@ -622,11 +811,13 @@ def _get_hive_context() -> HiveContext:
 
     This bundles the global state for RPC command handlers in modules/rpc_commands.py.
     Note: Some globals may not be initialized yet if init() hasn't completed.
+
+    The safe_plugin field receives the global plugin object directly - pyln-client
+    is inherently thread-safe (opens new socket per RPC call).
     """
     # These globals are always defined (may be None before init())
     _database = database if database is not None else None
     _config = config if config is not None else None
-    _safe_plugin = safe_plugin if safe_plugin is not None else None
     _our_pubkey = our_pubkey if our_pubkey is not None else None
     _vpn_transport = vpn_transport if vpn_transport is not None else None
     _planner = planner if planner is not None else None
@@ -651,7 +842,7 @@ def _get_hive_context() -> HiveContext:
     return HiveContext(
         database=_database,
         config=_config,
-        safe_plugin=_safe_plugin,
+        safe_plugin=plugin,  # Direct plugin access - pyln-client is thread-safe per-call
         our_pubkey=_our_pubkey,
         vpn_transport=_vpn_transport,
         planner=_planner,
@@ -862,6 +1053,12 @@ plugin.add_option(
     dynamic=True
 )
 
+plugin.add_option(
+    name='hive-rpc-pool-size',
+    default='3',
+    description='Number of RPC worker processes for bounded execution (1-8, default: 3)',
+)
+
 # VPN Transport Options (all dynamic)
 plugin.add_option(
     name='hive-transport-mode',
@@ -1034,17 +1231,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     Steps:
     1. Parse and validate options
     2. Initialize database
-    3. Create thread-safe plugin proxy
-    4. Initialize handshake manager
-    5. Verify cl-revenue-ops dependency
-    6. Set up signal handlers for graceful shutdown
+    3. Initialize handshake manager
+    4. Verify cl-revenue-ops dependency
+    5. Set up signal handlers for graceful shutdown
+
+    Note: pyln-client is inherently thread-safe (opens new socket per RPC call),
+    so no RPC locking is needed. The global 'plugin' object is used directly.
     """
-    global database, config, safe_plugin, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge, vpn_transport, relay_mgr
-    
+    global database, config, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge, vpn_transport, relay_mgr
+
     plugin.log("cl-hive: Initializing Swarm Intelligence layer...")
-    
-    # Create thread-safe plugin proxy
-    safe_plugin = ThreadSafePluginProxy(plugin)
     
     # Build configuration from options
     config = HiveConfig(
@@ -1073,28 +1269,51 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         budget_reserve_pct=float(options.get('hive-budget-reserve-pct', '0.20')),
         budget_max_per_channel_pct=float(options.get('hive-budget-max-per-channel-pct', '0.50')),
         max_expansion_feerate_perkb=int(options.get('hive-max-expansion-feerate', '5000')),
+        rpc_pool_size=int(options.get('hive-rpc-pool-size', '3')),
     )
-    
+
+    # Initialize RPC pool (Phase 3 — bounded execution via subprocess isolation)
+    # Resolve the CLN RPC socket path and replace plugin.rpc with pool-backed proxy
+    global _rpc_pool
+    _rpc_socket_path = getattr(plugin.rpc, "socket_path", None)
+    if not _rpc_socket_path:
+        ldir = configuration.get("lightning-dir") or configuration.get("lightning_dir")
+        rpcfile = configuration.get("rpc-file") or configuration.get("rpc_file")
+        if ldir and rpcfile:
+            _rpc_socket_path = rpcfile if os.path.isabs(rpcfile) else os.path.join(ldir, rpcfile)
+    if not _rpc_socket_path:
+        ldir = configuration.get("lightning-dir") or "~/.lightning"
+        _rpc_socket_path = os.path.expanduser(os.path.join(ldir, "lightning-rpc"))
+
+    _rpc_pool = RpcPool(
+        socket_path=str(_rpc_socket_path),
+        log_fn=lambda msg, level="info": plugin.log(msg, level=level),
+        pool_size=config.rpc_pool_size,
+    )
+    # Replace plugin.rpc so all modules transparently use the pool
+    plugin.rpc = RpcPoolProxy(_rpc_pool, timeout=30)
+    plugin.log(f"cl-hive: RPC pool initialized (workers={config.rpc_pool_size}, socket={_rpc_socket_path})")
+
     # Initialize database
-    database = HiveDatabase(config.db_path, safe_plugin)
+    database = HiveDatabase(config.db_path, plugin)
     database.initialize()
     plugin.log(f"cl-hive: Database initialized at {config.db_path}")
-    
+
     # Initialize handshake manager
     handshake_mgr = HandshakeManager(
-        safe_plugin.rpc, database, safe_plugin
+        plugin.rpc, database, plugin
     )
     plugin.log("cl-hive: Handshake manager initialized")
     
     # Initialize state manager (Phase 2)
-    state_manager = StateManager(database, safe_plugin)
+    state_manager = StateManager(database, plugin)
     state_manager.load_from_database()
     plugin.log(f"cl-hive: State manager initialized ({len(state_manager.get_all_peer_states())} peers cached)")
     
     # Initialize gossip manager (Phase 2)
     gossip_mgr = GossipManager(
         state_manager,
-        safe_plugin,
+        plugin,
         heartbeat_interval=config.heartbeat_interval,
         get_membership_hash=database.get_membership_hash
     )
@@ -1102,7 +1321,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     # Initialize intent manager (Phase 3)
     # Get our pubkey for tie-breaker logic
-    our_pubkey = safe_plugin.rpc.getinfo().get('id', '')
+    our_pubkey = plugin.rpc.getinfo().get('id', '')
 
     # Sync gossip version from persisted state to avoid version reset on restart
     gossip_mgr.sync_version_from_state_manager(our_pubkey)
@@ -1111,7 +1330,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     def _relay_send_message(peer_id: str, message_bytes: bytes) -> bool:
         """Send message to peer for relay."""
         try:
-            safe_plugin.rpc.call("sendcustommsg", {
+            plugin.rpc.call("sendcustommsg", {
                 "node_id": peer_id,
                 "msg": message_bytes.hex()
             })
@@ -1132,13 +1351,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         our_pubkey=our_pubkey,
         send_message=_relay_send_message,
         get_members=_relay_get_members,
-        log=lambda msg, level: safe_plugin.log(f"[Relay] {msg}", level=level)
+        log=lambda msg, level: plugin.log(f"[Relay] {msg}", level=level)
     )
     plugin.log("cl-hive: Relay manager initialized (TTL-based gossip propagation)")
 
     intent_mgr = IntentManager(
         database,
-        safe_plugin,
+        plugin,
         our_pubkey=our_pubkey,
         hold_seconds=config.intent_hold_seconds,
         expire_seconds=config.intent_expire_seconds
@@ -1156,7 +1375,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     # Initialize Integration Bridge (Phase 4)
     # Uses Circuit Breaker pattern for resilient cl-revenue-ops integration
-    bridge = Bridge(safe_plugin.rpc, safe_plugin)
+    bridge = Bridge(plugin.rpc, plugin)
     bridge_status = bridge.initialize()
     
     if bridge_status == BridgeStatus.ENABLED:
@@ -1176,14 +1395,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Initialize contribution and membership managers (Phase 5)
     global contribution_mgr, membership_mgr
-    contribution_mgr = ContributionManager(safe_plugin.rpc, database, safe_plugin, config)
+    contribution_mgr = ContributionManager(plugin.rpc, database, plugin, config)
     membership_mgr = MembershipManager(
         database,
         state_manager,
         contribution_mgr,
         bridge,
         config,
-        safe_plugin
+        plugin
     )
     plugin.log("cl-hive: Membership and contribution managers initialized")
 
@@ -1218,7 +1437,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     try:
         hive_members = {m["peer_id"] for m in database.get_all_members()}
         if hive_members:
-            channels = safe_plugin.rpc.listpeerchannels()
+            channels = plugin.rpc.listpeerchannels()
             fixed_count = 0
             for peer in channels.get("channels", []):
                 peer_id = peer.get("peer_id")
@@ -1230,7 +1449,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 channel_id = peer.get("short_channel_id")
                 if channel_id and (fee_base > 0 or fee_ppm > 0):
                     try:
-                        safe_plugin.rpc.setchannel(
+                        plugin.rpc.setchannel(
                             id=channel_id,
                             feebase=0,
                             feeppm=0
@@ -1253,11 +1472,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Initialize DecisionEngine (Phase 7)
     global decision_engine
-    decision_engine = DecisionEngine(database=database, plugin=safe_plugin)
+    decision_engine = DecisionEngine(database=database, plugin=plugin)
     plugin.log("cl-hive: DecisionEngine initialized")
 
     # Initialize VPN Transport Manager
-    vpn_transport = VPNTransportManager(plugin=safe_plugin)
+    vpn_transport = VPNTransportManager(plugin=plugin)
     vpn_result = vpn_transport.configure(
         mode=options.get('hive-transport-mode', 'any'),
         vpn_subnets=options.get('hive-vpn-subnets', ''),
@@ -1272,13 +1491,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Initialize Planner (Phase 6)
     global planner, clboss_bridge
-    clboss_bridge = CLBossBridge(safe_plugin.rpc, safe_plugin)
+    clboss_bridge = CLBossBridge(plugin.rpc, plugin)
     planner = Planner(
         state_manager=state_manager,
         database=database,
         bridge=bridge,
         clboss_bridge=clboss_bridge,
-        plugin=safe_plugin,
+        plugin=plugin,
         intent_manager=intent_mgr,
         decision_engine=decision_engine
     )
@@ -1295,12 +1514,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Initialize Cooperative Expansion Manager (Phase 6.4)
     global coop_expansion, quality_scorer_mgr
-    quality_scorer = PeerQualityScorer(database, safe_plugin)
+    quality_scorer = PeerQualityScorer(database, plugin)
     quality_scorer_mgr = quality_scorer
     coop_expansion = CooperativeExpansionManager(
         database=database,
         quality_scorer=quality_scorer,
-        plugin=safe_plugin,
+        plugin=plugin,
         our_id=our_pubkey,
         config_getter=lambda: config  # Provides access to budget settings
     )
@@ -1310,7 +1529,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global fee_intel_mgr
     fee_intel_mgr = FeeIntelligenceManager(
         database=database,
-        plugin=safe_plugin,
+        plugin=plugin,
         our_pubkey=our_pubkey
     )
     plugin.log("cl-hive: Fee intelligence manager initialized")
@@ -1319,7 +1538,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global health_aggregator
     health_aggregator = HealthScoreAggregator(
         database=database,
-        plugin=safe_plugin
+        plugin=plugin
     )
     plugin.log("cl-hive: Health aggregator initialized")
 
@@ -1358,7 +1577,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global liquidity_coord
     liquidity_coord = LiquidityCoordinator(
         database=database,
-        plugin=safe_plugin,
+        plugin=plugin,
         our_pubkey=our_pubkey,
         fee_intel_mgr=fee_intel_mgr,
         state_manager=state_manager
@@ -1369,7 +1588,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global splice_coord
     splice_coord = SpliceCoordinator(
         database=database,
-        plugin=safe_plugin,
+        plugin=plugin,
         state_manager=state_manager
     )
     plugin.log("cl-hive: Splice coordinator initialized")
@@ -1388,7 +1607,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global routing_map
     routing_map = HiveRoutingMap(
         database=database,
-        plugin=safe_plugin,
+        plugin=plugin,
         our_pubkey=our_pubkey
     )
     # Load existing probes from database
@@ -1399,7 +1618,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global peer_reputation_mgr
     peer_reputation_mgr = PeerReputationManager(
         database=database,
-        plugin=safe_plugin,
+        plugin=plugin,
         our_pubkey=our_pubkey
     )
     # Load existing reputation data from database
@@ -1410,7 +1629,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global routing_pool
     routing_pool = RoutingPool(
         database=database,
-        plugin=safe_plugin,
+        plugin=plugin,
         state_manager=state_manager
     )
     routing_pool.set_our_pubkey(our_pubkey)
@@ -1420,7 +1639,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     network_metrics.init_calculator(
         state_manager=state_manager,
         database=database,
-        plugin=safe_plugin
+        plugin=plugin
     )
     plugin.log("cl-hive: Network metrics calculator initialized")
 
@@ -1428,8 +1647,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global settlement_mgr
     settlement_mgr = SettlementManager(
         database=database,
-        plugin=safe_plugin,
-        rpc=safe_plugin.rpc
+        plugin=plugin,
+        rpc=plugin.rpc
     )
     settlement_mgr.initialize_tables()
     plugin.log("cl-hive: Settlement manager initialized (BOLT12 payouts)")
@@ -1438,7 +1657,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global yield_metrics_mgr
     yield_metrics_mgr = YieldMetricsManager(
         database=database,
-        plugin=safe_plugin,
+        plugin=plugin,
         state_manager=state_manager
     )
     yield_metrics_mgr.set_our_pubkey(our_pubkey)
@@ -1448,7 +1667,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global fee_coordination_mgr
     fee_coordination_mgr = FeeCoordinationManager(
         database=database,
-        plugin=safe_plugin,
+        plugin=plugin,
         state_manager=state_manager,
         liquidity_coordinator=liquidity_coord,
         gossip_mgr=gossip_mgr
@@ -1472,7 +1691,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize Cost Reduction Manager (Phase 3 - Cost Reduction)
     global cost_reduction_mgr
     cost_reduction_mgr = CostReductionManager(
-        plugin=safe_plugin,
+        plugin=plugin,
         database=database,
         state_manager=state_manager,
         yield_metrics_mgr=yield_metrics_mgr,
@@ -1493,7 +1712,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize Rationalization Manager (Channel Rationalization)
     global rationalization_mgr
     rationalization_mgr = RationalizationManager(
-        plugin=safe_plugin,
+        plugin=plugin,
         database=database,
         state_manager=state_manager,
         fee_coordination_mgr=fee_coordination_mgr,
@@ -1510,7 +1729,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize Strategic Positioning Manager (Phase 5 - Strategic Positioning)
     global strategic_positioning_mgr
     strategic_positioning_mgr = StrategicPositioningManager(
-        plugin=safe_plugin,
+        plugin=plugin,
         database=database,
         state_manager=state_manager,
         fee_coordination_mgr=fee_coordination_mgr,
@@ -1524,7 +1743,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global anticipatory_liquidity_mgr
     anticipatory_liquidity_mgr = AnticipatoryLiquidityManager(
         database=database,
-        plugin=safe_plugin,
+        plugin=plugin,
         state_manager=state_manager,
         our_id=our_pubkey
     )
@@ -1534,7 +1753,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global task_mgr
     task_mgr = TaskManager(
         database=database,
-        plugin=safe_plugin,
+        plugin=plugin,
         our_pubkey=our_pubkey
     )
     plugin.log("cl-hive: Task manager initialized")
@@ -1543,7 +1762,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     global splice_mgr
     splice_mgr = SpliceManager(
         database=database,
-        plugin=safe_plugin,
+        plugin=plugin,
         splice_coordinator=splice_coord,
         our_pubkey=our_pubkey
     )
@@ -1556,7 +1775,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         send_fn=_outbox_send_fn,
         get_members_fn=_outbox_get_member_ids,
         our_pubkey=our_pubkey,
-        log_fn=lambda msg, level='info': safe_plugin.log(msg, level=level),
+        log_fn=lambda msg, level='info': plugin.log(msg, level=level),
     )
     plugin.log("cl-hive: Outbox manager initialized")
 
@@ -1616,6 +1835,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 fee_coordination_mgr.save_state_to_database()
         except Exception:
             pass  # Best-effort on shutdown
+        try:
+            if _rpc_pool:
+                _rpc_pool.stop()
+        except Exception:
+            pass  # Best-effort on shutdown
         shutdown_event.set()
     
     try:
@@ -1667,8 +1891,8 @@ def on_peer_connected(peer: dict, plugin: Plugin, **kwargs):
         # Peer is known, but we're not a member - this shouldn't happen normally
         return {"result": "continue"}
 
-    # Send HIVE_HELLO in a background thread to avoid blocking the I/O thread
-    # on RPC_LOCK (same deadlock risk as custommsg handlers).
+    # Send HIVE_HELLO in a background thread to avoid blocking the I/O thread.
+    # (pyln-client is thread-safe per-call, no deadlock risk anymore)
     def _send_autodiscovery_hello():
         try:
             from modules.protocol import create_hello
@@ -1677,7 +1901,7 @@ def on_peer_connected(peer: dict, plugin: Plugin, **kwargs):
                 plugin.log("cl-hive: HELLO message too large, skipping autodiscovery", level='warning')
                 return
 
-            safe_plugin.rpc.call("sendcustommsg", {
+            plugin.rpc.call("sendcustommsg", {
                 "node_id": peer_id,
                 "msg": hello_msg.hex()
             })
@@ -1755,10 +1979,9 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             database.update_member(peer_id, last_seen=int(time.time()))
 
     # Dispatch to a background thread so the hook returns immediately.
-    # Handlers make RPC calls (checkmessage, sendcustommsg, etc.) that acquire
-    # RPC_LOCK. Running them on the I/O thread causes a deadlock when a
-    # background thread already holds the lock and is waiting for a CLN response
-    # that CLN can't deliver until this hook returns.
+    # Handlers make RPC calls (checkmessage, sendcustommsg, etc.) that may be slow.
+    # Running them on the I/O thread blocks CLN's event loop. pyln-client is
+    # thread-safe (opens new socket per call), so concurrent RPC is safe.
     threading.Thread(
         target=_dispatch_hive_message,
         args=(peer_id, msg_type, msg_payload, plugin),
@@ -1942,7 +2165,7 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Check if peer has a channel with us (proof of stake)
     try:
-        channels = safe_plugin.rpc.call("listpeerchannels", {"id": peer_id})
+        channels = plugin.rpc.call("listpeerchannels", {"id": peer_id})
         peer_channels = channels.get('channels', [])
         # Look for any active channel
         has_channel = any(
@@ -1976,7 +2199,7 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     challenge_msg = create_challenge(nonce, hive_id)
 
     try:
-        safe_plugin.rpc.call("sendcustommsg", {
+        plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
             "msg": challenge_msg.hex()
         })
@@ -2015,7 +2238,7 @@ def handle_challenge(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             manifest=attest_data['manifest']
         )
         
-        safe_plugin.rpc.call("sendcustommsg", {
+        plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
             "msg": attest_msg.hex()
         })
@@ -2132,9 +2355,9 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     database.save_peer_capabilities(peer_id, manifest_features)
 
     # Capture addresses from listpeers for the new member (Issue #60)
-    if safe_plugin:
+    if plugin:
         try:
-            peers_info = safe_plugin.rpc.listpeers(id=peer_id)
+            peers_info = plugin.rpc.listpeers(id=peer_id)
             if peers_info and peers_info.get('peers'):
                 addrs = peers_info['peers'][0].get('netaddr', [])
                 if addrs:
@@ -2174,7 +2397,7 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     welcome_msg = create_welcome(hive_id, initial_tier, len(members), state_hash)
 
     try:
-        safe_plugin.rpc.call("sendcustommsg", {
+        plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
             "msg": welcome_msg.hex()
         })
@@ -2243,11 +2466,11 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
                     plugin.log(f"cl-hive: Broadcast settlement offer to {broadcast_count} member(s)")
 
     # Initiate state sync with the peer that welcomed us
-    if gossip_mgr and safe_plugin:
+    if gossip_mgr and plugin:
         state_hash_msg = _create_signed_state_hash_msg()
         if state_hash_msg:
             try:
-                safe_plugin.rpc.call("sendcustommsg", {
+                plugin.rpc.call("sendcustommsg", {
                     "node_id": peer_id,
                     "msg": state_hash_msg.hex()
                 })
@@ -2299,7 +2522,7 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     signing_payload = get_gossip_signing_payload(payload)
 
     try:
-        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature)
         if not result.get("verified") or result.get("pubkey") != sender_id:
             plugin.log(
                 f"cl-hive: GOSSIP signature invalid from {peer_id[:16]}...",
@@ -2392,7 +2615,7 @@ def handle_state_hash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     signing_payload = get_state_hash_signing_payload(payload)
 
     try:
-        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature)
         if not result.get("verified") or result.get("pubkey") != sender_id:
             plugin.log(
                 f"cl-hive: STATE_HASH signature invalid from {peer_id[:16]}...",
@@ -2430,7 +2653,7 @@ def handle_state_hash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         full_sync_msg = _create_signed_full_sync_msg()
         if full_sync_msg:
             try:
-                safe_plugin.rpc.call("sendcustommsg", {
+                plugin.rpc.call("sendcustommsg", {
                     "node_id": peer_id,
                     "msg": full_sync_msg.hex()
                 })
@@ -2471,7 +2694,7 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     signing_payload = get_full_sync_signing_payload(payload)
 
     try:
-        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature)
         if not result.get("verified") or result.get("pubkey") != sender_id:
             plugin.log(
                 f"cl-hive: FULL_SYNC signature invalid from {peer_id[:16]}...",
@@ -2668,7 +2891,7 @@ def _create_signed_full_sync_msg() -> Optional[bytes]:
     Returns:
         Serialized and signed FULL_SYNC message, or None if signing fails
     """
-    if not gossip_mgr or not safe_plugin or not our_pubkey:
+    if not gossip_mgr or not plugin or not our_pubkey:
         return None
 
     # Create base payload
@@ -2682,7 +2905,7 @@ def _create_signed_full_sync_msg() -> Optional[bytes]:
     # Sign the payload
     signing_payload = get_full_sync_signing_payload(full_sync_payload)
     try:
-        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        sig_result = plugin.rpc.signmessage(signing_payload)
         full_sync_payload["signature"] = sig_result["zbase"]
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign FULL_SYNC: {e}", level='error')
@@ -2701,7 +2924,7 @@ def _create_signed_state_hash_msg() -> Optional[bytes]:
     Returns:
         Serialized and signed STATE_HASH message, or None if signing fails
     """
-    if not gossip_mgr or not safe_plugin or not our_pubkey:
+    if not gossip_mgr or not plugin or not our_pubkey:
         return None
 
     # Create base payload
@@ -2714,7 +2937,7 @@ def _create_signed_state_hash_msg() -> Optional[bytes]:
     # Sign the payload
     signing_payload = get_state_hash_signing_payload(state_hash_payload)
     try:
-        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        sig_result = plugin.rpc.signmessage(signing_payload)
         state_hash_payload["signature"] = sig_result["zbase"]
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign STATE_HASH: {e}", level='error')
@@ -2730,11 +2953,11 @@ def _get_our_addresses() -> List[str]:
     Returns:
         List of connection strings like ["1.2.3.4:9735", "xyz.onion:9735"]
     """
-    if not safe_plugin:
+    if not plugin:
         return []
 
     try:
-        info = safe_plugin.rpc.getinfo()
+        info = plugin.rpc.getinfo()
         addresses = []
         for addr in info.get("address", []):
             addr_type = addr.get("type", "")
@@ -2749,10 +2972,10 @@ def _get_our_addresses() -> List[str]:
 
 def _is_peer_connected(peer_id: str) -> bool:
     """Check if we're already connected to a peer."""
-    if not safe_plugin:
+    if not plugin:
         return False
     try:
-        peers = safe_plugin.rpc.listpeers(peer_id).get("peers", [])
+        peers = plugin.rpc.listpeers(peer_id).get("peers", [])
         return len(peers) > 0 and peers[0].get("connected", False)
     except Exception:
         return False
@@ -2772,7 +2995,7 @@ def _try_auto_connect(peer_id: str, addresses: List[str]) -> bool:
     Returns:
         True if connection was established or already exists, False otherwise
     """
-    if not safe_plugin or not peer_id or peer_id == our_pubkey:
+    if not plugin or not peer_id or peer_id == our_pubkey:
         return False
 
     # Skip if no addresses provided
@@ -2787,7 +3010,7 @@ def _try_auto_connect(peer_id: str, addresses: List[str]) -> bool:
     for addr in addresses:
         try:
             connect_str = f"{peer_id}@{addr}"
-            safe_plugin.rpc.connect(connect_str)
+            plugin.rpc.connect(connect_str)
             plugin.log(f"cl-hive: Auto-connected to hive member {peer_id[:16]}... via {addr}", level='info')
             return True
         except Exception as e:
@@ -2818,7 +3041,7 @@ def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
     Returns:
         Serialized and signed GOSSIP message, or None if signing fails
     """
-    if not gossip_mgr or not safe_plugin or not our_pubkey:
+    if not gossip_mgr or not plugin or not our_pubkey:
         return None
 
     # Create gossip payload using GossipManager
@@ -2837,7 +3060,7 @@ def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
     # Sign the payload (includes data hash for integrity)
     signing_payload = get_gossip_signing_payload(gossip_payload)
     try:
-        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        sig_result = plugin.rpc.signmessage(signing_payload)
         gossip_payload["signature"] = sig_result["zbase"]
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign GOSSIP: {e}", level='error')
@@ -2853,7 +3076,7 @@ def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
     Called after adding a new member to ensure all nodes sync.
     SECURITY: All FULL_SYNC messages are cryptographically signed.
     """
-    if not database or not gossip_mgr or not safe_plugin:
+    if not database or not gossip_mgr :
         plugin.log(f"cl-hive: _broadcast_full_sync_to_members: missing deps", level='debug')
         return
 
@@ -2873,7 +3096,7 @@ def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
             continue
 
         try:
-            safe_plugin.rpc.call("sendcustommsg", {
+            plugin.rpc.call("sendcustommsg", {
                 "node_id": member_id,
                 "msg": full_sync_msg.hex()
             })
@@ -2914,9 +3137,9 @@ def on_peer_connected(**kwargs):
 
     # Track VPN connection status + populate missing addresses (Issue #60)
     peer_address = None
-    if safe_plugin:
+    if plugin:
         try:
-            peers = safe_plugin.rpc.listpeers(id=peer_id)
+            peers = plugin.rpc.listpeers(id=peer_id)
             if peers and peers.get('peers'):
                 netaddr = peers['peers'][0].get('netaddr', [])
                 if netaddr:
@@ -2929,20 +3152,20 @@ def on_peer_connected(**kwargs):
         except Exception:
             pass
 
-    if safe_plugin:
-        safe_plugin.log(f"cl-hive: Hive member {peer_id[:16]}... connected, sending STATE_HASH")
+    if plugin:
+        plugin.log(f"cl-hive: Hive member {peer_id[:16]}... connected, sending STATE_HASH")
 
     # Send signed STATE_HASH for anti-entropy check
     state_hash_msg = _create_signed_state_hash_msg()
     if state_hash_msg:
         try:
-            safe_plugin.rpc.call("sendcustommsg", {
+            plugin.rpc.call("sendcustommsg", {
                 "node_id": peer_id,
                 "msg": state_hash_msg.hex()
             })
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
+            if plugin:
+                plugin.log(f"cl-hive: Failed to send STATE_HASH to {peer_id[:16]}...: {e}", level='warn')
 
 
 @plugin.subscribe("disconnect")
@@ -2975,8 +3198,8 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
         try:
             contribution_mgr.handle_forward_event(forward_event)
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"Forward event handling error: {e}", level="warn")
+            if plugin:
+                plugin.log(f"Forward event handling error: {e}", level="warn")
 
     # Generate route probe data from successful forwards (Phase 7.4)
     if routing_map and database and our_pubkey:
@@ -2984,8 +3207,8 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
             if status == "settled":
                 _record_forward_as_route_probe(forward_event)
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"Route probe from forward error: {e}", level="debug")
+            if plugin:
+                plugin.log(f"Route probe from forward error: {e}", level="debug")
 
     # Record routing revenue to pool (Phase 0 - Collective Economics)
     if routing_pool and our_pubkey:
@@ -3003,16 +3226,16 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
                     # Broadcast fee report to hive (real-time settlement)
                     _update_and_broadcast_fees(fee_sats)
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"Pool revenue recording error: {e}", level="debug")
+            if plugin:
+                plugin.log(f"Pool revenue recording error: {e}", level="debug")
 
     # Update fee coordination systems (pheromones + stigmergic markers)
     if fee_coordination_mgr and our_pubkey:
         try:
             _record_forward_for_fee_coordination(forward_event, status)
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"Fee coordination recording error: {e}", level="debug")
+            if plugin:
+                plugin.log(f"Fee coordination recording error: {e}", level="debug")
 
 
 def _update_and_broadcast_fees(new_fee_sats: int):
@@ -3029,7 +3252,7 @@ def _update_and_broadcast_fees(new_fee_sats: int):
     global _local_fees_period_start, _local_fees_last_broadcast
     global _local_fees_last_broadcast_amount, _local_rebalance_costs_sats
 
-    if not our_pubkey or not database or not safe_plugin:
+    if not our_pubkey or not database :
         return
 
     now = int(time.time())
@@ -3060,8 +3283,8 @@ def _update_and_broadcast_fees(new_fee_sats: int):
         )
 
         if not should_broadcast:
-            if safe_plugin:
-                safe_plugin.log(
+            if plugin:
+                plugin.log(
                     f"FEE_GOSSIP: Not broadcasting - cumulative={cumulative_fee_change}sats "
                     f"(need {FEE_BROADCAST_MIN_SATS}), time={time_since_broadcast}s "
                     f"(need {FEE_BROADCAST_MIN_INTERVAL})",
@@ -3080,8 +3303,8 @@ def _update_and_broadcast_fees(new_fee_sats: int):
         _local_fees_last_broadcast_amount = _local_fees_earned_sats
 
     # Broadcast outside the lock
-    if safe_plugin:
-        safe_plugin.log(
+    if plugin:
+        plugin.log(
             f"FEE_GOSSIP: Broadcasting fee report - {fees_to_broadcast} sats, "
             f"costs={costs_to_broadcast}, {forwards_to_broadcast} forwards",
             level="info"
@@ -3110,7 +3333,7 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
         create_fee_report, get_fee_report_signing_payload, HiveMessageType
     )
 
-    if not our_pubkey or not database or not safe_plugin:
+    if not our_pubkey or not database :
         return
 
     try:
@@ -3119,7 +3342,7 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
             our_pubkey, fees_earned, period_start, period_end, forward_count,
             rebalance_costs
         )
-        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        sig_result = plugin.rpc.signmessage(signing_payload)
         signature = sig_result["zbase"]
 
         # Create the message
@@ -3144,7 +3367,7 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
                 continue
 
             try:
-                safe_plugin.rpc.call("sendcustommsg", {
+                plugin.rpc.call("sendcustommsg", {
                     "node_id": member_id,
                     "msg": fee_report_msg.hex()
                 })
@@ -3154,13 +3377,13 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
                 pass  # Peer may be offline
 
         if broadcast_count > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"[FeeReport] Broadcast: {fees_earned} sats, costs={rebalance_costs}, "
                 f"{forward_count} forwards -> {broadcast_count} member(s)",
                 level="info"
             )
         else:
-            safe_plugin.log(
+            plugin.log(
                 f"[FeeReport] No members to broadcast to (found {len(members)} total)",
                 level="warn"
             )
@@ -3190,8 +3413,8 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
         )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Fee report broadcast error: {e}", level="warn")
+        if plugin:
+            plugin.log(f"cl-hive: Fee report broadcast error: {e}", level="warn")
 
 
 # Cached channel_scid -> peer_id mapping for _record_forward_as_route_probe
@@ -3209,7 +3432,7 @@ def _record_forward_as_route_probe(forward_event: Dict):
     """
     global _channel_peer_cache, _channel_peer_cache_time
 
-    if not routing_map or not database or not safe_plugin:
+    if not routing_map or not database :
         return
 
     try:
@@ -3224,7 +3447,7 @@ def _record_forward_as_route_probe(forward_event: Dict):
         # Use cached channel -> peer_id mapping (refreshed every 5 min)
         now = time.time()
         if not _channel_peer_cache or now - _channel_peer_cache_time > _CHANNEL_PEER_CACHE_TTL:
-            funds = safe_plugin.rpc.listfunds()
+            funds = plugin.rpc.listfunds()
             _channel_peer_cache = {
                 ch.get("short_channel_id"): ch.get("peer_id", "")
                 for ch in funds.get("channels", [])
@@ -3265,7 +3488,7 @@ def _record_forward_for_fee_coordination(forward_event: Dict, status: str):
     - Pheromone levels: Memory of successful fee levels
     - Stigmergic markers: Signals for fleet-wide coordination
     """
-    if not fee_coordination_mgr or not safe_plugin:
+    if not fee_coordination_mgr :
         return
 
     try:
@@ -3285,7 +3508,7 @@ def _record_forward_for_fee_coordination(forward_event: Dict, status: str):
         # Fall back to RPC on cache miss for outbound channel
         if not out_peer:
             try:
-                funds = safe_plugin.rpc.listfunds()
+                funds = plugin.rpc.listfunds()
                 channels_map = {ch.get("short_channel_id"): ch for ch in funds.get("channels", [])}
                 in_peer = channels_map.get(in_channel, {}).get("peer_id", "") if in_channel else ""
                 out_peer = channels_map.get(out_channel, {}).get("peer_id", "")
@@ -3318,15 +3541,15 @@ def _record_forward_for_fee_coordination(forward_event: Dict, status: str):
             destination=out_peer
         )
 
-        if success and safe_plugin:
-            safe_plugin.log(
+        if success and plugin:
+            plugin.log(
                 f"cl-hive: Recorded forward for fee coordination: "
                 f"{out_channel} fee={fee_ppm}ppm revenue={fee_sats}sats",
                 level="debug"
             )
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Fee coordination record error: {e}", level="debug")
+        if plugin:
+            plugin.log(f"cl-hive: Fee coordination record error: {e}", level="debug")
 
 
 # =============================================================================
@@ -3434,7 +3657,7 @@ def handle_intent_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # SECURITY: Verify cryptographic signature
     signing_payload = get_intent_abort_signing_payload(payload)
     try:
-        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature)
         if not result.get("verified") or result.get("pubkey") != initiator:
             plugin.log(
                 f"cl-hive: INTENT_ABORT signature invalid from {peer_id[:16]}...",
@@ -3467,7 +3690,7 @@ def broadcast_intent_abort(target: str, intent_type: str) -> None:
 
     SECURITY: All INTENT_ABORT messages are cryptographically signed.
     """
-    if not database or not safe_plugin or not intent_mgr:
+    if not database or not plugin or not intent_mgr:
         return
 
     members = database.get_all_members()
@@ -3482,10 +3705,10 @@ def broadcast_intent_abort(target: str, intent_type: str) -> None:
     # Sign the payload
     signing_payload = get_intent_abort_signing_payload(abort_payload)
     try:
-        sig_result = safe_plugin.rpc.signmessage(signing_payload)
+        sig_result = plugin.rpc.signmessage(signing_payload)
         abort_payload['signature'] = sig_result['zbase']
     except Exception as e:
-        safe_plugin.log(f"cl-hive: Failed to sign INTENT_ABORT: {e}", level='error')
+        plugin.log(f"cl-hive: Failed to sign INTENT_ABORT: {e}", level='error')
         return
 
     abort_msg = serialize(HiveMessageType.INTENT_ABORT, abort_payload)
@@ -3496,12 +3719,12 @@ def broadcast_intent_abort(target: str, intent_type: str) -> None:
             continue  # Skip self
 
         try:
-            safe_plugin.rpc.call("sendcustommsg", {
+            plugin.rpc.call("sendcustommsg", {
                 "node_id": member_id,
                 "msg": abort_msg.hex()
             })
         except Exception as e:
-            safe_plugin.log(f"Failed to send INTENT_ABORT to {member_id[:16]}...: {e}", level='debug')
+            plugin.log(f"Failed to send INTENT_ABORT to {member_id[:16]}...: {e}", level='debug')
         shutdown_event.wait(0.02)  # Yield for incoming RPC
 
 
@@ -3516,7 +3739,7 @@ def _broadcast_to_members(message_bytes: bytes) -> int:
     Returns:
         Number of members the message was successfully sent to.
     """
-    if not database or not safe_plugin:
+    if not database :
         return 0
 
     sent_count = 0
@@ -3529,14 +3752,14 @@ def _broadcast_to_members(message_bytes: bytes) -> int:
         if member_id == our_pubkey:
             continue
         try:
-            safe_plugin.rpc.call("sendcustommsg", {
+            plugin.rpc.call("sendcustommsg", {
                 "node_id": member_id,
                 "msg": message_bytes.hex()
             })
             sent_count += 1
             shutdown_event.wait(0.02)  # Yield for incoming RPC
         except Exception as e:
-            safe_plugin.log(f"Failed to send message to {member_id[:16]}...: {e}", level='debug')
+            plugin.log(f"Failed to send message to {member_id[:16]}...: {e}", level='debug')
 
     return sent_count
 
@@ -3547,10 +3770,10 @@ def _broadcast_to_members(message_bytes: bytes) -> int:
 
 def _outbox_send_fn(peer_id: str, msg_bytes: bytes) -> bool:
     """Send function for OutboxManager -- wraps sendcustommsg RPC."""
-    if not safe_plugin:
+    if not plugin:
         return False
     try:
-        safe_plugin.rpc.call("sendcustommsg", {
+        plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
             "msg": msg_bytes.hex()
         })
@@ -3601,11 +3824,11 @@ def _reliable_send(msg_type: HiveMessageType, payload: Dict,
         try:
             msg_bytes = serialize(msg_type, payload)
             if msg_bytes is None:
-                if safe_plugin:
-                    safe_plugin.log(f"cl-hive: message too large, skipping send to {peer_id[:16]}", level='warning')
+                if plugin:
+                    plugin.log(f"cl-hive: message too large, skipping send to {peer_id[:16]}", level='warning')
                 return
-            if safe_plugin:
-                safe_plugin.rpc.call("sendcustommsg", {
+            if plugin:
+                plugin.rpc.call("sendcustommsg", {
                     "node_id": peer_id,
                     "msg": msg_bytes.hex()
                 })
@@ -3619,11 +3842,11 @@ def _emit_ack(peer_id: str, msg_id: Optional[str]) -> None:
 
     Best-effort: we don't retry acks.
     """
-    if not msg_id or not safe_plugin or not our_pubkey:
+    if not msg_id or not plugin or not our_pubkey:
         return
     try:
-        ack_msg = create_msg_ack(msg_id, "ok", our_pubkey, rpc=safe_plugin.rpc)
-        safe_plugin.rpc.call("sendcustommsg", {
+        ack_msg = create_msg_ack(msg_id, "ok", our_pubkey, rpc=plugin.rpc)
+        plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
             "msg": ack_msg.hex()
         })
@@ -3641,11 +3864,11 @@ def handle_msg_ack(peer_id: str, payload: Dict, plugin) -> Dict:
     # from peers that haven't upgraded yet, but sender_id must match peer_id)
     sender_id = payload.get("sender_id", "")
     signature = payload.get("signature")
-    if signature and safe_plugin:
+    if signature and plugin:
         from modules.protocol import get_msg_ack_signing_payload
         signing_payload = get_msg_ack_signing_payload(payload)
         try:
-            verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+            verify_result = plugin.rpc.checkmessage(signing_payload, signature)
             if not verify_result.get("verified") or verify_result.get("pubkey") != sender_id:
                 plugin.log(f"cl-hive: MSG_ACK invalid signature from {peer_id[:16]}...", level='warn')
                 return {"result": "continue"}
@@ -3692,8 +3915,8 @@ def outbox_retry_loop():
                     outbox_mgr.expire_and_cleanup()
                     last_cleanup = now
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"Outbox retry error: {e}", level='warn')
+            if plugin:
+                plugin.log(f"Outbox retry error: {e}", level='warn')
         shutdown_event.wait(RETRY_INTERVAL)
 
 
@@ -3711,7 +3934,7 @@ def _broadcast_promotion_vote(target_peer_id: str, voter_peer_id: str) -> bool:
     Returns:
         True if broadcast was successful
     """
-    if not membership_mgr or not safe_plugin or not database:
+    if not membership_mgr or not plugin or not database:
         return False
 
     # Use a deterministic request_id so all nodes reference the same promotion
@@ -3723,9 +3946,9 @@ def _broadcast_promotion_vote(target_peer_id: str, voter_peer_id: str) -> bool:
     canonical = membership_mgr.build_vouch_message(target_peer_id, request_id, vouch_ts)
 
     try:
-        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
+        sig = plugin.rpc.signmessage(canonical)["zbase"]
     except Exception as e:
-        safe_plugin.log(f"Failed to sign promotion vote: {e}", level='warn')
+        plugin.log(f"Failed to sign promotion vote: {e}", level='warn')
         return False
 
     # Store locally in vouch table (so it's counted for regular promotion flow)
@@ -3748,7 +3971,7 @@ def _broadcast_promotion_vote(target_peer_id: str, voter_peer_id: str) -> bool:
     vouch_msg = serialize(HiveMessageType.VOUCH, vouch_payload)
     sent = _broadcast_to_members(vouch_msg)
 
-    safe_plugin.log(
+    plugin.log(
         f"Broadcast promotion vote for {target_peer_id[:16]}... to {sent} members",
         level='debug'
     )
@@ -3880,15 +4103,15 @@ def _check_timestamp_freshness(payload: Dict[str, Any], max_age: int,
     now = int(time.time())
     age = now - int(ts)
     if age > max_age:
-        if safe_plugin:
-            safe_plugin.log(
+        if plugin:
+            plugin.log(
                 f"cl-hive: {label} rejected: timestamp too old ({age}s > {max_age}s)",
                 level='debug'
             )
         return False
     if age < -MAX_CLOCK_SKEW_SECONDS:
-        if safe_plugin:
-            safe_plugin.log(
+        if plugin:
+            plugin.log(
                 f"cl-hive: {label} rejected: timestamp {-age}s in the future",
                 level='debug'
             )
@@ -3956,7 +4179,7 @@ def _sync_membership_on_startup(plugin: Plugin) -> None:
 
     SECURITY: All FULL_SYNC messages are cryptographically signed.
     """
-    if not database or not gossip_mgr or not safe_plugin:
+    if not database or not gossip_mgr :
         return
 
     members = database.get_all_members()
@@ -3976,7 +4199,7 @@ def _sync_membership_on_startup(plugin: Plugin) -> None:
             continue
 
         try:
-            safe_plugin.rpc.call("sendcustommsg", {
+            plugin.rpc.call("sendcustommsg", {
                 "node_id": member_id,
                 "msg": full_sync_msg.hex()
             })
@@ -4061,7 +4284,7 @@ def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     vouch_ts = int(time.time())
     canonical = membership_mgr.build_vouch_message(target_pubkey, request_id, vouch_ts)
     try:
-        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
+        sig = plugin.rpc.signmessage(canonical)["zbase"]
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign vouch: {e}", level='warn')
         return {"result": "continue"}
@@ -4134,7 +4357,7 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         payload["target_pubkey"], payload["request_id"], payload["timestamp"]
     )
     try:
-        result = safe_plugin.rpc.checkmessage(canonical, payload["sig"])
+        result = plugin.rpc.checkmessage(canonical, payload["sig"])
     except Exception as e:
         plugin.log(f"cl-hive: VOUCH signature check failed: {e}", level='warn')
         return {"result": "continue"}
@@ -4283,7 +4506,7 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             vouch["target_pubkey"], vouch["request_id"], vouch["timestamp"]
         )
         try:
-            result = safe_plugin.rpc.checkmessage(canonical, vouch["sig"])
+            result = plugin.rpc.checkmessage(canonical, vouch["sig"])
         except Exception:
             continue
         if not result.get("verified") or result.get("pubkey") != vouch["voucher_pubkey"]:
@@ -4315,7 +4538,7 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     Validates the signature and removes the member from the hive.
     """
-    if not config or not database or not safe_plugin:
+    if not config or not database :
         return {"result": "continue"}
 
     # Deduplication check
@@ -4355,7 +4578,7 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Verify signature
     canonical = f"hive:leave:{leaving_peer_id}:{timestamp}:{reason}"
     try:
-        result = safe_plugin.rpc.checkmessage(canonical, signature)
+        result = plugin.rpc.checkmessage(canonical, signature)
         if not result.get("verified") or result.get("pubkey") != leaving_peer_id:
             plugin.log(f"cl-hive: MEMBER_LEFT signature invalid for {leaving_peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -4418,7 +4641,7 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     Validates the proposal and stores it for voting.
     """
-    if not config or not database or not safe_plugin:
+    if not config or not database :
         return {"result": "continue"}
 
     # Deduplication check
@@ -4470,7 +4693,7 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Verify signature
     canonical = f"hive:ban_proposal:{proposal_id}:{target_peer_id}:{timestamp}:{reason}"
     try:
-        result = safe_plugin.rpc.checkmessage(canonical, signature)
+        result = plugin.rpc.checkmessage(canonical, signature)
         if not result.get("verified") or result.get("pubkey") != proposer_peer_id:
             plugin.log(f"cl-hive: BAN_PROPOSAL signature invalid", level='warn')
             return {"result": "continue"}
@@ -4504,7 +4727,7 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     Validates the vote, stores it, and checks if quorum is reached.
     """
-    if not config or not database or not safe_plugin or not membership_mgr:
+    if not config or not database or not plugin or not membership_mgr:
         return {"result": "continue"}
 
     # Deduplication check
@@ -4552,7 +4775,7 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Verify signature
     canonical = f"hive:ban_vote:{proposal_id}:{vote}:{timestamp}"
     try:
-        result = safe_plugin.rpc.checkmessage(canonical, signature)
+        result = plugin.rpc.checkmessage(canonical, signature)
         if not result.get("verified") or result.get("pubkey") != voter_peer_id:
             plugin.log(f"cl-hive: BAN_VOTE signature invalid", level='warn')
             return {"result": "continue"}
@@ -4713,7 +4936,7 @@ def handle_peer_available(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     signing_payload = get_peer_available_signing_payload(payload)
 
     try:
-        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature)
         if not result.get("verified") or result.get("pubkey") != reporter_peer_id:
             plugin.log(
                 f"cl-hive: PEER_AVAILABLE signature invalid from {peer_id[:16]}...",
@@ -4826,18 +5049,18 @@ def handle_peer_available(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     # Don't open channels to ourselves
-    if safe_plugin:
+    if plugin:
         try:
-            our_id = safe_plugin.rpc.getinfo().get("id")
+            our_id = plugin.rpc.getinfo().get("id")
             if target_peer_id == our_id:
                 return {"result": "continue"}
         except Exception:
             pass
 
     # Check if we already have a channel to this peer
-    if safe_plugin:
+    if plugin:
         try:
-            channels = safe_plugin.rpc.listpeerchannels(id=target_peer_id)
+            channels = plugin.rpc.listpeerchannels(id=target_peer_id)
             if channels.get("channels"):
                 plugin.log(
                     f"cl-hive: Already have channel to {target_peer_id[:16]}..., "
@@ -4946,11 +5169,11 @@ def _check_feerate_for_expansion(max_feerate_perkb: int) -> tuple:
     if max_feerate_perkb == 0:
         return (True, 0, "feerate check disabled")
 
-    if not safe_plugin:
+    if not plugin:
         return (False, 0, "plugin not initialized")
 
     try:
-        feerates = safe_plugin.rpc.feerates("perkb")
+        feerates = plugin.rpc.feerates("perkb")
         # Use 'opening' feerate which is what fundchannel uses
         opening_feerate = feerates.get("perkb", {}).get("opening")
 
@@ -4983,10 +5206,10 @@ def _get_spendable_balance(cfg) -> int:
     Returns:
         Spendable balance in sats, or 0 if unavailable
     """
-    if not safe_plugin:
+    if not plugin:
         return 0
     try:
-        funds = safe_plugin.rpc.listfunds()
+        funds = plugin.rpc.listfunds()
         outputs = funds.get('outputs', [])
         onchain_balance = sum(
             (o.get('amount_msat', 0) // 1000 if isinstance(o.get('amount_msat'), int)
@@ -5132,11 +5355,11 @@ def broadcast_peer_available(target_peer_id: str, event_type: str,
     Returns:
         Number of members message was sent to
     """
-    if not safe_plugin or not database:
+    if not plugin or not database:
         return 0
 
     try:
-        our_id = safe_plugin.rpc.getinfo().get("id")
+        our_id = plugin.rpc.getinfo().get("id")
     except Exception:
         return 0
 
@@ -5154,7 +5377,7 @@ def broadcast_peer_available(target_peer_id: str, event_type: str,
     # Sign the payload
     signing_str = get_peer_available_signing_payload(signing_payload_dict)
     try:
-        sig_result = safe_plugin.rpc.signmessage(signing_str)
+        sig_result = plugin.rpc.signmessage(signing_str)
         signature = sig_result['zbase']
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign PEER_AVAILABLE: {e}", level='error')
@@ -5198,17 +5421,17 @@ def _broadcast_expansion_nomination(round_id: str, target_peer_id: str) -> int:
     Returns:
         Number of members message was sent to
     """
-    if not safe_plugin or not database or not coop_expansion:
+    if not plugin or not database or not coop_expansion:
         return 0
 
     try:
-        our_id = safe_plugin.rpc.getinfo().get("id")
+        our_id = plugin.rpc.getinfo().get("id")
     except Exception:
         return 0
 
     # Get our nomination info
     try:
-        funds = safe_plugin.rpc.listfunds()
+        funds = plugin.rpc.listfunds()
         outputs = funds.get('outputs', [])
         available_liquidity = sum(
             (o.get('amount_msat', 0) // 1000 if isinstance(o.get('amount_msat'), int)
@@ -5220,14 +5443,14 @@ def _broadcast_expansion_nomination(round_id: str, target_peer_id: str) -> int:
         available_liquidity = 0
 
     try:
-        channels = safe_plugin.rpc.listpeerchannels()
+        channels = plugin.rpc.listpeerchannels()
         channel_count = len(channels.get('channels', []))
     except Exception:
         channel_count = 0
 
     # Check if we have a channel to target
     try:
-        target_channels = safe_plugin.rpc.listpeerchannels(id=target_peer_id)
+        target_channels = plugin.rpc.listpeerchannels(id=target_peer_id)
         has_existing = len(target_channels.get('channels', [])) > 0
     except Exception:
         has_existing = False
@@ -5236,7 +5459,7 @@ def _broadcast_expansion_nomination(round_id: str, target_peer_id: str) -> int:
     quality_score = 0.5
     if database:
         try:
-            scorer = PeerQualityScorer(database, safe_plugin)
+            scorer = PeerQualityScorer(database, plugin)
             result = scorer.calculate_score(target_peer_id)
             quality_score = result.overall_score
         except Exception:
@@ -5260,10 +5483,10 @@ def _broadcast_expansion_nomination(round_id: str, target_peer_id: str) -> int:
 
     # Sign the message with our node key
     try:
-        sig_result = safe_plugin.rpc.signmessage(signing_message)
+        sig_result = plugin.rpc.signmessage(signing_message)
         signature = sig_result['zbase']
     except Exception as e:
-        safe_plugin.log(f"cl-hive: Failed to sign nomination: {e}", level='error')
+        plugin.log(f"cl-hive: Failed to sign nomination: {e}", level='error')
         return 0
 
     msg = create_expansion_nominate(
@@ -5280,7 +5503,7 @@ def _broadcast_expansion_nomination(round_id: str, target_peer_id: str) -> int:
     )
 
     sent = _broadcast_to_members(msg)
-    safe_plugin.log(
+    plugin.log(
         f"cl-hive: [BROADCAST] Sent signed nomination for round {round_id[:8]}... "
         f"target={target_peer_id[:16]}... to {sent} members",
         level='info'
@@ -5309,11 +5532,11 @@ def _broadcast_expansion_elect(round_id: str, target_peer_id: str, elected_id: s
     Returns:
         Number of members message was sent to
     """
-    if not safe_plugin or not database:
+    if not plugin or not database:
         return 0
 
     try:
-        coordinator_id = safe_plugin.rpc.getinfo().get("id")
+        coordinator_id = plugin.rpc.getinfo().get("id")
     except Exception:
         return 0
 
@@ -5335,10 +5558,10 @@ def _broadcast_expansion_elect(round_id: str, target_peer_id: str, elected_id: s
 
     # Sign the message with our node key
     try:
-        sig_result = safe_plugin.rpc.signmessage(signing_message)
+        sig_result = plugin.rpc.signmessage(signing_message)
         signature = sig_result['zbase']
     except Exception as e:
-        safe_plugin.log(f"cl-hive: Failed to sign election: {e}", level='error')
+        plugin.log(f"cl-hive: Failed to sign election: {e}", level='error')
         return 0
 
     msg = create_expansion_elect(
@@ -5356,7 +5579,7 @@ def _broadcast_expansion_elect(round_id: str, target_peer_id: str, elected_id: s
 
     sent = _broadcast_to_members(msg)
     if sent > 0:
-        safe_plugin.log(
+        plugin.log(
             f"cl-hive: Broadcast signed expansion election for round {round_id[:8]}... "
             f"elected={elected_id[:16]}... to {sent} members",
             level='info'
@@ -5383,11 +5606,11 @@ def _broadcast_expansion_decline(round_id: str, reason: str) -> int:
     Returns:
         Number of members message was sent to
     """
-    if not safe_plugin or not database:
+    if not plugin or not database:
         return 0
 
     try:
-        decliner_id = safe_plugin.rpc.getinfo().get("id")
+        decliner_id = plugin.rpc.getinfo().get("id")
     except Exception:
         return 0
 
@@ -5405,10 +5628,10 @@ def _broadcast_expansion_decline(round_id: str, reason: str) -> int:
 
     # Sign the message with our node key
     try:
-        sig_result = safe_plugin.rpc.signmessage(signing_message)
+        sig_result = plugin.rpc.signmessage(signing_message)
         signature = sig_result['zbase']
     except Exception as e:
-        safe_plugin.log(f"cl-hive: Failed to sign decline: {e}", level='error')
+        plugin.log(f"cl-hive: Failed to sign decline: {e}", level='error')
         return 0
 
     msg = create_expansion_decline(
@@ -5421,7 +5644,7 @@ def _broadcast_expansion_decline(round_id: str, reason: str) -> int:
 
     sent = _broadcast_to_members(msg)
     if sent > 0:
-        safe_plugin.log(
+        plugin.log(
             f"cl-hive: Broadcast expansion decline for round {round_id[:8]}... "
             f"(reason={reason}) to {sent} members",
             level='info'
@@ -5466,7 +5689,7 @@ def handle_expansion_nominate(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     signing_message = get_expansion_nominate_signing_payload(payload)
 
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_message, signature)
+        verify_result = plugin.rpc.checkmessage(signing_message, signature)
         if not verify_result.get("verified", False):
             plugin.log(
                 f"cl-hive: [NOMINATE] Signature verification failed for {nominator_id[:16]}...",
@@ -5537,7 +5760,7 @@ def handle_expansion_elect(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     signing_message = get_expansion_elect_signing_payload(payload)
 
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_message, signature)
+        verify_result = plugin.rpc.checkmessage(signing_message, signature)
         if not verify_result.get("verified", False):
             plugin.log(
                 f"cl-hive: [ELECT] Signature verification failed for coordinator {coordinator_id[:16]}...",
@@ -5661,7 +5884,7 @@ def handle_expansion_decline(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     signing_message = get_expansion_decline_signing_payload(payload)
 
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_message, signature)
+        verify_result = plugin.rpc.checkmessage(signing_message, signature)
         if not verify_result.get("verified", False):
             plugin.log(
                 f"cl-hive: [DECLINE] Signature verification failed for decliner {decliner_id[:16]}...",
@@ -5705,7 +5928,7 @@ def handle_expansion_decline(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
         new_elected = result.get("elected_id", "")
         our_id = None
         try:
-            our_id = safe_plugin.rpc.getinfo().get("id")
+            our_id = plugin.rpc.getinfo().get("id")
         except Exception:
             pass
 
@@ -5808,7 +6031,7 @@ def handle_fee_intelligence_snapshot(peer_id: str, payload: Dict, plugin: Plugin
         plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT relayed to {relay_count} members", level='debug')
 
     # Delegate to fee intelligence manager
-    result = fee_intel_mgr.handle_fee_intelligence_snapshot(reporter_id, payload, safe_plugin.rpc)
+    result = fee_intel_mgr.handle_fee_intelligence_snapshot(reporter_id, payload, plugin.rpc)
 
     if result.get("success"):
         relay_info = " (relayed)" if is_relayed else ""
@@ -5864,7 +6087,7 @@ def handle_health_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     from modules.protocol import get_health_report_signing_payload
     signing_payload = get_health_report_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
             plugin.log(f"cl-hive: HEALTH_REPORT invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -5878,7 +6101,7 @@ def handle_health_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: HEALTH_REPORT relayed to {relay_count} members", level='debug')
 
     # Delegate to fee intelligence manager
-    result = fee_intel_mgr.handle_health_report(reporter_id, payload, safe_plugin.rpc)
+    result = fee_intel_mgr.handle_health_report(reporter_id, payload, plugin.rpc)
 
     if result.get("success"):
         tier = result.get("tier", "unknown")
@@ -5934,7 +6157,7 @@ def handle_liquidity_need(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     from modules.protocol import get_liquidity_need_signing_payload
     signing_payload = get_liquidity_need_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
             plugin.log(f"cl-hive: LIQUIDITY_NEED invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -5948,7 +6171,7 @@ def handle_liquidity_need(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: LIQUIDITY_NEED relayed to {relay_count} members", level='debug')
 
     # Delegate to liquidity coordinator
-    result = liquidity_coord.handle_liquidity_need(reporter_id, payload, safe_plugin.rpc)
+    result = liquidity_coord.handle_liquidity_need(reporter_id, payload, plugin.rpc)
 
     if result.get("success"):
         relay_info = " (relayed)" if is_relayed else ""
@@ -6004,7 +6227,7 @@ def handle_liquidity_snapshot(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     from modules.protocol import get_liquidity_snapshot_signing_payload
     signing_payload = get_liquidity_snapshot_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
             plugin.log(f"cl-hive: LIQUIDITY_SNAPSHOT invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -6018,7 +6241,7 @@ def handle_liquidity_snapshot(peer_id: str, payload: Dict, plugin: Plugin) -> Di
         plugin.log(f"cl-hive: LIQUIDITY_SNAPSHOT relayed to {relay_count} members", level='debug')
 
     # Delegate to liquidity coordinator
-    result = liquidity_coord.handle_liquidity_snapshot(reporter_id, payload, safe_plugin.rpc)
+    result = liquidity_coord.handle_liquidity_snapshot(reporter_id, payload, plugin.rpc)
 
     if result.get("success"):
         relay_info = " (relayed)" if is_relayed else ""
@@ -6075,7 +6298,7 @@ def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     from modules.protocol import get_route_probe_signing_payload
     signing_payload = get_route_probe_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
             plugin.log(f"cl-hive: ROUTE_PROBE invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -6086,7 +6309,7 @@ def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Delegate to routing map — pass verified reporter_id (not transport peer_id)
     # and skip re-verification since we already checked the signature above
     result = routing_map.handle_route_probe(
-        reporter_id, payload, safe_plugin.rpc, pre_verified=True
+        reporter_id, payload, plugin.rpc, pre_verified=True
     )
 
     if result.get("success"):
@@ -6147,7 +6370,7 @@ def handle_route_probe_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     from modules.protocol import get_route_probe_batch_signing_payload
     signing_payload = get_route_probe_batch_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
             plugin.log(f"cl-hive: ROUTE_PROBE_BATCH invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -6158,7 +6381,7 @@ def handle_route_probe_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     # Delegate to routing map — pass verified reporter_id (not transport peer_id)
     # and skip re-verification since we already checked the signature above
     result = routing_map.handle_route_probe_batch(
-        reporter_id, payload, safe_plugin.rpc, pre_verified=True
+        reporter_id, payload, plugin.rpc, pre_verified=True
     )
 
     if result.get("success"):
@@ -6220,7 +6443,7 @@ def handle_peer_reputation_snapshot(peer_id: str, payload: Dict, plugin: Plugin)
     from modules.protocol import get_peer_reputation_snapshot_signing_payload
     signing_payload = get_peer_reputation_snapshot_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
             plugin.log(f"cl-hive: PEER_REPUTATION_SNAPSHOT invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -6229,7 +6452,7 @@ def handle_peer_reputation_snapshot(peer_id: str, payload: Dict, plugin: Plugin)
         return {"result": "continue"}
 
     # Delegate to peer reputation manager
-    result = peer_reputation_mgr.handle_peer_reputation_snapshot(peer_id, payload, safe_plugin.rpc)
+    result = peer_reputation_mgr.handle_peer_reputation_snapshot(peer_id, payload, plugin.rpc)
 
     if result.get("success"):
         relay_info = " (relayed)" if is_relayed else ""
@@ -6297,7 +6520,7 @@ def handle_stigmergic_marker_batch(peer_id: str, payload: Dict, plugin: Plugin) 
 
     try:
         signing_payload = get_stigmergic_marker_batch_signing_payload(payload)
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        verify_result = plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
         if not verify_result.get("verified"):
             plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH signature invalid from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
@@ -6393,7 +6616,7 @@ def handle_pheromone_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     try:
         signing_payload = get_pheromone_batch_signing_payload(payload)
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        verify_result = plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
         if not verify_result.get("verified"):
             plugin.log(f"cl-hive: PHEROMONE_BATCH signature invalid from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
@@ -6484,7 +6707,7 @@ def handle_yield_metrics_batch(peer_id: str, payload: Dict, plugin: Plugin) -> D
 
     try:
         signing_payload = get_yield_metrics_batch_signing_payload(payload)
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        verify_result = plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
         if not verify_result.get("verified"):
             plugin.log(f"cl-hive: YIELD_METRICS_BATCH signature invalid from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
@@ -6570,7 +6793,7 @@ def handle_circular_flow_alert(peer_id: str, payload: Dict, plugin: Plugin) -> D
 
     try:
         signing_payload = get_circular_flow_alert_signing_payload(payload)
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        verify_result = plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
         if not verify_result.get("verified"):
             plugin.log(f"cl-hive: CIRCULAR_FLOW_ALERT signature invalid from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
@@ -6651,7 +6874,7 @@ def handle_temporal_pattern_batch(peer_id: str, payload: Dict, plugin: Plugin) -
 
     try:
         signing_payload = get_temporal_pattern_batch_signing_payload(payload)
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        verify_result = plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
         if not verify_result.get("verified"):
             plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH signature invalid from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
@@ -6742,7 +6965,7 @@ def handle_corridor_value_batch(peer_id: str, payload: Dict, plugin: Plugin) -> 
 
     try:
         signing_payload = get_corridor_value_batch_signing_payload(payload)
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        verify_result = plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
         if not verify_result.get("verified"):
             plugin.log(f"cl-hive: CORRIDOR_VALUE_BATCH signature invalid from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
@@ -6827,7 +7050,7 @@ def handle_positioning_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> 
 
     try:
         signing_payload = get_positioning_proposal_signing_payload(payload)
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        verify_result = plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
         if not verify_result.get("verified"):
             plugin.log(f"cl-hive: POSITIONING_PROPOSAL signature invalid from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
@@ -6906,7 +7129,7 @@ def handle_physarum_recommendation(peer_id: str, payload: Dict, plugin: Plugin) 
 
     try:
         signing_payload = get_physarum_recommendation_signing_payload(payload)
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        verify_result = plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
         if not verify_result.get("verified"):
             plugin.log(f"cl-hive: PHYSARUM_RECOMMENDATION signature invalid from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
@@ -6986,7 +7209,7 @@ def handle_coverage_analysis_batch(peer_id: str, payload: Dict, plugin: Plugin) 
 
     try:
         signing_payload = get_coverage_analysis_batch_signing_payload(payload)
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        verify_result = plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
         if not verify_result.get("verified"):
             plugin.log(f"cl-hive: COVERAGE_ANALYSIS_BATCH signature invalid from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
@@ -7056,7 +7279,7 @@ def handle_close_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     try:
         signing_payload = get_close_proposal_signing_payload(payload)
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
+        verify_result = plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
         if not verify_result.get("verified"):
             plugin.log(f"cl-hive: CLOSE_PROPOSAL signature invalid from {peer_id[:16]}...", level='debug')
             return {"result": "continue"}
@@ -7129,7 +7352,7 @@ def handle_settlement_offer(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
     # Verify the signature
     signing_payload = get_settlement_offer_signing_payload(offer_peer_id, bolt12_offer)
     try:
-        verify_result = safe_plugin.rpc.call("checkmessage", {
+        verify_result = plugin.rpc.call("checkmessage", {
             "message": signing_payload,
             "zbase": signature,
             "pubkey": offer_peer_id
@@ -7226,7 +7449,7 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             report_peer_id, fees_earned_sats, period_start, period_end, forward_count,
             rebalance_costs_sats
         )
-        verify_result = safe_plugin.rpc.call("checkmessage", {
+        verify_result = plugin.rpc.call("checkmessage", {
             "message": signing_payload,
             "zbase": signature,
             "pubkey": report_peer_id
@@ -7238,7 +7461,7 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             legacy_payload = get_fee_report_signing_payload_legacy(
                 report_peer_id, fees_earned_sats, period_start, period_end, forward_count
             )
-            verify_result = safe_plugin.rpc.call("checkmessage", {
+            verify_result = plugin.rpc.call("checkmessage", {
                 "message": legacy_payload,
                 "zbase": signature,
                 "pubkey": report_peer_id
@@ -7354,7 +7577,7 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     signature = payload.get("signature")
     signing_payload = get_settlement_propose_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.call("checkmessage", {
+        verify_result = plugin.rpc.call("checkmessage", {
             "message": signing_payload,
             "zbase": signature,
             "pubkey": proposer_peer_id
@@ -7395,7 +7618,7 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
         proposal=payload,
         our_peer_id=our_pubkey,
         state_manager=state_manager,
-        rpc=safe_plugin.rpc
+        rpc=plugin.rpc
     )
 
     if vote:
@@ -7475,7 +7698,7 @@ def handle_settlement_ready(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
     signature = payload.get("signature")
     signing_payload = get_settlement_ready_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.call("checkmessage", {
+        verify_result = plugin.rpc.call("checkmessage", {
             "message": signing_payload,
             "zbase": signature,
             "pubkey": voter_peer_id
@@ -7589,7 +7812,7 @@ def handle_settlement_executed(peer_id: str, payload: Dict, plugin: Plugin) -> D
     signature = payload.get("signature")
     signing_payload = get_settlement_executed_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.call("checkmessage", {
+        verify_result = plugin.rpc.call("checkmessage", {
             "message": signing_payload,
             "zbase": signature,
             "pubkey": executor_peer_id
@@ -7673,7 +7896,7 @@ def handle_task_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     from modules.protocol import get_task_request_signing_payload
     signing_payload = get_task_request_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != requester_id:
             plugin.log(f"cl-hive: TASK_REQUEST invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -7691,7 +7914,7 @@ def handle_task_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         payload["_event_id"] = event_id
 
     # Delegate to task manager
-    result = task_mgr.handle_task_request(peer_id, payload, safe_plugin.rpc)
+    result = task_mgr.handle_task_request(peer_id, payload, plugin.rpc)
 
     if result.get("status") == "accepted":
         plugin.log(
@@ -7745,7 +7968,7 @@ def handle_task_response(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     from modules.protocol import get_task_response_signing_payload
     signing_payload = get_task_response_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != responder_id:
             plugin.log(f"cl-hive: TASK_RESPONSE invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -7763,7 +7986,7 @@ def handle_task_response(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         payload["_event_id"] = event_id
 
     # Delegate to task manager
-    result = task_mgr.handle_task_response(peer_id, payload, safe_plugin.rpc)
+    result = task_mgr.handle_task_response(peer_id, payload, plugin.rpc)
 
     if result.get("status") == "processed":
         response_status = result.get("response_status", "")
@@ -7819,7 +8042,7 @@ def handle_splice_init_request(peer_id: str, payload: Dict, plugin: Plugin) -> D
     from modules.protocol import get_splice_init_request_signing_payload
     signing_payload = get_splice_init_request_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != initiator_id:
             plugin.log(f"cl-hive: SPLICE_INIT_REQUEST invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -7835,7 +8058,7 @@ def handle_splice_init_request(peer_id: str, payload: Dict, plugin: Plugin) -> D
         return {"result": "continue"}
 
     # Delegate to splice manager
-    result = splice_mgr.handle_splice_init_request(peer_id, payload, safe_plugin.rpc)
+    result = splice_mgr.handle_splice_init_request(peer_id, payload, plugin.rpc)
 
     if result.get("success"):
         plugin.log(
@@ -7883,7 +8106,7 @@ def handle_splice_init_response(peer_id: str, payload: Dict, plugin: Plugin) -> 
     from modules.protocol import get_splice_init_response_signing_payload
     signing_payload = get_splice_init_response_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != responder_id:
             plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -7899,7 +8122,7 @@ def handle_splice_init_response(peer_id: str, payload: Dict, plugin: Plugin) -> 
         return {"result": "continue"}
 
     # Delegate to splice manager
-    result = splice_mgr.handle_splice_init_response(peer_id, payload, safe_plugin.rpc)
+    result = splice_mgr.handle_splice_init_response(peer_id, payload, plugin.rpc)
 
     if result.get("rejected"):
         plugin.log(
@@ -7946,7 +8169,7 @@ def handle_splice_update(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     from modules.protocol import get_splice_update_signing_payload
     signing_payload = get_splice_update_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != sender_id_field:
             plugin.log(f"cl-hive: SPLICE_UPDATE invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -7962,7 +8185,7 @@ def handle_splice_update(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     # Delegate to splice manager
-    result = splice_mgr.handle_splice_update(peer_id, payload, safe_plugin.rpc)
+    result = splice_mgr.handle_splice_update(peer_id, payload, plugin.rpc)
 
     if result.get("error"):
         plugin.log(
@@ -8002,7 +8225,7 @@ def handle_splice_signed(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     from modules.protocol import get_splice_signed_signing_payload
     signing_payload = get_splice_signed_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != sender_id_field:
             plugin.log(f"cl-hive: SPLICE_SIGNED invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -8018,7 +8241,7 @@ def handle_splice_signed(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     # Delegate to splice manager
-    result = splice_mgr.handle_splice_signed(peer_id, payload, safe_plugin.rpc)
+    result = splice_mgr.handle_splice_signed(peer_id, payload, plugin.rpc)
 
     if result.get("txid"):
         plugin.log(
@@ -8063,7 +8286,7 @@ def handle_splice_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     from modules.protocol import get_splice_abort_signing_payload
     signing_payload = get_splice_abort_signing_payload(payload)
     try:
-        verify_result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
         if not verify_result.get("verified") or verify_result.get("pubkey") != sender_id_field:
             plugin.log(f"cl-hive: SPLICE_ABORT invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
@@ -8079,7 +8302,7 @@ def handle_splice_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     # Delegate to splice manager
-    result = splice_mgr.handle_splice_abort(peer_id, payload, safe_plugin.rpc)
+    result = splice_mgr.handle_splice_abort(peer_id, payload, plugin.rpc)
 
     if result.get("aborted"):
         plugin.log(
@@ -8141,7 +8364,7 @@ def handle_mcf_needs_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Verify signature
     signing_payload = get_mcf_needs_batch_signing_payload(payload)
     try:
-        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature)
         if not result.get("verified") or result.get("pubkey") != reporter_id:
             plugin.log(
                 f"cl-hive: MCF_NEEDS_BATCH signature invalid from {peer_id[:16]}...",
@@ -8233,7 +8456,7 @@ def handle_mcf_solution_broadcast(peer_id: str, payload: Dict, plugin: Plugin) -
     # Verify signature
     signing_payload = get_mcf_solution_signing_payload(payload)
     try:
-        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature)
         if not result.get("verified") or result.get("pubkey") != coordinator_id:
             plugin.log(
                 f"cl-hive: MCF_SOLUTION_BROADCAST signature invalid from {peer_id[:16]}...",
@@ -8312,7 +8535,7 @@ def handle_mcf_assignment_ack(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     # Verify signature
     signing_payload = get_mcf_assignment_ack_signing_payload(payload)
     try:
-        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature)
         if not result.get("verified") or result.get("pubkey") != member_id:
             plugin.log(
                 f"cl-hive: MCF_ASSIGNMENT_ACK signature invalid from {peer_id[:16]}...",
@@ -8385,7 +8608,7 @@ def handle_mcf_completion_report(peer_id: str, payload: Dict, plugin: Plugin) ->
     # Verify signature
     signing_payload = get_mcf_completion_signing_payload(payload)
     try:
-        result = safe_plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature)
         if not result.get("verified") or result.get("pubkey") != member_id:
             plugin.log(
                 f"cl-hive: MCF_COMPLETION_REPORT signature invalid from {peer_id[:16]}...",
@@ -8433,7 +8656,7 @@ def _send_mcf_ack(coordinator_id: str, solution_timestamp: int, assignment_count
     Returns:
         True if sent successfully
     """
-    if not liquidity_coord or not safe_plugin:
+    if not liquidity_coord :
         return False
 
     ack_msg = liquidity_coord.create_mcf_ack_message()
@@ -8442,13 +8665,13 @@ def _send_mcf_ack(coordinator_id: str, solution_timestamp: int, assignment_count
         return False
 
     try:
-        safe_plugin.rpc.sendcustommsg(
+        plugin.rpc.sendcustommsg(
             node_id=coordinator_id,
             msg=ack_msg.hex()
         )
         return True
     except Exception as e:
-        safe_plugin.log(f"cl-hive: Failed to send MCF ACK: {e}", level='debug')
+        plugin.log(f"cl-hive: Failed to send MCF ACK: {e}", level='debug')
         return False
 
 
@@ -8468,7 +8691,7 @@ def _broadcast_mcf_completion(assignment_id: str, success: bool,
     Returns:
         Number of members the message was sent to
     """
-    if not liquidity_coord or not safe_plugin:
+    if not liquidity_coord :
         return 0
 
     completion_msg = liquidity_coord.create_mcf_completion_message(
@@ -8492,7 +8715,7 @@ def _broadcast_settlement_offer(peer_id: str, bolt12_offer: str) -> int:
     Returns:
         Number of members the message was sent to
     """
-    if not safe_plugin or not handshake_mgr:
+    if not plugin or not handshake_mgr:
         return 0
 
     timestamp = int(time.time())
@@ -8500,13 +8723,13 @@ def _broadcast_settlement_offer(peer_id: str, bolt12_offer: str) -> int:
     # Sign the offer
     signing_payload = get_settlement_offer_signing_payload(peer_id, bolt12_offer)
     try:
-        sign_result = safe_plugin.rpc.call("signmessage", {"message": signing_payload})
+        sign_result = plugin.rpc.call("signmessage", {"message": signing_payload})
         signature = sign_result.get("zbase")
         if not signature:
-            safe_plugin.log("cl-hive: Failed to sign settlement offer", level='warn')
+            plugin.log("cl-hive: Failed to sign settlement offer", level='warn')
             return 0
     except Exception as e:
-        safe_plugin.log(f"cl-hive: Failed to sign settlement offer: {e}", level='warn')
+        plugin.log(f"cl-hive: Failed to sign settlement offer: {e}", level='warn')
         return 0
 
     # Create the message
@@ -8515,7 +8738,7 @@ def _broadcast_settlement_offer(peer_id: str, bolt12_offer: str) -> int:
     # Broadcast to all members
     sent = _broadcast_to_members(msg)
     if sent > 0:
-        safe_plugin.log(f"cl-hive: Broadcast settlement offer to {sent} member(s)")
+        plugin.log(f"cl-hive: Broadcast settlement offer to {sent} member(s)")
 
     return sent
 
@@ -8535,7 +8758,7 @@ def _send_settlement_offer_to_peer(target_peer_id: str, our_peer_id: str, bolt12
     Returns:
         True if sent successfully, False otherwise
     """
-    if not safe_plugin:
+    if not plugin:
         return False
 
     timestamp = int(time.time())
@@ -8543,13 +8766,13 @@ def _send_settlement_offer_to_peer(target_peer_id: str, our_peer_id: str, bolt12
     # Sign the offer
     signing_payload = get_settlement_offer_signing_payload(our_peer_id, bolt12_offer)
     try:
-        sign_result = safe_plugin.rpc.call("signmessage", {"message": signing_payload})
+        sign_result = plugin.rpc.call("signmessage", {"message": signing_payload})
         signature = sign_result.get("zbase")
         if not signature:
-            safe_plugin.log("cl-hive: Failed to sign settlement offer for peer", level='warn')
+            plugin.log("cl-hive: Failed to sign settlement offer for peer", level='warn')
             return False
     except Exception as e:
-        safe_plugin.log(f"cl-hive: Failed to sign settlement offer: {e}", level='warn')
+        plugin.log(f"cl-hive: Failed to sign settlement offer: {e}", level='warn')
         return False
 
     # Create the message
@@ -8557,14 +8780,14 @@ def _send_settlement_offer_to_peer(target_peer_id: str, our_peer_id: str, bolt12
 
     # Send to the specific peer
     try:
-        safe_plugin.rpc.call("sendcustommsg", {
+        plugin.rpc.call("sendcustommsg", {
             "node_id": target_peer_id,
             "msg": msg.hex()
         })
-        safe_plugin.log(f"cl-hive: Sent settlement offer to new member {target_peer_id[:16]}...")
+        plugin.log(f"cl-hive: Sent settlement offer to new member {target_peer_id[:16]}...")
         return True
     except Exception as e:
-        safe_plugin.log(f"cl-hive: Failed to send settlement offer to {target_peer_id[:16]}...: {e}", level='debug')
+        plugin.log(f"cl-hive: Failed to send settlement offer to {target_peer_id[:16]}...: {e}", level='debug')
         return False
 
 
@@ -8590,8 +8813,8 @@ def intent_monitor_loop():
                 intent_mgr.cleanup_expired_intents()
                 intent_mgr.recover_stuck_intents(max_age_seconds=300)
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"Intent monitor error: {e}", level='warn')
+            if plugin:
+                plugin.log(f"Intent monitor error: {e}", level='warn')
         
         # Wait for next iteration or shutdown
         shutdown_event.wait(MONITOR_INTERVAL)
@@ -8623,8 +8846,8 @@ def process_ready_intents():
         # In advisor mode, intents wait for AI/human approval
         # In failsafe mode, only emergency actions auto-execute (not intents)
         if cfg.governance_mode != "failsafe":
-            if safe_plugin:
-                safe_plugin.log(
+            if plugin:
+                plugin.log(
                     f"cl-hive: Intent {intent_id} ready but not committing "
                     f"(mode={cfg.governance_mode})",
                     level='debug'
@@ -8633,8 +8856,8 @@ def process_ready_intents():
 
         # Commit the intent (only in failsafe mode for backwards compatibility)
         if intent_mgr.commit_intent(intent_id):
-            if safe_plugin:
-                safe_plugin.log(f"cl-hive: Committed intent {intent_id}: {intent_type} -> {target[:16]}...")
+            if plugin:
+                plugin.log(f"cl-hive: Committed intent {intent_id}: {intent_type} -> {target[:16]}...")
 
             # Execute the action (callback registry)
             intent_mgr.execute_committed_intent(intent_row)
@@ -8653,7 +8876,7 @@ def _auto_connect_to_all_members() -> int:
     Returns:
         Number of new connections established
     """
-    if not database or not safe_plugin:
+    if not database :
         return 0
 
     members = database.get_all_members()
@@ -8708,8 +8931,8 @@ def membership_maintenance_loop():
     # for extended periods, causing RPC lock timeout for startup sync.
     STARTUP_DELAY_SECONDS = 30
     if not shutdown_event.wait(STARTUP_DELAY_SECONDS):
-        if safe_plugin:
-            safe_plugin.log("cl-hive: Membership maintenance starting after init delay", level='debug')
+        if plugin:
+            plugin.log("cl-hive: Membership maintenance starting after init delay", level='debug')
 
     while not shutdown_event.is_set():
         try:
@@ -8721,8 +8944,8 @@ def membership_maintenance_loop():
 
                 # Sync uptime from presence data to hive_members
                 updated = database.sync_uptime_from_presence(window_seconds=PRESENCE_WINDOW_SECONDS)
-                if updated > 0 and safe_plugin:
-                    safe_plugin.log(f"Synced uptime for {updated} member(s)", level='debug')
+                if updated > 0 and plugin:
+                    plugin.log(f"Synced uptime for {updated} member(s)", level='debug')
 
                 # Sync contribution ratios from ledger to hive_members (Issue #59)
                 if membership_mgr:
@@ -8767,12 +8990,12 @@ def membership_maintenance_loop():
 
                 # Issue #38: Auto-connect to hive members we're not connected to
                 reconnected = _auto_connect_to_all_members()
-                if reconnected > 0 and safe_plugin:
-                    safe_plugin.log(f"Auto-connected to {reconnected} hive member(s)", level='info')
+                if reconnected > 0 and plugin:
+                    plugin.log(f"Auto-connected to {reconnected} hive member(s)", level='info')
 
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"Membership maintenance error: {e}", level='warn')
+            if plugin:
+                plugin.log(f"Membership maintenance error: {e}", level='warn')
 
         shutdown_event.wait(MAINTENANCE_INTERVAL)
 
@@ -8807,8 +9030,8 @@ def planner_loop():
     # blocking startup sync's signmessage() call.
     PLANNER_STARTUP_DELAY_SECONDS = 45
     if not shutdown_event.wait(PLANNER_STARTUP_DELAY_SECONDS):
-        if safe_plugin:
-            safe_plugin.log("cl-hive: Planner starting after init delay", level='debug')
+        if plugin:
+            plugin.log("cl-hive: Planner starting after init delay", level='debug')
 
     first_run = True
 
@@ -8819,8 +9042,8 @@ def planner_loop():
                 cfg_snapshot = config.snapshot()
                 run_id = secrets.token_hex(8)
 
-                if safe_plugin:
-                    safe_plugin.log(f"cl-hive: Planner cycle starting (run_id={run_id})")
+                if plugin:
+                    plugin.log(f"cl-hive: Planner cycle starting (run_id={run_id})")
 
                 # Run the planner cycle
                 decisions = planner.run_cycle(
@@ -8829,21 +9052,21 @@ def planner_loop():
                     run_id=run_id
                 )
 
-                if safe_plugin:
-                    safe_plugin.log(
+                if plugin:
+                    plugin.log(
                         f"cl-hive: Planner cycle complete: {len(decisions)} decisions"
                     )
 
                 # Clean up expired expansion rounds
                 if coop_expansion:
                     cleaned = coop_expansion.cleanup_expired_rounds()
-                    if cleaned > 0 and safe_plugin:
-                        safe_plugin.log(
+                    if cleaned > 0 and plugin:
+                        plugin.log(
                             f"cl-hive: Cleaned up {cleaned} expired expansion rounds"
                         )
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"Planner loop error: {e}", level='warn')
+            if plugin:
+                plugin.log(f"Planner loop error: {e}", level='warn')
 
         # Calculate next sleep interval
         if first_run:
@@ -8892,7 +9115,7 @@ def fee_intelligence_loop():
 
     while not shutdown_event.is_set():
         try:
-            if not fee_intel_mgr or not database or not safe_plugin or not our_pubkey:
+            if not fee_intel_mgr or not database or not plugin or not our_pubkey:
                 shutdown_event.wait(60)
                 continue
 
@@ -8903,12 +9126,12 @@ def fee_intelligence_loop():
             try:
                 updated = fee_intel_mgr.aggregate_fee_profiles()
                 if updated > 0:
-                    safe_plugin.log(
+                    plugin.log(
                         f"cl-hive: Aggregated {updated} peer fee profiles",
                         level='debug'
                     )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Fee aggregation error: {e}", level='warn')
+                plugin.log(f"cl-hive: Fee aggregation error: {e}", level='warn')
 
             # Step 3: Broadcast our health report
             _broadcast_health_report()
@@ -8917,12 +9140,12 @@ def fee_intelligence_loop():
             try:
                 deleted = database.cleanup_old_fee_intelligence(FEE_INTELLIGENCE_MAX_AGE_HOURS)
                 if deleted > 0:
-                    safe_plugin.log(
+                    plugin.log(
                         f"cl-hive: Cleaned up {deleted} old fee intelligence records",
                         level='debug'
                     )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Fee intelligence cleanup error: {e}", level='warn')
+                plugin.log(f"cl-hive: Fee intelligence cleanup error: {e}", level='warn')
 
             # Step 5: Broadcast liquidity needs
             # NOTE: Small delays (50ms) between broadcasts reduce RPC lock contention
@@ -8949,7 +9172,7 @@ def fee_intelligence_loop():
                     _broadcast_our_yield_metrics._last_broadcast = today
                     shutdown_event.wait(0.05)
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Yield metrics broadcast check error: {e}", level='debug')
+                plugin.log(f"cl-hive: Yield metrics broadcast check error: {e}", level='debug')
 
             # Step 5d: Broadcast circular flow alerts (Phase 14 - Event-driven)
             _broadcast_circular_flow_alerts()
@@ -8965,7 +9188,7 @@ def fee_intelligence_loop():
                     _broadcast_our_temporal_patterns._last_broadcast = current_week
                     shutdown_event.wait(0.05)
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Temporal patterns broadcast check error: {e}", level='debug')
+                plugin.log(f"cl-hive: Temporal patterns broadcast check error: {e}", level='debug')
 
             # Step 5f: Broadcast corridor values (Phase 14.2 - Weekly)
             try:
@@ -8977,7 +9200,7 @@ def fee_intelligence_loop():
                     _broadcast_our_corridor_values._last_broadcast = current_week
                     shutdown_event.wait(0.05)
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Corridor values broadcast check error: {e}", level='debug')
+                plugin.log(f"cl-hive: Corridor values broadcast check error: {e}", level='debug')
 
             # Step 5g: Broadcast positioning proposals (Phase 14.2 - Event-driven)
             _broadcast_our_positioning_proposals()
@@ -8997,7 +9220,7 @@ def fee_intelligence_loop():
                     _broadcast_our_coverage_analysis._last_broadcast = current_week
                     shutdown_event.wait(0.05)
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Coverage analysis broadcast check error: {e}", level='debug')
+                plugin.log(f"cl-hive: Coverage analysis broadcast check error: {e}", level='debug')
 
             # Step 5j: Broadcast close proposals (Phase 14.2 - Event-driven)
             _broadcast_our_close_proposals()
@@ -9007,12 +9230,12 @@ def fee_intelligence_loop():
             try:
                 deleted_needs = database.cleanup_old_liquidity_needs(max_age_hours=24)
                 if deleted_needs > 0:
-                    safe_plugin.log(
+                    plugin.log(
                         f"cl-hive: Cleaned up {deleted_needs} old liquidity needs",
                         level='debug'
                     )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Liquidity needs cleanup error: {e}", level='warn')
+                plugin.log(f"cl-hive: Liquidity needs cleanup error: {e}", level='warn')
 
             # Step 7: Cleanup old route probes
             try:
@@ -9020,31 +9243,31 @@ def fee_intelligence_loop():
                     # Clean database
                     deleted_probes = database.cleanup_old_route_probes(max_age_hours=24)
                     if deleted_probes > 0:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Cleaned up {deleted_probes} old route probes from database",
                             level='debug'
                         )
                     # Clean in-memory stats
                     cleaned_paths = routing_map.cleanup_stale_data()
                     if cleaned_paths > 0:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Cleaned up {cleaned_paths} stale paths from routing map",
                             level='debug'
                         )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Route probe cleanup error: {e}", level='warn')
+                plugin.log(f"cl-hive: Route probe cleanup error: {e}", level='warn')
 
             # Step 8: Cleanup stale peer states (memory management)
             try:
                 if state_manager:
                     cleaned_states = state_manager.cleanup_stale_states()
                     if cleaned_states > 0:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Cleaned up {cleaned_states} stale peer states",
                             level='debug'
                         )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: State cleanup error: {e}", level='warn')
+                plugin.log(f"cl-hive: State cleanup error: {e}", level='warn')
 
             # Step 8a: Verify hive channel zero-fee policy (security check)
             try:
@@ -9059,12 +9282,12 @@ def fee_intelligence_loop():
                             if not is_valid and reason not in ('no_channel', 'our_direction_not_found'):
                                 violations.append((peer_id[:16], reason))
                     if violations:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: SECURITY WARNING - Hive channels with non-zero fees: {violations}",
                             level='warn'
                         )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Zero-fee verification error: {e}", level='debug')
+                plugin.log(f"cl-hive: Zero-fee verification error: {e}", level='debug')
 
             # Step 9: Cleanup old peer reputation (Phase 5 - Advanced Cooperation)
             try:
@@ -9072,19 +9295,19 @@ def fee_intelligence_loop():
                     # Clean database
                     deleted_reps = database.cleanup_old_peer_reputation(max_age_hours=168)
                     if deleted_reps > 0:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Cleaned up {deleted_reps} old peer reputation records",
                             level='debug'
                         )
                     # Clean in-memory aggregations
                     cleaned_reps = peer_reputation_mgr.cleanup_stale_data()
                     if cleaned_reps > 0:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Cleaned up {cleaned_reps} stale peer reputations",
                             level='debug'
                         )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Peer reputation cleanup error: {e}", level='warn')
+                plugin.log(f"cl-hive: Peer reputation cleanup error: {e}", level='warn')
 
             # Step 10: Cleanup old remote pheromones (Phase 13 - Fleet Learning)
             try:
@@ -9093,29 +9316,29 @@ def fee_intelligence_loop():
                         max_age_hours=48
                     )
                     if cleaned_pheromones > 0:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Cleaned up {cleaned_pheromones} old remote pheromones",
                             level='debug'
                         )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Remote pheromone cleanup error: {e}", level='warn')
+                plugin.log(f"cl-hive: Remote pheromone cleanup error: {e}", level='warn')
 
             # Step 10a: Evaporate local pheromones (time-based decay for idle channels)
             try:
                 if fee_coordination_mgr:
                     evaporated = fee_coordination_mgr.adaptive_controller.evaporate_all_pheromones()
                     if evaporated > 0:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Applied time-based decay to {evaporated} channel pheromones",
                             level='debug'
                         )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Local pheromone evaporation error: {e}", level='warn')
+                plugin.log(f"cl-hive: Local pheromone evaporation error: {e}", level='warn')
 
             # Step 10b: Update velocity cache for adaptive evaporation
             try:
                 if fee_coordination_mgr:
-                    funds = safe_plugin.rpc.listfunds()
+                    funds = plugin.rpc.listfunds()
                     for ch in funds.get("channels", []):
                         scid = ch.get("short_channel_id")
                         if not scid or ch.get("state") != "CHANNELD_NORMAL":
@@ -9129,14 +9352,14 @@ def fee_intelligence_loop():
                         velocity = (balance_pct - 0.5) * 2  # -1 to +1 range
                         fee_coordination_mgr.adaptive_controller.update_velocity(scid, velocity)
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Velocity cache update error: {e}", level='debug')
+                plugin.log(f"cl-hive: Velocity cache update error: {e}", level='debug')
 
             # Step 10c: Save routing intelligence to database (every cycle, ~5 min)
             try:
                 if fee_coordination_mgr:
                     saved = fee_coordination_mgr.save_state_to_database()
                     if any(saved.get(k, 0) > 0 for k in saved):
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Saved routing intelligence "
                             f"(pheromones={saved['pheromones']}, markers={saved['markers']}, "
                             f"defense_reports={saved.get('defense_reports', 0)}, "
@@ -9146,59 +9369,59 @@ def fee_intelligence_loop():
                             level='debug'
                         )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Failed to save routing intelligence: {e}", level='warn')
+                plugin.log(f"cl-hive: Failed to save routing intelligence: {e}", level='warn')
 
             # Step 11: Cleanup old remote yield metrics (Phase 14)
             try:
                 if yield_metrics_mgr:
                     cleaned_yields = yield_metrics_mgr.cleanup_old_remote_yield_metrics(max_age_days=30)
                     if cleaned_yields > 0:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Cleaned up {cleaned_yields} old remote yield metrics",
                             level='debug'
                         )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Remote yield metrics cleanup error: {e}", level='warn')
+                plugin.log(f"cl-hive: Remote yield metrics cleanup error: {e}", level='warn')
 
             # Step 12: Cleanup old remote temporal patterns (Phase 14)
             try:
                 if anticipatory_liquidity_mgr:
                     cleaned_patterns = anticipatory_liquidity_mgr.cleanup_old_remote_patterns(max_age_days=14)
                     if cleaned_patterns > 0:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Cleaned up {cleaned_patterns} old remote temporal patterns",
                             level='debug'
                         )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Remote temporal patterns cleanup error: {e}", level='warn')
+                plugin.log(f"cl-hive: Remote temporal patterns cleanup error: {e}", level='warn')
 
             # Step 13: Cleanup old remote strategic positioning data (Phase 14.2)
             try:
                 if strategic_positioning_mgr:
                     cleaned_positioning = strategic_positioning_mgr.cleanup_old_remote_data(max_age_days=7)
                     if cleaned_positioning > 0:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Cleaned up {cleaned_positioning} old remote positioning data",
                             level='debug'
                         )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Remote positioning cleanup error: {e}", level='warn')
+                plugin.log(f"cl-hive: Remote positioning cleanup error: {e}", level='warn')
 
             # Step 14: Cleanup old remote rationalization data (Phase 14.2)
             try:
                 if rationalization_mgr:
                     cleaned_rationalization = rationalization_mgr.cleanup_old_remote_data(max_age_days=7)
                     if cleaned_rationalization > 0:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Cleaned up {cleaned_rationalization} old remote rationalization data",
                             level='debug'
                         )
             except Exception as e:
-                safe_plugin.log(f"cl-hive: Remote rationalization cleanup error: {e}", level='warn')
+                plugin.log(f"cl-hive: Remote rationalization cleanup error: {e}", level='warn')
 
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"cl-hive: Fee intelligence loop error: {e}", level='warn')
+            if plugin:
+                plugin.log(f"cl-hive: Fee intelligence loop error: {e}", level='warn')
 
         # Wait for next cycle
         shutdown_event.wait(FEE_INTELLIGENCE_INTERVAL)
@@ -9240,7 +9463,7 @@ def settlement_loop():
 
     while not shutdown_event.is_set():
         try:
-            if not settlement_mgr or not database or not state_manager or not safe_plugin or not our_pubkey:
+            if not settlement_mgr or not database or not state_manager or not plugin or not our_pubkey:
                 shutdown_event.wait(60)
                 continue
 
@@ -9257,7 +9480,7 @@ def settlement_loop():
                             period=previous_period,
                             our_peer_id=our_pubkey,
                             state_manager=state_manager,
-                            rpc=safe_plugin.rpc
+                            rpc=plugin.rpc
                         )
 
                         if proposal:
@@ -9274,10 +9497,10 @@ def settlement_loop():
                             }
                             signing_payload = get_settlement_propose_signing_payload(outgoing)
                             try:
-                                sig_result = safe_plugin.rpc.signmessage(signing_payload)
+                                sig_result = plugin.rpc.signmessage(signing_payload)
                                 signature = sig_result.get('zbase', '')
                             except Exception as e:
-                                safe_plugin.log(f"SETTLEMENT: Failed to sign proposal: {e}", level='warn')
+                                plugin.log(f"SETTLEMENT: Failed to sign proposal: {e}", level='warn')
                                 signature = ''
 
                             if signature:
@@ -9299,7 +9522,7 @@ def settlement_loop():
                                     propose_payload,
                                     msg_id=proposal['proposal_id']
                                 )
-                                safe_plugin.log(
+                                plugin.log(
                                     f"SETTLEMENT: Proposed settlement for {previous_period}"
                                 )
 
@@ -9309,7 +9532,7 @@ def settlement_loop():
                                     proposal=proposal,
                                     our_peer_id=our_pubkey,
                                     state_manager=state_manager,
-                                    rpc=safe_plugin.rpc,
+                                    rpc=plugin.rpc,
                                     skip_hash_verify=True,
                                 )
                                 if vote:
@@ -9323,7 +9546,7 @@ def settlement_loop():
                                     )
                                     _broadcast_to_members(vote_msg)
             except Exception as e:
-                safe_plugin.log(f"SETTLEMENT: Error proposing settlement: {e}", level='warn')
+                plugin.log(f"SETTLEMENT: Error proposing settlement: {e}", level='warn')
 
             # Step 2: Settlement rebroadcast is now handled by the outbox retry loop
             # (Phase D). The outbox entries created by _reliable_broadcast() in Step 1
@@ -9344,7 +9567,7 @@ def settlement_loop():
                             proposal=proposal,
                             our_peer_id=our_pubkey,
                             state_manager=state_manager,
-                            rpc=safe_plugin.rpc
+                            rpc=plugin.rpc
                         )
                         if vote:
                             from modules.protocol import create_settlement_ready
@@ -9360,7 +9583,7 @@ def settlement_loop():
                     # Check if quorum reached
                     settlement_mgr.check_quorum_and_mark_ready(proposal_id, member_count)
             except Exception as e:
-                safe_plugin.log(f"SETTLEMENT: Error processing pending: {e}", level='warn')
+                plugin.log(f"SETTLEMENT: Error processing pending: {e}", level='warn')
 
             # Step 4: Execute ready settlements
             try:
@@ -9399,7 +9622,7 @@ def settlement_loop():
                             }),
                             source="settlement_loop",
                         )
-                        safe_plugin.log(
+                        plugin.log(
                             f"SETTLEMENT: Queued execution of {proposal_id[:16]}... for approval (governance={governance_mode})",
                             level='info'
                         )
@@ -9416,7 +9639,7 @@ def settlement_loop():
                                     proposal=proposal,
                                     contributions=contributions,
                                     our_peer_id=our_pubkey,
-                                    rpc=safe_plugin.rpc
+                                    rpc=plugin.rpc
                                 )
                             )
                         finally:
@@ -9443,27 +9666,27 @@ def settlement_loop():
                             settlement_mgr.check_and_complete_settlement(proposal_id)
 
                     except Exception as e:
-                        safe_plugin.log(f"SETTLEMENT: Execution error: {e}", level='warn')
+                        plugin.log(f"SETTLEMENT: Execution error: {e}", level='warn')
             except Exception as e:
-                safe_plugin.log(f"SETTLEMENT: Error executing ready: {e}", level='warn')
+                plugin.log(f"SETTLEMENT: Error executing ready: {e}", level='warn')
 
             # Step 5: Cleanup expired proposals
             try:
                 expired = database.cleanup_expired_settlement_proposals()
                 if expired > 0:
-                    safe_plugin.log(f"SETTLEMENT: Cleaned up {expired} expired proposals")
+                    plugin.log(f"SETTLEMENT: Cleaned up {expired} expired proposals")
             except Exception as e:
-                safe_plugin.log(f"SETTLEMENT: Cleanup error: {e}", level='warn')
+                plugin.log(f"SETTLEMENT: Cleanup error: {e}", level='warn')
 
             # Step 6: Check for gaming behavior and auto-propose bans
             try:
                 _check_settlement_gaming_and_propose_bans()
             except Exception as e:
-                safe_plugin.log(f"SETTLEMENT: Gaming check error: {e}", level='warn')
+                plugin.log(f"SETTLEMENT: Gaming check error: {e}", level='warn')
 
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"SETTLEMENT: Loop error: {e}", level='warn')
+            if plugin:
+                plugin.log(f"SETTLEMENT: Loop error: {e}", level='warn')
 
         # Wait for next cycle
         shutdown_event.wait(SETTLEMENT_CHECK_INTERVAL)
@@ -9487,7 +9710,7 @@ def _check_settlement_gaming_and_propose_bans():
     This protects the hive from members who intentionally skip votes/payments
     to avoid paying their fair share.
     """
-    if not database or not our_pubkey or not safe_plugin:
+    if not database or not our_pubkey :
         return
 
     # Get recent settled periods
@@ -9555,7 +9778,7 @@ def _check_settlement_gaming_and_propose_bans():
                 f"Automatic proposal for repeated settlement evasion."
             )
 
-            safe_plugin.log(
+            plugin.log(
                 f"SETTLEMENT GAMING: Proposing ban for {peer_id[:16]}... "
                 f"(vote={vote_rate:.1f}%, owed={total_owed})",
                 level='warn'
@@ -9572,7 +9795,7 @@ def _propose_settlement_gaming_ban(target_peer_id: str, reason: str):
     This is called automatically when a member is detected gaming
     the settlement system. Uses the standard ban proposal flow.
     """
-    if not database or not our_pubkey or not safe_plugin:
+    if not database or not our_pubkey :
         return
 
     # Verify target is still a member
@@ -9587,9 +9810,9 @@ def _propose_settlement_gaming_ban(target_peer_id: str, reason: str):
     # Sign the proposal
     canonical = f"hive:ban_proposal:{proposal_id}:{target_peer_id}:{timestamp}:{reason[:500]}"
     try:
-        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
+        sig = plugin.rpc.signmessage(canonical)["zbase"]
     except Exception as e:
-        safe_plugin.log(f"SETTLEMENT: Failed to sign gaming ban proposal: {e}", level='warn')
+        plugin.log(f"SETTLEMENT: Failed to sign gaming ban proposal: {e}", level='warn')
         return
 
     # Store locally - use 'settlement_gaming' proposal_type for reversed voting
@@ -9601,9 +9824,9 @@ def _propose_settlement_gaming_ban(target_peer_id: str, reason: str):
     # Add our vote (proposer auto-votes approve)
     vote_canonical = f"hive:ban_vote:{proposal_id}:approve:{timestamp}"
     try:
-        vote_sig = safe_plugin.rpc.signmessage(vote_canonical).get("zbase", "")
+        vote_sig = plugin.rpc.signmessage(vote_canonical).get("zbase", "")
     except Exception as e:
-        safe_plugin.log(f"SETTLEMENT: Failed to sign gaming ban vote: {e}", level='warn')
+        plugin.log(f"SETTLEMENT: Failed to sign gaming ban vote: {e}", level='warn')
         return
     database.add_ban_vote(proposal_id, our_pubkey, "approve", timestamp, vote_sig)
 
@@ -9629,7 +9852,7 @@ def _propose_settlement_gaming_ban(target_peer_id: str, reason: str):
     }
     _reliable_broadcast(HiveMessageType.BAN_VOTE, vote_payload)
 
-    safe_plugin.log(
+    plugin.log(
         f"SETTLEMENT: Proposed ban for gaming member {target_peer_id[:16]}... "
         f"(proposal_id={proposal_id[:16]}...)",
         level='warn'
@@ -9657,16 +9880,16 @@ def gossip_loop():
 
     while not shutdown_event.is_set():
         try:
-            if not gossip_mgr or not safe_plugin or not database or not our_pubkey:
+            if not gossip_mgr or not plugin or not database or not our_pubkey:
                 shutdown_event.wait(60)
                 continue
 
             # Step 1: Get our channel data
             try:
-                funds = safe_plugin.rpc.listfunds()
+                funds = plugin.rpc.listfunds()
                 channels = funds.get("channels", [])
             except Exception as e:
-                safe_plugin.log(f"cl-hive: gossip_loop listfunds error: {e}", level='warn')
+                plugin.log(f"cl-hive: gossip_loop listfunds error: {e}", level='warn')
                 shutdown_event.wait(DEFAULT_HEARTBEAT_INTERVAL)
                 continue
 
@@ -9734,7 +9957,7 @@ def gossip_loop():
                             continue
 
                         try:
-                            safe_plugin.rpc.call("sendcustommsg", {
+                            plugin.rpc.call("sendcustommsg", {
                                 "node_id": member_id,
                                 "msg": gossip_msg.hex()
                             })
@@ -9744,7 +9967,7 @@ def gossip_loop():
                             pass  # Peer may be offline
 
                     if broadcast_count > 0:
-                        safe_plugin.log(
+                        plugin.log(
                             f"cl-hive: Gossip broadcast (capacity={hive_capacity_sats}sats, "
                             f"available={hive_available_sats}sats, external_peers={len(external_peers)}, "
                             f"sent to {broadcast_count} members)",
@@ -9752,8 +9975,8 @@ def gossip_loop():
                         )
 
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"cl-hive: Gossip loop error: {e}", level='warn')
+            if plugin:
+                plugin.log(f"cl-hive: Gossip loop error: {e}", level='warn')
 
         # Wait for next cycle (5 minutes default)
         shutdown_event.wait(DEFAULT_HEARTBEAT_INTERVAL)
@@ -9782,7 +10005,7 @@ def mcf_optimization_loop():
 
     while not shutdown_event.is_set():
         try:
-            if not cost_reduction_mgr or not safe_plugin or not database or not our_pubkey:
+            if not cost_reduction_mgr or not plugin or not database or not our_pubkey:
                 shutdown_event.wait(60)
                 continue
 
@@ -9812,8 +10035,8 @@ def mcf_optimization_loop():
             _process_mcf_assignments()
 
         except Exception as e:
-            if safe_plugin:
-                safe_plugin.log(f"cl-hive: MCF optimization loop error: {e}", level='warn')
+            if plugin:
+                plugin.log(f"cl-hive: MCF optimization loop error: {e}", level='warn')
 
         # Wait for next cycle (10 minutes)
         shutdown_event.wait(MCF_CYCLE_INTERVAL)
@@ -9828,7 +10051,7 @@ def _broadcast_mcf_solution(solution):
     """
     from modules.protocol import create_mcf_solution_broadcast
 
-    if not safe_plugin or not database or not our_pubkey:
+    if not plugin or not database or not our_pubkey:
         return
 
     try:
@@ -9841,12 +10064,12 @@ def _broadcast_mcf_solution(solution):
             total_cost_sats=solution.total_cost_sats,
             unmet_demand_sats=solution.unmet_demand_sats,
             iterations=solution.iterations,
-            rpc=safe_plugin.rpc,
+            rpc=plugin.rpc,
             our_pubkey=our_pubkey
         )
 
         if not msg:
-            safe_plugin.log("cl-hive: Failed to create MCF solution message", level='warn')
+            plugin.log("cl-hive: Failed to create MCF solution message", level='warn')
             return
 
         # Broadcast to all members
@@ -9859,27 +10082,27 @@ def _broadcast_mcf_solution(solution):
                 continue
 
             try:
-                safe_plugin.rpc.sendcustommsg(
+                plugin.rpc.sendcustommsg(
                     node_id=peer_id,
                     msg=msg.hex()
                 )
                 broadcast_count += 1
                 shutdown_event.wait(0.02)  # Yield for incoming RPC
             except Exception as e:
-                safe_plugin.log(
+                plugin.log(
                     f"cl-hive: Failed to send MCF solution to {peer_id[:16]}...: {e}",
                     level='debug'
                 )
 
         if broadcast_count > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: MCF solution broadcast to {broadcast_count} members "
                 f"(flow={solution.total_flow_sats}sats, assignments={len(solution.assignments)})",
                 level='info'
             )
 
     except Exception as e:
-        safe_plugin.log(f"cl-hive: MCF solution broadcast error: {e}", level='warn')
+        plugin.log(f"cl-hive: MCF solution broadcast error: {e}", level='warn')
 
 
 def _broadcast_mcf_needs():
@@ -9889,7 +10112,7 @@ def _broadcast_mcf_needs():
     Non-coordinator members call this to share their needs
     with the coordinator for inclusion in MCF optimization.
     """
-    if not safe_plugin or not liquidity_coord or not cost_reduction_mgr or not our_pubkey:
+    if not plugin or not liquidity_coord or not cost_reduction_mgr or not our_pubkey:
         return
 
     try:
@@ -9923,32 +10146,32 @@ def _broadcast_mcf_needs():
         # Create signed needs batch message
         msg = create_mcf_needs_batch(
             needs=needs_for_batch,
-            rpc=safe_plugin.rpc,
+            rpc=plugin.rpc,
             our_pubkey=our_pubkey
         )
 
         if not msg:
-            safe_plugin.log("cl-hive: Failed to create MCF needs batch", level='debug')
+            plugin.log("cl-hive: Failed to create MCF needs batch", level='debug')
             return
 
         # Send to coordinator
         try:
-            safe_plugin.rpc.sendcustommsg(
+            plugin.rpc.sendcustommsg(
                 node_id=coordinator_id,
                 msg=msg.hex()
             )
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Sent {len(needs_for_batch)} MCF need(s) to coordinator",
                 level='debug'
             )
         except Exception as e:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Failed to send MCF needs to coordinator: {e}",
                 level='debug'
             )
 
     except Exception as e:
-        safe_plugin.log(f"cl-hive: MCF needs broadcast error: {e}", level='debug')
+        plugin.log(f"cl-hive: MCF needs broadcast error: {e}", level='debug')
 
 
 def _process_mcf_assignments():
@@ -9989,7 +10212,7 @@ def _process_mcf_assignments():
 
         # Log status periodically (only if there's activity)
         if pending_count > 0 or executing_count > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: MCF assignments - pending={pending_count}, "
                 f"executing={executing_count}, completed={completed_count}, "
                 f"failed={failed_count}",
@@ -10000,7 +10223,7 @@ def _process_mcf_assignments():
         _check_stuck_mcf_assignments()
 
     except Exception as e:
-        safe_plugin.log(f"cl-hive: MCF assignment processing error: {e}", level='debug')
+        plugin.log(f"cl-hive: MCF assignment processing error: {e}", level='debug')
 
 
 def _check_stuck_mcf_assignments():
@@ -10010,7 +10233,7 @@ def _check_stuck_mcf_assignments():
 
     timed_out = liquidity_coord.timeout_stuck_assignments(max_execution_time=1800)
     if timed_out:
-        safe_plugin.log(
+        plugin.log(
             f"cl-hive: Timed out {len(timed_out)} stuck MCF assignments",
             level='warn'
         )
@@ -10027,16 +10250,16 @@ def _broadcast_mcf_ack(ack_msg: bytes):
         return  # We're coordinator, no need to ACK ourselves
 
     try:
-        safe_plugin.rpc.sendcustommsg(
+        plugin.rpc.sendcustommsg(
             node_id=coordinator_id,
             msg=ack_msg.hex()
         )
-        safe_plugin.log(
+        plugin.log(
             f"cl-hive: MCF ACK sent to coordinator {coordinator_id[:16]}...",
             level='debug'
         )
     except Exception as e:
-        safe_plugin.log(f"cl-hive: Failed to send MCF ACK: {e}", level='debug')
+        plugin.log(f"cl-hive: Failed to send MCF ACK: {e}", level='debug')
 
 
 def _broadcast_our_fee_intelligence():
@@ -10047,12 +10270,12 @@ def _broadcast_our_fee_intelligence():
     channels with and broadcasts a single FEE_INTELLIGENCE_SNAPSHOT message
     containing all peer observations.
     """
-    if not fee_intel_mgr or not safe_plugin or not database or not our_pubkey:
+    if not fee_intel_mgr or not plugin or not database or not our_pubkey:
         return
 
     try:
         # Get our channels
-        funds = safe_plugin.rpc.listfunds()
+        funds = plugin.rpc.listfunds()
         channels = funds.get("channels", [])
 
         # Get list of hive members (to exclude from external peer reporting)
@@ -10061,7 +10284,7 @@ def _broadcast_our_fee_intelligence():
 
         # Build fee map from listpeerchannels for actual fee rates
         try:
-            peer_channels = safe_plugin.rpc.listpeerchannels()
+            peer_channels = plugin.rpc.listpeerchannels()
             fee_map = {}
             for pc in peer_channels.get("channels", []):
                 scid = pc.get("short_channel_id")
@@ -10074,7 +10297,7 @@ def _broadcast_our_fee_intelligence():
 
         # Get forwarding stats if available
         try:
-            forwards = safe_plugin.rpc.listforwards(status="settled")
+            forwards = plugin.rpc.listforwards(status="settled")
             forwards_list = forwards.get("forwards", [])
         except Exception:
             forwards_list = []
@@ -10163,7 +10386,7 @@ def _broadcast_our_fee_intelligence():
         try:
             msg = fee_intel_mgr.create_fee_intelligence_snapshot_message(
                 peers=peers_data,
-                rpc=safe_plugin.rpc
+                rpc=plugin.rpc
             )
 
             if msg:
@@ -10174,7 +10397,7 @@ def _broadcast_our_fee_intelligence():
                     if not member_id or member_id == our_pubkey:
                         continue
                     try:
-                        safe_plugin.rpc.call("sendcustommsg", {
+                        plugin.rpc.call("sendcustommsg", {
                             "node_id": member_id,
                             "msg": msg.hex()
                         })
@@ -10184,21 +10407,21 @@ def _broadcast_our_fee_intelligence():
                         pass  # Peer might be offline
 
                 if broadcast_count > 0:
-                    safe_plugin.log(
+                    plugin.log(
                         f"cl-hive: Broadcast fee intelligence snapshot "
                         f"({len(peers_data)} peers to {broadcast_count} members)",
                         level='debug'
                     )
 
         except Exception as e:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Failed to create fee intelligence snapshot: {e}",
                 level='debug'
             )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Fee intelligence broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Fee intelligence broadcast error: {e}", level='warn')
 
 
 def _broadcast_our_stigmergic_markers():
@@ -10209,7 +10432,7 @@ def _broadcast_our_stigmergic_markers():
     success/failure, fee levels, and volume. Sharing these enables the fleet
     to learn from each other's routing outcomes without direct coordination.
     """
-    if not fee_coordination_mgr or not safe_plugin or not database or not our_pubkey:
+    if not fee_coordination_mgr or not plugin or not database or not our_pubkey:
         return
 
     try:
@@ -10242,10 +10465,10 @@ def _broadcast_our_stigmergic_markers():
 
         signing_payload = get_stigmergic_marker_batch_signing_payload(payload)
         try:
-            sig_result = safe_plugin.rpc.signmessage(signing_payload)
+            sig_result = plugin.rpc.signmessage(signing_payload)
             signature = sig_result["zbase"]
         except Exception as e:
-            safe_plugin.log(f"cl-hive: Failed to sign stigmergic marker batch: {e}", level='warn')
+            plugin.log(f"cl-hive: Failed to sign stigmergic marker batch: {e}", level='warn')
             return
 
         # Create signed batch message
@@ -10269,7 +10492,7 @@ def _broadcast_our_stigmergic_markers():
                 continue
 
             try:
-                safe_plugin.rpc.call("sendcustommsg", {
+                plugin.rpc.call("sendcustommsg", {
                     "node_id": member_id,
                     "msg": msg.hex()
                 })
@@ -10279,15 +10502,15 @@ def _broadcast_our_stigmergic_markers():
                 pass  # Peer might be offline
 
         if broadcast_count > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Broadcast {len(shareable_markers)} stigmergic markers "
                 f"to {broadcast_count} members",
                 level='debug'
             )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Stigmergic marker broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Stigmergic marker broadcast error: {e}", level='warn')
 
 
 def _broadcast_our_pheromones():
@@ -10298,7 +10521,7 @@ def _broadcast_our_pheromones():
     Sharing these enables the fleet to learn from each other's fee experiments
     without direct coordination.
     """
-    if not fee_coordination_mgr or not safe_plugin or not database or not our_pubkey:
+    if not fee_coordination_mgr or not plugin or not database or not our_pubkey:
         return
 
     try:
@@ -10309,7 +10532,7 @@ def _broadcast_our_pheromones():
         )
 
         # Get our channels and update the channel-to-peer mapping
-        funds = safe_plugin.rpc.listfunds()
+        funds = plugin.rpc.listfunds()
         channels = funds.get("channels", [])
 
         # Update channel-to-peer mappings in the adaptive controller
@@ -10341,7 +10564,7 @@ def _broadcast_our_pheromones():
         # Create signed batch message
         msg = create_pheromone_batch(
             pheromones=shareable_pheromones,
-            rpc=safe_plugin.rpc,
+            rpc=plugin.rpc,
             our_pubkey=our_pubkey
         )
 
@@ -10357,7 +10580,7 @@ def _broadcast_our_pheromones():
                 continue
 
             try:
-                safe_plugin.rpc.call("sendcustommsg", {
+                plugin.rpc.call("sendcustommsg", {
                     "node_id": member_id,
                     "msg": msg.hex()
                 })
@@ -10367,15 +10590,15 @@ def _broadcast_our_pheromones():
                 pass  # Peer might be offline
 
         if broadcast_count > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Broadcast {len(shareable_pheromones)} pheromones "
                 f"to {broadcast_count} members",
                 level='debug'
             )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Pheromone broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Pheromone broadcast error: {e}", level='warn')
 
 
 def _broadcast_our_yield_metrics():
@@ -10386,7 +10609,7 @@ def _broadcast_our_yield_metrics():
     tier. Sharing these enables the fleet to learn which external peers are
     profitable and which should be avoided.
     """
-    if not yield_metrics_mgr or not safe_plugin or not database or not our_pubkey:
+    if not yield_metrics_mgr or not plugin or not database or not our_pubkey:
         return
 
     try:
@@ -10409,7 +10632,7 @@ def _broadcast_our_yield_metrics():
         # Create signed batch message
         msg = create_yield_metrics_batch(
             metrics=shareable_metrics,
-            rpc=safe_plugin.rpc,
+            rpc=plugin.rpc,
             our_pubkey=our_pubkey
         )
 
@@ -10425,7 +10648,7 @@ def _broadcast_our_yield_metrics():
                 continue
 
             try:
-                safe_plugin.rpc.call("sendcustommsg", {
+                plugin.rpc.call("sendcustommsg", {
                     "node_id": member_id,
                     "msg": msg.hex()
                 })
@@ -10435,15 +10658,15 @@ def _broadcast_our_yield_metrics():
                 pass  # Peer might be offline
 
         if broadcast_count > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Broadcast {len(shareable_metrics)} yield metrics "
                 f"to {broadcast_count} members",
                 level='debug'
             )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Yield metrics broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Yield metrics broadcast error: {e}", level='warn')
 
 
 def _broadcast_circular_flow_alerts():
@@ -10454,7 +10677,7 @@ def _broadcast_circular_flow_alerts():
     improving liquidity. Sharing detected flows enables fleet-wide
     prevention and coordination.
     """
-    if not cost_reduction_mgr or not safe_plugin or not database or not our_pubkey:
+    if not cost_reduction_mgr or not plugin or not database or not our_pubkey:
         return
 
     try:
@@ -10486,7 +10709,7 @@ def _broadcast_circular_flow_alerts():
                 cycle_count=flow["cycle_count"],
                 detection_window_hours=flow["detection_window_hours"],
                 recommendation=flow["recommendation"],
-                rpc=safe_plugin.rpc,
+                rpc=plugin.rpc,
                 our_pubkey=our_pubkey
             )
 
@@ -10499,7 +10722,7 @@ def _broadcast_circular_flow_alerts():
                     continue
 
                 try:
-                    safe_plugin.rpc.call("sendcustommsg", {
+                    plugin.rpc.call("sendcustommsg", {
                         "node_id": member_id,
                         "msg": msg.hex()
                     })
@@ -10509,14 +10732,14 @@ def _broadcast_circular_flow_alerts():
                     pass
 
         if total_broadcast > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Broadcast {len(shareable_flows)} circular flow alerts",
                 level='info'
             )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Circular flow alert broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Circular flow alert broadcast error: {e}", level='warn')
 
 
 def _broadcast_our_temporal_patterns():
@@ -10526,7 +10749,7 @@ def _broadcast_our_temporal_patterns():
     Temporal patterns include hour/day flow patterns that enable coordinated
     liquidity positioning and proactive fee optimization.
     """
-    if not anticipatory_liquidity_mgr or not safe_plugin or not database or not our_pubkey:
+    if not anticipatory_liquidity_mgr or not plugin or not database or not our_pubkey:
         return
 
     try:
@@ -10555,7 +10778,7 @@ def _broadcast_our_temporal_patterns():
         # Create signed batch message
         msg = create_temporal_pattern_batch(
             patterns=shareable_patterns,
-            rpc=safe_plugin.rpc,
+            rpc=plugin.rpc,
             our_pubkey=our_pubkey
         )
 
@@ -10571,7 +10794,7 @@ def _broadcast_our_temporal_patterns():
                 continue
 
             try:
-                safe_plugin.rpc.call("sendcustommsg", {
+                plugin.rpc.call("sendcustommsg", {
                     "node_id": member_id,
                     "msg": msg.hex()
                 })
@@ -10581,15 +10804,15 @@ def _broadcast_our_temporal_patterns():
                 pass  # Peer might be offline
 
         if broadcast_count > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Broadcast {len(shareable_patterns)} temporal patterns "
                 f"to {broadcast_count} members",
                 level='debug'
             )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Temporal patterns broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Temporal patterns broadcast error: {e}", level='warn')
 
 
 # ============================================================================
@@ -10604,7 +10827,7 @@ def _broadcast_our_corridor_values():
     Corridors are routing paths with high volume, margin, and low competition.
     Sharing enables coordinated strategic positioning across the fleet.
     """
-    if not strategic_positioning_mgr or not safe_plugin or not database or not our_pubkey:
+    if not strategic_positioning_mgr or not plugin or not database or not our_pubkey:
         return
 
     try:
@@ -10626,7 +10849,7 @@ def _broadcast_our_corridor_values():
         # Create signed batch message
         msg = create_corridor_value_batch(
             corridors=shareable_corridors,
-            rpc=safe_plugin.rpc,
+            rpc=plugin.rpc,
             our_pubkey=our_pubkey
         )
 
@@ -10643,7 +10866,7 @@ def _broadcast_our_corridor_values():
                 continue
 
             try:
-                safe_plugin.rpc.call("sendcustommsg", {
+                plugin.rpc.call("sendcustommsg", {
                     "node_id": member_id,
                     "msg": msg.hex()
                 })
@@ -10653,15 +10876,15 @@ def _broadcast_our_corridor_values():
                 pass
 
         if broadcast_count > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Broadcast {len(shareable_corridors)} corridor values "
                 f"to {broadcast_count} members",
                 level='debug'
             )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Corridor values broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Corridor values broadcast error: {e}", level='warn')
 
 
 def _broadcast_our_positioning_proposals():
@@ -10671,7 +10894,7 @@ def _broadcast_our_positioning_proposals():
     Positioning proposals suggest strategic channel targets for optimal
     fleet placement based on exchange coverage and corridor value analysis.
     """
-    if not strategic_positioning_mgr or not safe_plugin or not database or not our_pubkey:
+    if not strategic_positioning_mgr or not plugin or not database or not our_pubkey:
         return
 
     try:
@@ -10697,7 +10920,7 @@ def _broadcast_our_positioning_proposals():
                 score=proposal["score"],
                 suggested_amount_sats=proposal.get("suggested_amount_sats", 0),
                 priority=proposal.get("priority", "medium"),
-                rpc=safe_plugin.rpc,
+                rpc=plugin.rpc,
                 our_pubkey=our_pubkey
             )
 
@@ -10710,7 +10933,7 @@ def _broadcast_our_positioning_proposals():
                     continue
 
                 try:
-                    safe_plugin.rpc.call("sendcustommsg", {
+                    plugin.rpc.call("sendcustommsg", {
                         "node_id": member_id,
                         "msg": msg.hex()
                     })
@@ -10720,14 +10943,14 @@ def _broadcast_our_positioning_proposals():
                     pass
 
         if total_broadcast > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Broadcast {len(shareable_proposals)} positioning proposals",
                 level='debug'
             )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Positioning proposals broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Positioning proposals broadcast error: {e}", level='warn')
 
 
 def _broadcast_our_physarum_recommendations():
@@ -10739,7 +10962,7 @@ def _broadcast_our_physarum_recommendations():
     - atrophy: Low flow channels that should be closed
     - stimulate: Young low flow channels that need fee reduction
     """
-    if not strategic_positioning_mgr or not safe_plugin or not database or not our_pubkey:
+    if not strategic_positioning_mgr or not plugin or not database or not our_pubkey:
         return
 
     try:
@@ -10768,7 +10991,7 @@ def _broadcast_our_physarum_recommendations():
                 flow_intensity=rec["flow_intensity"],
                 reason=rec["reason"],
                 expected_yield_change_pct=rec.get("expected_yield_change_pct", 0.0),
-                rpc=safe_plugin.rpc,
+                rpc=plugin.rpc,
                 our_pubkey=our_pubkey,
                 splice_amount_sats=rec.get("splice_amount_sats", 0)
             )
@@ -10782,7 +11005,7 @@ def _broadcast_our_physarum_recommendations():
                     continue
 
                 try:
-                    safe_plugin.rpc.call("sendcustommsg", {
+                    plugin.rpc.call("sendcustommsg", {
                         "node_id": member_id,
                         "msg": msg.hex()
                     })
@@ -10792,14 +11015,14 @@ def _broadcast_our_physarum_recommendations():
                     pass
 
         if total_broadcast > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Broadcast {len(shareable_recommendations)} Physarum recommendations",
                 level='debug'
             )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Physarum recommendations broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Physarum recommendations broadcast error: {e}", level='warn')
 
 
 def _broadcast_our_coverage_analysis():
@@ -10810,7 +11033,7 @@ def _broadcast_our_coverage_analysis():
     ownership determination based on routing activity (stigmergic markers),
     and identifies redundant coverage for rationalization.
     """
-    if not rationalization_mgr or not safe_plugin or not database or not our_pubkey:
+    if not rationalization_mgr or not plugin or not database or not our_pubkey:
         return
 
     try:
@@ -10832,7 +11055,7 @@ def _broadcast_our_coverage_analysis():
         # Create signed batch message
         msg = create_coverage_analysis_batch(
             coverage_entries=shareable_coverage,
-            rpc=safe_plugin.rpc,
+            rpc=plugin.rpc,
             our_pubkey=our_pubkey
         )
 
@@ -10849,7 +11072,7 @@ def _broadcast_our_coverage_analysis():
                 continue
 
             try:
-                safe_plugin.rpc.call("sendcustommsg", {
+                plugin.rpc.call("sendcustommsg", {
                     "node_id": member_id,
                     "msg": msg.hex()
                 })
@@ -10859,15 +11082,15 @@ def _broadcast_our_coverage_analysis():
                 pass
 
         if broadcast_count > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Broadcast {len(shareable_coverage)} coverage entries "
                 f"to {broadcast_count} members",
                 level='debug'
             )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Coverage analysis broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Coverage analysis broadcast error: {e}", level='warn')
 
 
 def _broadcast_our_close_proposals():
@@ -10878,7 +11101,7 @@ def _broadcast_our_close_proposals():
     based on coverage analysis and ownership determination. The channel
     owner with less routing activity should close to improve capital efficiency.
     """
-    if not rationalization_mgr or not safe_plugin or not database or not our_pubkey:
+    if not rationalization_mgr or not plugin or not database or not our_pubkey:
         return
 
     try:
@@ -10904,7 +11127,7 @@ def _broadcast_our_close_proposals():
                 our_routing_share=proposal["our_routing_share"],
                 their_routing_share=proposal["their_routing_share"],
                 suggested_action=proposal.get("suggested_action", "close"),
-                rpc=safe_plugin.rpc,
+                rpc=plugin.rpc,
                 our_pubkey=our_pubkey
             )
 
@@ -10917,7 +11140,7 @@ def _broadcast_our_close_proposals():
                     continue
 
                 try:
-                    safe_plugin.rpc.call("sendcustommsg", {
+                    plugin.rpc.call("sendcustommsg", {
                         "node_id": member_id,
                         "msg": msg.hex()
                     })
@@ -10927,26 +11150,26 @@ def _broadcast_our_close_proposals():
                     pass
 
         if total_broadcast > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Broadcast {len(shareable_proposals)} close proposals",
                 level='debug'
             )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Close proposals broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Close proposals broadcast error: {e}", level='warn')
 
 
 def _broadcast_health_report():
     """
     Calculate and broadcast our health report for NNLB coordination.
     """
-    if not fee_intel_mgr or not safe_plugin or not database or not our_pubkey:
+    if not fee_intel_mgr or not plugin or not database or not our_pubkey:
         return
 
     try:
         # Get our channel data
-        funds = safe_plugin.rpc.listfunds()
+        funds = plugin.rpc.listfunds()
         channels = funds.get("channels", [])
 
         capacity_sats = sum(
@@ -10962,7 +11185,7 @@ def _broadcast_health_report():
         # Calculate actual daily revenue from forwarding stats
         daily_revenue_sats = 0
         try:
-            forwards = safe_plugin.rpc.listforwards(status="settled")
+            forwards = plugin.rpc.listforwards(status="settled")
             forwards_list = forwards.get("forwards", [])
             one_day_ago = time.time() - (24 * 3600)
             daily_revenue_sats = sum(
@@ -11018,7 +11241,7 @@ def _broadcast_health_report():
             capacity_score=health["capacity_score"],
             revenue_score=health["revenue_score"],
             connectivity_score=health["connectivity_score"],
-            rpc=safe_plugin.rpc,
+            rpc=plugin.rpc,
             needs_inbound=available_sats < capacity_sats * 0.3 if capacity_sats > 0 else False,
             needs_outbound=available_sats > capacity_sats * 0.7 if capacity_sats > 0 else False,
             needs_channels=channel_count < 5,
@@ -11033,7 +11256,7 @@ def _broadcast_health_report():
                 if not member_id or member_id == our_pubkey:
                     continue
                 try:
-                    safe_plugin.rpc.call("sendcustommsg", {
+                    plugin.rpc.call("sendcustommsg", {
                         "node_id": member_id,
                         "msg": msg.hex()
                     })
@@ -11043,15 +11266,15 @@ def _broadcast_health_report():
                     pass
 
             if broadcast_count > 0:
-                safe_plugin.log(
+                plugin.log(
                     f"cl-hive: Broadcast health report (health={health['overall_health']}, "
                     f"tier={health['tier']}, to {broadcast_count} members)",
                     level='debug'
                 )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Health report broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Health report broadcast error: {e}", level='warn')
 
 
 def _broadcast_liquidity_needs():
@@ -11061,12 +11284,12 @@ def _broadcast_liquidity_needs():
     Identifies channels that need rebalancing and broadcasts
     LIQUIDITY_NEED messages for cooperative assistance.
     """
-    if not liquidity_coord or not safe_plugin or not database or not our_pubkey:
+    if not liquidity_coord or not plugin or not database or not our_pubkey:
         return
 
     try:
         # Get our channel data
-        funds = safe_plugin.rpc.listfunds()
+        funds = plugin.rpc.listfunds()
 
         # Assess our liquidity needs
         needs = liquidity_coord.assess_our_liquidity_needs(funds)
@@ -11093,7 +11316,7 @@ def _broadcast_liquidity_needs():
                 current_balance_pct=need["current_balance_pct"],
                 can_provide_inbound=0,   # No cooperative rebalancing
                 can_provide_outbound=0,  # No cooperative rebalancing
-                rpc=safe_plugin.rpc
+                rpc=plugin.rpc
             )
 
             if msg:
@@ -11102,7 +11325,7 @@ def _broadcast_liquidity_needs():
                     if not member_id or member_id == our_pubkey:
                         continue
                     try:
-                        safe_plugin.rpc.call("sendcustommsg", {
+                        plugin.rpc.call("sendcustommsg", {
                             "node_id": member_id,
                             "msg": msg.hex()
                         })
@@ -11112,14 +11335,14 @@ def _broadcast_liquidity_needs():
                         pass
 
         if broadcast_count > 0:
-            safe_plugin.log(
+            plugin.log(
                 f"cl-hive: Broadcast {len(needs[:3])} liquidity needs to hive",
                 level='debug'
             )
 
     except Exception as e:
-        if safe_plugin:
-            safe_plugin.log(f"cl-hive: Liquidity needs broadcast error: {e}", level='warn')
+        if plugin:
+            plugin.log(f"cl-hive: Liquidity needs broadcast error: {e}", level='warn')
 
 
 # =============================================================================
@@ -11127,16 +11350,21 @@ def _broadcast_liquidity_needs():
 # =============================================================================
 
 
-def _require_safe_rpc(plugin: Plugin):
-    if safe_plugin is None:
-        return None, {"error": "safe_plugin not initialized"}
-    return safe_plugin.rpc, None
+def _require_rpc(plugin_obj: Plugin):
+    """Check that plugin RPC is available and return it.
+
+    Note: pyln-client is inherently thread-safe (opens new socket per call),
+    so no locking wrapper is needed.
+    """
+    if plugin_obj is None or plugin_obj.rpc is None:
+        return None, {"error": "plugin not initialized"}
+    return plugin_obj.rpc, None
 
 
 @plugin.method("hive-getinfo")
 def hive_getinfo(plugin: Plugin):
     """Proxy to CLN getinfo via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     return rpc.getinfo()
@@ -11145,7 +11373,7 @@ def hive_getinfo(plugin: Plugin):
 @plugin.method("hive-listpeers")
 def hive_listpeers(plugin: Plugin, id: str = None, level: str = None):
     """Proxy to CLN listpeers via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     params = {}
@@ -11159,7 +11387,7 @@ def hive_listpeers(plugin: Plugin, id: str = None, level: str = None):
 @plugin.method("hive-listpeerchannels")
 def hive_listpeerchannels(plugin: Plugin, id: str = None):
     """Proxy to CLN listpeerchannels via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     return rpc.listpeerchannels(id=id) if id else rpc.listpeerchannels()
@@ -11168,7 +11396,7 @@ def hive_listpeerchannels(plugin: Plugin, id: str = None):
 @plugin.method("hive-listforwards")
 def hive_listforwards(plugin: Plugin, status: str = None):
     """Proxy to CLN listforwards via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     return rpc.listforwards(status=status) if status else rpc.listforwards()
@@ -11177,7 +11405,7 @@ def hive_listforwards(plugin: Plugin, status: str = None):
 @plugin.method("hive-listchannels")
 def hive_listchannels(plugin: Plugin, source: str = None):
     """Proxy to CLN listchannels via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     return rpc.listchannels(source=source) if source else rpc.listchannels()
@@ -11186,7 +11414,7 @@ def hive_listchannels(plugin: Plugin, source: str = None):
 @plugin.method("hive-listfunds")
 def hive_listfunds(plugin: Plugin):
     """Proxy to CLN listfunds via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     return rpc.listfunds()
@@ -11195,7 +11423,7 @@ def hive_listfunds(plugin: Plugin):
 @plugin.method("hive-listnodes")
 def hive_listnodes(plugin: Plugin, id: str = None):
     """Proxy to CLN listnodes via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     return rpc.listnodes(id=id) if id else rpc.listnodes()
@@ -11204,7 +11432,7 @@ def hive_listnodes(plugin: Plugin, id: str = None):
 @plugin.method("hive-plugin-list")
 def hive_plugin_list(plugin: Plugin):
     """Proxy to CLN plugin list via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     try:
@@ -11216,7 +11444,7 @@ def hive_plugin_list(plugin: Plugin):
 @plugin.method("hive-connect")
 def hive_connect(plugin: Plugin, peer_id: str):
     """Connect to a peer via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     if not peer_id:
@@ -11227,7 +11455,7 @@ def hive_connect(plugin: Plugin, peer_id: str):
 @plugin.method("hive-open-channel")
 def hive_open_channel(plugin: Plugin, peer_id: str, amount_sats: int, feerate: str = "normal", announce: bool = True):
     """Open a channel via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     if not peer_id:
@@ -11244,7 +11472,7 @@ def hive_open_channel(plugin: Plugin, peer_id: str, amount_sats: int, feerate: s
 @plugin.method("hive-close-channel")
 def hive_close_channel(plugin: Plugin, peer_id: str = None, channel_id: str = None, unilateraltimeout: int = None):
     """Close a channel via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     if not peer_id and not channel_id:
@@ -11262,7 +11490,7 @@ def hive_close_channel(plugin: Plugin, peer_id: str = None, channel_id: str = No
 @plugin.method("hive-setchannel")
 def hive_setchannel(plugin: Plugin, id: str = None, feebase: int = None, feeppm: int = None):
     """Proxy to CLN setchannel via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     if not id:
@@ -11278,7 +11506,7 @@ def hive_setchannel(plugin: Plugin, id: str = None, feebase: int = None, feeppm:
 @plugin.method("hive-sling-stats")
 def hive_sling_stats(plugin: Plugin, scid: str = None, json: bool = True):
     """Proxy to sling-stats via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     params = {}
@@ -11292,7 +11520,7 @@ def hive_sling_stats(plugin: Plugin, scid: str = None, json: bool = True):
 @plugin.method("hive-sling-status")
 def hive_sling_status(plugin: Plugin):
     """Proxy to sling-status via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     return rpc.call("sling-status")
@@ -11301,7 +11529,7 @@ def hive_sling_status(plugin: Plugin):
 @plugin.method("hive-sling-deletejob")
 def hive_sling_deletejob(plugin: Plugin, job: str = None):
     """Proxy to sling-deletejob via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     if not job:
@@ -11312,7 +11540,7 @@ def hive_sling_deletejob(plugin: Plugin, job: str = None):
 @plugin.method("hive-askrene-listlayers")
 def hive_askrene_listlayers(plugin: Plugin, layer: str = None):
     """Proxy to askrene-listlayers via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     params = {}
@@ -11324,10 +11552,20 @@ def hive_askrene_listlayers(plugin: Plugin, layer: str = None):
 @plugin.method("hive-askrene-listreservations")
 def hive_askrene_listreservations(plugin: Plugin):
     """Proxy to askrene-listreservations via plugin (native RPC)."""
-    rpc, err = _require_safe_rpc(plugin)
+    rpc, err = _require_rpc(plugin)
     if err:
         return err
     return rpc.call("askrene-listreservations")
+
+
+@plugin.method("hive-health")
+def hive_health(plugin: Plugin):
+    """Lightweight health check — no RPC, no lock, no DB."""
+    return {
+        "status": "ok",
+        "uptime_seconds": int(time.time() - _start_time),
+        "threads_alive": threading.active_count(),
+    }
 
 
 @plugin.method("hive-status")
@@ -11792,10 +12030,10 @@ def hive_channel_opened(plugin: Plugin, peer_id: str, channel_id: str,
     is_hive_internal = member is not None and not database.is_banned(peer_id)
 
     # HIVE SAFETY: Immediately set 0 fee for hive member channels
-    if is_hive_internal and safe_plugin:
+    if is_hive_internal and plugin:
         try:
             # Set both base fee and ppm to 0 for hive internal channels
-            safe_plugin.rpc.setchannel(
+            plugin.rpc.setchannel(
                 id=channel_id,
                 feebase=0,
                 feeppm=0
@@ -12097,7 +12335,7 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
     if capacity_sats is None or channel_count is None:
         try:
             # Try to get from listchannels
-            channels = safe_plugin.rpc.listchannels(source=peer_id)
+            channels = plugin.rpc.listchannels(source=peer_id)
             peer_channels = channels.get('channels', [])
 
             if capacity_sats is None:
@@ -12118,7 +12356,7 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
 
     # Get onchain balance
     try:
-        funds = safe_plugin.rpc.listfunds()
+        funds = plugin.rpc.listfunds()
         outputs = funds.get('outputs', [])
         onchain_balance = sum(
             (o.get('amount_msat', 0) // 1000 if isinstance(o.get('amount_msat'), int)
@@ -12603,7 +12841,7 @@ def hive_test_intent(plugin: Plugin, target: str, intent_type: str = "channel_op
             result["broadcast"] = success
             if success:
                 members = database.get_all_members()
-                our_id = safe_plugin.rpc.getinfo().get('id', '')
+                our_id = plugin.rpc.getinfo().get('id', '')
                 result["broadcast_count"] = len([m for m in members if m.get('peer_id') != our_id])
 
         return result
@@ -12659,8 +12897,8 @@ def hive_test_pending_action(plugin: Plugin, action_type: str = "channel_open",
     if not target:
         # Try to find an external node from the network graph
         try:
-            channels = safe_plugin.rpc.listchannels()
-            our_id = safe_plugin.rpc.getinfo().get('id', '')
+            channels = plugin.rpc.listchannels()
+            our_id = plugin.rpc.getinfo().get('id', '')
             members = database.get_all_members()
             member_ids = {m.get('peer_id', '') for m in members}
 
@@ -13119,7 +13357,7 @@ def hive_trigger_fee_broadcast(plugin: Plugin):
     if perm_error:
         return perm_error
 
-    if not fee_intel_mgr or not safe_plugin:
+    if not fee_intel_mgr :
         return {"error": "Fee intelligence manager not initialized"}
 
     try:
@@ -13147,7 +13385,7 @@ def hive_trigger_health_report(plugin: Plugin):
     if perm_error:
         return perm_error
 
-    if not fee_intel_mgr or not safe_plugin:
+    if not fee_intel_mgr :
         return {"error": "Fee intelligence manager not initialized"}
 
     try:
@@ -13188,7 +13426,7 @@ def hive_trigger_all(plugin: Plugin):
     if perm_error:
         return perm_error
 
-    if not fee_intel_mgr or not safe_plugin:
+    if not fee_intel_mgr :
         return {"error": "Fee intelligence manager not initialized"}
 
     results = {}
@@ -13407,12 +13645,12 @@ def hive_calculate_health(plugin: Plugin):
     if perm_error:
         return perm_error
 
-    if not fee_intel_mgr or not safe_plugin:
+    if not fee_intel_mgr :
         return {"error": "Not initialized"}
 
     # Get our channel data
     try:
-        funds = safe_plugin.rpc.listfunds()
+        funds = plugin.rpc.listfunds()
         channels = funds.get("channels", [])
 
         capacity_sats = sum(
@@ -14083,7 +14321,7 @@ def hive_vouch(plugin: Plugin, peer_id: str):
     canonical = membership_mgr.build_vouch_message(peer_id, request_id, vouch_ts)
 
     try:
-        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
+        sig = plugin.rpc.signmessage(canonical)["zbase"]
     except Exception as e:
         return {"error": f"Failed to sign vouch: {e}"}
 
@@ -14256,7 +14494,7 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     ban_message = f"BAN:{peer_id}:{reason}:{now}"
 
     try:
-        sig = safe_plugin.rpc.signmessage(ban_message)["zbase"]
+        sig = plugin.rpc.signmessage(ban_message)["zbase"]
     except Exception as e:
         return {"error": f"Failed to sign ban: {e}"}
 
@@ -14318,7 +14556,7 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
 
     Permission: Any member
     """
-    if not database or not our_pubkey or not safe_plugin:
+    if not database or not our_pubkey :
         return {"error": "Hive not initialized"}
 
     # Check we're a member of the hive
@@ -14343,7 +14581,7 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
     canonical = f"hive:leave:{our_pubkey}:{timestamp}:{reason}"
 
     try:
-        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
+        sig = plugin.rpc.signmessage(canonical)["zbase"]
     except Exception as e:
         return {"error": f"Failed to sign leave message: {e}"}
 
@@ -14449,7 +14687,7 @@ def hive_propose_ban(plugin: Plugin, peer_id: str, reason: str = "no reason give
     if perm_error:
         return perm_error
 
-    if not database or not our_pubkey or not safe_plugin:
+    if not database or not our_pubkey :
         return {"error": "Hive not initialized"}
 
     # Validate reason length
@@ -14481,7 +14719,7 @@ def hive_propose_ban(plugin: Plugin, peer_id: str, reason: str = "no reason give
     # Sign the proposal
     canonical = f"hive:ban_proposal:{proposal_id}:{peer_id}:{timestamp}:{reason}"
     try:
-        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
+        sig = plugin.rpc.signmessage(canonical)["zbase"]
     except Exception as e:
         return {"error": f"Failed to sign proposal: {e}"}
 
@@ -14493,7 +14731,7 @@ def hive_propose_ban(plugin: Plugin, peer_id: str, reason: str = "no reason give
     # Add our vote (proposer auto-votes approve)
     vote_canonical = f"hive:ban_vote:{proposal_id}:approve:{timestamp}"
     try:
-        vote_sig = safe_plugin.rpc.signmessage(vote_canonical).get("zbase", "")
+        vote_sig = plugin.rpc.signmessage(vote_canonical).get("zbase", "")
     except Exception as e:
         return {"error": f"Failed to sign proposal vote: {e}"}
     database.add_ban_vote(proposal_id, our_pubkey, "approve", timestamp, vote_sig)
@@ -14559,7 +14797,7 @@ def hive_vote_ban(plugin: Plugin, proposal_id: str, vote: str):
     if perm_error:
         return perm_error
 
-    if not database or not our_pubkey or not safe_plugin:
+    if not database or not our_pubkey :
         return {"error": "Hive not initialized"}
 
     # Validate vote
@@ -14599,7 +14837,7 @@ def hive_vote_ban(plugin: Plugin, proposal_id: str, vote: str):
     timestamp = int(time.time())
     canonical = f"hive:ban_vote:{proposal_id}:{vote}:{timestamp}"
     try:
-        sig = safe_plugin.rpc.signmessage(canonical)["zbase"]
+        sig = plugin.rpc.signmessage(canonical)["zbase"]
     except Exception as e:
         return {"error": f"Failed to sign vote: {e}"}
 
@@ -15027,7 +15265,7 @@ def hive_settlement_calculate(plugin: Plugin):
     node_pubkey = our_pubkey
     if not node_pubkey:
         try:
-            info = safe_plugin.rpc.getinfo()
+            info = plugin.rpc.getinfo()
             node_pubkey = info.get("id")
         except Exception:
             return {"error": "Could not determine our node pubkey"}
@@ -15190,7 +15428,7 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
     node_pubkey = our_pubkey
     if not node_pubkey:
         try:
-            info = safe_plugin.rpc.getinfo()
+            info = plugin.rpc.getinfo()
             node_pubkey = info.get("id")
         except Exception:
             return {"error": "Could not determine our node pubkey"}
@@ -15362,7 +15600,7 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
 
         try:
             # Fetch invoice from BOLT12 offer
-            invoice_result = safe_plugin.rpc.fetchinvoice(
+            invoice_result = plugin.rpc.fetchinvoice(
                 offer=payment.bolt12_offer,
                 amount_msat=f"{payment.amount_sats * 1000}msat"
             )
@@ -15382,7 +15620,7 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
             # even when channels are 0ppm, due to rounding/overhead in the pay layers.
             # 1 sat (1000 msat) is ample for these small settlement payments and prevents
             # deterministic failures like: "xpay says max is 293999msat" for a 294000msat pay.
-            pay_result = safe_plugin.rpc.pay(
+            pay_result = plugin.rpc.pay(
                 bolt12_invoice,
                 maxfee="1sat",
                 # CLN constraint: cannot specify exemptfee when maxfee is set.
@@ -15669,7 +15907,7 @@ def hive_backfill_fees(plugin: Plugin, period: str = None, source: str = "revenu
         # Try to get fee data from cl-revenue-ops
         try:
             # Get dashboard data which includes fee totals
-            dashboard = safe_plugin.rpc.call("revenue-dashboard", {
+            dashboard = plugin.rpc.call("revenue-dashboard", {
                 "window_days": 7
             })
 
@@ -17091,7 +17329,7 @@ def hive_genesis(plugin: Plugin, hive_id: str = None):
     Returns:
         Dict with genesis status and member ticket
     """
-    if not database or not safe_plugin or not handshake_mgr:
+    if not database or not plugin or not handshake_mgr:
         return {"error": "Hive not initialized"}
 
     existing_members = database.get_all_members()
@@ -17182,7 +17420,7 @@ def hive_join(plugin: Plugin, ticket: str, peer_id: str = None):
     Returns:
         Dict with join request status
     """
-    if not handshake_mgr or not safe_plugin:
+    if not handshake_mgr :
         return {"error": "Hive not initialized"}
     
     # Decode ticket to get admin pubkey if peer_id not provided
@@ -17205,7 +17443,7 @@ def hive_join(plugin: Plugin, ticket: str, peer_id: str = None):
         return {"error": "HELLO message too large to serialize"}
 
     try:
-        safe_plugin.rpc.call("sendcustommsg", {
+        plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
             "msg": hello_msg.hex()
         })
@@ -17412,12 +17650,12 @@ def hive_backfill_routing_intelligence(
     if not fee_coordination_mgr:
         return {"error": "Fee coordination manager not initialized"}
 
-    if not safe_plugin:
+    if not plugin:
         return {"error": "Plugin not initialized"}
 
     try:
         # Get historical forwards
-        forwards_result = safe_plugin.rpc.listforwards(status=status_filter if status_filter != "all" else None)
+        forwards_result = plugin.rpc.listforwards(status=status_filter if status_filter != "all" else None)
         forwards = forwards_result.get("forwards", [])
 
         if not forwards:
@@ -17428,7 +17666,7 @@ def hive_backfill_routing_intelligence(
             }
 
         # Get channel info for peer mapping
-        funds = safe_plugin.rpc.listfunds()
+        funds = plugin.rpc.listfunds()
         channels = {ch.get("short_channel_id"): ch for ch in funds.get("channels", [])}
 
         # Calculate cutoff time
@@ -17629,7 +17867,7 @@ def hive_splice(
     # Find the peer for this channel
     try:
         peer_id = None
-        result = safe_plugin.rpc.listpeerchannels()
+        result = plugin.rpc.listpeerchannels()
         for ch in result.get("channels", []):
             scid = ch.get("short_channel_id", ch.get("channel_id"))
             if scid == channel_id:
@@ -17656,7 +17894,7 @@ def hive_splice(
         peer_id=peer_id,
         channel_id=channel_id,
         relative_amount=relative_amount,
-        rpc=safe_plugin.rpc,
+        rpc=plugin.rpc,
         feerate_perkw=feerate_per_kw,
         dry_run=dry_run,
         force=force
@@ -17704,7 +17942,7 @@ def hive_splice_abort(plugin: Plugin, session_id: str):
     if not splice_mgr:
         return {"error": "Splice manager not initialized"}
 
-    return splice_mgr.abort_session(session_id, safe_plugin.rpc)
+    return splice_mgr.abort_session(session_id, plugin.rpc)
 
 
 # =============================================================================

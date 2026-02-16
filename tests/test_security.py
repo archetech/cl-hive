@@ -319,16 +319,18 @@ class TestRpcLockTimeout:
         assert 'class RpcLockTimeoutError' in content
         assert 'TimeoutError' in content  # Should inherit from TimeoutError
 
-    def test_thread_safe_proxy_uses_timeout(self):
-        """ThreadSafeRpcProxy should use timeout on lock.acquire."""
+    def test_rpc_pool_provides_bounded_execution(self):
+        """RpcPool should provide hard timeout guarantees via subprocess isolation."""
         with open(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             'cl-hive.py'
         )) as f:
             content = f.read()
 
-        # Check that timeout is used in lock acquisition
-        assert 'RPC_LOCK.acquire(timeout=' in content
+        # Phase 3: RPC Pool replaces global RPC_LOCK with subprocess-based pool
+        assert 'class RpcPool' in content
+        assert 'class RpcPoolProxy' in content
+        # Backwards-compat: deprecated exception class still exists
         assert 'RpcLockTimeoutError' in content
 
 
@@ -417,8 +419,8 @@ class TestSecurityIntegration:
         )) as f:
             main_content = f.read()
 
-        assert 'RPC_LOCK_TIMEOUT_SECONDS' in main_content
-        assert 'X-01' in main_content
+        # Phase 3: RPC Pool replaces global RPC_LOCK
+        assert 'class RpcPool' in main_content
         assert 'P3-02' in main_content
 
 

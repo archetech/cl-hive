@@ -79,6 +79,8 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'budget_max_per_channel_pct': (0.10, 1.0),  # 10% to 100% of daily budget per channel
     # Feerate gate for expansions
     'max_expansion_feerate_perkb': (1000, 100000),  # 1-100 sat/vB (perkb = 4x perkw)
+    # RPC Pool (Phase 3)
+    'rpc_pool_size': (1, 8),
 }
 
 # Valid governance modes
@@ -146,6 +148,9 @@ class HiveConfig:
     # Feerate gate for expansions (sat/kB, where 1 sat/vB = 4 sat/kB approx)
     # Default 5000 sat/kB = ~1.25 sat/vB - conservative low-fee threshold
     max_expansion_feerate_perkb: int = 5000
+
+    # RPC Pool (Phase 3 — bounded execution via subprocess isolation)
+    rpc_pool_size: int = 3             # Number of RPC worker processes
 
     # Internal version tracking
     _version: int = field(default=0, repr=False, compare=False)
@@ -242,6 +247,7 @@ class HiveConfigSnapshot:
     budget_reserve_pct: float
     budget_max_per_channel_pct: float
     max_expansion_feerate_perkb: int
+    rpc_pool_size: int
     version: int
 
     @classmethod
@@ -277,5 +283,6 @@ class HiveConfigSnapshot:
             budget_reserve_pct=config.budget_reserve_pct,
             budget_max_per_channel_pct=config.budget_max_per_channel_pct,
             max_expansion_feerate_perkb=config.max_expansion_feerate_perkb,
+            rpc_pool_size=config.rpc_pool_size,
             version=config._version,
         )
