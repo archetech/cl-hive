@@ -454,3 +454,43 @@ class TestMethodAllowlist:
 
         assert "def _check_method_allowed" in source
         assert "HIVE_ALLOWED_METHODS" in source
+
+
+# =============================================================================
+# RPC Wrapper Audit Regressions (Phase 4)
+# =============================================================================
+
+class TestRpcWrapperAudit:
+    """Prevent regressions back to raw CLN calls in MCP handlers."""
+
+    def test_set_fees_prefers_plugin_wrapper(self):
+        """hive_set_fees should route fee ppm updates via revenue-set-fee wrapper."""
+        server_path = os.path.join(
+            os.path.dirname(__file__), '..', 'tools', 'mcp-hive-server.py'
+        )
+        with open(server_path, 'r') as f:
+            source = f.read()
+
+        start = source.find("async def handle_set_fees")
+        assert start != -1, "handle_set_fees not found"
+        end = source.find("\n\nasync def ", start + 1)
+        block = source[start:end] if end != -1 else source[start:]
+
+        assert 'node.call("revenue-set-fee"' in block
+        assert "TODO(phase4-audit)" in block
+
+    def test_mcf_optimized_path_uses_plugin_signature(self):
+        """hive_mcf_optimized_path should pass from_channel/to_channel to cl-hive."""
+        server_path = os.path.join(
+            os.path.dirname(__file__), '..', 'tools', 'mcp-hive-server.py'
+        )
+        with open(server_path, 'r') as f:
+            source = f.read()
+
+        start = source.find("async def handle_mcf_optimized_path")
+        assert start != -1, "handle_mcf_optimized_path not found"
+        end = source.find("\n\nasync def ", start + 1)
+        block = source[start:end] if end != -1 else source[start:]
+
+        assert '"from_channel": source_channel' in block
+        assert '"to_channel": dest_channel' in block

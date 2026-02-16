@@ -452,7 +452,7 @@ class HiveFleet:
         async def check_node(name: str, node: NodeConnection) -> tuple:
             try:
                 start = asyncio.get_running_loop().time()
-                result = await asyncio.wait_for(node.call("getinfo"), timeout=timeout)
+                result = await asyncio.wait_for(node.call("hive-getinfo"), timeout=timeout)
                 latency = asyncio.get_running_loop().time() - start
                 if "error" in result:
                     return (name, {"status": "error", "error": result["error"]})
@@ -5077,11 +5077,11 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
     since_24h = now - 86400
 
     info, peers, channels_result, pending, forwards, profitability = await asyncio.gather(
-        node.call("getinfo"),
-        node.call("listpeers"),
-        node.call("listpeerchannels"),
+        node.call("hive-getinfo"),
+        node.call("hive-listpeers"),
+        node.call("hive-listpeerchannels"),
         node.call("hive-pending-actions"),
-        node.call("listforwards", {"status": "settled"}),
+        node.call("hive-listforwards", {"status": "settled"}),
         node.call("revenue-profitability"),
         return_exceptions=True,
     )
@@ -5227,9 +5227,9 @@ async def _node_anomalies(node: NodeConnection) -> Dict[str, Any]:
 
     # Fetch all three data sources in parallel
     forwards, channels, peers = await asyncio.gather(
-        node.call("listforwards", {"status": "settled"}),
-        node.call("listpeerchannels"),
-        node.call("listpeers"),
+        node.call("hive-listforwards", {"status": "settled"}),
+        node.call("hive-listpeerchannels"),
+        node.call("hive-listpeers"),
         return_exceptions=True,
     )
     if isinstance(forwards, Exception):
@@ -5352,7 +5352,7 @@ async def handle_compare_periods(args: Dict) -> Dict:
     p2_end = now - (offset_days * 86400)
     p2_start = p2_end - (period2_days * 86400)
 
-    forwards = await node.call("listforwards", {"status": "settled"})
+    forwards = await node.call("hive-listforwards", {"status": "settled"})
     forwards_list = forwards.get("forwards", [])
 
     p1 = _forward_stats(forwards_list, p1_start, p1_end)
@@ -5419,7 +5419,7 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     # Resolve channel and peer from listpeerchannels
-    channels_result = await node.call("listpeerchannels")
+    channels_result = await node.call("hive-listpeerchannels")
     channels = channels_result.get("channels", [])
     target_channel = None
     if channel_id:
@@ -5447,10 +5447,10 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
 
     # Gather remaining RPC calls in parallel (all independent after finding target_channel)
     peers, prof, debug, forwards = await asyncio.gather(
-        node.call("listpeers"),
+        node.call("hive-listpeers"),
         node.call("revenue-profitability", {"channel_id": channel_id}),
         node.call("revenue-fee-debug"),
-        node.call("listforwards", {"status": "settled"}),
+        node.call("hive-listforwards", {"status": "settled"}),
         return_exceptions=True,
     )
 
@@ -5464,7 +5464,7 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
     # Fallback to listnodes if peer not in listpeers (disconnected peer)
     if not peer_alias and peer_id:
         try:
-            nodes_result = await node.call("listnodes", {"id": peer_id})
+            nodes_result = await node.call("hive-listnodes", {"id": peer_id})
             if nodes_result.get("nodes"):
                 peer_alias = nodes_result["nodes"][0].get("alias", "")
         except Exception:
@@ -5473,7 +5473,7 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
     # Calculate channel age from SCID
     channel_age_days = None
     try:
-        info_result = await node.call("getinfo")
+        info_result = await node.call("hive-getinfo")
         current_blockheight = info_result.get("blockheight", 0)
         if current_blockheight and channel_id:
             channel_age_days = _scid_to_age_days(channel_id, current_blockheight)
@@ -5674,9 +5674,9 @@ async def _node_peer_search(node: NodeConnection, query: str) -> Dict[str, Any]:
     query_lower = query.lower()
 
     peers, channels_result, nodes_result = await asyncio.gather(
-        node.call("listpeers"),
-        node.call("listpeerchannels"),
-        node.call("listnodes"),
+        node.call("hive-listpeers"),
+        node.call("hive-listpeerchannels"),
+        node.call("hive-listnodes"),
         return_exceptions=True,
     )
 
@@ -5922,7 +5922,7 @@ async def handle_connect(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     logger.info(f"Connecting {node_name} to peer {peer_id[:20]}...")
-    return await node.call("connect", {"id": peer_id})
+    return await node.call("hive-connect", {"peer_id": peer_id})
 
 
 async def handle_open_channel(args: Dict) -> Dict:
@@ -5945,7 +5945,7 @@ async def handle_open_channel(args: Dict) -> Dict:
 
     # Try connect first (ignore errors if already connected)
     try:
-        await node.call("connect", {"id": peer_id})
+        await node.call("hive-connect", {"peer_id": peer_id})
     except Exception as e:
         # "Already connected" is fine, other errors we log but continue
         logger.debug(f"Connect attempt: {e}")
@@ -5953,14 +5953,14 @@ async def handle_open_channel(args: Dict) -> Dict:
     logger.info(f"Opening {amount_sats} sat channel from {node_name} to {peer_id[:20]}... (feerate={feerate})")
 
     params = {
-        "id": peer_id,
-        "amount": amount_sats,
+        "peer_id": peer_id,
+        "amount_sats": amount_sats,
         "feerate": feerate,
         "announce": announce
     }
 
     try:
-        result = await node.call("fundchannel", params)
+        result = await node.call("hive-open-channel", params)
         # Record the decision
         try:
             db = ensure_advisor_db()
@@ -6019,8 +6019,8 @@ async def handle_onboard_new_members(args: Dict) -> Dict:
     try:
         members_data, node_info, channels_data = await asyncio.gather(
             node.call("hive-members"),
-            node.call("getinfo"),
-            node.call("listpeerchannels"),
+            node.call("hive-getinfo"),
+            node.call("hive-listpeerchannels"),
         )
     except Exception as e:
         return {"error": f"Failed to gather node data: {e}"}
@@ -6189,7 +6189,7 @@ async def handle_propose_promotion(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     # Get our pubkey as the proposer
-    info = await node.call("getinfo")
+    info = await node.call("hive-getinfo")
     proposer_peer_id = info.get("id")
 
     return await node.call("hive-propose-promotion", {
@@ -6211,7 +6211,7 @@ async def handle_vote_promotion(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     # Get our pubkey as the voter
-    info = await node.call("getinfo")
+    info = await node.call("hive-getinfo")
     voter_peer_id = info.get("id")
 
     return await node.call("hive-vote-promotion", {
@@ -6435,8 +6435,8 @@ async def handle_node_info(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     info, funds = await asyncio.gather(
-        node.call("getinfo"),
-        node.call("listfunds"),
+        node.call("hive-getinfo"),
+        node.call("hive-listfunds"),
         return_exceptions=True,
     )
     if isinstance(info, Exception):
@@ -6467,7 +6467,7 @@ async def handle_channels(args: Dict) -> Dict:
 
     # Get raw channel data and profitability in parallel
     channels_result, profitability = await asyncio.gather(
-        node.call("listpeerchannels"),
+        node.call("hive-listpeerchannels"),
         node.call("revenue-profitability"),
         return_exceptions=True,
     )
@@ -6545,13 +6545,28 @@ async def handle_set_fees(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
+    if not channel_id:
+        return {"error": "channel_id is required"}
+    if fee_ppm is None:
+        return {"error": "fee_ppm is required"}
+
+    try:
+        fee_ppm = int(fee_ppm)
+    except (TypeError, ValueError):
+        return {"error": f"fee_ppm must be an integer (got {fee_ppm!r})"}
+
+    try:
+        base_fee_msat = int(base_fee_msat or 0)
+    except (TypeError, ValueError):
+        return {"error": f"base_fee_msat must be an integer (got {base_fee_msat!r})"}
+
     # Guard: check if the target channel peer is a hive member (zero-fee policy)
-    if fee_ppm and int(fee_ppm) > 0 and not force:
+    if fee_ppm > 0 and not force:
         try:
             members_result = await node.call("hive-members")
             member_ids = {m.get("peer_id") for m in members_result.get("members", [])}
             # Resolve channel_id to peer_id
-            channels = await node.call("listpeerchannels")
+            channels = await node.call("hive-listpeerchannels")
             for ch in channels.get("channels", []):
                 scid = ch.get("short_channel_id", "")
                 peer_id = ch.get("peer_id", "")
@@ -6565,13 +6580,41 @@ async def handle_set_fees(args: Dict) -> Dict:
                         }
                     break
         except Exception:
-            pass  # Fail open on guard check — setchannel itself will still work
+            pass  # Fail open on guard check — RPC path below still validates
 
-    return await node.call("setchannel", {
-        "id": channel_id,
-        "feebase": base_fee_msat,
-        "feeppm": fee_ppm
+    # Prefer plugin wrapper for fee updates so clboss/revenue policy coordination remains consistent.
+    fee_result = await node.call("revenue-set-fee", {
+        "channel_id": channel_id,
+        "fee_ppm": fee_ppm,
+        "force": bool(force),
     })
+    if isinstance(fee_result, dict) and "error" in fee_result:
+        return fee_result
+
+    # TODO(phase4-audit): Add a hive-/revenue-ops wrapper for base fee updates and remove this raw fallback.
+    if base_fee_msat != 0:
+        base_result = await node.call("setchannel", {
+            "id": channel_id,
+            "feebase": base_fee_msat
+        })
+        if isinstance(base_result, dict) and "error" in base_result:
+            return {
+                "error": "fee_rate_updated_but_base_fee_failed",
+                "message": base_result.get("error"),
+                "details": {
+                    "channel_id": channel_id,
+                    "fee_ppm": fee_ppm,
+                    "base_fee_msat": base_fee_msat,
+                },
+            }
+        if isinstance(fee_result, dict):
+            fee_result = dict(fee_result)
+            fee_result["base_fee_update"] = {
+                "status": "applied",
+                "base_fee_msat": base_fee_msat
+            }
+
+    return fee_result
 
 
 async def handle_topology_analysis(args: Dict) -> Dict:
@@ -7383,7 +7426,7 @@ async def read_resource(uri: str) -> str:
                 results = {}
                 for name, node in fleet.nodes.items():
                     status = await node.call("hive-status")
-                    info = await node.call("getinfo")
+                    info = await node.call("hive-getinfo")
                     results[name] = {
                         "hive_status": status,
                         "node_info": {
@@ -7426,7 +7469,7 @@ async def read_resource(uri: str) -> str:
 
                 for name, node in fleet.nodes.items():
                     status = await node.call("hive-status")
-                    funds = await node.call("listfunds")
+                    funds = await node.call("hive-listfunds")
                     pending = await node.call("hive-pending-actions")
 
                     channels = funds.get("channels", [])
@@ -7472,8 +7515,8 @@ async def read_resource(uri: str) -> str:
 
             if resource_type == "status":
                 status = await node.call("hive-status")
-                info = await node.call("getinfo")
-                funds = await node.call("listfunds")
+                info = await node.call("hive-getinfo")
+                funds = await node.call("hive-listfunds")
                 pending = await node.call("hive-pending-actions")
 
                 channels = funds.get("channels", [])
@@ -7492,7 +7535,7 @@ async def read_resource(uri: str) -> str:
                 }, indent=2)
 
             elif resource_type == "channels":
-                channels = await node.call("listpeerchannels")
+                channels = await node.call("hive-listpeerchannels")
                 return json.dumps(channels, indent=2)
 
             elif resource_type == "profitability":
@@ -8791,7 +8834,7 @@ async def handle_revenue_competitor_analysis(args: Dict) -> Dict:
             }
 
         # Get our current fee to this peer for comparison
-        channels_result = await node.call("listchannels", {"source": peer_id})
+        channels_result = await node.call("hive-listchannels", {"source": peer_id})
 
         our_fee = 0
         for channel in channels_result.get("channels", []):
@@ -8928,7 +8971,7 @@ async def handle_hive_node_diagnostic(args: Dict) -> Dict:
 
     # Channel balances
     try:
-        channels_result = await node.call("listpeerchannels")
+        channels_result = await node.call("hive-listpeerchannels")
         channels = channels_result.get("channels", [])
         total_capacity_msat = 0
         total_local_msat = 0
@@ -8957,7 +9000,7 @@ async def handle_hive_node_diagnostic(args: Dict) -> Dict:
 
     # 24h forwarding stats
     try:
-        forwards = await node.call("listforwards", {"status": "settled"})
+        forwards = await node.call("hive-listforwards", {"status": "settled"})
         stats = _forward_stats(forwards.get("forwards", []), since_24h, now)
         result["forwards_24h"] = stats
     except Exception as e:
@@ -8972,7 +9015,7 @@ async def handle_hive_node_diagnostic(args: Dict) -> Dict:
 
     # Plugin list
     try:
-        plugins = await node.call("plugin", {"subcommand": "list"})
+        plugins = await node.call("hive-plugin-list", {})
         plugin_names = []
         for p in plugins.get("plugins", []):
             name = p.get("name", "")
@@ -9136,7 +9179,7 @@ async def handle_advisor_validate_data(args: Dict) -> Dict:
 
     # Compare snapshot vs live data
     try:
-        channels_result = await node.call("listpeerchannels")
+        channels_result = await node.call("hive-listpeerchannels")
         live_channels = {}
         for ch in channels_result.get("channels", []):
             scid = ch.get("short_channel_id")
@@ -9255,7 +9298,7 @@ async def handle_rebalance_diagnostic(args: Dict) -> Dict:
     # Check sling plugin availability
     sling_available = False
     try:
-        plugins = await node.call("plugin", {"subcommand": "list"})
+        plugins = await node.call("hive-plugin-list", {})
         for p in plugins.get("plugins", []):
             name = p.get("name", "")
             if "sling" in name.lower():
@@ -9336,7 +9379,7 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
     # Gather data from the node
     try:
         hive_status = await node.call("hive-status")
-        funds = await node.call("listfunds")
+        funds = await node.call("hive-listfunds")
         pending = await node.call("hive-pending-actions")
 
         # Try to get revenue data if plugin is installed
@@ -9383,7 +9426,7 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
         }
 
         # Process channel details for history
-        channels_data = await node.call("listpeerchannels")
+        channels_data = await node.call("hive-listpeerchannels")
         channels_by_class = profitability.get("channels_by_class", {})
         if not channels_by_class and "error" in profitability:
             logger.warning(f"Profitability returned error for {node_name}: {profitability.get('error')}")
@@ -9836,7 +9879,7 @@ async def handle_advisor_get_peer_intel(args: Dict) -> Dict:
             try:
                 # Query listnodes for peer info
                 # NOTE: Requires listnodes, listchannels, listpeers permissions in rune
-                nodes_result = await node.call("listnodes", {"id": peer_id})
+                nodes_result = await node.call("hive-listnodes", {"id": peer_id})
                 if nodes_result.get("error"):
                     graph_data["rpc_errors"] = graph_data.get("rpc_errors", [])
                     graph_data["rpc_errors"].append(f"listnodes: {nodes_result['error']}")
@@ -9846,7 +9889,7 @@ async def handle_advisor_get_peer_intel(args: Dict) -> Dict:
                     graph_data["last_timestamp"] = node_info.get("last_timestamp", 0)
 
                 # Query listchannels for peer's channels
-                channels_result = await node.call("listchannels", {"source": peer_id})
+                channels_result = await node.call("hive-listchannels", {"source": peer_id})
                 if channels_result.get("error"):
                     graph_data["rpc_errors"] = graph_data.get("rpc_errors", [])
                     graph_data["rpc_errors"].append(f"listchannels: {channels_result['error']}")
@@ -9881,7 +9924,7 @@ async def handle_advisor_get_peer_intel(args: Dict) -> Dict:
                     graph_data["is_well_connected"] = len(channels) >= 15
 
                 # Check if we already have a channel with this peer
-                peers_result = await node.call("listpeers", {"id": peer_id})
+                peers_result = await node.call("hive-listpeers", {"id": peer_id})
                 if peers_result.get("error"):
                     graph_data["rpc_errors"] = graph_data.get("rpc_errors", [])
                     graph_data["rpc_errors"].append(f"listpeers: {peers_result['error']}")
@@ -10889,9 +10932,9 @@ async def handle_stagnant_channels(args: Dict) -> Dict:
     # Gather data
     try:
         info_result, channels_result, forwards_result = await asyncio.gather(
-            node.call("getinfo"),
-            node.call("listpeerchannels"),
-            node.call("listforwards", {"status": "settled"}),
+            node.call("hive-getinfo"),
+            node.call("hive-listpeerchannels"),
+            node.call("hive-listforwards", {"status": "settled"}),
             return_exceptions=True
         )
     except Exception as e:
@@ -10926,7 +10969,7 @@ async def handle_stagnant_channels(args: Dict) -> Dict:
                 forward_by_channel[out_ch] = resolved_time
 
     # Get nodes list for alias lookup
-    nodes_result = await node.call("listnodes")
+    nodes_result = await node.call("hive-listnodes")
     alias_map = {}
     if not isinstance(nodes_result, Exception) and "nodes" in nodes_result:
         for n in nodes_result.get("nodes", []):
@@ -12915,8 +12958,9 @@ async def handle_mcf_assignments(args: Dict) -> Dict:
 async def handle_mcf_optimized_path(args: Dict) -> Dict:
     """Get MCF-optimized rebalance path."""
     node_name = args.get("node")
-    source_channel = args.get("source_channel")
-    dest_channel = args.get("dest_channel")
+    # Accept both names for compatibility; plugin RPC expects from_channel/to_channel.
+    source_channel = args.get("source_channel") or args.get("from_channel")
+    dest_channel = args.get("dest_channel") or args.get("to_channel")
     amount_sats = args.get("amount_sats")
 
     node = fleet.get_node(node_name)
@@ -12928,8 +12972,8 @@ async def handle_mcf_optimized_path(args: Dict) -> Dict:
 
     try:
         result = await node.call("hive-mcf-optimized-path", {
-            "source_channel": source_channel,
-            "dest_channel": dest_channel,
+            "from_channel": source_channel,
+            "to_channel": dest_channel,
             "amount_sats": amount_sats
         })
     except Exception as e:
@@ -13187,7 +13231,7 @@ async def handle_check_neophytes(args: Dict) -> Dict:
         else:
             try:
                 # Get our pubkey as proposer
-                info = await node.call("getinfo")
+                info = await node.call("hive-getinfo")
                 proposer_id = info.get("id")
 
                 result = await node.call("hive-propose-promotion", {
@@ -13421,8 +13465,8 @@ async def _fleet_health_for_node(node: "NodeConnection") -> Dict[str, Any]:
     """Gather health data for a single node (7 parallel RPCs)."""
     try:
         info, channels, dashboard, prof, mcf, nnlb, conn_alerts = await asyncio.gather(
-            node.call("getinfo"),
-            node.call("listpeerchannels"),
+            node.call("hive-getinfo"),
+            node.call("hive-listpeerchannels"),
             node.call("revenue-dashboard", {"window_days": 1}),
             node.call("revenue-profitability", {}),
             node.call("hive-mcf-status", {}),
@@ -13624,7 +13668,7 @@ async def handle_routing_intelligence_health(args: Dict) -> Dict:
     try:
         intel_status, channels_data = await asyncio.gather(
             node.call("hive-routing-intelligence-status", {}),
-            node.call("listpeerchannels"),
+            node.call("hive-listpeerchannels"),
         )
     except Exception as e:
         return {"error": f"Failed to get routing intelligence: {e}"}
@@ -13942,18 +13986,18 @@ async def handle_stagnant_channels(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
     
     # Get current blockheight for age calculation
-    info = await node.call("getinfo")
+    info = await node.call("hive-getinfo")
     if "error" in info:
         return info
     current_blockheight = info.get("blockheight", 0)
     
     # Get all channels
-    channels_result = await node.call("listpeerchannels")
+    channels_result = await node.call("hive-listpeerchannels")
     if "error" in channels_result:
         return channels_result
     
     # Get forwards for last forward calculation
-    forwards = await node.call("listforwards", {"status": "settled"})
+    forwards = await node.call("hive-listforwards", {"status": "settled"})
     forwards_list = forwards.get("forwards", []) if not forwards.get("error") else []
     
     # Build map of channel -> last forward timestamp
@@ -14002,7 +14046,7 @@ async def handle_stagnant_channels(args: Dict) -> Dict:
         # Get peer alias
         peer_alias = ""
         try:
-            nodes_result = await node.call("listnodes", {"id": peer_id})
+            nodes_result = await node.call("hive-listnodes", {"id": peer_id})
             if nodes_result.get("nodes"):
                 peer_alias = nodes_result["nodes"][0].get("alias", "")
         except Exception:
@@ -14144,7 +14188,7 @@ async def handle_bulk_policy(args: Dict) -> Dict:
             
     elif filter_type == "depleted":
         # Channels with <5% local balance
-        channels_result = await node.call("listpeerchannels")
+        channels_result = await node.call("hive-listpeerchannels")
         if "error" in channels_result:
             return channels_result
         for ch in channels_result.get("channels", []):
@@ -14162,7 +14206,7 @@ async def handle_bulk_policy(args: Dict) -> Dict:
                 
     elif filter_type == "custom":
         # Custom filter based on provided criteria
-        channels_result = await node.call("listpeerchannels")
+        channels_result = await node.call("hive-listpeerchannels")
         if "error" in channels_result:
             return channels_result
         for ch in channels_result.get("channels", []):
