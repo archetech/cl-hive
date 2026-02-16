@@ -1273,7 +1273,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
 
     # Initialize RPC pool (Phase 3 — bounded execution via subprocess isolation)
-    # Resolve the CLN RPC socket path and replace plugin.rpc with pool-backed proxy
+    # Resolve the CLN RPC socket path for pool workers.
+    # NOTE: We start the pool now but install the proxy at the END of init.
+    # Reason: spawn-context workers take several seconds to start, but init
+    # needs immediate RPC calls (getinfo, listpeerchannels, setchannel).
+    # By the end of init, workers are ready for background thread use.
     global _rpc_pool
     _rpc_socket_path = getattr(plugin.rpc, "socket_path", None)
     if not _rpc_socket_path:
@@ -1290,9 +1294,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         log_fn=lambda msg, level="info": plugin.log(msg, level=level),
         pool_size=config.rpc_pool_size,
     )
-    # Replace plugin.rpc so all modules transparently use the pool
-    plugin.rpc = RpcPoolProxy(_rpc_pool, timeout=30)
-    plugin.log(f"cl-hive: RPC pool initialized (workers={config.rpc_pool_size}, socket={_rpc_socket_path})")
+    plugin.log(f"cl-hive: RPC pool started (workers={config.rpc_pool_size}, socket={_rpc_socket_path})")
 
     # Initialize database
     database = HiveDatabase(config.db_path, plugin)
@@ -1848,6 +1850,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     except Exception as e:
         plugin.log(f"cl-hive: Could not set signal handlers: {e}", level='debug')
     
+    # Install RPC pool proxy now that init is complete and workers are ready.
+    # Background threads that access plugin.rpc will get bounded execution.
+    plugin.rpc = RpcPoolProxy(_rpc_pool, timeout=30)
+    plugin.log("cl-hive: RPC pool proxy installed")
+
     plugin.log("cl-hive: Initialization complete. Swarm Intelligence ready.")
 
 
