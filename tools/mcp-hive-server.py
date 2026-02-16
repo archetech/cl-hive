@@ -687,6 +687,136 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="hive_connect",
+            description="Connect to a Lightning peer. Required before opening a channel to a new node.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to connect from (e.g. hive-nexus-01)"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Target peer pubkey (optionally with @host:port)"
+                    }
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="hive_open_channel",
+            description="Open a channel to a peer. Connects first if not already connected. Amount in satoshis. Uses 'normal' feerate by default (or specify feerate like '1000perkb', 'slow', 'normal', 'urgent').",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to open from (e.g. hive-nexus-01)"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Target peer pubkey (optionally with @host:port)"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Channel size in satoshis"
+                    },
+                    "feerate": {
+                        "type": "string",
+                        "description": "Fee rate for the funding tx (default: 'normal'). Can be slow/normal/urgent or NNNperkb."
+                    },
+                    "announce": {
+                        "type": "boolean",
+                        "description": "Whether to announce the channel (default: true)"
+                    }
+                },
+                "required": ["node", "peer_id", "amount_sats"]
+            }
+        ),
+        # =====================================================================
+        # Boltz Loop-Out Tools
+        # =====================================================================
+        Tool(
+            name="boltz_quote",
+            description="Get current Boltz reverse swap (loop-out) pricing. Shows fees, on-chain amount, and limits. No side effects.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Amount in sats to loop out (Lightning → on-chain)"
+                    },
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (optional, defaults to first node)"
+                    }
+                },
+                "required": ["amount_sats"]
+            }
+        ),
+        Tool(
+            name="boltz_loop_out",
+            description="Execute a Boltz reverse swap (loop-out): send Lightning sats, receive on-chain BTC. Uses cl-revenue-ops on the node (no extra runes). Tracks all costs in the swap ledger.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (e.g. hive-nexus-01)"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Amount in sats to loop out"
+                    },
+                    "address": {
+                        "type": "string",
+                        "description": "Destination BTC address (optional, defaults to node's newaddr)"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, only quote without executing (default: false)"
+                    }
+                },
+                "required": ["node", "amount_sats"]
+            }
+        ),
+        Tool(
+            name="boltz_swap_status",
+            description="Check status of a Boltz swap from local ledger and Boltz API.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "swap_id": {
+                        "type": "string",
+                        "description": "Boltz swap ID"
+                    },
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (optional, defaults to first node)"
+                    }
+                },
+                "required": ["swap_id"]
+            }
+        ),
+        Tool(
+            name="boltz_swap_history",
+            description="View Boltz swap history with cost summary. Shows all loop-outs and cumulative costs.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Filter by node name (optional)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max swaps to return (default: 20)"
+                    }
+                }
+            }
+        ),
+        Tool(
             name="hive_members",
             description="List all members of the Hive with their status and health scores.",
             inputSchema={
@@ -5691,6 +5821,160 @@ async def handle_reject_action(args: Dict) -> Dict:
     if reason:
         params["reason"] = reason
     return await node.call("hive-reject-action", params)
+
+
+# =============================================================================
+# Boltz Loop-Out Handlers (via cl-revenue-ops)
+# =============================================================================
+
+
+def _get_default_node() -> Optional[NodeConnection]:
+    return next(iter(fleet.nodes.values()), None)
+
+
+async def handle_boltz_quote(args: Dict) -> Dict:
+    """Get Boltz reverse swap pricing."""
+    amount = args.get("amount_sats", 0)
+    node_name = args.get("node")
+
+    if amount < 1:
+        return {"error": "amount_sats must be positive"}
+
+    node = fleet.get_node(node_name) if node_name else _get_default_node()
+    if not node:
+        return {"error": "No nodes available"}
+
+    try:
+        return await node.call("revenue-boltz-quote", {"amount_sats": amount})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def handle_boltz_loop_out(args: Dict) -> Dict:
+    """Execute a Boltz loop-out."""
+    node_name = args.get("node")
+    amount = args.get("amount_sats", 0)
+    address = args.get("address")
+    dry_run = args.get("dry_run", False)
+
+    if not node_name:
+        return {"error": "node is required"}
+    if amount < 25000:
+        return {"error": f"amount_sats must be at least 25,000 (got {amount})"}
+    if amount > 25000000:
+        return {"error": f"amount_sats must be at most 25,000,000 (got {amount})"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        return await node.call("revenue-boltz-loop-out", {
+            "amount_sats": amount,
+            "address": address,
+            "dry_run": dry_run
+        })
+    except Exception as e:
+        logger.error(f"Boltz loop-out error: {e}")
+        return {"error": str(e)}
+
+
+async def handle_boltz_swap_status(args: Dict) -> Dict:
+    """Check Boltz swap status."""
+    swap_id = args.get("swap_id")
+    node_name = args.get("node")
+
+    if not swap_id:
+        return {"error": "swap_id is required"}
+
+    node = fleet.get_node(node_name) if node_name else _get_default_node()
+    if not node:
+        return {"error": "No nodes available"}
+
+    try:
+        return await node.call("revenue-boltz-status", {"swap_id": swap_id})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def handle_boltz_swap_history(args: Dict) -> Dict:
+    """Get Boltz swap history."""
+    node_name = args.get("node")
+    limit = args.get("limit", 20)
+
+    node = fleet.get_node(node_name) if node_name else _get_default_node()
+    if not node:
+        return {"error": "No nodes available"}
+
+    try:
+        return await node.call("revenue-boltz-history", {"limit": limit})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def handle_connect(args: Dict) -> Dict:
+    """Connect to a Lightning peer."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    logger.info(f"Connecting {node_name} to peer {peer_id[:20]}...")
+    return await node.call("connect", {"id": peer_id})
+
+
+async def handle_open_channel(args: Dict) -> Dict:
+    """Open a channel to a peer."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    amount_sats = args.get("amount_sats")
+    feerate = args.get("feerate", "normal")
+    announce = args.get("announce", True)
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if not amount_sats or amount_sats < 20000:
+        return {"error": "amount_sats must be at least 20,000"}
+
+    if amount_sats > 16777215:  # ~0.168 BTC wumbo limit for non-wumbo
+        logger.info(f"Large channel requested: {amount_sats} sats (wumbo)")
+
+    # Try connect first (ignore errors if already connected)
+    try:
+        await node.call("connect", {"id": peer_id})
+    except Exception as e:
+        # "Already connected" is fine, other errors we log but continue
+        logger.debug(f"Connect attempt: {e}")
+
+    logger.info(f"Opening {amount_sats} sat channel from {node_name} to {peer_id[:20]}... (feerate={feerate})")
+
+    params = {
+        "id": peer_id,
+        "amount": amount_sats,
+        "feerate": feerate,
+        "announce": announce
+    }
+
+    try:
+        result = await node.call("fundchannel", params)
+        # Record the decision
+        try:
+            db = ensure_advisor_db()
+            db.record_decision(
+                decision_type="channel_open",
+                node_name=node_name,
+                recommendation=f"Opened {amount_sats} sat channel to {peer_id[:20]}...",
+                reasoning=f"feerate={feerate}, announce={announce}"
+            )
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        return {"error": str(e)}
 
 
 async def handle_members(args: Dict) -> Dict:
@@ -14140,6 +14424,13 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "hive_pending_actions": handle_pending_actions,
     "hive_approve_action": handle_approve_action,
     "hive_reject_action": handle_reject_action,
+    "hive_connect": handle_connect,
+    "hive_open_channel": handle_open_channel,
+    # Boltz loop-out
+    "boltz_quote": handle_boltz_quote,
+    "boltz_loop_out": handle_boltz_loop_out,
+    "boltz_swap_status": handle_boltz_swap_status,
+    "boltz_swap_history": handle_boltz_swap_history,
     "hive_members": handle_members,
     "hive_onboard_new_members": handle_onboard_new_members,
     "hive_propose_promotion": handle_propose_promotion,
