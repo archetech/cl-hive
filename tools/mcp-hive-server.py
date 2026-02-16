@@ -735,7 +735,7 @@ async def list_tools() -> List[Tool]:
             }
         ),
         # =====================================================================
-        # Boltz Loop-Out Tools
+        # Boltz Swap Tools
         # =====================================================================
         Tool(
             name="boltz_quote",
@@ -776,6 +776,32 @@ async def list_tools() -> List[Tool]:
                     "dry_run": {
                         "type": "boolean",
                         "description": "If true, only quote without executing (default: false)"
+                    }
+                },
+                "required": ["node", "amount_sats"]
+            }
+        ),
+        Tool(
+            name="boltz_loop_in",
+            description="Execute a Boltz submarine swap (loop-in): send on-chain BTC and receive Lightning liquidity. Optionally target channel_id or peer_id for inbound hints.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name (e.g. hive-nexus-01)"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Amount in sats to receive over Lightning"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Optional short_channel_id to target"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Optional peer pubkey to target"
                     }
                 },
                 "required": ["node", "amount_sats"]
@@ -5876,6 +5902,37 @@ async def handle_boltz_loop_out(args: Dict) -> Dict:
         })
     except Exception as e:
         logger.error(f"Boltz loop-out error: {e}")
+        return {"error": str(e)}
+
+
+async def handle_boltz_loop_in(args: Dict) -> Dict:
+    """Execute a Boltz loop-in."""
+    node_name = args.get("node")
+    amount = args.get("amount_sats", 0)
+    channel_id = args.get("channel_id")
+    peer_id = args.get("peer_id")
+
+    if not node_name:
+        return {"error": "node is required"}
+    if amount < 25000:
+        return {"error": f"amount_sats must be at least 25,000 (got {amount})"}
+    if amount > 25000000:
+        return {"error": f"amount_sats must be at most 25,000,000 (got {amount})"}
+    if channel_id and peer_id:
+        return {"error": "Provide either channel_id or peer_id, not both"}
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    try:
+        return await node.call("revenue-boltz-loop-in", {
+            "amount_sats": amount,
+            "channel_id": channel_id,
+            "peer_id": peer_id,
+        })
+    except Exception as e:
+        logger.error(f"Boltz loop-in error: {e}")
         return {"error": str(e)}
 
 
@@ -14470,9 +14527,10 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "hive_reject_action": handle_reject_action,
     "hive_connect": handle_connect,
     "hive_open_channel": handle_open_channel,
-    # Boltz loop-out
+    # Boltz swaps
     "boltz_quote": handle_boltz_quote,
     "boltz_loop_out": handle_boltz_loop_out,
+    "boltz_loop_in": handle_boltz_loop_in,
     "boltz_swap_status": handle_boltz_swap_status,
     "boltz_swap_history": handle_boltz_swap_history,
     "hive_members": handle_members,
