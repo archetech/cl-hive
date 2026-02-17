@@ -5116,10 +5116,6 @@ Creates a signed credential specifying allowed schemas, tier, and constraints.""
                         "type": "string",
                         "description": "Pubkey of the agent/advisor"
                     },
-                    "node_id": {
-                        "type": "string",
-                        "description": "Pubkey of the managed node"
-                    },
                     "tier": {
                         "type": "string",
                         "description": "Permission tier: monitor, standard, advanced, or admin"
@@ -5137,7 +5133,7 @@ Creates a signed credential specifying allowed schemas, tier, and constraints.""
                         "description": "Optional JSON constraints (max_fee_change_pct, etc.)"
                     }
                 },
-                "required": ["node", "agent_id", "node_id", "tier", "allowed_schemas_json"]
+                "required": ["node", "agent_id", "tier", "allowed_schemas_json"]
             }
         ),
         Tool(
@@ -5282,7 +5278,6 @@ async def handle_hive_mgmt_credential_issue(args: Dict) -> Dict:
         return {"error": f"Unknown node: {args.get('node')}"}
     params = {
         "agent_id": args["agent_id"],
-        "node_id": args["node_id"],
         "tier": args["tier"],
         "allowed_schemas_json": args["allowed_schemas_json"],
     }

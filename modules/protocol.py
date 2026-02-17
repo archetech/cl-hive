@@ -6231,6 +6231,8 @@ def validate_did_credential_revoke(payload: dict) -> bool:
     credential_id = payload.get("credential_id")
     if not isinstance(credential_id, str) or not credential_id:
         return False
+    if len(credential_id) > 64:
+        return False
 
     issuer_id = payload.get("issuer_id")
     if not isinstance(issuer_id, str) or not _valid_pubkey(issuer_id):
@@ -6244,6 +6246,8 @@ def validate_did_credential_revoke(payload: dict) -> bool:
 
     signature = payload.get("signature")
     if not isinstance(signature, str) or not signature:
+        return False
+    if len(signature) < 10:
         return False
 
     return True
@@ -6455,6 +6459,8 @@ def validate_mgmt_credential_revoke(payload: dict) -> bool:
     credential_id = payload.get("credential_id")
     if not isinstance(credential_id, str) or not credential_id:
         return False
+    if len(credential_id) > 64:
+        return False
 
     issuer_id = payload.get("issuer_id")
     if not isinstance(issuer_id, str) or not _valid_pubkey(issuer_id):
@@ -6468,6 +6474,8 @@ def validate_mgmt_credential_revoke(payload: dict) -> bool:
 
     signature = payload.get("signature")
     if not isinstance(signature, str) or not signature:
+        return False
+    if len(signature) < 10:
         return False
 
     return True

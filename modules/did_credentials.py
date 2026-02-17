@@ -539,7 +539,7 @@ class DIDCredentialManager:
                 pubkey = result.get("pubkey", "")
                 if not verified:
                     return False, "signature verification failed"
-                if pubkey and pubkey != issuer_id:
+                if not pubkey or pubkey != issuer_id:
                     return False, f"signature pubkey {pubkey[:16]}... != issuer {issuer_id[:16]}..."
             else:
                 return False, "unexpected checkmessage response"
@@ -825,6 +825,21 @@ class DIDCredentialManager:
         if not credential_id or not isinstance(credential_id, str):
             self._log("credential_present: missing credential_id", "warn")
             return False
+        if len(credential_id) > 64:
+            self._log("credential_present: credential_id too long", "warn")
+            return False
+
+        # Validate issued_at is within reasonable range
+        issued_at = credential.get("issued_at")
+        if issued_at is not None and isinstance(issued_at, int):
+            now = int(time.time())
+            period_start = credential.get("period_start", 0)
+            if issued_at < period_start:
+                self._log("credential_present: issued_at before period_start", "warn")
+                return False
+            if issued_at > now + TIMESTAMP_TOLERANCE:
+                self._log("credential_present: issued_at too far in future", "warn")
+                return False
 
         existing = self.db.get_did_credential(credential_id)
         if existing:
@@ -909,13 +924,15 @@ class DIDCredentialManager:
         }, sort_keys=True, separators=(',', ':'))
         try:
             result = self.rpc.checkmessage(revoke_payload, signature)
-            if isinstance(result, dict):
-                if not result.get("verified", False):
-                    self._log(f"revoke: signature verification failed", "warn")
-                    return False
-                if result.get("pubkey", "") != issuer_id:
-                    self._log(f"revoke: signature pubkey mismatch", "warn")
-                    return False
+            if not isinstance(result, dict):
+                self._log("revoke: unexpected checkmessage response type", "warn")
+                return False
+            if not result.get("verified", False):
+                self._log(f"revoke: signature verification failed", "warn")
+                return False
+            if not result.get("pubkey", "") or result.get("pubkey", "") != issuer_id:
+                self._log(f"revoke: signature pubkey mismatch", "warn")
+                return False
         except Exception as e:
             self._log(f"revoke: checkmessage error: {e}", "warn")
             return False
@@ -1293,12 +1310,16 @@ class DIDCredentialManager:
         else:
             return 1.0
 
+    # Metrics where lower values indicate better performance
+    LOWER_IS_BETTER = frozenset({"avg_fee_ppm", "response_time_ms"})
+
     def _score_metrics(self, domain: str, metrics: Dict[str, Any]) -> float:
         """
         Compute a 0-100 score from domain-specific metrics.
 
         Each metric is normalized to 0-1 range using the profile's ranges,
-        then averaged (equal weight).
+        then averaged (equal weight). Metrics in LOWER_IS_BETTER are inverted
+        so that lower values produce higher scores.
         """
         profile = CREDENTIAL_PROFILES.get(domain)
         if not profile:
@@ -1315,6 +1336,9 @@ class DIDCredentialManager:
                 if hi > lo:
                     normalized = (value - lo) / (hi - lo)
                     normalized = max(0.0, min(1.0, normalized))
+                    # Invert for metrics where lower is better
+                    if key in self.LOWER_IS_BETTER:
+                        normalized = 1.0 - normalized
                     scores.append(normalized)
 
         if not scores:

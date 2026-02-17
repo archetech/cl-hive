@@ -1038,13 +1038,15 @@ class ManagementSchemaRegistry:
 
         try:
             result = self.rpc.checkmessage(signing_payload, signature)
-            if isinstance(result, dict):
-                if not result.get("verified", False):
-                    self._log("mgmt_credential_present: signature verification failed", "warn")
-                    return False
-                if result.get("pubkey", "") != issuer_id:
-                    self._log("mgmt_credential_present: signature pubkey mismatch", "warn")
-                    return False
+            if not isinstance(result, dict):
+                self._log("mgmt_credential_present: unexpected checkmessage response type", "warn")
+                return False
+            if not result.get("verified", False):
+                self._log("mgmt_credential_present: signature verification failed", "warn")
+                return False
+            if not result.get("pubkey", "") or result.get("pubkey", "") != issuer_id:
+                self._log("mgmt_credential_present: signature pubkey mismatch", "warn")
+                return False
         except Exception as e:
             self._log(f"mgmt_credential_present: checkmessage error: {e}", "warn")
             return False
@@ -1137,13 +1139,15 @@ class ManagementSchemaRegistry:
 
         try:
             result = self.rpc.checkmessage(revoke_payload, signature)
-            if isinstance(result, dict):
-                if not result.get("verified", False):
-                    self._log("mgmt revoke: signature verification failed", "warn")
-                    return False
-                if result.get("pubkey", "") != issuer_id:
-                    self._log("mgmt revoke: signature pubkey mismatch", "warn")
-                    return False
+            if not isinstance(result, dict):
+                self._log("mgmt revoke: unexpected checkmessage response type", "warn")
+                return False
+            if not result.get("verified", False):
+                self._log("mgmt revoke: signature verification failed", "warn")
+                return False
+            if not result.get("pubkey", "") or result.get("pubkey", "") != issuer_id:
+                self._log("mgmt revoke: signature pubkey mismatch", "warn")
+                return False
         except Exception as e:
             self._log(f"mgmt revoke: checkmessage error: {e}", "warn")
             return False
