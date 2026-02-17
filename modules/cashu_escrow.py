@@ -22,6 +22,7 @@ import logging
 import os
 import threading
 import time
+import concurrent.futures
 import urllib.request
 import urllib.error
 from enum import Enum
@@ -37,6 +38,7 @@ VALID_TICKET_STATUSES = frozenset({"active", "redeemed", "refunded", "expired", 
 
 # Mint HTTP timeout
 MINT_HTTP_TIMEOUT = 10
+MINT_EXECUTOR_WORKERS = 2
 
 # Secret key derivation message (signed once at startup)
 SECRET_KEY_DERIVATION_MSG = "escrow_key_derivation"
@@ -206,6 +208,13 @@ class CashuEscrowManager:
         # Per-mint circuit breakers
         self._mint_breakers: Dict[str, MintCircuitBreaker] = {}
         self._breaker_lock = threading.Lock()
+        self._mint_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=MINT_EXECUTOR_WORKERS,
+            thread_name_prefix="cl-hive-cashu",
+        )
+
+        # Lock for ticket status transitions (redeem/refund atomicity)
+        self._ticket_lock = threading.Lock()
 
         # Encryption key for secrets at rest (derived at startup)
         self._secret_key: Optional[bytes] = None
@@ -226,11 +235,12 @@ class CashuEscrowManager:
                 # Use SHA256 of the signature as the XOR key (32 bytes)
                 self._secret_key = hashlib.sha256(sig.encode('utf-8')).digest()
         except Exception as e:
-            self._log(f"secret key derivation failed (non-fatal): {e}", level='debug')
+            self._log(f"secret key derivation failed (non-fatal): {e}", level='warn')
 
     def _encrypt_secret(self, secret_hex: str) -> str:
         """XOR-encrypt a hex secret with the derived key. Returns hex."""
         if not self._secret_key:
+            self._log("secret key unavailable — storing secret as plaintext", level='warn')
             return secret_hex  # No key available, store plaintext
         secret_bytes = bytes.fromhex(secret_hex)
         key = self._secret_key
@@ -263,19 +273,44 @@ class CashuEscrowManager:
             return None
 
         url = mint_url.rstrip('/') + path
-        try:
+
+        if not self._mint_executor:
+            self._log("mint executor unavailable, skipping call", level='warn')
+            return None
+
+        def _http_request() -> Dict:
             req = urllib.request.Request(url, data=body, method=method)
             if body:
                 req.add_header('Content-Type', 'application/json')
             with urllib.request.urlopen(req, timeout=MINT_HTTP_TIMEOUT) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
-                breaker.record_success()
-                return data
+                return json.loads(resp.read(1_048_576).decode('utf-8'))
+
+        try:
+            future = self._mint_executor.submit(_http_request)
+            data = future.result(timeout=MINT_HTTP_TIMEOUT + 1)
+            breaker.record_success()
+            return data
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            breaker.record_failure()
+            self._log(f"mint call timed out {mint_url}{path}", level='debug')
+            return None
         except (urllib.error.URLError, urllib.error.HTTPError, OSError,
-                json.JSONDecodeError, ValueError) as e:
+                json.JSONDecodeError, ValueError, RuntimeError) as e:
             breaker.record_failure()
             self._log(f"mint call failed {mint_url}{path}: {e}", level='debug')
             return None
+
+    def shutdown(self) -> None:
+        """Shutdown mint executor threads."""
+        executor = self._mint_executor
+        self._mint_executor = None
+        if not executor:
+            return
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as e:
+            self._log(f"mint executor shutdown failed: {e}", level='debug')
 
     # =========================================================================
     # SECRET MANAGEMENT
@@ -314,11 +349,18 @@ class CashuEscrowManager:
 
         return hash_hex
 
-    def reveal_secret(self, task_id: str) -> Optional[str]:
+    def reveal_secret(self, task_id: str, caller_id: Optional[str] = None,
+                      require_receipt: bool = True) -> Optional[str]:
         """
         Return the HTLC preimage for a completed task.
 
-        Returns decrypted secret hex, or None if not found.
+        Args:
+            task_id: The task whose secret to reveal.
+            caller_id: If provided, must match ticket's operator_id.
+            require_receipt: If True (default), a successful receipt must
+                exist for this ticket before the secret is revealed.
+
+        Returns decrypted secret hex, or None if authorization fails or not found.
         """
         if not self.db:
             return None
@@ -326,6 +368,26 @@ class CashuEscrowManager:
         record = self.db.get_escrow_secret(task_id)
         if not record:
             return None
+
+        ticket_id = record.get('ticket_id', '')
+
+        # Authorization: caller must be the operator
+        if caller_id is not None:
+            ticket = self.db.get_escrow_ticket(ticket_id) if ticket_id else None
+            if not ticket or ticket.get('operator_id') != caller_id:
+                self._log(f"reveal_secret denied: caller {caller_id[:16]}... "
+                          f"is not ticket operator", level='warn')
+                return None
+
+        # Require a successful receipt before revealing the secret
+        if require_receipt and ticket_id:
+            receipts = self.db.get_escrow_receipts(ticket_id)
+            has_success = any(r.get('success') == 1 or r.get('success') is True
+                             for r in (receipts or []))
+            if not has_success:
+                self._log(f"reveal_secret denied: no successful receipt "
+                          f"for ticket {ticket_id[:16]}...", level='warn')
+                return None
 
         secret_hex = self._decrypt_secret(record['secret_hex'])
 
@@ -406,7 +468,7 @@ class CashuEscrowManager:
             self._log(f"invalid ticket_type: {ticket_type}", level='warn')
             return None
 
-        if amount_sats < 0 or amount_sats > 10_000_000:
+        if amount_sats <= 0 or amount_sats > 10_000_000:
             self._log(f"invalid amount_sats: {amount_sats}", level='warn')
             return None
 
@@ -414,7 +476,11 @@ class CashuEscrowManager:
             self._log(f"invalid danger_score: {danger_score}", level='warn')
             return None
 
-        if mint_url and mint_url not in self.acceptable_mints:
+        if not mint_url:
+            self._log("empty mint_url", level='warn')
+            return None
+
+        if mint_url not in self.acceptable_mints:
             self._log(f"mint not in acceptable list: {mint_url}", level='warn')
             return None
 
@@ -425,7 +491,10 @@ class CashuEscrowManager:
             return None
 
         # Check active ticket limit
-        active = self.db.list_escrow_tickets(status='active')
+        active = self.db.list_escrow_tickets(
+            status='active',
+            limit=self.MAX_ACTIVE_TICKETS + 1,
+        )
         if len(active) >= self.MAX_ACTIVE_TICKETS:
             self._log("active ticket limit reached", level='warn')
             return None
@@ -534,6 +603,10 @@ class CashuEscrowManager:
             return False, "nut10.kind must be HTLC"
         if not isinstance(nut10.get("data"), str) or len(nut10["data"]) != 64:
             return False, "nut10.data must be 64-char hex hash"
+        try:
+            bytes.fromhex(nut10["data"])
+        except ValueError:
+            return False, "nut10.data must be valid hex"
 
         # Verify NUT-11 P2PK
         nut11 = conditions.get("nut11", {})
@@ -575,25 +648,51 @@ class CashuEscrowManager:
 
         return self._mint_http_call(mint_url, '/v1/checkstate', method='POST', body=body)
 
-    def redeem_ticket(self, ticket_id: str, preimage: str) -> Optional[Dict[str, Any]]:
+    def redeem_ticket(self, ticket_id: str, preimage: str,
+                      caller_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Agent-side redemption: swap tokens with preimage (mint call).
 
+        Args:
+            ticket_id: Ticket to redeem.
+            preimage: HTLC preimage hex string.
+            caller_id: If provided, must match ticket's agent_id.
+
         Returns result dict or None on failure.
         """
-        ticket = self.db.get_escrow_ticket(ticket_id)
-        if not ticket:
-            return {"error": "ticket not found"}
+        # Validate preimage is valid hex before anything else
+        try:
+            preimage_bytes = bytes.fromhex(preimage)
+        except ValueError:
+            return {"error": "preimage is not valid hex"}
 
-        if ticket['status'] != 'active':
-            return {"error": f"ticket status is {ticket['status']}, expected active"}
+        with self._ticket_lock:
+            ticket = self.db.get_escrow_ticket(ticket_id)
+            if not ticket:
+                return {"error": "ticket not found"}
 
-        # Verify preimage matches hash
-        preimage_hash = hashlib.sha256(bytes.fromhex(preimage)).hexdigest()
-        if preimage_hash != ticket['htlc_hash']:
-            return {"error": "preimage does not match HTLC hash"}
+            if ticket['status'] != 'active':
+                return {"error": f"ticket status is {ticket['status']}, expected active"}
 
-        # Attempt mint swap (optional)
+            # Authorization: caller must be the agent
+            if caller_id is not None and caller_id != ticket['agent_id']:
+                return {"error": "caller is not the ticket agent"}
+
+            # Verify preimage matches hash
+            preimage_hash = hashlib.sha256(preimage_bytes).hexdigest()
+            if preimage_hash != ticket['htlc_hash']:
+                return {"error": "preimage does not match HTLC hash"}
+
+            # Update status under lock
+            now = int(time.time())
+            self.db.update_escrow_ticket_status(ticket_id, 'redeemed', now)
+
+            # Re-read to confirm the transition took effect
+            updated = self.db.get_escrow_ticket(ticket_id)
+            if not updated or updated['status'] != 'redeemed':
+                return {"error": "ticket status transition failed (race condition)"}
+
+        # Attempt mint swap (optional) — outside the lock
         mint_result = None
         mint_url = ticket.get('mint_url', '')
         if mint_url:
@@ -602,10 +701,6 @@ class CashuEscrowManager:
                 "token": ticket.get('token_json', ''),
             }).encode('utf-8')
             mint_result = self._mint_http_call(mint_url, '/v1/swap', method='POST', body=body)
-
-        # Update status regardless (the protocol-level redemption is valid)
-        now = int(time.time())
-        self.db.update_escrow_ticket_status(ticket_id, 'redeemed', now)
 
         self._log(f"ticket {ticket_id[:16]}... redeemed by {ticket['agent_id'][:16]}...")
 
@@ -617,24 +712,42 @@ class CashuEscrowManager:
             "redeemed_at": now,
         }
 
-    def refund_ticket(self, ticket_id: str) -> Optional[Dict[str, Any]]:
+    def refund_ticket(self, ticket_id: str,
+                      caller_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Operator reclaim after timelock expiry (mint call).
 
+        Args:
+            ticket_id: Ticket to refund.
+            caller_id: If provided, must match ticket's operator_id.
+
         Returns result dict or None on failure.
         """
-        ticket = self.db.get_escrow_ticket(ticket_id)
-        if not ticket:
-            return {"error": "ticket not found"}
+        with self._ticket_lock:
+            ticket = self.db.get_escrow_ticket(ticket_id)
+            if not ticket:
+                return {"error": "ticket not found"}
 
-        if ticket['status'] not in ('active', 'expired'):
-            return {"error": f"ticket status is {ticket['status']}, cannot refund"}
+            if ticket['status'] not in ('active', 'expired'):
+                return {"error": f"ticket status is {ticket['status']}, cannot refund"}
 
-        now = int(time.time())
-        if now < ticket['timelock']:
-            return {"error": "timelock not yet expired", "timelock": ticket['timelock']}
+            # Authorization: caller must be the operator
+            if caller_id is not None and caller_id != ticket['operator_id']:
+                return {"error": "caller is not the ticket operator"}
 
-        # Attempt mint refund (optional)
+            now = int(time.time())
+            if now < ticket['timelock']:
+                return {"error": "timelock not yet expired", "timelock": ticket['timelock']}
+
+            # Update status under lock
+            self.db.update_escrow_ticket_status(ticket_id, 'refunded', now)
+
+            # Re-read to confirm the transition took effect
+            updated = self.db.get_escrow_ticket(ticket_id)
+            if not updated or updated['status'] != 'refunded':
+                return {"error": "ticket status transition failed (race condition)"}
+
+        # Attempt mint refund (optional) — outside the lock
         mint_result = None
         mint_url = ticket.get('mint_url', '')
         if mint_url:
@@ -644,7 +757,6 @@ class CashuEscrowManager:
             }).encode('utf-8')
             mint_result = self._mint_http_call(mint_url, '/v1/swap', method='POST', body=body)
 
-        self.db.update_escrow_ticket_status(ticket_id, 'refunded', now)
         self._log(f"ticket {ticket_id[:16]}... refunded to operator")
 
         return {
@@ -675,7 +787,7 @@ class CashuEscrowManager:
             return None
 
         receipt_id = hashlib.sha256(
-            f"{ticket_id}:{schema_id}:{action}:{int(time.time())}".encode()
+            f"{ticket_id}:{schema_id}:{action}:{int(time.time())}:{os.urandom(8).hex()}".encode()
         ).hexdigest()[:32]
 
         params_json = json.dumps(params, sort_keys=True, separators=(',', ':'))
@@ -746,7 +858,7 @@ class CashuEscrowManager:
             return 0
 
         now = int(time.time())
-        tickets = self.db.list_escrow_tickets(status='active')
+        tickets = self.db.list_escrow_tickets(status='active', limit=self.MAX_ACTIVE_TICKETS)
         expired_count = 0
         for t in tickets:
             if t['timelock'] < now:
@@ -773,6 +885,9 @@ class CashuEscrowManager:
                 # Try check state
                 result = self.check_ticket_with_mint(t['ticket_id'])
                 if result is not None:
+                    # Mint responded — promote pending ticket to active
+                    self.db.update_escrow_ticket_status(
+                        t['ticket_id'], 'active', int(time.time()))
                     retried += 1
 
         return retried

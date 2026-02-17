@@ -868,6 +868,21 @@ class TestReceiptRecording:
         db = MockDatabase()
         plugin = MagicMock()
         reg = ManagementSchemaRegistry(db, plugin, rpc=None, our_pubkey=ALICE_PUBKEY)
+        # Pre-populate a credential so the existence check passes
+        db.credentials["cred-123"] = {
+            "credential_id": "cred-123",
+            "issuer_id": ALICE_PUBKEY,
+            "agent_id": BOB_PUBKEY,
+            "node_id": ALICE_PUBKEY,
+            "tier": "monitor",
+            "allowed_schemas_json": '["*"]',
+            "constraints_json": "{}",
+            "valid_from": int(time.time()),
+            "valid_until": int(time.time()) + 86400,
+            "signature": "fakesig",
+            "revoked_at": None,
+            "created_at": int(time.time()),
+        }
         # Need to use a valid schema/action
         receipt_id = reg.record_receipt(
             credential_id="cred-123",
@@ -881,6 +896,21 @@ class TestReceiptRecording:
 
     def test_receipt_with_state_hashes(self):
         reg, db = _make_registry()
+        # Pre-populate a credential so the existence check passes
+        db.credentials["cred-123"] = {
+            "credential_id": "cred-123",
+            "issuer_id": ALICE_PUBKEY,
+            "agent_id": BOB_PUBKEY,
+            "node_id": ALICE_PUBKEY,
+            "tier": "standard",
+            "allowed_schemas_json": '["*"]',
+            "constraints_json": "{}",
+            "valid_from": int(time.time()),
+            "valid_until": int(time.time()) + 86400,
+            "signature": "fakesig",
+            "revoked_at": None,
+            "created_at": int(time.time()),
+        }
         receipt_id = reg.record_receipt(
             credential_id="cred-123",
             schema_id="hive:fee-policy/v1",
@@ -1025,6 +1055,9 @@ class TestRPCHandlers:
         ctx = MagicMock(spec=HiveContext)
         ctx.management_schema_registry = reg
         ctx.our_pubkey = ALICE_PUBKEY
+        # Provide database mock so check_permission succeeds
+        ctx.database = MagicMock()
+        ctx.database.get_member.return_value = {"peer_id": ALICE_PUBKEY, "tier": "member"}
         return ctx, reg, db
 
     def test_schema_list_handler(self):

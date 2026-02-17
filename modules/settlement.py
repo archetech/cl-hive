@@ -1899,9 +1899,15 @@ class NettingEngine:
             if ob.get("status") not in ("pending", None):
                 continue
             amount = ob.get("amount_sats", 0)
-            if ob.get("from_peer") == peer_a and ob.get("to_peer") == peer_b:
+            if amount <= 0:
+                continue
+            from_p = ob.get("from_peer", "")
+            to_p = ob.get("to_peer", "")
+            if from_p == to_p:
+                continue
+            if from_p == peer_a and to_p == peer_b:
                 a_to_b += amount
-            elif ob.get("from_peer") == peer_b and ob.get("to_peer") == peer_a:
+            elif from_p == peer_b and to_p == peer_a:
                 b_to_a += amount
 
         net = a_to_b - b_to_a
@@ -1949,9 +1955,13 @@ class NettingEngine:
             if ob.get("status") not in ("pending", None):
                 continue
             amount = ob.get("amount_sats", 0)
+            if amount <= 0:
+                continue
             from_p = ob.get("from_peer", "")
             to_p = ob.get("to_peer", "")
             if not from_p or not to_p:
+                continue
+            if from_p == to_p:
                 continue
             balances[from_p] = balances.get(from_p, 0) - amount
             balances[to_p] = balances.get(to_p, 0) + amount
@@ -1965,7 +1975,7 @@ class NettingEngine:
             elif balance > 0:
                 creditors.append([peer, balance])  # amount they're owed
 
-        # Greedy matching: match largest debtor with largest creditor
+        # Greedy matching: match debtors with creditors in deterministic peer_id order
         payments = []
         di, ci = 0, 0
         while di < len(debtors) and ci < len(creditors):
@@ -2028,14 +2038,21 @@ class BondManager:
         return "observer"
 
     def effective_bond(self, amount_sats: int, tenure_days: int) -> int:
-        """Calculate time-weighted effective bond amount."""
-        weight = min(1.0, tenure_days / self.TENURE_MATURITY_DAYS)
-        return int(amount_sats * weight)
+        """Calculate time-weighted effective bond amount (integer arithmetic)."""
+        if tenure_days >= self.TENURE_MATURITY_DAYS:
+            return amount_sats
+        return amount_sats * tenure_days // self.TENURE_MATURITY_DAYS
 
     def post_bond(self, peer_id: str, amount_sats: int,
                   token_json: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Post a new bond for a peer."""
         if amount_sats < 0:
+            return None
+
+        # Reject if peer already has an active or slashed bond
+        existing = self.db.get_bond_for_peer(peer_id)
+        if existing:
+            self._log(f"bond rejected: {peer_id[:16]}... already has active bond")
             return None
 
         tier = self.get_tier_for_amount(amount_sats)
@@ -2075,19 +2092,21 @@ class BondManager:
                         repeat_count: int = 1,
                         estimated_profit: int = 0) -> int:
         """
-        Calculate slash amount.
+        Calculate slash amount (integer arithmetic).
 
-        Formula: max(penalty * severity * repeat_mult, estimated_profit * 2.0)
+        Formula: max(penalty * severity * repeat_mult, estimated_profit * 2)
         """
-        repeat_mult = 1.0 + (0.5 * max(0, repeat_count - 1))
-        option_a = int(penalty_base * severity * repeat_mult)
-        option_b = int(estimated_profit * 2.0)
+        repeat_mult_1000 = 1000 + (500 * max(0, repeat_count - 1))
+        # severity is a float 0.0-1.0, scale to integer
+        severity_1000 = int(severity * 1000)
+        option_a = penalty_base * severity_1000 * repeat_mult_1000 // 1_000_000
+        option_b = estimated_profit * 2
         return max(option_a, option_b)
 
     def distribute_slash(self, slash_amount: int) -> Dict[str, int]:
-        """Distribute slashed funds per policy."""
-        aggrieved = int(slash_amount * self.SLASH_DISTRIBUTION["aggrieved"])
-        panel = int(slash_amount * self.SLASH_DISTRIBUTION["panel"])
+        """Distribute slashed funds per policy (integer arithmetic)."""
+        aggrieved = slash_amount * 50 // 100
+        panel = slash_amount * 30 // 100
         burned = slash_amount - aggrieved - panel  # Remainder to burned
         return {
             "aggrieved": aggrieved,
@@ -2214,13 +2233,12 @@ class DisputeResolver:
         seed_input = f"{dispute_id}{block_hash}"
         seed = hashlib.sha256(seed_input.encode()).digest()
 
-        # Weight: bond_amount + sqrt(tenure_days)
-        import math
+        # Weight: bond_amount + tenure_days * 100
         weighted = []
         for m in eligible_members:
             bond = m.get("bond_amount", 0)
             tenure = m.get("tenure_days", 0)
-            weight = bond + int(math.sqrt(max(0, tenure)))
+            weight = bond + tenure * 100
             weighted.append((m["peer_id"], max(1, weight)))
 
         # Sort by peer_id for determinism
@@ -2261,18 +2279,13 @@ class DisputeResolver:
     def file_dispute(self, obligation_id: str, filing_peer: str,
                      evidence: Dict) -> Optional[Dict]:
         """File a new dispute."""
-        obligation = None
-        try:
-            obligations = self.db.get_obligations_for_window("", status=None, limit=10000)
-            for ob in obligations:
-                if ob['obligation_id'] == obligation_id:
-                    obligation = ob
-                    break
-        except Exception:
-            pass
+        obligation = self.db.get_obligation(obligation_id)
 
         if not obligation:
             return {"error": "obligation not found"}
+
+        if filing_peer not in (obligation['from_peer'], obligation['to_peer']):
+            return {"error": "not a party to this obligation"}
 
         respondent = obligation['from_peer'] if obligation['to_peer'] == filing_peer else obligation['to_peer']
 
@@ -2294,20 +2307,80 @@ class DisputeResolver:
         if not success:
             return None
 
+        now = int(time.time())
+
+        # Deterministically select an arbitration panel at filing time when possible.
+        eligible_members = []
+        try:
+            all_members = self.db.get_all_members()
+        except Exception:
+            all_members = []
+        for m in all_members:
+            peer_id = m.get("peer_id", "")
+            if not peer_id or peer_id in (filing_peer, respondent):
+                continue
+            joined_at = int(m.get("joined_at", now) or now)
+            tenure_days = max(0, (now - joined_at) // 86400)
+            bond = self.db.get_bond_for_peer(peer_id)
+            bond_amount = int((bond or {}).get("amount_sats", 0) or 0)
+            eligible_members.append({
+                "peer_id": peer_id,
+                "bond_amount": bond_amount,
+                "tenure_days": tenure_days,
+            })
+
+        block_hash = "0" * 64
+        if self.rpc:
+            try:
+                info = self.rpc.getinfo()
+                if isinstance(info, dict):
+                    block_hash = (
+                        info.get("bestblockhash")
+                        or info.get("blockhash")
+                        or f"height:{info.get('blockheight', 0)}"
+                    )
+            except Exception:
+                pass
+
+        panel_info = self.select_arbitration_panel(dispute_id, str(block_hash), eligible_members)
+        if panel_info:
+            panel_members_json = json.dumps(
+                panel_info["panel_members"], sort_keys=True, separators=(',', ':')
+            )
+            self.db.update_dispute_outcome(
+                dispute_id=dispute_id,
+                outcome=None,
+                slash_amount=0,
+                panel_members_json=panel_members_json,
+                votes_json=json.dumps({}, sort_keys=True, separators=(',', ':')),
+                resolved_at=0,
+            )
+
         # Mark obligation as disputed
         self.db.update_obligation_status(obligation_id, 'disputed')
 
         self._log(f"dispute {dispute_id[:16]}... filed by {filing_peer[:16]}...")
 
-        return {
+        result = {
             "dispute_id": dispute_id,
             "obligation_id": obligation_id,
             "filing_peer": filing_peer,
             "respondent_peer": respondent,
         }
+        if panel_info:
+            result["panel"] = panel_info
+        elif len(eligible_members) < self.MIN_ELIGIBLE_FOR_PANEL:
+            result["panel"] = {
+                "panel_members": [],
+                "panel_size": 0,
+                "quorum": 0,
+                "mode": "bilateral_negotiation",
+            }
+        return result
 
     def record_vote(self, dispute_id: str, voter_id: str,
-                    vote: str, reason: str = "") -> Optional[Dict]:
+                    vote: str, reason: str = "",
+                    signature: str = "") -> Optional[Dict]:
         """Record an arbitration panel vote."""
         dispute = self.db.get_dispute(dispute_id)
         if not dispute:
@@ -2315,6 +2388,20 @@ class DisputeResolver:
 
         if dispute.get('resolved_at'):
             return {"error": "dispute already resolved"}
+
+        # Check panel membership before accepting vote
+        panel_members = []
+        if dispute.get('panel_members_json'):
+            try:
+                panel_members = json.loads(dispute['panel_members_json'])
+            except (json.JSONDecodeError, TypeError):
+                panel_members = []
+
+        if voter_id not in panel_members:
+            return {"error": "voter not on arbitration panel"}
+
+        if vote not in {"upheld", "rejected", "partial", "abstain"}:
+            return {"error": "invalid vote"}
 
         # Parse existing votes
         votes = {}
@@ -2324,15 +2411,12 @@ class DisputeResolver:
             except (json.JSONDecodeError, TypeError):
                 votes = {}
 
-        votes[voter_id] = {"vote": vote, "reason": reason, "timestamp": int(time.time())}
-
-        # Check if we have quorum
-        panel_members = []
-        if dispute.get('panel_members_json'):
-            try:
-                panel_members = json.loads(dispute['panel_members_json'])
-            except (json.JSONDecodeError, TypeError):
-                panel_members = []
+        votes[voter_id] = {
+            "vote": vote,
+            "reason": reason,
+            "signature": signature,
+            "timestamp": int(time.time()),
+        }
 
         votes_json = json.dumps(votes, sort_keys=True, separators=(',', ':'))
 
@@ -2377,6 +2461,7 @@ class DisputeResolver:
                 counts[vtype] += 1
 
         # Determine outcome: majority of non-abstain votes
+        # Priority: upheld > partial > rejected (deterministic tie-breaking)
         non_abstain = counts["upheld"] + counts["rejected"] + counts["partial"]
         if non_abstain == 0:
             outcome = "rejected"

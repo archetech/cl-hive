@@ -893,6 +893,7 @@ class TestHandleCredentialPresent:
                 "metrics": _valid_node_metrics(),
                 "outcome": "neutral",
                 "signature": "valid_sig",
+                "issued_at": now,
             },
         }
 
@@ -1135,7 +1136,7 @@ class TestProtocolMessages:
                 "period_end": now,
                 "metrics": _valid_node_metrics(),
                 "outcome": "neutral",
-                "signature": "sig123",
+                "signature": "sig1234567890",
             },
         }
         assert validate_did_credential_present(payload) is True

@@ -120,6 +120,11 @@ pip install -r requirements.txt
 lightningd --plugin=/path/to/cl-hive/cl-hive.py
 ```
 
+Phase 6 planning-only references:
+- `docs/planning/13-PHASE6-READINESS-GATED-PLAN.md`
+- `docs/deployment/PHASE6-MANUAL-INSTALL-NON-DOCKER.md`
+- `docs/deployment/PHASE6-DOCKER-PLUGIN-INTEGRATION-PLAN.md`
+
 ## RPC Commands
 
 ### Hive Management

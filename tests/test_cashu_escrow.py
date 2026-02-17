@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import time
+import concurrent.futures
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -263,7 +264,7 @@ class TestCashuEscrowManager:
         assert htlc_hash is not None
         assert len(htlc_hash) == 64
 
-        preimage = mgr.reveal_secret("task1")
+        preimage = mgr.reveal_secret("task1", require_receipt=False)
         assert preimage is not None
         # Verify hash matches
         computed_hash = hashlib.sha256(bytes.fromhex(preimage)).hexdigest()
@@ -481,7 +482,7 @@ class TestRedemption:
             danger_score=3, amount_sats=100,
             mint_url=MINT_URL,
         )
-        preimage = mgr.reveal_secret("redeem_task")
+        preimage = mgr.reveal_secret("redeem_task", require_receipt=False)
         result = mgr.redeem_ticket(ticket["ticket_id"], preimage)
         assert result["status"] == "redeemed"
         assert result["preimage_valid"]
@@ -508,7 +509,7 @@ class TestRedemption:
             danger_score=3, amount_sats=100,
             mint_url=MINT_URL,
         )
-        preimage = mgr.reveal_secret("double_redeem")
+        preimage = mgr.reveal_secret("double_redeem", require_receipt=False)
         mgr.redeem_ticket(ticket["ticket_id"], preimage)
         # Try again
         result = mgr.redeem_ticket(ticket["ticket_id"], preimage)
@@ -596,7 +597,7 @@ class TestMaintenance:
     def test_prune_old_secrets(self):
         mgr = make_manager()
         mgr.generate_secret("old_task", "old_ticket")
-        mgr.reveal_secret("old_task")
+        mgr.reveal_secret("old_task", require_receipt=False)
         # Force old reveal time
         mgr.db.secrets["old_task"]["revealed_at"] = int(time.time()) - (91 * 86400)
         count = mgr.prune_old_secrets()
@@ -607,6 +608,33 @@ class TestMaintenance:
         status = mgr.get_mint_status(MINT_URL)
         assert status["mint_url"] == MINT_URL
         assert status["state"] == "closed"
+
+
+class TestMintExecutorIsolation:
+
+    def test_mint_http_call_uses_executor(self):
+        mgr = make_manager()
+        future = MagicMock()
+        future.result.return_value = {"states": ["UNSPENT"]}
+        with patch.object(mgr._mint_executor, "submit", return_value=future) as submit:
+            result = mgr._mint_http_call(
+                MINT_URL, "/v1/checkstate", method="POST", body=b"{}"
+            )
+        assert result == {"states": ["UNSPENT"]}
+        submit.assert_called_once()
+
+    def test_mint_http_call_timeout_records_failure(self):
+        mgr = make_manager()
+        future = MagicMock()
+        future.result.side_effect = concurrent.futures.TimeoutError()
+        with patch.object(mgr._mint_executor, "submit", return_value=future):
+            result = mgr._mint_http_call(
+                MINT_URL, "/v1/checkstate", method="POST", body=b"{}"
+            )
+        assert result is None
+        future.cancel.assert_called_once()
+        stats = mgr.get_mint_status(MINT_URL)
+        assert stats["failure_count"] == 1
 
 
 class TestRowCaps:

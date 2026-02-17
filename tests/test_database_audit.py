@@ -327,3 +327,39 @@ class TestPruneSettlementData:
         total = database.prune_old_settlement_data(older_than_days=90)
         assert total == 0
         assert conn.execute("SELECT COUNT(*) FROM settlement_proposals").fetchone()[0] == 1
+
+
+class TestNostrState:
+    """Phase 5A: Test bounded nostr_state KV helpers."""
+
+    def test_set_get_delete_nostr_state(self, database):
+        assert database.set_nostr_state("config:pubkey", "abc123")
+        assert database.get_nostr_state("config:pubkey") == "abc123"
+        assert database.delete_nostr_state("config:pubkey")
+        assert database.get_nostr_state("config:pubkey") is None
+
+    def test_list_nostr_state_prefix(self, database):
+        assert database.set_nostr_state("config:pubkey", "p1")
+        assert database.set_nostr_state("config:privkey", "s1")
+        assert database.set_nostr_state("event:last", "e1")
+
+        rows = database.list_nostr_state(prefix="config:")
+        keys = [r["key"] for r in rows]
+        assert "config:pubkey" in keys
+        assert "config:privkey" in keys
+        assert "event:last" not in keys
+
+    def test_nostr_state_row_cap(self, database):
+        original_cap = database.MAX_NOSTR_STATE_ROWS
+        database.MAX_NOSTR_STATE_ROWS = 3
+        try:
+            assert database.set_nostr_state("k1", "v1")
+            assert database.set_nostr_state("k2", "v2")
+            assert database.set_nostr_state("k3", "v3")
+            # New key rejected at cap.
+            assert not database.set_nostr_state("k4", "v4")
+            # Existing key can still be updated at cap.
+            assert database.set_nostr_state("k3", "v3b")
+            assert database.get_nostr_state("k3") == "v3b"
+        finally:
+            database.MAX_NOSTR_STATE_ROWS = original_cap

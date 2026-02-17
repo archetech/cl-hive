@@ -142,6 +142,9 @@ class MockDatabase:
         }
         return True
 
+    def get_obligation(self, obligation_id):
+        return self.obligations.get(obligation_id)
+
     def get_obligations_for_window(self, window_id, status=None, limit=1000):
         result = []
         for ob in self.obligations.values():
@@ -568,12 +571,25 @@ class TestDisputeResolver:
     def test_record_vote(self):
         resolver, db = self._make_resolver()
         db.store_dispute("disp1", "ob1", BOB, ALICE, '{}', int(time.time()))
+        # Set panel members so vote is accepted
+        panel = json.dumps([CHARLIE, DAVE])
+        db.disputes["disp1"]["panel_members_json"] = panel
         result = resolver.record_vote("disp1", CHARLIE, "upheld", "clear evidence")
         assert result["total_votes"] == 1
+
+    def test_record_vote_rejected_non_panel(self):
+        resolver, db = self._make_resolver()
+        db.store_dispute("disp1", "ob1", BOB, ALICE, '{}', int(time.time()))
+        panel = json.dumps([DAVE])
+        db.disputes["disp1"]["panel_members_json"] = panel
+        result = resolver.record_vote("disp1", CHARLIE, "upheld", "clear evidence")
+        assert result["error"] == "voter not on arbitration panel"
 
     def test_quorum_resolves_dispute(self):
         resolver, db = self._make_resolver()
         db.store_dispute("disp2", "ob1", BOB, ALICE, '{}', int(time.time()))
+        panel = json.dumps([CHARLIE, DAVE, GRACE])
+        db.disputes["disp2"]["panel_members_json"] = panel
         resolver.record_vote("disp2", CHARLIE, "upheld", "")
         resolver.record_vote("disp2", DAVE, "upheld", "")
         result = resolver.check_quorum("disp2", quorum=2)
@@ -583,6 +599,8 @@ class TestDisputeResolver:
     def test_quorum_rejected_outcome(self):
         resolver, db = self._make_resolver()
         db.store_dispute("disp3", "ob1", BOB, ALICE, '{}', int(time.time()))
+        panel = json.dumps([CHARLIE, DAVE, GRACE])
+        db.disputes["disp3"]["panel_members_json"] = panel
         resolver.record_vote("disp3", CHARLIE, "rejected", "")
         resolver.record_vote("disp3", DAVE, "rejected", "")
         result = resolver.check_quorum("disp3", quorum=2)
@@ -591,6 +609,8 @@ class TestDisputeResolver:
     def test_quorum_not_reached(self):
         resolver, db = self._make_resolver()
         db.store_dispute("disp4", "ob1", BOB, ALICE, '{}', int(time.time()))
+        panel = json.dumps([CHARLIE, DAVE, GRACE])
+        db.disputes["disp4"]["panel_members_json"] = panel
         resolver.record_vote("disp4", CHARLIE, "upheld", "")
         result = resolver.check_quorum("disp4", quorum=3)
         assert result is None

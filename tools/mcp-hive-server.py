@@ -5141,6 +5141,24 @@ Only the original issuer can revoke a management credential.""",
                 "required": ["node", "ticket_id"]
             }
         ),
+        Tool(
+            name="hive_escrow_complete",
+            description="Complete an escrow task by creating receipt and optionally revealing preimage.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "ticket_id": {"type": "string", "description": "Ticket ID"},
+                    "schema_id": {"type": "string", "description": "Management schema ID"},
+                    "action": {"type": "string", "description": "Management action"},
+                    "params_json": {"type": "string", "description": "Action params JSON"},
+                    "result_json": {"type": "string", "description": "Action result JSON"},
+                    "success": {"type": "boolean", "description": "Whether task completed successfully"},
+                    "reveal_preimage": {"type": "boolean", "description": "Reveal preimage if available"}
+                },
+                "required": ["node", "ticket_id"]
+            }
+        ),
         # Phase 4B: Extended Settlement Tools
         Tool(
             name="hive_bond_post",
@@ -5242,6 +5260,204 @@ Only the original issuer can revoke a management credential.""",
                     "peer_id": {"type": "string", "description": "Peer pubkey (default: self)"}
                 },
                 "required": ["node"]
+            }
+        ),
+        # Phase 5B: Advisor Marketplace Tools
+        Tool(
+            name="hive_marketplace_discover",
+            description="Discover advisor profiles from marketplace cache.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "criteria_json": {"type": "string", "description": "Discovery criteria JSON"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_marketplace_profile",
+            description="View cached advisor profiles or publish local advisor profile.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "profile_json": {"type": "string", "description": "Advisor profile JSON (optional for publish)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_marketplace_propose",
+            description="Propose a contract to an advisor.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "advisor_did": {"type": "string", "description": "Advisor DID"},
+                    "node_id": {"type": "string", "description": "Managed node pubkey"},
+                    "scope_json": {"type": "string", "description": "Contract scope JSON"},
+                    "tier": {"type": "string", "description": "Contract tier"},
+                    "pricing_json": {"type": "string", "description": "Pricing JSON"}
+                },
+                "required": ["node", "advisor_did", "node_id"]
+            }
+        ),
+        Tool(
+            name="hive_marketplace_accept",
+            description="Accept an advisor contract proposal.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "contract_id": {"type": "string", "description": "Contract ID"}
+                },
+                "required": ["node", "contract_id"]
+            }
+        ),
+        Tool(
+            name="hive_marketplace_trial",
+            description="Start or evaluate a marketplace trial.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "contract_id": {"type": "string", "description": "Contract ID"},
+                    "action": {"type": "string", "description": "start/evaluate"},
+                    "duration_days": {"type": "integer", "description": "Trial duration days"},
+                    "flat_fee_sats": {"type": "integer", "description": "Trial fee in sats"},
+                    "evaluation_json": {"type": "string", "description": "Trial evaluation JSON"}
+                },
+                "required": ["node", "contract_id"]
+            }
+        ),
+        Tool(
+            name="hive_marketplace_terminate",
+            description="Terminate an advisor contract.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "contract_id": {"type": "string", "description": "Contract ID"},
+                    "reason": {"type": "string", "description": "Termination reason"}
+                },
+                "required": ["node", "contract_id"]
+            }
+        ),
+        Tool(
+            name="hive_marketplace_status",
+            description="Get advisor marketplace status.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"}
+                },
+                "required": ["node"]
+            }
+        ),
+        # Phase 5C: Liquidity Marketplace Tools
+        Tool(
+            name="hive_liquidity_discover",
+            description="Discover liquidity offers.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "service_type": {"type": "integer", "description": "Service type filter"},
+                    "min_capacity": {"type": "integer", "description": "Minimum capacity sats"},
+                    "max_rate": {"type": "integer", "description": "Maximum rate ppm"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_liquidity_offer",
+            description="Publish a liquidity offer.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "provider_id": {"type": "string", "description": "Provider pubkey"},
+                    "service_type": {"type": "integer", "description": "Service type (1-9)"},
+                    "capacity_sats": {"type": "integer", "description": "Capacity in sats"},
+                    "duration_hours": {"type": "integer", "description": "Lease duration in hours"},
+                    "pricing_model": {"type": "string", "description": "Pricing model"},
+                    "rate_json": {"type": "string", "description": "Rate JSON"},
+                    "min_reputation": {"type": "integer", "description": "Minimum reputation"},
+                    "expires_at": {"type": "integer", "description": "Offer expiry unix timestamp"}
+                },
+                "required": ["node", "provider_id", "service_type", "capacity_sats"]
+            }
+        ),
+        Tool(
+            name="hive_liquidity_request",
+            description="Publish a liquidity request (RFP).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "requester_id": {"type": "string", "description": "Requester pubkey"},
+                    "service_type": {"type": "integer", "description": "Requested service type"},
+                    "capacity_sats": {"type": "integer", "description": "Requested capacity sats"},
+                    "details_json": {"type": "string", "description": "Request details JSON"}
+                },
+                "required": ["node", "requester_id", "service_type", "capacity_sats"]
+            }
+        ),
+        Tool(
+            name="hive_liquidity_lease",
+            description="Accept a liquidity offer and create a lease.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "offer_id": {"type": "string", "description": "Offer ID"},
+                    "client_id": {"type": "string", "description": "Client pubkey"},
+                    "heartbeat_interval": {"type": "integer", "description": "Heartbeat interval seconds"}
+                },
+                "required": ["node", "offer_id", "client_id"]
+            }
+        ),
+        Tool(
+            name="hive_liquidity_heartbeat",
+            description="Send or verify a lease heartbeat.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "lease_id": {"type": "string", "description": "Lease ID"},
+                    "action": {"type": "string", "description": "send/verify"},
+                    "heartbeat_id": {"type": "string", "description": "Heartbeat ID (verify)"},
+                    "channel_id": {"type": "string", "description": "Channel ID (send)"},
+                    "remote_balance_sats": {"type": "integer", "description": "Remote balance sats"},
+                    "capacity_sats": {"type": "integer", "description": "Capacity sats override"}
+                },
+                "required": ["node", "lease_id"]
+            }
+        ),
+        Tool(
+            name="hive_liquidity_lease_status",
+            description="Get liquidity lease status.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "lease_id": {"type": "string", "description": "Lease ID"}
+                },
+                "required": ["node", "lease_id"]
+            }
+        ),
+        Tool(
+            name="hive_liquidity_terminate",
+            description="Terminate a liquidity lease.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "lease_id": {"type": "string", "description": "Lease ID"},
+                    "reason": {"type": "string", "description": "Termination reason"}
+                },
+                "required": ["node", "lease_id"]
             }
         ),
     ]
@@ -5435,6 +5651,20 @@ async def handle_hive_escrow_receipt(args: Dict) -> Dict:
     })
 
 
+async def handle_hive_escrow_complete(args: Dict) -> Dict:
+    """Complete escrow task and optionally reveal preimage."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {"ticket_id": args["ticket_id"]}
+    for k in (
+        "schema_id", "action", "params_json", "result_json", "success", "reveal_preimage"
+    ):
+        if args.get(k) is not None:
+            params[k] = args[k]
+    return await node.call("hive-escrow-complete", params)
+
+
 # =============================================================================
 # Phase 4B: Extended Settlement Handlers
 # =============================================================================
@@ -5531,6 +5761,186 @@ async def handle_hive_credit_tier(args: Dict) -> Dict:
     if args.get("peer_id"):
         params["peer_id"] = args["peer_id"]
     return await node.call("hive-credit-tier", params)
+
+
+# =============================================================================
+# Phase 5B: Advisor Marketplace Handlers
+# =============================================================================
+
+async def handle_hive_marketplace_discover(args: Dict) -> Dict:
+    """Discover advisor profiles from marketplace cache."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("criteria_json"):
+        params["criteria_json"] = args["criteria_json"]
+    return await node.call("hive-marketplace-discover", params)
+
+
+async def handle_hive_marketplace_profile(args: Dict) -> Dict:
+    """View cached advisor profiles or publish local profile."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("profile_json"):
+        params["profile_json"] = args["profile_json"]
+    return await node.call("hive-marketplace-profile", params)
+
+
+async def handle_hive_marketplace_propose(args: Dict) -> Dict:
+    """Propose a contract to an advisor."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {
+        "advisor_did": args["advisor_did"],
+        "node_id": args["node_id"],
+    }
+    for key in ("scope_json", "tier", "pricing_json"):
+        if args.get(key) is not None:
+            params[key] = args[key]
+    return await node.call("hive-marketplace-propose", params)
+
+
+async def handle_hive_marketplace_accept(args: Dict) -> Dict:
+    """Accept a contract proposal."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-marketplace-accept", {
+        "contract_id": args["contract_id"],
+    })
+
+
+async def handle_hive_marketplace_trial(args: Dict) -> Dict:
+    """Start or evaluate a marketplace trial."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {"contract_id": args["contract_id"]}
+    for key in ("action", "duration_days", "flat_fee_sats", "evaluation_json"):
+        if args.get(key) is not None:
+            params[key] = args[key]
+    return await node.call("hive-marketplace-trial", params)
+
+
+async def handle_hive_marketplace_terminate(args: Dict) -> Dict:
+    """Terminate a marketplace contract."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {"contract_id": args["contract_id"]}
+    if args.get("reason"):
+        params["reason"] = args["reason"]
+    return await node.call("hive-marketplace-terminate", params)
+
+
+async def handle_hive_marketplace_status(args: Dict) -> Dict:
+    """Get marketplace status."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-marketplace-status")
+
+
+# =============================================================================
+# Phase 5C: Liquidity Marketplace Handlers
+# =============================================================================
+
+async def handle_hive_liquidity_discover(args: Dict) -> Dict:
+    """Discover liquidity offers."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    for key in ("service_type", "min_capacity", "max_rate"):
+        if args.get(key) is not None:
+            params[key] = args[key]
+    return await node.call("hive-liquidity-discover", params)
+
+
+async def handle_hive_liquidity_offer(args: Dict) -> Dict:
+    """Publish a liquidity offer."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {
+        "provider_id": args["provider_id"],
+        "service_type": args["service_type"],
+        "capacity_sats": args["capacity_sats"],
+    }
+    for key in (
+        "duration_hours", "pricing_model", "rate_json", "min_reputation", "expires_at"
+    ):
+        if args.get(key) is not None:
+            params[key] = args[key]
+    return await node.call("hive-liquidity-offer", params)
+
+
+async def handle_hive_liquidity_request(args: Dict) -> Dict:
+    """Publish liquidity RFP request."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {
+        "requester_id": args["requester_id"],
+        "service_type": args["service_type"],
+        "capacity_sats": args["capacity_sats"],
+    }
+    if args.get("details_json") is not None:
+        params["details_json"] = args["details_json"]
+    return await node.call("hive-liquidity-request", params)
+
+
+async def handle_hive_liquidity_lease(args: Dict) -> Dict:
+    """Accept liquidity offer and create lease."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {
+        "offer_id": args["offer_id"],
+        "client_id": args["client_id"],
+    }
+    if args.get("heartbeat_interval") is not None:
+        params["heartbeat_interval"] = args["heartbeat_interval"]
+    return await node.call("hive-liquidity-lease", params)
+
+
+async def handle_hive_liquidity_heartbeat(args: Dict) -> Dict:
+    """Send or verify lease heartbeat."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {"lease_id": args["lease_id"]}
+    for key in (
+        "action", "heartbeat_id", "channel_id", "remote_balance_sats", "capacity_sats"
+    ):
+        if args.get(key) is not None:
+            params[key] = args[key]
+    return await node.call("hive-liquidity-heartbeat", params)
+
+
+async def handle_hive_liquidity_lease_status(args: Dict) -> Dict:
+    """Get lease status and heartbeat history."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-liquidity-lease-status", {
+        "lease_id": args["lease_id"],
+    })
+
+
+async def handle_hive_liquidity_terminate(args: Dict) -> Dict:
+    """Terminate liquidity lease."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {"lease_id": args["lease_id"]}
+    if args.get("reason"):
+        params["reason"] = args["reason"]
+    return await node.call("hive-liquidity-terminate", params)
 
 
 @server.call_tool()
@@ -15263,6 +15673,7 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "hive_escrow_redeem": handle_hive_escrow_redeem,
     "hive_escrow_refund": handle_hive_escrow_refund,
     "hive_escrow_receipt": handle_hive_escrow_receipt,
+    "hive_escrow_complete": handle_hive_escrow_complete,
     # Phase 4B: Extended Settlement Tools
     "hive_bond_post": handle_hive_bond_post,
     "hive_bond_status": handle_hive_bond_status,
@@ -15272,6 +15683,22 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "hive_dispute_vote": handle_hive_dispute_vote,
     "hive_dispute_status": handle_hive_dispute_status,
     "hive_credit_tier": handle_hive_credit_tier,
+    # Phase 5B: Advisor Marketplace Tools
+    "hive_marketplace_discover": handle_hive_marketplace_discover,
+    "hive_marketplace_profile": handle_hive_marketplace_profile,
+    "hive_marketplace_propose": handle_hive_marketplace_propose,
+    "hive_marketplace_accept": handle_hive_marketplace_accept,
+    "hive_marketplace_trial": handle_hive_marketplace_trial,
+    "hive_marketplace_terminate": handle_hive_marketplace_terminate,
+    "hive_marketplace_status": handle_hive_marketplace_status,
+    # Phase 5C: Liquidity Marketplace Tools
+    "hive_liquidity_discover": handle_hive_liquidity_discover,
+    "hive_liquidity_offer": handle_hive_liquidity_offer,
+    "hive_liquidity_request": handle_hive_liquidity_request,
+    "hive_liquidity_lease": handle_hive_liquidity_lease,
+    "hive_liquidity_heartbeat": handle_hive_liquidity_heartbeat,
+    "hive_liquidity_lease_status": handle_hive_liquidity_lease_status,
+    "hive_liquidity_terminate": handle_hive_liquidity_terminate,
 }
 
 

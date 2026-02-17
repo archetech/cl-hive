@@ -18,8 +18,10 @@ Security:
 - Row caps on storage to prevent unbounded growth
 """
 
+import heapq
 import json
 import math
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -37,6 +39,8 @@ MAX_METRICS_JSON_LEN = 4096
 MAX_EVIDENCE_JSON_LEN = 8192
 MAX_REASON_LEN = 500
 MAX_AGGREGATION_CACHE_ENTRIES = 10_000
+MAX_CREDENTIAL_PRESENTS_PER_PEER_PER_HOUR = 20
+MAX_CREDENTIAL_REVOKES_PER_PEER_PER_HOUR = 10
 
 # Tier thresholds
 TIER_NEWCOMER_MAX = 59
@@ -225,6 +229,7 @@ def get_credential_signing_payload(credential: Dict[str, Any]) -> str:
     Uses sorted keys and minimal separators for reproducibility.
     """
     signing_data = {
+        "credential_id": credential.get("credential_id", ""),
         "issuer_id": credential["issuer_id"],
         "subject_id": credential["subject_id"],
         "domain": credential["domain"],
@@ -296,8 +301,9 @@ class DIDCredentialManager:
         self.rpc = rpc
         self.our_pubkey = our_pubkey
         self._aggregation_cache: Dict[str, AggregatedReputation] = {}
-        import threading
         self._cache_lock = threading.Lock()
+        self._rate_limiters: Dict[tuple, List[int]] = {}
+        self._rate_lock = threading.Lock()
 
     def _log(self, msg: str, level: str = "info"):
         """Log a message via the plugin."""
@@ -305,6 +311,33 @@ class DIDCredentialManager:
             self.plugin.log(f"cl-hive: did_credentials: {msg}", level=level)
         except Exception:
             pass
+
+    def _check_rate_limit(self, peer_id: str, message_type: str, max_per_hour: int) -> bool:
+        """Per-peer sliding-window rate limit."""
+        now = int(time.time())
+        cutoff = now - 3600
+        key = (peer_id, message_type)
+
+        with self._rate_lock:
+            timestamps = self._rate_limiters.get(key, [])
+            timestamps = [ts for ts in timestamps if ts > cutoff]
+
+            if len(timestamps) >= max_per_hour:
+                self._rate_limiters[key] = timestamps
+                return False
+
+            timestamps.append(now)
+            self._rate_limiters[key] = timestamps
+
+            if len(self._rate_limiters) > 1000:
+                stale_keys = [
+                    k for k, vals in self._rate_limiters.items()
+                    if not vals or vals[-1] <= cutoff
+                ]
+                for k in stale_keys:
+                    self._rate_limiters.pop(k, None)
+
+        return True
 
     # --- Credential Issuance ---
 
@@ -346,6 +379,11 @@ class DIDCredentialManager:
         # Self-issuance rejected
         if subject_id == self.our_pubkey:
             self._log("rejected self-issuance attempt", "warn")
+            return None
+
+        # Validate subject_id pubkey format
+        if not _is_valid_pubkey(subject_id):
+            self._log(f"invalid subject_id pubkey format", "warn")
             return None
 
         # Validate domain
@@ -391,6 +429,7 @@ class DIDCredentialManager:
 
         # Build signing payload
         cred_dict = {
+            "credential_id": credential_id,
             "issuer_id": self.our_pubkey,
             "subject_id": subject_id,
             "domain": domain,
@@ -639,6 +678,12 @@ class DIDCredentialManager:
         issuers = set()
         components = {}
 
+        # Fetch members once for issuer weight lookups
+        try:
+            members = self.db.get_all_members()
+        except Exception:
+            members = []
+
         for cred in active_creds:
             issuer_id = cred.get("issuer_id", "")
             cred_domain = cred.get("domain", "")
@@ -660,7 +705,7 @@ class DIDCredentialManager:
             recency = math.exp(-RECENCY_DECAY_LAMBDA * age_days)
 
             # 2. Issuer weight: 1.0 default, up to 3.0 for channel peers
-            issuer_weight = self._get_issuer_weight(issuer_id, subject_id)
+            issuer_weight = self._get_issuer_weight(issuer_id, subject_id, members=members)
 
             # 3. Evidence strength
             evidence_strength = self._compute_evidence_strength(evidence)
@@ -721,12 +766,13 @@ class DIDCredentialManager:
         # Update cache (bounded)
         with self._cache_lock:
             if len(self._aggregation_cache) >= MAX_AGGREGATION_CACHE_ENTRIES:
-                # Evict oldest entries
-                sorted_keys = sorted(
+                # Evict oldest 50% using heapq for efficiency
+                keys_to_evict = heapq.nsmallest(
+                    len(self._aggregation_cache) // 2,
                     self._aggregation_cache.keys(),
                     key=lambda k: self._aggregation_cache[k].computed_at,
                 )
-                for k in sorted_keys[:len(sorted_keys) // 2]:
+                for k in keys_to_evict:
                     del self._aggregation_cache[k]
             self._aggregation_cache[cache_key] = result
 
@@ -790,6 +836,14 @@ class DIDCredentialManager:
             self._log("invalid credential_present: missing credential dict", "warn")
             return False
 
+        if not self._check_rate_limit(
+            peer_id,
+            "did_credential_present",
+            MAX_CREDENTIAL_PRESENTS_PER_PEER_PER_HOUR,
+        ):
+            self._log(f"rate limit exceeded for credential presents from {peer_id[:16]}...", "warn")
+            return False
+
         # Size checks
         metrics_json = json.dumps(credential.get("metrics", {}))
         if len(metrics_json) > MAX_METRICS_JSON_LEN:
@@ -829,17 +883,19 @@ class DIDCredentialManager:
             self._log("credential_present: credential_id too long", "warn")
             return False
 
-        # Validate issued_at is within reasonable range
+        # Validate issued_at is within reasonable range — reject if missing or non-int
         issued_at = credential.get("issued_at")
-        if issued_at is not None and isinstance(issued_at, int):
-            now = int(time.time())
-            period_start = credential.get("period_start", 0)
-            if issued_at < period_start:
-                self._log("credential_present: issued_at before period_start", "warn")
-                return False
-            if issued_at > now + TIMESTAMP_TOLERANCE:
-                self._log("credential_present: issued_at too far in future", "warn")
-                return False
+        if issued_at is None or not isinstance(issued_at, int):
+            self._log(f"rejecting credential without valid issued_at from {peer_id[:16]}...", "info")
+            return False
+        now = int(time.time())
+        period_start = credential.get("period_start", 0)
+        if issued_at < period_start:
+            self._log("credential_present: issued_at before period_start", "warn")
+            return False
+        if issued_at > now + TIMESTAMP_TOLERANCE:
+            self._log("credential_present: issued_at too far in future", "warn")
+            return False
 
         existing = self.db.get_did_credential(credential_id)
         if existing:
@@ -885,6 +941,14 @@ class DIDCredentialManager:
         reason = payload.get("reason", "")
         issuer_id = payload.get("issuer_id", "")
         signature = payload.get("signature", "")
+
+        if not self._check_rate_limit(
+            peer_id,
+            "did_credential_revoke",
+            MAX_CREDENTIAL_REVOKES_PER_PEER_PER_HOUR,
+        ):
+            self._log(f"rate limit exceeded for credential revokes from {peer_id[:16]}...", "warn")
+            return False
 
         if not credential_id or not isinstance(credential_id, str):
             self._log("invalid credential_revoke: missing credential_id", "warn")
@@ -1042,7 +1106,16 @@ class DIDCredentialManager:
             self._log(f"auto_issue: cannot get peer states: {e}", "warn")
             return 0
 
-        for peer_id, peer_state in all_peers.items():
+        if isinstance(all_peers, dict):
+            peer_states = all_peers.values()
+        elif isinstance(all_peers, (list, tuple, set)):
+            peer_states = all_peers
+        else:
+            self._log("auto_issue: unexpected peer state container", "debug")
+            return 0
+
+        for peer_state in peer_states:
+            peer_id = getattr(peer_state, 'peer_id', '')
             if peer_id == self.our_pubkey:
                 continue
 
@@ -1260,14 +1333,18 @@ class DIDCredentialManager:
 
     # --- Internal Helpers ---
 
-    def _get_issuer_weight(self, issuer_id: str, subject_id: str) -> float:
+    def _get_issuer_weight(self, issuer_id: str, subject_id: str, members: Optional[list] = None) -> float:
         """
         Compute issuer weight. Issuers with open channels to subject
         get up to 3.0 weight (proof-of-stake). Default 1.0.
         """
         # Check if issuer has a channel to subject via the database
         try:
-            members = self.db.get_all_members()
+            if members is None:
+                try:
+                    members = self.db.get_all_members()
+                except Exception:
+                    members = []
             issuer_is_member = any(m.get("peer_id") == issuer_id for m in members)
             subject_is_member = any(m.get("peer_id") == subject_id for m in members)
 

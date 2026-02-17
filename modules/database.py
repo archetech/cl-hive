@@ -1396,6 +1396,157 @@ class HiveDatabase:
             ON management_receipts(credential_id)
         """)
 
+        # Phase 5A: Nostr transport state (bounded key-value store)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS nostr_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
+        # Phase 5B: Advisor marketplace profiles
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS marketplace_profiles (
+                advisor_did TEXT PRIMARY KEY,
+                profile_json TEXT NOT NULL,
+                nostr_pubkey TEXT,
+                version TEXT NOT NULL,
+                capabilities_json TEXT NOT NULL,
+                pricing_json TEXT NOT NULL,
+                reputation_score INTEGER DEFAULT 0,
+                last_seen INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT 'gossip'
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_mp_reputation
+            ON marketplace_profiles(reputation_score DESC)
+        """)
+
+        # Phase 5B: Advisor marketplace contracts
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS marketplace_contracts (
+                contract_id TEXT PRIMARY KEY,
+                advisor_did TEXT NOT NULL,
+                operator_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'proposed',
+                tier TEXT NOT NULL,
+                scope_json TEXT NOT NULL,
+                pricing_json TEXT NOT NULL,
+                sla_json TEXT,
+                trial_start INTEGER,
+                trial_end INTEGER,
+                contract_start INTEGER,
+                contract_end INTEGER,
+                auto_renew INTEGER NOT NULL DEFAULT 0,
+                notice_days INTEGER NOT NULL DEFAULT 7,
+                created_at INTEGER NOT NULL,
+                terminated_at INTEGER,
+                termination_reason TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_contract_advisor
+            ON marketplace_contracts(advisor_did, status)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_contract_status
+            ON marketplace_contracts(status)
+        """)
+
+        # Phase 5B: Advisor trial records
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS marketplace_trials (
+                trial_id TEXT PRIMARY KEY,
+                contract_id TEXT NOT NULL,
+                advisor_did TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                sequence_number INTEGER NOT NULL DEFAULT 1,
+                flat_fee_sats INTEGER NOT NULL,
+                start_at INTEGER NOT NULL,
+                end_at INTEGER NOT NULL,
+                evaluation_json TEXT,
+                outcome TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trial_node_scope
+            ON marketplace_trials(node_id, scope, start_at)
+        """)
+
+        # Phase 5C: Liquidity offers
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS liquidity_offers (
+                offer_id TEXT PRIMARY KEY,
+                provider_id TEXT NOT NULL,
+                service_type INTEGER NOT NULL,
+                capacity_sats INTEGER NOT NULL,
+                duration_hours INTEGER,
+                pricing_model TEXT NOT NULL,
+                rate_json TEXT NOT NULL,
+                min_reputation INTEGER DEFAULT 0,
+                nostr_event_id TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_liq_offer_type
+            ON liquidity_offers(service_type, status)
+        """)
+
+        # Phase 5C: Liquidity leases
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS liquidity_leases (
+                lease_id TEXT PRIMARY KEY,
+                offer_id TEXT,
+                provider_id TEXT NOT NULL,
+                client_id TEXT NOT NULL,
+                service_type INTEGER NOT NULL,
+                channel_id TEXT,
+                capacity_sats INTEGER NOT NULL,
+                start_at INTEGER NOT NULL,
+                end_at INTEGER NOT NULL,
+                heartbeat_interval INTEGER NOT NULL DEFAULT 3600,
+                last_heartbeat INTEGER,
+                missed_heartbeats INTEGER NOT NULL DEFAULT 0,
+                total_paid_sats INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_lease_status
+            ON liquidity_leases(status)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_lease_provider
+            ON liquidity_leases(provider_id)
+        """)
+
+        # Phase 5C: Liquidity heartbeat attestations
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS liquidity_heartbeats (
+                heartbeat_id TEXT PRIMARY KEY,
+                lease_id TEXT NOT NULL,
+                period_number INTEGER NOT NULL,
+                channel_id TEXT NOT NULL,
+                capacity_sats INTEGER NOT NULL,
+                remote_balance_sats INTEGER NOT NULL,
+                provider_signature TEXT NOT NULL,
+                client_verified INTEGER NOT NULL DEFAULT 0,
+                preimage_revealed INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_heartbeat_lease
+            ON liquidity_heartbeats(lease_id, period_number)
+        """)
+
         # Phase 4A: Cashu escrow tickets
         conn.execute("""
             CREATE TABLE IF NOT EXISTS escrow_tickets (
@@ -1908,6 +2059,19 @@ class HiveDatabase:
     # Absolute caps on management credential/receipt rows
     MAX_MANAGEMENT_CREDENTIAL_ROWS = 1000
     MAX_MANAGEMENT_RECEIPT_ROWS = 100000
+
+    # Phase 5A: Nostr state bounded KV rows
+    MAX_NOSTR_STATE_ROWS = 100
+
+    # Phase 5B: Marketplace row caps
+    MAX_MARKETPLACE_PROFILE_ROWS = 5000
+    MAX_MARKETPLACE_CONTRACT_ROWS = 10000
+    MAX_MARKETPLACE_TRIAL_ROWS = 10000
+
+    # Phase 5C: Liquidity marketplace row caps
+    MAX_LIQUIDITY_OFFER_ROWS = 10000
+    MAX_LIQUIDITY_LEASE_ROWS = 10000
+    MAX_HEARTBEAT_ROWS = 500000
 
     # Phase 4A: Cashu escrow row caps
     MAX_ESCROW_TICKET_ROWS = 50000
@@ -7645,6 +7809,107 @@ class HiveDatabase:
         return [dict(r) for r in rows]
 
     # =========================================================================
+    # PHASE 5A: NOSTR TRANSPORT STATE
+    # =========================================================================
+
+    def set_nostr_state(self, key: str, value: str) -> bool:
+        """Set a Nostr state key/value. Enforces bounded KV row cap."""
+        if not key:
+            return False
+        if value is None:
+            return False
+
+        conn = self._get_connection()
+        try:
+            existing = conn.execute(
+                "SELECT 1 FROM nostr_state WHERE key = ?",
+                (key,)
+            ).fetchone()
+            if not existing:
+                row = conn.execute(
+                    "SELECT COUNT(*) as cnt FROM nostr_state"
+                ).fetchone()
+                if row and row['cnt'] >= self.MAX_NOSTR_STATE_ROWS:
+                    self.plugin.log(
+                        f"HiveDatabase: nostr_state at cap ({self.MAX_NOSTR_STATE_ROWS}), rejecting new key",
+                        level='warn'
+                    )
+                    return False
+
+            conn.execute(
+                "INSERT OR REPLACE INTO nostr_state (key, value) VALUES (?, ?)",
+                (key, value)
+            )
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: set_nostr_state error: {e}",
+                level='error'
+            )
+            return False
+
+    def get_nostr_state(self, key: str) -> Optional[str]:
+        """Get a Nostr state value by key."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT value FROM nostr_state WHERE key = ?",
+            (key,)
+        ).fetchone()
+        return row['value'] if row else None
+
+    def delete_nostr_state(self, key: str) -> bool:
+        """Delete a Nostr state key. Returns True if a row was deleted."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM nostr_state WHERE key = ?",
+                (key,)
+            )
+            return cursor.rowcount > 0
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: delete_nostr_state error: {e}",
+                level='error'
+            )
+            return False
+
+    def list_nostr_state(self, prefix: Optional[str] = None,
+                         limit: int = 100) -> List[Dict[str, Any]]:
+        """List Nostr state rows, optionally filtered by key prefix."""
+        conn = self._get_connection()
+        if prefix:
+            rows = conn.execute(
+                "SELECT key, value FROM nostr_state "
+                "WHERE key LIKE ? ORDER BY key ASC LIMIT ?",
+                (f"{prefix}%", limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT key, value FROM nostr_state ORDER BY key ASC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_rows(self, table_name: str) -> int:
+        """Count rows in selected internal tables."""
+        allowed_tables = {
+            "marketplace_profiles",
+            "marketplace_contracts",
+            "marketplace_trials",
+            "liquidity_offers",
+            "liquidity_leases",
+            "liquidity_heartbeats",
+            "nostr_state",
+        }
+        if table_name not in allowed_tables:
+            raise ValueError(f"count_rows: table not allowed: {table_name}")
+        conn = self._get_connection()
+        row = conn.execute(
+            f"SELECT COUNT(*) as cnt FROM {table_name}"
+        ).fetchone()
+        return int(row["cnt"]) if row else 0
+
+    # =========================================================================
     # PHASE 4A: CASHU ESCROW OPERATIONS
     # =========================================================================
 
@@ -7903,13 +8168,19 @@ class HiveDatabase:
                     level='warn'
                 )
                 return False
-            conn.execute("""
-                INSERT OR REPLACE INTO settlement_bonds (
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO settlement_bonds (
                     bond_id, peer_id, amount_sats, token_json,
                     posted_at, timelock, tier, slashed_amount, status
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'active')
             """, (bond_id, peer_id, amount_sats, token_json,
                   posted_at, timelock, tier))
+            if cursor.rowcount == 0:
+                self.plugin.log(
+                    f"HiveDatabase: store_bond ignored duplicate bond_id={bond_id[:16]}",
+                    level='warn'
+                )
+                return False
             return True
         except Exception as e:
             self.plugin.log(
@@ -8039,6 +8310,15 @@ class HiveDatabase:
         params.append(limit)
         rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
+
+    def get_obligation(self, obligation_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single obligation by its primary key."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM settlement_obligations WHERE obligation_id = ?",
+            (obligation_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
     def update_obligation_status(self, obligation_id: str, status: str) -> bool:
         """Update obligation status."""

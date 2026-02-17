@@ -775,9 +775,9 @@ class TestAutoIssueNodeCredentials:
         mgr, db, _ = self._make_mgr()
         now = int(time.time())
         state_mgr = MagicMock()
-        state_mgr.get_all_peer_states.return_value = {
-            BOB_PUBKEY: MockPeerState(peer_id=BOB_PUBKEY, last_update=now - 300),
-        }
+        state_mgr.get_all_peer_states.return_value = [
+            MockPeerState(peer_id=BOB_PUBKEY, last_update=now - 300),
+        ]
         count = mgr.auto_issue_node_credentials(state_manager=state_mgr)
         assert count == 1
         assert db.did_credential_count == 1
@@ -786,9 +786,9 @@ class TestAutoIssueNodeCredentials:
         mgr, db, _ = self._make_mgr()
         now = int(time.time())
         state_mgr = MagicMock()
-        state_mgr.get_all_peer_states.return_value = {
-            ALICE_PUBKEY: MockPeerState(peer_id=ALICE_PUBKEY, last_update=now - 300),
-        }
+        state_mgr.get_all_peer_states.return_value = [
+            MockPeerState(peer_id=ALICE_PUBKEY, last_update=now - 300),
+        ]
         count = mgr.auto_issue_node_credentials(state_manager=state_mgr)
         assert count == 0
 
@@ -806,9 +806,9 @@ class TestAutoIssueNodeCredentials:
             expires_at=now + 86400 * 90, received_from=None,
         )
         state_mgr = MagicMock()
-        state_mgr.get_all_peer_states.return_value = {
-            BOB_PUBKEY: MockPeerState(peer_id=BOB_PUBKEY, last_update=now - 300),
-        }
+        state_mgr.get_all_peer_states.return_value = [
+            MockPeerState(peer_id=BOB_PUBKEY, last_update=now - 300),
+        ]
         count = mgr.auto_issue_node_credentials(state_manager=state_mgr)
         assert count == 0  # Skipped due to recent credential
 
@@ -823,7 +823,7 @@ class TestAutoIssueNodeCredentials:
             database=db, plugin=MagicMock(), rpc=None, our_pubkey=ALICE_PUBKEY,
         )
         state_mgr = MagicMock()
-        state_mgr.get_all_peer_states.return_value = {}
+        state_mgr.get_all_peer_states.return_value = []
         count = mgr.auto_issue_node_credentials(state_manager=state_mgr)
         assert count == 0
 
@@ -831,9 +831,9 @@ class TestAutoIssueNodeCredentials:
         mgr, _, _ = self._make_mgr()
         now = int(time.time())
         state_mgr = MagicMock()
-        state_mgr.get_all_peer_states.return_value = {
-            BOB_PUBKEY: MockPeerState(peer_id=BOB_PUBKEY, last_update=now - 300),
-        }
+        state_mgr.get_all_peer_states.return_value = [
+            MockPeerState(peer_id=BOB_PUBKEY, last_update=now - 300),
+        ]
         broadcast_fn = MagicMock()
         mgr.auto_issue_node_credentials(
             state_manager=state_mgr, broadcast_fn=broadcast_fn,
@@ -845,11 +845,9 @@ class TestAutoIssueNodeCredentials:
         now = int(time.time())
         state_mgr = MagicMock()
         # Peer not updated in > 1 day → low uptime
-        state_mgr.get_all_peer_states.return_value = {
-            BOB_PUBKEY: MockPeerState(
-                peer_id=BOB_PUBKEY, last_update=now - 100000,
-            ),
-        }
+        state_mgr.get_all_peer_states.return_value = [
+            MockPeerState(peer_id=BOB_PUBKEY, last_update=now - 100000),
+        ]
         count = mgr.auto_issue_node_credentials(state_manager=state_mgr)
         assert count == 1
         cred = list(db.did_credentials.values())[0]

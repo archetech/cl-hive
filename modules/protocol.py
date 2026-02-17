@@ -6107,6 +6107,8 @@ def validate_did_credential_present(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
     if not isinstance(timestamp, (int, float)) or timestamp < 0:
@@ -6180,6 +6182,10 @@ def validate_did_credential_present(payload: dict) -> bool:
     signature = credential.get("signature")
     if not isinstance(signature, str) or not signature:
         return False
+    if len(signature) < 10:
+        return False
+    if len(signature) > 200:
+        return False
 
     return True
 
@@ -6189,13 +6195,14 @@ def get_did_credential_present_signing_payload(payload: dict) -> str:
     import json
     credential = payload.get("credential", {})
     signing_data = {
+        "credential_id": credential.get("credential_id", ""),
         "issuer_id": credential.get("issuer_id", ""),
         "subject_id": credential.get("subject_id", ""),
         "domain": credential.get("domain", ""),
         "period_start": credential.get("period_start", 0),
         "period_end": credential.get("period_end", 0),
         "metrics": credential.get("metrics", {}),
-        "outcome": credential.get("outcome", "neutral"),
+        "outcome": credential.get("outcome"),
     }
     return json.dumps(signing_data, sort_keys=True, separators=(',', ':'))
 
@@ -6268,6 +6275,8 @@ def validate_did_credential_revoke(payload: dict) -> bool:
         return False
     if len(signature) < 10:
         return False
+    if len(signature) > 200:
+        return False
 
     return True
 
@@ -6332,6 +6341,8 @@ def validate_mgmt_credential_present(payload: dict) -> bool:
 
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
+        return False
+    if len(event_id) > 128:
         return False
 
     timestamp = payload.get("timestamp")
@@ -6405,6 +6416,10 @@ def validate_mgmt_credential_present(payload: dict) -> bool:
 
     signature = credential.get("signature")
     if not isinstance(signature, str) or not signature:
+        return False
+    if len(signature) < 10:
+        return False
+    if len(signature) > 200:
         return False
 
     return True
@@ -6495,6 +6510,8 @@ def validate_mgmt_credential_revoke(payload: dict) -> bool:
     if not isinstance(signature, str) or not signature:
         return False
     if len(signature) < 10:
+        return False
+    if len(signature) > 200:
         return False
 
     return True
@@ -6607,7 +6624,7 @@ def validate_settlement_receipt(payload: dict) -> bool:
         return False
 
     amount_sats = payload.get("amount_sats")
-    if not isinstance(amount_sats, int) or amount_sats < 0:
+    if not isinstance(amount_sats, int) or amount_sats <= 0:
         return False
 
     window_id = payload.get("window_id")
@@ -6635,6 +6652,7 @@ def validate_settlement_receipt(payload: dict) -> bool:
 def get_settlement_receipt_signing_payload(
     receipt_id: str, settlement_type: str, from_peer: str,
     to_peer: str, amount_sats: int, window_id: str,
+    receipt_data: Optional[dict] = None,
 ) -> str:
     """Get deterministic signing payload for a settlement receipt."""
     import json
@@ -6643,6 +6661,7 @@ def get_settlement_receipt_signing_payload(
         "amount_sats": amount_sats,
         "from_peer": from_peer,
         "receipt_id": receipt_id,
+        "receipt_data": receipt_data or {},
         "settlement_type": settlement_type,
         "to_peer": to_peer,
         "window_id": window_id,
@@ -6705,7 +6724,7 @@ def validate_bond_posting(payload: dict) -> bool:
         return False
 
     amount_sats = payload.get("amount_sats")
-    if not isinstance(amount_sats, int) or amount_sats < 0:
+    if not isinstance(amount_sats, int) or amount_sats <= 0:
         return False
 
     tier = payload.get("tier")
@@ -6729,6 +6748,7 @@ def validate_bond_posting(payload: dict) -> bool:
 
 def get_bond_posting_signing_payload(
     bond_id: str, amount_sats: int, tier: str, timelock: int,
+    token_hash: str = "",
 ) -> str:
     """Get deterministic signing payload for a bond posting."""
     import json
@@ -6738,6 +6758,7 @@ def get_bond_posting_signing_payload(
         "bond_id": bond_id,
         "tier": tier,
         "timelock": timelock,
+        "token_hash": token_hash,
     }, sort_keys=True, separators=(',', ':'))
 
 
@@ -6795,7 +6816,7 @@ def validate_bond_slash(payload: dict) -> bool:
         return False
 
     slash_amount = payload.get("slash_amount")
-    if not isinstance(slash_amount, int) or slash_amount < 0:
+    if not isinstance(slash_amount, int) or slash_amount <= 0:
         return False
 
     reason = payload.get("reason")
@@ -6815,6 +6836,7 @@ def validate_bond_slash(payload: dict) -> bool:
 
 def get_bond_slash_signing_payload(
     bond_id: str, slash_amount: int, dispute_id: str,
+    reason: str = "",
 ) -> str:
     """Get deterministic signing payload for a bond slash."""
     import json
@@ -6822,6 +6844,7 @@ def get_bond_slash_signing_payload(
         "action": "bond_slash",
         "bond_id": bond_id,
         "dispute_id": dispute_id,
+        "reason": reason,
         "slash_amount": slash_amount,
     }, sort_keys=True, separators=(',', ':'))
 
@@ -6912,12 +6935,14 @@ def validate_netting_proposal(payload: dict) -> bool:
 
 def get_netting_proposal_signing_payload(
     window_id: str, netting_type: str, obligations_hash: str,
+    net_payments: Optional[list] = None,
 ) -> str:
     """Get deterministic signing payload for a netting proposal."""
     import json
     return json.dumps({
         "action": "netting_proposal",
         "netting_type": netting_type,
+        "net_payments": net_payments or [],
         "obligations_hash": obligations_hash,
         "window_id": window_id,
     }, sort_keys=True, separators=(',', ':'))
@@ -7083,11 +7108,13 @@ def validate_violation_report(payload: dict) -> bool:
 
 def get_violation_report_signing_payload(
     violation_id: str, violator_id: str, violation_type: str,
+    evidence: Optional[dict] = None,
 ) -> str:
     """Get deterministic signing payload for a violation report."""
     import json
     return json.dumps({
         "action": "violation_report",
+        "evidence": evidence or {},
         "violation_id": violation_id,
         "violation_type": violation_type,
         "violator_id": violator_id,
@@ -7161,12 +7188,13 @@ def validate_arbitration_vote(payload: dict) -> bool:
 
 
 def get_arbitration_vote_signing_payload(
-    dispute_id: str, vote: str,
+    dispute_id: str, vote: str, reason: str = "",
 ) -> str:
     """Get deterministic signing payload for an arbitration vote."""
     import json
     return json.dumps({
         "action": "arbitration_vote",
         "dispute_id": dispute_id,
+        "reason": reason,
         "vote": vote,
     }, sort_keys=True, separators=(',', ':'))
