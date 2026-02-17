@@ -218,18 +218,42 @@ bash scripts/bootstrap-node.sh
 The bootstrap script:
 1. Updates system packages, hardens SSH (key-only, non-standard port)
 2. Installs WireGuard, configures fleet VPN
-3. Installs Bitcoin Core (pruned, `prune=50000`)
+3. Installs Bitcoin Core 28.0+ (pruned, `prune=50000`)
 4. Installs CLN from official release
 5. Installs Python 3.11+, cl-hive, cl-revenue-ops (cl-hive-comms when available)
 6. Configures UFW firewall (LN port + WireGuard + SSH only)
 7. Sets up systemd services for bitcoind + lightningd
-8. Waits for Bitcoin IBD to complete (pruned: ~4-8 hours on good hardware)
+8. Bootstraps chain state via `assumeutxo` (see below) — node operational within minutes
 
-**IBD Optimization:**
-- Bitcoin Core uses `-assumevalid` by default (recent versions) — no need to set manually
-- Add `addnode=<fast-peer-ip>` for known fast peers in the fleet to speed sync
-- Consider pre-synced pruned snapshots (with hash verification via `sha256sum`) to reduce IBD from 4-8h to <1h
-- **Node is NOT operational until IBD completes.** Do not open channels or announce to fleet until fully synced
+**Chain Bootstrap (critical for viability):**
+
+A pruned node still performs full IBD — it downloads the entire blockchain (~650GB+ in 2026) and only discards old blocks after validation. On a 2vCPU/4GB VPS this takes 12-24+ hours and consumes a huge chunk of a 2TB/month bandwidth cap. **This makes traditional IBD unacceptable for autonomous provisioning.**
+
+Three strategies, in priority order:
+
+1. **`assumeutxo` (primary — requires Bitcoin Core 28.0+):**
+   ```bash
+   # Load a UTXO snapshot — node becomes operational in ~10 minutes
+   # Mainnet snapshot support was added in Bitcoin Core 28.0 (Oct 2024)
+   bitcoin-cli loadtxoutset /path/to/utxo-snapshot.dat
+   # → Node can serve blocks, validate transactions, and support CLN immediately
+   # → Full chain validation continues in background over days/weeks
+   # → Snapshot must match a hardcoded hash in the Bitcoin Core binary (tamper-proof)
+   ```
+   The UTXO snapshot is ~10GB and can be downloaded from any source — the hash is compiled into the binary, so it's trustless. Fleet nodes can host snapshots for fast provisioning.
+
+2. **Pre-synced datadir snapshot (fallback):**
+   ```bash
+   # Copy pruned datadir from a trusted fleet node
+   rsync -avz fleet-node:/var/lib/bitcoind/ /var/lib/bitcoind/
+   sha256sum /var/lib/bitcoind/chainstate/MANIFEST-* # Verify against known hash
+   ```
+   Fast (<1h) but requires trust in the source node. Acceptable within the fleet where nodes are authenticated via cl-hive membership.
+
+3. **Full IBD (last resort):**
+   If neither snapshot is available, fall back to traditional IBD with `assumevalid` (default in recent versions) and `addnode=<fast-peer-ip>` for known fleet peers. Budget 12-24h and ~650GB bandwidth.
+
+**Node is NOT operational until chain state is loaded.** Do not start CLN, open channels, or announce to fleet until `bitcoin-cli getblockchaininfo` shows `verificationprogress > 0.9999`.
 
 #### Step 3: Install Agent (OpenClaw Multi)
 
@@ -273,7 +297,7 @@ Fleet peers validate the join request, then optionally open reciprocal channels.
 | Layer | Component | Version | Purpose |
 |-------|-----------|---------|---------|
 | OS | Ubuntu 24.04 LTS | Latest | Stable base (22.04 also supported) |
-| Bitcoin | Bitcoin Core | 27.x+ | Pruned blockchain (50GB) |
+| Bitcoin | Bitcoin Core | 28.x+ | Pruned blockchain (50GB), `assumeutxo` for fast bootstrap |
 | Lightning | CLN | 24.x+ | Lightning node daemon |
 | Fleet | cl-hive | Latest | Hive coordination + gossip |
 | Revenue | cl-revenue-ops | Latest | Fee optimization + rebalancing |
@@ -957,7 +981,7 @@ The capital budgets above allocate ~20,000 sats/open as a conservative buffer th
 ### Realistic Growth Path
 
 ```
-Month 1-2: 0 revenue (IBD + cold start + routing table propagation).
+Month 1-2: 0 revenue (chain bootstrap + cold start + routing table propagation).
             VPS: 50,000. Rebalancing: 10,000. On-chain fees: 40,000.  Burn: ~100,000 sats.
 Month 3:   300 sats/day.   Revenue: 9,000.  VPS: 25,000.  Net: -16,000.
 Month 4:   800 sats/day.   Revenue: 24,000. VPS: 25,000.  Net: -1,000.
