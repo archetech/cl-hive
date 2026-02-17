@@ -6934,6 +6934,14 @@ class HiveDatabase:
         row = conn.execute("SELECT COUNT(*) as cnt FROM pheromone_levels").fetchone()
         return row['cnt'] if row else 0
 
+    def get_latest_pheromone_timestamp(self) -> Optional[float]:
+        """Get the most recent pheromone last_update, or None if empty."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT MAX(last_update) as latest FROM pheromone_levels"
+        ).fetchone()
+        return row['latest'] if row and row['latest'] is not None else None
+
     def get_latest_marker_timestamp(self) -> Optional[float]:
         """Get the most recent marker timestamp, or None if empty."""
         conn = self._get_connection()

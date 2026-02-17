@@ -1109,6 +1109,11 @@ class MockPersistenceDatabase:
     def get_pheromone_count(self):
         return len(self._pheromones)
 
+    def get_latest_pheromone_timestamp(self):
+        if not self._pheromones:
+            return None
+        return max(p.get('last_update', 0) for p in self._pheromones)
+
     def get_latest_marker_timestamp(self):
         if not self._markers:
             return None

@@ -2903,18 +2903,25 @@ class FeeCoordinationManager:
 
     def should_auto_backfill(self) -> bool:
         """
-        Check if routing intelligence is empty and should be auto-backfilled.
-        Returns True when DB has no pheromones AND no recent markers.
+        Check if routing intelligence should be auto-backfilled on startup.
+        Returns True when pheromone/marker data is empty OR stale (>24h old).
         """
-        if self.database.get_pheromone_count() > 0:
-            return False
+        stale_threshold = 24 * 3600
 
-        latest = self.database.get_latest_marker_timestamp()
-        if latest is None:
+        pheromone_count = self.database.get_pheromone_count()
+        if pheromone_count == 0:
             return True
 
-        # Also backfill if markers are older than 24 hours
-        return (time.time() - latest) > 24 * 3600
+        # Have pheromone data — check if it's stale
+        latest_pheromone = self.database.get_latest_pheromone_timestamp()
+        if latest_pheromone is not None and (time.time() - latest_pheromone) > stale_threshold:
+            return True
+
+        latest_marker = self.database.get_latest_marker_timestamp()
+        if latest_marker is not None and (time.time() - latest_marker) > stale_threshold:
+            return True
+
+        return False
 
     def get_coordination_status(self) -> Dict:
         """Get overall fee coordination status."""
