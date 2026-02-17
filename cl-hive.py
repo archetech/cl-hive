@@ -446,16 +446,17 @@ class RpcPool:
             if self._req_q is None:
                 self.restart("pool not running")
             self._req_q.put(req)
-            if not slot["event"].wait(timeout=timeout):
-                with self._pending_lock:
-                    self._pending.pop(req_id, None)
-                self.restart(f"timeout ({timeout}s) on {method}")
-                raise TimeoutError(f"RPC pool timeout on {method}")
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError):
             with self._pending_lock:
                 self._pending.pop(req_id, None)
             self.restart(f"queue error on {method}")
             raise TimeoutError(f"RPC pool queue error on {method}")
+
+        if not slot["event"].wait(timeout=timeout):
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+            self.restart(f"timeout ({timeout}s) on {method}")
+            raise TimeoutError(f"RPC pool timeout on {method}")
 
         with self._pending_lock:
             self._pending.pop(req_id, None)
