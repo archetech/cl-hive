@@ -71,7 +71,7 @@ A node approaching insolvency doesn't crash — it executes an orderly shutdown:
 | **API for provisioning** | Agents must self-provision without human intervention |
 | **API for billing status** | Agent must monitor costs and detect upcoming bills |
 | **Linux (Ubuntu 24.04 LTS preferred, 22.04+ supported)** | CLN + Bitcoin Core compatibility |
-| **≥2 vCPU, 4GB RAM, 80GB SSD** | Minimum for pruned Bitcoin Core + CLN |
+| **≥2 vCPU, 8GB RAM, 100GB SSD** | See [Section 5.2](#52-minimum-hardware) for constraints |
 | **Static IPv4 or IPv6** | Lightning nodes need stable addresses for peer connections |
 | **Unmetered or ≥2TB bandwidth** | Routing nodes generate significant traffic |
 
@@ -143,11 +143,11 @@ Using existing fleet routing data and public graph data, estimate:
 
 Given simulated traffic and fee rates:
 - Projected monthly revenue at Month 3, Month 6
-- Compare against monthly VPS cost (25,000-30,000 sats)
+- Compare against total monthly operating cost (~80,000-90,000 sats: VPS + AI API + amortized on-chain)
 
 ### 3.4 Go/No-Go Decision
 
-**Only provision if projected revenue > 1.5× monthly VPS cost within 6 months.** If the model can't show a credible path to that target, don't provision. Capital is better deployed as larger channels on existing nodes.
+**Only provision if projected revenue > 1.5× total monthly operating cost within 6 months.** Total operating cost includes VPS + AI API (~80,000-90,000 sats/mo). If the model can't show a credible path to that target (~135,000 sats/mo revenue), don't provision. Capital is better deployed as larger channels on existing nodes.
 
 ---
 
@@ -175,8 +175,8 @@ Before creating a VPS, the provisioning agent verifies:
 
 - [ ] **Viability assessment passed**: Section 3 analysis shows projected revenue > 1.5× VPS cost within 6 months
 - [ ] **Funding available**: Sufficient sats for chosen capital tier (see [Appendix B](#appendix-b-capital-allocation))
-  - Tier 1 (Minimum Viable): 6,180,000 sats
-  - Tier 2 (Conservative/Recommended): 18,560,000 sats
+  - Tier 1 (Minimum Viable): 6,550,000 sats
+  - Tier 2 (Conservative/Recommended): 19,460,000 sats
 - [ ] **Fleet position analysis**: Proposed location fills a routing gap (not redundant)
 - [ ] **Provider API accessible**: Can reach provider API and authenticate
 - [ ] **Bootstrap image/script available**: Validated, hash-verified setup script exists for target OS
@@ -191,7 +191,7 @@ POST /api/v1/servers
 {
   "name": "hive-{region}-{seq}",
   "image": "ubuntu-24.04",
-  "size": "s-2vcpu-4gb",
+  "size": "s-2vcpu-8gb",
   "region": "tor1",
   "ssh_keys": ["provisioner-key"],
   "payment": "lightning"
@@ -219,11 +219,13 @@ The bootstrap script:
 1. Updates system packages, hardens SSH (key-only, non-standard port)
 2. Installs WireGuard, configures fleet VPN
 3. Installs Bitcoin Core 28.0+ (pruned, `prune=50000`)
-4. Installs CLN from official release
-5. Installs Python 3.11+, cl-hive, cl-revenue-ops (cl-hive-comms when available)
-6. Configures UFW firewall (LN port + WireGuard + SSH only)
-7. Sets up systemd services for bitcoind + lightningd
-8. Bootstraps chain state via `assumeutxo` (see below) — node operational within minutes
+4. Writes constrained `bitcoin.conf` (see [Section 5.3](#53-bitcoin-core-memory-tuning) — mandatory for ≤8GB VPS)
+5. Installs CLN from official release
+6. Installs Python 3.11+, cl-hive, cl-revenue-ops (cl-hive-comms when available)
+7. Configures UFW firewall (LN port + WireGuard + SSH only)
+8. Configures log rotation for bitcoind and CLN (prevents disk exhaustion)
+9. Sets up systemd services for bitcoind + lightningd (with `MALLOC_ARENA_MAX=1`)
+10. Bootstraps chain state via `assumeutxo` (see below) — node operational within minutes
 
 **Chain Bootstrap (critical for viability):**
 
@@ -241,6 +243,16 @@ Three strategies, in priority order:
    # → Snapshot must match a hardcoded hash in the Bitcoin Core binary (tamper-proof)
    ```
    The UTXO snapshot is ~10GB and can be downloaded from any source — the hash is compiled into the binary, so it's trustless. Fleet nodes can host snapshots for fast provisioning.
+
+   **Creating and hosting fleet snapshots:**
+   ```bash
+   # On any fully-synced fleet node, create a snapshot:
+   bitcoin-cli dumptxoutset /var/lib/bitcoind/utxo-snapshot.dat
+   # → Produces a ~10GB file with a hash matching the one hardcoded in Bitcoin Core
+   # → This file can be served to new nodes over HTTP, rsync, or IPFS
+   # → Because the hash is compiled into the binary, ANY source is equally trustless
+   ```
+   Fleet nodes SHOULD host the latest snapshot for their Bitcoin Core version. The provisioning agent downloads from the nearest fleet peer, verifies the hash matches what's hardcoded in the binary, and loads it. No trust required beyond the Bitcoin Core binary itself.
 
 2. **Pre-synced datadir snapshot (fallback):**
    ```bash
@@ -313,20 +325,93 @@ Fleet peers validate the join request, then optionally open reciprocal channels.
 | Resource | Minimum | Recommended | Notes |
 |----------|---------|-------------|-------|
 | vCPU | 2 | 4 | CLN + Bitcoin Core + agent |
-| RAM | 4 GB | 8 GB | Bitcoin Core mempool + CLN |
-| Storage | 80 GB SSD | 120 GB SSD | Pruned chain (~50GB) + logs |
-| Bandwidth | 2 TB/mo | Unmetered | Routing traffic |
+| RAM | 8 GB | 16 GB | See [tuning notes](#53-bitcoin-core-memory-tuning) below |
+| Storage | 100 GB SSD | 150 GB SSD | Pruned chain (~50GB) + dual-chainstate during `assumeutxo` (~12GB temp) + logs |
+| Bandwidth | 2 TB/mo | Unmetered | Routing traffic; month 1 higher due to chain sync |
 | IPv4 | 1 static | 1 static | Peer connections |
 
-### 5.3 Estimated Monthly Cost
+**Why 8GB minimum:** Bitcoin Core defaults (`maxmempool=300`, `dbcache=450`) plus CLN plus the OpenClaw agent easily exceed 4GB. With aggressive tuning (see below) a 4GB VPS *might* survive, but OOM kills during mempool surges make it unreliable. 8GB provides safe headroom.
+
+### 5.3 Bitcoin Core Memory Tuning
+
+On VPS instances with ≤8GB RAM, Bitcoin Core **must** be configured with constrained memory settings. Default values will OOM-kill the process during mempool surges or background validation.
+
+**Required `bitcoin.conf` additions for constrained VPS:**
+
+```ini
+# Memory constraints (mandatory for ≤8GB VPS)
+maxmempool=100          # MB — default 300 is too large (saves ~200MB)
+dbcache=300             # MB — default 450 (saves ~150MB during IBD/validation)
+maxconnections=25       # Default 125 — each peer costs ~1-5MB
+par=1                   # Single validation thread (saves ~50MB per thread)
+
+# Bandwidth constraints (recommended for metered VPS)
+maxuploadtarget=1440    # MB/day — limits upload to ~1.4GB/day (~43GB/month)
+                        # Enough for routing, prevents runaway block serving
+blocksonly=0            # Keep relay on — routing nodes need mempool for fee estimation
+
+# Disk management
+prune=50000             # Keep 50GB of blocks (minimum for CLN compatibility)
+```
+
+**Additional OS-level tuning:**
+
+```bash
+# Limit glibc memory arena fragmentation (saves ~100-200MB)
+echo 'Environment="MALLOC_ARENA_MAX=1"' >> /etc/systemd/system/bitcoind.service.d/override.conf
+
+# Log rotation (prevents disk exhaustion)
+cat > /etc/logrotate.d/bitcoind << 'EOF'
+/var/log/bitcoind/debug.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+```
+
+**Dual-chainstate storage overhead:** During `assumeutxo` background validation, Bitcoin Core maintains two chainstate directories simultaneously. This adds 7-12GB of temporary storage. The 100GB minimum accounts for: pruned blocks (~50GB) + primary chainstate (~7GB) + temporary second chainstate (~12GB) + CLN data (~5GB) + logs + OS = ~80-85GB peak. The extra 15-20GB provides margin.
+
+### 5.4 Estimated Monthly Cost
 
 | Provider | Spec | Lightning Cost | USD Equivalent |
 |----------|------|---------------|----------------|
-| BitLaunch (DO) | 2vCPU/4GB | ~30,000 sats | ~$29 |
-| BitLaunch (Vultr) | 2vCPU/4GB | ~25,000 sats | ~$24 |
-| LunaNode | 2vCPU/4GB | ~15,000 sats | ~$15 |
+| BitLaunch (DO) | 2vCPU/8GB | ~55,000 sats | ~$48 |
+| BitLaunch (Vultr) | 2vCPU/8GB | ~45,000 sats | ~$44 |
+| LunaNode | 2vCPU/8GB | ~30,000 sats | ~$29 |
 
-**Break-even target:** A node must route enough to earn ≥ its monthly VPS cost in fees. At 50 ppm average and 30,000 sats/mo cost, that requires routing ~600M sats/month (~20M sats/day). Achievable for a well-positioned node with 5+ balanced channels of ≥1M sats each.
+**Note:** 8GB plans cost roughly 1.5-2× more than 4GB plans. This is the real cost — 4GB plans cannot reliably run the full stack. Budget accordingly.
+
+### 5.5 AI Agent Operating Cost (Critical)
+
+The autonomous agent requires API access to an LLM (currently Claude). This is a **significant recurring cost** that must be included in survival economics:
+
+| Task | Frequency | Model | Est. Monthly Cost |
+|------|-----------|-------|-------------------|
+| Heartbeat check (node health) | Every 30 min | Haiku | ~$5 |
+| Hourly watchdog | Hourly | Haiku | ~$3 |
+| Profitability analysis | Every 6 hours | Sonnet | ~$15 |
+| VPS payment | Monthly | Sonnet | ~$0.50 |
+| Ad-hoc decisions (rebalancing, channel ops) | ~10/day | Haiku/Sonnet | ~$20 |
+| **Total estimated** | | | **~$44/month (~64,000 sats)** |
+
+**Cost mitigation strategies:**
+1. **Tiered model selection** — Use Haiku ($0.25/$1.25 per MTok) for routine checks, Sonnet ($3/$15 per MTok) only for complex decisions
+2. **Script-first, AI-escalate** — Use deterministic scripts for routine monitoring (healthcheck, profitability math, bill payment). Only invoke the LLM when a script detects an anomaly or a decision requires judgment
+3. **Prompt caching** — Cache system prompts and SOUL.md context to reduce per-call token cost by ~80%
+4. **Batch operations** — Combine multiple checks into single LLM calls instead of separate invocations
+
+**With aggressive optimization (script-first + Haiku + caching), realistic monthly AI cost: ~$15-25 (~22,000-36,000 sats)**
+
+**API key funding:** Anthropic does not currently accept Lightning payments for API credits. Options:
+- Pre-fund API key with fiat (operator expense, reimbursed from node revenue)
+- Use a Lightning-to-fiat bridge service to pay Anthropic invoices
+- Self-host an open-source model (e.g., Llama 3) — eliminates API cost but adds GPU/compute cost and reduces capability
+
+**Break-even target (all-in):** A node must earn ≥ VPS cost + AI cost in fees. At 50 ppm average and ~80,000 sats/mo total cost (45,000 VPS + 35,000 AI), that requires routing ~1.6B sats/month (~53M sats/day). This is significantly harder than VPS-only break-even. See Section 9.1 for the full survival equation.
 
 ---
 
@@ -424,8 +509,8 @@ Each agent gets an LNbits wallet (or equivalent) for economic autonomy:
 # Agent manages its own keys and balance
 
 # Minimum starting balance — see Appendix B for full capital allocation:
-# Tier 1 (Minimum Viable): 6,180,000 sats
-# Tier 2 (Conservative):  18,560,000 sats
+# Tier 1 (Minimum Viable): 6,550,000 sats
+# Tier 2 (Conservative):  19,460,000 sats
 ```
 
 ---
@@ -555,8 +640,16 @@ A new node can't route if nobody sends traffic through it. Strategies:
 ```
 monthly_revenue = sum(routing_fees) + sum(liquidity_lease_income) + sum(service_fees)
                 + sum(pool_distributions)  # if participating in routing pool
-monthly_cost = vps_cost + on_chain_fees + rebalancing_costs
+monthly_cost = vps_cost + ai_api_cost + on_chain_fees + rebalancing_costs
              + liquidity_service_costs     # inbound leases, swaps, insurance
+
+# Realistic monthly cost breakdown (2026 estimate):
+#   VPS (2vCPU/8GB):           45,000 sats (~$44)
+#   AI agent API (optimized):  30,000 sats (~$25)
+#   On-chain fees (amortized):  5,000 sats
+#   Rebalancing:               10,000 sats
+#   ─────────────────────────────────────
+#   Total:                    ~90,000 sats/month (~$80)
 
 survival_ratio = monthly_revenue / monthly_cost
 
@@ -566,14 +659,17 @@ ratio >= 1.0:          PROFITABLE (thriving)
 ratio < 0.5:           TERMINAL (begin graceful shutdown immediately)
 ```
 
+**⚠️ The AI cost roughly doubles total operating expenses vs. VPS-only.** This makes the break-even bar significantly higher. Aggressive AI cost optimization (Section 5.5) is not optional — it's a survival requirement.
+
 ### 9.2 Revenue Allocation Priority
 
 When the agent earns routing fees, they are allocated in strict priority order:
 
 1. **VPS bill reserve** — Always maintain ≥1 month VPS cost in reserve
-2. **On-chain fee reserve** — Maintain ≥50,000 sats for emergency channel closes
-3. **Operating budget** — Rebalancing, channel opens, service payments
-4. **Savings** — Buffer toward 3-month reserve
+2. **AI API reserve** — Maintain ≥1 month API cost in reserve (~30,000 sats)
+3. **On-chain fee reserve** — Maintain ≥50,000 sats for emergency channel closes
+4. **Operating budget** — Rebalancing, channel opens, service payments
+5. **Savings** — Buffer toward 3-month reserve
 
 ### 9.3 Cost Tracking
 
@@ -595,22 +691,26 @@ hexmem_event "economics" "survival" "Weekly P&L" "Revenue: 12,400 sats, Cost: 7,
 When scaling to multiple nodes, model fleet-level outcomes:
 
 ```
-If 10 nodes provisioned at Tier 1 (6M sats each): 60M total investment
+If 10 nodes provisioned at Tier 1 (6.5M sats each): 65M total investment
 Expected survival rate: 30-50% (based on Lightning routing economics)
 Surviving nodes (3-5) must generate enough to justify fleet-wide capital burn
 
 Acceptable outcome: fleet ROI positive within 12 months
-  - 10 nodes × 6M = 60M sats deployed
-  - 5 survive at 2,500 sats/day = 12,500 sats/day fleet revenue
-  - 12,500 × 365 = 4,562,500 sats/year
-  - 5 nodes × 30,000 sats/mo VPS = 1,800,000 sats/year cost
-  - Net operating profit: +2,762,500 sats/year
-  - Capital loss from 5 dead nodes: ~30M sats (surviving nodes retain their 30M in channels)
-  - Break-even on lost capital: 30M / 2,762,500 = ~11 months
-  - Break-even on total deployed capital (60M): ~22 months
+  - 10 nodes × 6.5M = 65M sats deployed
+  - 5 survive at 3,000 sats/day = 15,000 sats/day fleet revenue
+  - 15,000 × 365 = 5,475,000 sats/year
+  - 5 nodes × 75,000 sats/mo (VPS + AI) = 4,500,000 sats/year cost
+  - Net operating profit: +975,000 sats/year
+  - Capital loss from 5 dead nodes: ~32.5M sats (surviving nodes retain their 32.5M in channels)
+  - Break-even on lost capital: 32.5M / 975,000 = ~33 months (!)
+  - Break-even on total deployed capital (65M): ~67 months (!!)
 
 Reality: fleet scaling only makes sense when per-node economics are proven.
 Don't scale to 10 before 1 node is sustainably profitable.
+AI cost makes the fleet economics MUCH harder. The path to viability requires:
+  1. Higher per-node revenue (better routing positions, more capital per node)
+  2. Aggressive AI cost optimization (script-first, Haiku, caching)
+  3. Potentially self-hosted models once open-source LLM quality is sufficient
 ```
 
 ### 9.5 Profitability Benchmarks
@@ -623,9 +723,11 @@ Based on current fleet data (Feb 2026):
 | Daily revenue | ~1,500 sats | 1,000+ sats by month 2 |
 | Effective fee rate | 18 ppm | 30+ ppm (new nodes can charge more with good position) |
 | Daily volume routed | ~3.7M sats | 3M+ sats by month 2 |
-| Monthly VPS cost | N/A (owned hardware) | 15,000-30,000 sats |
+| Monthly VPS cost (8GB) | N/A (owned hardware) | 30,000-55,000 sats |
+| Monthly AI API cost | N/A (shared agent) | 22,000-36,000 sats (optimized) |
+| **Monthly total operating cost** | **N/A** | **52,000-91,000 sats** |
 
-**Reality check:** Our current fleet of 2 nodes with 265M sats capacity earns ~2,900 sats/day. A single new node with 2.5M sats capacity will earn proportionally less unless it finds a niche routing position. The cold-start period (months 1-3) will almost certainly be unprofitable. Seed capital must cover this burn period.
+**Reality check:** Our current fleet of 2 nodes with 265M sats capacity earns ~2,900 sats/day (~87,000 sats/month). A single new node with 2.5M sats capacity will earn proportionally less unless it finds a niche routing position. The cold-start period (months 1-3) will almost certainly be unprofitable. Seed capital must cover this burn period. **With AI costs included, the monthly operating bar is ~75,000 sats — meaning the new node needs to earn ~2,500 sats/day just to break even.** This is roughly what our entire existing fleet earns today.
 
 ---
 
@@ -635,7 +737,7 @@ Based on current fleet data (Feb 2026):
 
 Graceful shutdown begins when ANY of these are true:
 - `survival_ratio < 0.5` for 14 consecutive days
-- Wallet balance < 1 month VPS cost with no revenue trend improvement
+- Wallet balance < 1 month operating cost (VPS + AI) with no revenue trend improvement
 - Agent determines no viable path to profitability after exhausting optimization options
 - Human operator issues shutdown command
 
@@ -941,31 +1043,33 @@ Our provisioning flow should integrate LNCURL patterns where they align with the
 
 ### Tier 1 — Minimum Viable (High Risk)
 
-**Total: 6,180,000 sats**
+**Total: 6,550,000 sats**
 
 | Item | Amount | Notes |
 |------|--------|-------|
-| VPS runway (6 months) | 180,000 sats | 30,000/mo × 6 — strict earmark |
+| VPS runway (6 months) | 270,000 sats | 45,000/mo × 6 — strict earmark (8GB plan) |
+| AI API runway (6 months) | 180,000 sats | 30,000/mo × 6 — strict earmark (optimized usage) |
 | Channel opens (5 × 1M sats) | 5,000,000 sats | Minimum competitive size |
 | On-chain fees (5 opens) | 100,000 sats | ~20,000/open budget (covers fee spikes up to ~100 sat/vB × ~200 vB) |
 | On-chain reserve (emergency closes) | 200,000 sats | Force-close fallback |
 | Rebalancing budget | 500,000 sats | Circular rebalancing, Boltz swaps |
-| Emergency fund | 200,000 sats | Unexpected costs |
+| Emergency fund | 300,000 sats | Unexpected costs |
 
 ### Tier 2 — Conservative (Recommended)
 
-**Total: 18,560,000 sats**
+**Total: 19,460,000 sats**
 
 | Item | Amount | Notes |
 |------|--------|-------|
-| VPS runway (12 months) | 360,000 sats | 30,000/mo × 12 — strict earmark |
+| VPS runway (12 months) | 540,000 sats | 45,000/mo × 12 — strict earmark (8GB plan) |
+| AI API runway (12 months) | 360,000 sats | 30,000/mo × 12 — strict earmark (optimized usage) |
 | Channel opens (8 × 2M sats) | 16,000,000 sats | Competitive routing channels |
 | On-chain fees (8 opens) | 200,000 sats | ~25,000/open with margin |
 | On-chain reserve (emergency closes) | 500,000 sats | Force-close fallback |
 | Rebalancing budget | 1,000,000 sats | Active liquidity management |
-| Emergency fund | 500,000 sats | Unexpected costs, fee spikes |
+| Emergency fund | 860,000 sats | Unexpected costs, fee spikes |
 
-**⚠️ VPS budget is a STRICT earmark — not fungible with channel capital.** The agent MUST maintain VPS runway as priority #1. If VPS reserve drops below 2 months (60,000 sats), the agent enters cost-cutting mode: no new channel opens, no rebalancing, focus entirely on revenue from existing channels.
+**⚠️ VPS + AI budgets are STRICT earmarks — not fungible with channel capital.** The agent MUST maintain infrastructure runway as priority #1. If combined VPS + AI reserve drops below 2 months (~150,000 sats), the agent enters cost-cutting mode: no new channel opens, no rebalancing, focus entirely on revenue from existing channels.
 
 ### On-Chain Fee Guidance
 
@@ -982,18 +1086,21 @@ The capital budgets above allocate ~20,000 sats/open as a conservative buffer th
 
 ```
 Month 1-2: 0 revenue (chain bootstrap + cold start + routing table propagation).
-            VPS: 50,000. Rebalancing: 10,000. On-chain fees: 40,000.  Burn: ~100,000 sats.
-Month 3:   300 sats/day.   Revenue: 9,000.  VPS: 25,000.  Net: -16,000.
-Month 4:   800 sats/day.   Revenue: 24,000. VPS: 25,000.  Net: -1,000.
-Month 5:   1,500 sats/day. Revenue: 45,000. VPS: 25,000.  Net: +20,000.
-Month 6+:  2,500+ sats/day if channels grow. Sustainable.
+            VPS: 90,000. AI: 60,000. Rebalancing: 10,000. On-chain: 40,000.  Burn: ~200,000 sats.
+Month 3:   300 sats/day.   Revenue: 9,000.  Operating: 75,000.  Net: -66,000.
+Month 4:   800 sats/day.   Revenue: 24,000. Operating: 75,000.  Net: -51,000.
+Month 5:   1,500 sats/day. Revenue: 45,000. Operating: 75,000.  Net: -30,000.
+Month 6:   2,500 sats/day. Revenue: 75,000. Operating: 75,000.  Net: ~0 (break-even).
+Month 7+:  3,000+ sats/day if channels grow. Sustainable.
 
-Total operating burn before break-even: ~117,000 sats
-  (50k VPS + 10k rebalancing + 40k on-chain + 16k + 1k = 117k)
-Total seed capital needed: 6,180,000+ sats (Tier 1)
+Total operating burn before break-even: ~347,000 sats
+  (200k months 1-2 + 66k + 51k + 30k = 347k)
+Total seed capital needed: 6,550,000+ sats (Tier 1)
 ```
 
-**Note:** VPS costs vary by provider (15,000-30,000 sats/mo per Section 5.3). The growth path uses 25,000/mo (mid-range). Tier 1 capital allocation budgets the higher 30,000/mo figure for safety margin.
+**Note:** Operating cost = VPS (~45,000/mo for 8GB) + AI API (~30,000/mo optimized). VPS costs vary by provider (30,000-55,000 sats/mo per Section 5.4). AI costs assume aggressive optimization (Section 5.5). The growth path uses 75,000/mo combined (mid-range). Tier 1 capital allocation budgets higher figures for safety margin.
+
+**Harsh truth:** Break-even requires ~2,500 sats/day — comparable to our entire existing fleet's output. A single new node reaching this level within 6 months requires either (a) an excellent routing position with high-volume corridors, or (b) significantly more channel capital than Tier 1's 5M sats.
 
 **Key insight:** The first 4 months are an investment period. Seed capital must cover this burn. Nodes that survive the cold-start period and find good routing positions become sustainable. Those that don't, die — and that's the correct outcome.
 
