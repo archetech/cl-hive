@@ -22,7 +22,7 @@ Documents are numbered by dependency order: foundational specs first, implementa
 | 08 | [Hive Client](./08-HIVE-CLIENT.md) | Draft | Client-side architecture — 3 independently installable CLN plugins: `cl-hive-comms` (Nostr + REST transport), `cl-hive-archon` (DID + VC), `cl-hive` (coordination). One plugin → all services. |
 | 09 | [Archon Integration](./09-ARCHON-INTEGRATION.md) | Draft | Optional Archon DID integration for governance messaging. Tiered participation: Basic (routing, no DID) → Governance (voting, proposals, verified identity). |
 | 10 | [Node Provisioning](./10-NODE-PROVISIONING.md) | Draft | Autonomous VPS lifecycle — provision, operate, and decommission self-sustaining Lightning nodes. Paid with Lightning. Revenue ≥ costs or graceful death. Capital allocation: 6.55M–19.46M sats. |
-| 11 | [Implementation Plan (Phase 1–3)](./11-IMPLEMENTATION-PLAN.md) | **Phase 1 Complete** | Phased implementation roadmap. Dependency order: Reputation → Fleet Mgmt → Escrow → Marketplace → Settlements → Liquidity → Client. Python-first with Archon wired in later. Phase 1 (DID Credential Foundation) implemented. |
+| 11 | [Implementation Plan (Phase 1–3)](./11-IMPLEMENTATION-PLAN.md) | **Phase 2 Complete** | Phased implementation roadmap. Dependency order: Reputation → Fleet Mgmt → Escrow → Marketplace → Settlements → Liquidity → Client. Python-first with Archon wired in later. Phase 1 (DID Credential Foundation) and Phase 2 (Management Schemas + Danger Scoring) implemented. |
 | 12 | [Implementation Plan (Phase 4–6)](./12-IMPLEMENTATION-PLAN-PHASE4-6.md) | Draft | Later implementation phases. |
 
 ---
