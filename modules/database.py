@@ -1677,6 +1677,10 @@ class HiveDatabase:
     # P5-03: Absolute cap on contribution ledger rows to prevent unbounded DB growth
     MAX_CONTRIBUTION_ROWS = 500000
 
+    # Absolute caps on protocol tables to prevent unbounded DB growth
+    MAX_PROTO_EVENT_ROWS = 500000
+    MAX_PROTO_OUTBOX_ROWS = 100000
+
     def record_contribution(self, peer_id: str, direction: str,
                             amount_sats: int) -> bool:
         """
@@ -1881,15 +1885,22 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
         try:
-            # Clear stale approvals from any previous proposal for this target
-            conn.execute("""
-                DELETE FROM admin_promotion_approvals WHERE target_peer_id = ?
-            """, (target_peer_id,))
-            conn.execute("""
-                INSERT OR REPLACE INTO admin_promotions
-                (target_peer_id, proposed_by, proposed_at, status)
-                VALUES (?, ?, ?, 'pending')
-            """, (target_peer_id, proposed_by, now))
+            # P5-03: Wrap multi-write in transaction for atomicity
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Clear stale approvals from any previous proposal for this target
+                conn.execute("""
+                    DELETE FROM admin_promotion_approvals WHERE target_peer_id = ?
+                """, (target_peer_id,))
+                conn.execute("""
+                    INSERT OR REPLACE INTO admin_promotions
+                    (target_peer_id, proposed_by, proposed_at, status)
+                    VALUES (?, ?, ?, 'pending')
+                """, (target_peer_id, proposed_by, now))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
             return True
         except Exception:
             return False
@@ -5305,6 +5316,7 @@ class HiveDatabase:
             SELECT * FROM flow_samples
             WHERE channel_id = ? AND timestamp > ?
             ORDER BY timestamp DESC
+            LIMIT 10000
         """, (channel_id, cutoff)).fetchall()
 
         return [dict(row) for row in rows]
@@ -5440,12 +5452,14 @@ class HiveDatabase:
                 SELECT * FROM temporal_patterns
                 WHERE channel_id = ? AND confidence >= ?
                 ORDER BY confidence DESC
+                LIMIT 5000
             """, (channel_id, min_confidence)).fetchall()
         else:
             rows = conn.execute("""
                 SELECT * FROM temporal_patterns
                 WHERE confidence >= ?
                 ORDER BY confidence DESC
+                LIMIT 5000
             """, (min_confidence,)).fetchall()
 
         return [dict(row) for row in rows]
@@ -6545,6 +6559,7 @@ class HiveDatabase:
         Record a protocol event for idempotency.
 
         Uses INSERT OR IGNORE so duplicate event_ids are silently skipped.
+        Rejects inserts if proto_events exceeds MAX_PROTO_EVENT_ROWS.
 
         Args:
             event_id: SHA256-based unique event identifier
@@ -6552,11 +6567,19 @@ class HiveDatabase:
             actor_id: Peer that originated the event
 
         Returns:
-            True if this is a new event (inserted), False if duplicate.
+            True if this is a new event (inserted), False if duplicate or at cap.
         """
         conn = self._get_connection()
         now = int(time.time())
         try:
+            # Check row cap before inserting
+            row = conn.execute("SELECT COUNT(*) AS cnt FROM proto_events").fetchone()
+            if row and row['cnt'] >= self.MAX_PROTO_EVENT_ROWS:
+                self.plugin.log(
+                    f"HiveDatabase: proto_events at cap ({self.MAX_PROTO_EVENT_ROWS}), rejecting insert",
+                    level='warn'
+                )
+                return False
             result = conn.execute(
                 """INSERT OR IGNORE INTO proto_events
                    (event_id, event_type, actor_id, created_at, received_at)
@@ -6605,7 +6628,8 @@ class HiveDatabase:
         Enqueue a message for reliable delivery to a specific peer.
 
         Uses INSERT OR IGNORE for idempotent enqueue (same msg_id+peer_id
-        is silently ignored).
+        is silently ignored). Rejects inserts if proto_outbox exceeds
+        MAX_PROTO_OUTBOX_ROWS.
 
         Args:
             msg_id: Unique message identifier
@@ -6615,11 +6639,19 @@ class HiveDatabase:
             expires_at: Unix timestamp when message expires
 
         Returns:
-            True if inserted, False if duplicate or error.
+            True if inserted, False if duplicate, at cap, or error.
         """
         conn = self._get_connection()
         now = int(time.time())
         try:
+            # Check row cap before inserting
+            row = conn.execute("SELECT COUNT(*) AS cnt FROM proto_outbox").fetchone()
+            if row and row['cnt'] >= self.MAX_PROTO_OUTBOX_ROWS:
+                self.plugin.log(
+                    f"HiveDatabase: proto_outbox at cap ({self.MAX_PROTO_OUTBOX_ROWS}), rejecting enqueue",
+                    level='warn'
+                )
+                return False
             result = conn.execute(
                 """INSERT OR IGNORE INTO proto_outbox
                    (msg_id, peer_id, msg_type, payload_json, status,
@@ -6892,7 +6924,7 @@ class HiveDatabase:
     def load_pheromone_levels(self) -> List[Dict[str, Any]]:
         """Load all persisted pheromone levels."""
         conn = self._get_connection()
-        rows = conn.execute("SELECT * FROM pheromone_levels").fetchall()
+        rows = conn.execute("SELECT * FROM pheromone_levels LIMIT 5000").fetchall()
         return [dict(r) for r in rows]
 
     def save_stigmergic_markers(self, markers: List[Dict[str, Any]]) -> int:
@@ -6925,7 +6957,7 @@ class HiveDatabase:
     def load_stigmergic_markers(self) -> List[Dict[str, Any]]:
         """Load all persisted stigmergic markers."""
         conn = self._get_connection()
-        rows = conn.execute("SELECT * FROM stigmergic_markers").fetchall()
+        rows = conn.execute("SELECT * FROM stigmergic_markers LIMIT 10000").fetchall()
         return [dict(r) for r in rows]
 
     def get_pheromone_count(self) -> int:
@@ -7031,7 +7063,7 @@ class HiveDatabase:
     def load_remote_pheromones(self) -> List[Dict[str, Any]]:
         """Load all persisted remote pheromones."""
         conn = self._get_connection()
-        rows = conn.execute("SELECT * FROM remote_pheromones").fetchall()
+        rows = conn.execute("SELECT * FROM remote_pheromones LIMIT 10000").fetchall()
         return [dict(r) for r in rows]
 
     def save_fee_observations(self, observations: List[Dict[str, Any]]) -> int:
@@ -7057,5 +7089,5 @@ class HiveDatabase:
     def load_fee_observations(self) -> List[Dict[str, Any]]:
         """Load all persisted fee observations."""
         conn = self._get_connection()
-        rows = conn.execute("SELECT * FROM fee_observations").fetchall()
+        rows = conn.execute("SELECT * FROM fee_observations LIMIT 10000").fetchall()
         return [dict(r) for r in rows]

@@ -40,6 +40,7 @@ import threading
 import time
 import secrets
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional, Any, List
 
 from pyln.client import Plugin, RpcError
@@ -271,6 +272,7 @@ class RpcPool:
         self._dispatcher_stop = threading.Event()
 
         self._lifecycle_lock = threading.Lock()
+        self._last_restart_time = 0.0
 
         self.start()
 
@@ -339,7 +341,7 @@ class RpcPool:
         while not self._dispatcher_stop.is_set():
             try:
                 resp = self._resp_q.get(timeout=1.0)
-            except (queue.Empty, OSError):
+            except (queue.Empty, OSError, AttributeError, TypeError):
                 resp = None
 
             if resp is not None:
@@ -357,7 +359,11 @@ class RpcPool:
                 self._check_worker_health()
 
     def _check_worker_health(self):
-        with self._lifecycle_lock:
+        # Non-blocking acquire: avoids deadlock when stop() holds this lock
+        # while joining the dispatcher thread (which calls this method).
+        if not self._lifecycle_lock.acquire(blocking=False):
+            return
+        try:
             if not self._req_q or self._dispatcher_stop.is_set():
                 return
             for i, w in enumerate(self._workers):
@@ -374,6 +380,8 @@ class RpcPool:
                     new_w.start()
                     self._workers[i] = new_w
                     self._log(f"RPC pool: respawned dead worker {i}", "warn")
+        finally:
+            self._lifecycle_lock.release()
 
     def start(self):
         with self._lifecycle_lock:
@@ -422,6 +430,12 @@ class RpcPool:
                 self._pending.clear()
 
     def restart(self, reason: str):
+        # Thundering herd prevention: skip if restarted within last 5 seconds
+        now = time.time()
+        if now - self._last_restart_time < 5.0:
+            self._log(f"RPC pool restart skipped (cooldown): {reason}", "info")
+            return
+        self._last_restart_time = now
         self._log(f"RPC pool restart ({self._pool_size} workers): {reason}", "warn")
         self.stop()
         self.start()
@@ -443,27 +457,24 @@ class RpcPool:
         }
 
         try:
-            if self._req_q is None:
-                self.restart("pool not running")
-            self._req_q.put(req)
-        except (OSError, ValueError, AttributeError):
+            try:
+                if self._req_q is None:
+                    self.restart("pool not running")
+                self._req_q.put(req)
+            except (OSError, ValueError, AttributeError):
+                self.restart(f"queue error on {method}")
+                raise TimeoutError(f"RPC pool queue error on {method}")
+
+            if not slot["event"].wait(timeout=timeout):
+                self.restart(f"timeout ({timeout}s) on {method}")
+                raise TimeoutError(f"RPC pool timeout on {method}")
+
+            resp = slot["resp"]
+            if resp is None:
+                raise TimeoutError(f"RPC pool shutdown during {method}")
+        finally:
             with self._pending_lock:
                 self._pending.pop(req_id, None)
-            self.restart(f"queue error on {method}")
-            raise TimeoutError(f"RPC pool queue error on {method}")
-
-        if not slot["event"].wait(timeout=timeout):
-            with self._pending_lock:
-                self._pending.pop(req_id, None)
-            self.restart(f"timeout ({timeout}s) on {method}")
-            raise TimeoutError(f"RPC pool timeout on {method}")
-
-        with self._pending_lock:
-            self._pending.pop(req_id, None)
-
-        resp = slot["resp"]
-        if resp is None:
-            raise TimeoutError(f"RPC pool shutdown during {method}")
 
         if resp.get("ok"):
             return resp.get("result")
@@ -514,6 +525,9 @@ class RpcPoolProxy:
 
 # Global RPC pool instance (initialized in init)
 _rpc_pool: Optional[RpcPool] = None
+
+# Bounded thread pool for message dispatch (prevents unbounded thread creation)
+_msg_executor: Optional[ThreadPoolExecutor] = None
 
 
 # =============================================================================
@@ -1295,7 +1309,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Reason: spawn-context workers take several seconds to start, but init
     # needs immediate RPC calls (getinfo, listpeerchannels, setchannel).
     # By the end of init, workers are ready for background thread use.
-    global _rpc_pool
+    global _rpc_pool, _msg_executor
+    _msg_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="hive_msg")
     _rpc_socket_path = getattr(plugin.rpc, "socket_path", None)
     if not _rpc_socket_path:
         ldir = configuration.get("lightning-dir") or configuration.get("lightning_dir")
@@ -2006,11 +2021,15 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
     # Handlers make RPC calls (checkmessage, sendcustommsg, etc.) that may be slow.
     # Running them on the I/O thread blocks CLN's event loop. pyln-client is
     # thread-safe (opens new socket per call), so concurrent RPC is safe.
-    threading.Thread(
-        target=_dispatch_hive_message,
-        args=(peer_id, msg_type, msg_payload, plugin),
-        daemon=True,
-    ).start()
+    # Uses bounded ThreadPoolExecutor to prevent unbounded thread creation under load.
+    if _msg_executor is not None:
+        _msg_executor.submit(_dispatch_hive_message, peer_id, msg_type, msg_payload, plugin)
+    else:
+        threading.Thread(
+            target=_dispatch_hive_message,
+            args=(peer_id, msg_type, msg_payload, plugin),
+            daemon=True,
+        ).start()
     return {"result": "continue"}
 
 
@@ -3444,6 +3463,7 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
 # Cached channel_scid -> peer_id mapping for _record_forward_as_route_probe
 _channel_peer_cache: Dict[str, str] = {}
 _channel_peer_cache_time: float = 0
+_channel_peer_cache_lock = threading.Lock()
 _CHANNEL_PEER_CACHE_TTL = 300  # Refresh every 5 minutes
 
 
@@ -3470,17 +3490,18 @@ def _record_forward_as_route_probe(forward_event: Dict):
 
         # Use cached channel -> peer_id mapping (refreshed every 5 min)
         now = time.time()
-        if not _channel_peer_cache or now - _channel_peer_cache_time > _CHANNEL_PEER_CACHE_TTL:
-            funds = plugin.rpc.listfunds()
-            _channel_peer_cache = {
-                ch.get("short_channel_id"): ch.get("peer_id", "")
-                for ch in funds.get("channels", [])
-                if ch.get("short_channel_id")
-            }
-            _channel_peer_cache_time = now
+        with _channel_peer_cache_lock:
+            if not _channel_peer_cache or now - _channel_peer_cache_time > _CHANNEL_PEER_CACHE_TTL:
+                funds = plugin.rpc.listfunds()
+                _channel_peer_cache = {
+                    ch.get("short_channel_id"): ch.get("peer_id", "")
+                    for ch in funds.get("channels", [])
+                    if ch.get("short_channel_id")
+                }
+                _channel_peer_cache_time = now
 
-        in_peer = _channel_peer_cache.get(in_channel, "")
-        out_peer = _channel_peer_cache.get(out_channel, "")
+            in_peer = _channel_peer_cache.get(in_channel, "")
+            out_peer = _channel_peer_cache.get(out_channel, "")
 
         if not in_peer or not out_peer:
             return
@@ -6049,12 +6070,7 @@ def handle_fee_intelligence_snapshot(peer_id: str, payload: Dict, plugin: Plugin
     if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "FEE_INTELLIGENCE_SNAPSHOT"):
         return {"result": "continue"}
 
-    # RELAY: Forward to other members
-    relay_count = _relay_message(HiveMessageType.FEE_INTELLIGENCE_SNAPSHOT, payload, peer_id)
-    if relay_count > 0:
-        plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT relayed to {relay_count} members", level='debug')
-
-    # Delegate to fee intelligence manager
+    # Delegate to fee intelligence manager (validate data BEFORE relaying)
     result = fee_intel_mgr.handle_fee_intelligence_snapshot(reporter_id, payload, plugin.rpc)
 
     if result.get("success"):
@@ -6064,6 +6080,10 @@ def handle_fee_intelligence_snapshot(peer_id: str, payload: Dict, plugin: Plugin
             f"with {result.get('peers_stored', 0)} peers",
             level='debug'
         )
+        # RELAY: Forward only after successful validation/processing
+        relay_count = _relay_message(HiveMessageType.FEE_INTELLIGENCE_SNAPSHOT, payload, peer_id)
+        if relay_count > 0:
+            plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT relayed to {relay_count} members", level='debug')
     elif result.get("error"):
         plugin.log(
             f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT rejected from {reporter_id[:16]}...: {result.get('error')}",
@@ -6512,6 +6532,10 @@ def handle_stigmergic_marker_batch(peer_id: str, payload: Dict, plugin: Plugin) 
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "STIGMERGIC_MARKER_BATCH"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member and not banned (supports relay)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
@@ -6608,6 +6632,10 @@ def handle_pheromone_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "PHEROMONE_BATCH"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member and not banned (supports relay)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
@@ -6699,6 +6727,10 @@ def handle_yield_metrics_batch(peer_id: str, payload: Dict, plugin: Plugin) -> D
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "YIELD_METRICS_BATCH"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member and not banned (supports relay)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
@@ -6785,6 +6817,10 @@ def handle_circular_flow_alert(peer_id: str, payload: Dict, plugin: Plugin) -> D
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "CIRCULAR_FLOW_ALERT"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member and not banned (supports relay)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
@@ -6864,6 +6900,10 @@ def handle_temporal_pattern_batch(peer_id: str, payload: Dict, plugin: Plugin) -
 
     # Deduplication check
     if not _should_process_message(payload):
+        return {"result": "continue"}
+
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "TEMPORAL_PATTERN_BATCH"):
         return {"result": "continue"}
 
     # Verify sender is a hive member and not banned (supports relay)
@@ -6957,6 +6997,10 @@ def handle_corridor_value_batch(peer_id: str, payload: Dict, plugin: Plugin) -> 
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "CORRIDOR_VALUE_BATCH"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member and not banned (supports relay)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
@@ -7042,6 +7086,10 @@ def handle_positioning_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> 
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "POSITIONING_PROPOSAL"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member and not banned (supports relay)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
@@ -7119,6 +7167,10 @@ def handle_physarum_recommendation(peer_id: str, payload: Dict, plugin: Plugin) 
 
     # Deduplication check
     if not _should_process_message(payload):
+        return {"result": "continue"}
+
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "PHYSARUM_RECOMMENDATION"):
         return {"result": "continue"}
 
     # Verify sender is a hive member and not banned (supports relay)
@@ -7201,6 +7253,10 @@ def handle_coverage_analysis_batch(peer_id: str, payload: Dict, plugin: Plugin) 
     if not _should_process_message(payload):
         return {"result": "continue"}
 
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "COVERAGE_ANALYSIS_BATCH"):
+        return {"result": "continue"}
+
     # Verify sender is a hive member and not banned (supports relay)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
@@ -7281,6 +7337,10 @@ def handle_close_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     for redundancy elimination and capital efficiency.
     """
     if not rationalization_mgr or not database:
+        return {"result": "continue"}
+
+    # SECURITY: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "CLOSE_PROPOSAL"):
         return {"result": "continue"}
 
     # Verify sender is a hive member and not banned
@@ -8056,8 +8116,14 @@ def handle_splice_init_request(peer_id: str, payload: Dict, plugin: Plugin) -> D
         plugin.log(f"cl-hive: SPLICE_INIT_REQUEST from non-member {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # SECURITY: Verify signature
+    # SECURITY: Identity binding — splice messages are NOT relayed,
+    # so initiator_id must match the transport-layer peer_id
     initiator_id = payload.get("initiator_id", peer_id)
+    if initiator_id != peer_id:
+        plugin.log(f"cl-hive: SPLICE_INIT_REQUEST identity mismatch: initiator {initiator_id[:16]}... != peer {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
     signature = payload.get("signature")
     if not signature:
         plugin.log(f"cl-hive: SPLICE_INIT_REQUEST missing signature from {peer_id[:16]}...", level='warn')
@@ -8120,8 +8186,14 @@ def handle_splice_init_response(peer_id: str, payload: Dict, plugin: Plugin) -> 
         plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE from non-member/banned {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # SECURITY: Verify signature
+    # SECURITY: Identity binding — splice messages are NOT relayed,
+    # so responder_id must match the transport-layer peer_id
     responder_id = payload.get("responder_id", peer_id)
+    if responder_id != peer_id:
+        plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE identity mismatch: responder {responder_id[:16]}... != peer {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
     signature = payload.get("signature")
     if not signature:
         plugin.log(f"cl-hive: SPLICE_INIT_RESPONSE missing signature from {peer_id[:16]}...", level='warn')

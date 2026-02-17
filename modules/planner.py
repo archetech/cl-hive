@@ -2267,8 +2267,10 @@ class Planner:
             else:
                 # Fallback: Manual governance handling (backwards compatibility)
                 if getattr(cfg, 'governance_mode', 'advisor') == 'failsafe':
+                    self._log("WARNING: Failsafe fallback broadcast (no decision_engine) — intent only, no fund action")
                     self._broadcast_intent(intent)
                     decisions[-1]['broadcast'] = True
+                    decisions[-1]['governance_result'] = 'failsafe_fallback'
                 else:
                     # In advisor mode, queue to pending_actions for AI/human approval
                     action_id = self.db.add_pending_action(

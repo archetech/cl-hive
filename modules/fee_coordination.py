@@ -640,6 +640,9 @@ class AdaptiveFeeController:
     Deposit = reinforcement from success
     """
 
+    # Max entries in pheromone dicts (prevents unbounded growth from closed channels)
+    MAX_PHEROMONE_ENTRIES = 1000
+
     def __init__(self, plugin: Any = None):
         self.plugin = plugin
         self.our_pubkey: Optional[str] = None
@@ -729,6 +732,16 @@ class AdaptiveFeeController:
         with self._lock:
             self._velocity_cache[channel_id] = velocity_pct_per_hour
             self._velocity_cache_time[channel_id] = time.time()
+            # Evict stale velocity entries beyond cap
+            if len(self._velocity_cache) > self.MAX_PHEROMONE_ENTRIES:
+                oldest = min(
+                    (k for k in self._velocity_cache_time if k != channel_id),
+                    key=lambda k: self._velocity_cache_time[k],
+                    default=None
+                )
+                if oldest:
+                    self._velocity_cache.pop(oldest, None)
+                    self._velocity_cache_time.pop(oldest, None)
 
     def record_fee_observation(self, fee_ppm: int) -> None:
         """Record a network fee observation for volatility calculation."""
@@ -795,6 +808,21 @@ class AdaptiveFeeController:
                     f"total now {self._pheromone[channel_id]:.2f}",
                     level="debug"
                 )
+
+            # Evict oldest entries if dicts exceed cap
+            if len(self._pheromone) > self.MAX_PHEROMONE_ENTRIES:
+                oldest = min(
+                    (k for k in self._pheromone_last_update if k != channel_id),
+                    key=lambda k: self._pheromone_last_update[k],
+                    default=None
+                )
+                if oldest:
+                    self._pheromone.pop(oldest, None)
+                    self._pheromone_fee.pop(oldest, None)
+                    self._pheromone_last_update.pop(oldest, None)
+                    self._velocity_cache.pop(oldest, None)
+                    self._velocity_cache_time.pop(oldest, None)
+                    self._channel_peer_map.pop(oldest, None)
 
     def suggest_fee(
         self,
