@@ -291,16 +291,17 @@ class RpcPool:
 
             req_id = req.get("id")
             method = req.get("method")
-            args = req.get("args") or []
             kwargs = req.get("kwargs") or {}
             payload = req.get("payload")
-            kind = req.get("kind", "attr")
 
             try:
-                if kind == "call":
-                    result = rpc.call(method, {} if payload is None else payload)
+                # Always use rpc.call() to bypass explicit LightningRpc method
+                # signatures (e.g. listnodes(node_id=) vs id=). The call()
+                # method sends kwargs directly as the JSON-RPC payload dict.
+                if payload is not None:
+                    result = rpc.call(method, payload)
                 else:
-                    result = getattr(rpc, method)(*args, **kwargs)
+                    result = rpc.call(method, kwargs if kwargs else {})
                 resp_q.put({"id": req_id, "ok": True, "result": result})
             except _RpcError as e:
                 resp_q.put({
@@ -412,8 +413,8 @@ class RpcPool:
         self.stop()
         self.start()
 
-    def request(self, *, kind: str = "attr", method: str,
-                payload: Any = None, args: list = None, kwargs: dict = None,
+    def request(self, *, method: str,
+                payload: Any = None, kwargs: dict = None,
                 timeout: int = 30):
         """Send an RPC request through the pool. Blocks only this caller."""
         req_id = uuid.uuid4().hex
@@ -423,8 +424,8 @@ class RpcPool:
             self._pending[req_id] = slot
 
         req = {
-            "id": req_id, "kind": kind, "method": method,
-            "payload": payload, "args": args or [], "kwargs": kwargs or {},
+            "id": req_id, "method": method,
+            "payload": payload, "kwargs": kwargs or {},
         }
 
         try:
@@ -478,17 +479,16 @@ class RpcPoolProxy:
         self._timeout = timeout
 
     def call(self, method: str, payload: Any = None) -> Any:
-        return self._pool.request(kind="call", method=method,
-                                  payload=payload, timeout=self._timeout)
+        return self._pool.request(method=method, payload=payload,
+                                  timeout=self._timeout)
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
 
-        def _method_proxy(*args, **kwargs):
+        def _method_proxy(**kwargs):
             return self._pool.request(
-                kind="attr", method=name,
-                args=list(args), kwargs=kwargs,
+                method=name, kwargs=kwargs,
                 timeout=self._timeout,
             )
 
