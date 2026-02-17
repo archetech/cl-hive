@@ -1396,6 +1396,127 @@ class HiveDatabase:
             ON management_receipts(credential_id)
         """)
 
+        # Phase 4A: Cashu escrow tickets
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS escrow_tickets (
+                ticket_id TEXT PRIMARY KEY,
+                ticket_type TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                operator_id TEXT NOT NULL,
+                mint_url TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                token_json TEXT NOT NULL,
+                htlc_hash TEXT NOT NULL,
+                timelock INTEGER NOT NULL,
+                danger_score INTEGER NOT NULL,
+                schema_id TEXT,
+                action TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at INTEGER NOT NULL,
+                redeemed_at INTEGER,
+                refunded_at INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_escrow_agent
+            ON escrow_tickets(agent_id, status)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_escrow_status
+            ON escrow_tickets(status, timelock)
+        """)
+
+        # Phase 4A: Cashu escrow secrets (HTLC preimages)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS escrow_secrets (
+                task_id TEXT PRIMARY KEY,
+                ticket_id TEXT NOT NULL,
+                secret_hex TEXT NOT NULL,
+                hash_hex TEXT NOT NULL,
+                revealed_at INTEGER,
+                FOREIGN KEY (ticket_id) REFERENCES escrow_tickets(ticket_id)
+            )
+        """)
+
+        # Phase 4A: Cashu escrow receipts (task execution proof)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS escrow_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                ticket_id TEXT NOT NULL,
+                schema_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                result_json TEXT,
+                success INTEGER NOT NULL,
+                preimage_revealed INTEGER NOT NULL DEFAULT 0,
+                agent_signature TEXT,
+                node_signature TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES escrow_tickets(ticket_id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_escrow_receipt_ticket
+            ON escrow_receipts(ticket_id)
+        """)
+
+        # Phase 4B: Settlement bonds
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settlement_bonds (
+                bond_id TEXT PRIMARY KEY,
+                peer_id TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                token_json TEXT,
+                posted_at INTEGER NOT NULL,
+                timelock INTEGER NOT NULL,
+                tier TEXT NOT NULL DEFAULT 'observer',
+                slashed_amount INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                UNIQUE(peer_id)
+            )
+        """)
+
+        # Phase 4B: Settlement obligations
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settlement_obligations (
+                obligation_id TEXT PRIMARY KEY,
+                settlement_type TEXT NOT NULL,
+                from_peer TEXT NOT NULL,
+                to_peer TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                window_id TEXT NOT NULL,
+                receipt_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_obligation_window
+            ON settlement_obligations(window_id, status)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_obligation_peers
+            ON settlement_obligations(from_peer, to_peer)
+        """)
+
+        # Phase 4B: Settlement disputes
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settlement_disputes (
+                dispute_id TEXT PRIMARY KEY,
+                obligation_id TEXT NOT NULL,
+                filing_peer TEXT NOT NULL,
+                respondent_peer TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                panel_members_json TEXT,
+                votes_json TEXT,
+                outcome TEXT,
+                slash_amount INTEGER DEFAULT 0,
+                filed_at INTEGER NOT NULL,
+                resolved_at INTEGER,
+                FOREIGN KEY (obligation_id) REFERENCES settlement_obligations(obligation_id)
+            )
+        """)
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -1787,6 +1908,16 @@ class HiveDatabase:
     # Absolute caps on management credential/receipt rows
     MAX_MANAGEMENT_CREDENTIAL_ROWS = 1000
     MAX_MANAGEMENT_RECEIPT_ROWS = 100000
+
+    # Phase 4A: Cashu escrow row caps
+    MAX_ESCROW_TICKET_ROWS = 50000
+    MAX_ESCROW_SECRET_ROWS = 50000
+    MAX_ESCROW_RECEIPT_ROWS = 100000
+
+    # Phase 4B: Settlement extension row caps
+    MAX_SETTLEMENT_BOND_ROWS = 1000
+    MAX_SETTLEMENT_OBLIGATION_ROWS = 100000
+    MAX_SETTLEMENT_DISPUTE_ROWS = 10000
 
     def record_contribution(self, peer_id: str, direction: str,
                             amount_sats: int) -> bool:
@@ -7512,3 +7643,495 @@ class HiveDatabase:
             (credential_id, limit)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # =========================================================================
+    # PHASE 4A: CASHU ESCROW OPERATIONS
+    # =========================================================================
+
+    def store_escrow_ticket(self, ticket_id: str, ticket_type: str,
+                            agent_id: str, operator_id: str,
+                            mint_url: str, amount_sats: int,
+                            token_json: str, htlc_hash: str,
+                            timelock: int, danger_score: int,
+                            schema_id: Optional[str], action: Optional[str],
+                            status: str, created_at: int) -> bool:
+        """Store an escrow ticket. Returns True on success."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM escrow_tickets"
+            ).fetchone()
+            if row and row['cnt'] >= self.MAX_ESCROW_TICKET_ROWS:
+                self.plugin.log(
+                    f"HiveDatabase: escrow_tickets at cap ({self.MAX_ESCROW_TICKET_ROWS})",
+                    level='warn'
+                )
+                return False
+            conn.execute("""
+                INSERT OR IGNORE INTO escrow_tickets (
+                    ticket_id, ticket_type, agent_id, operator_id,
+                    mint_url, amount_sats, token_json, htlc_hash,
+                    timelock, danger_score, schema_id, action,
+                    status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (ticket_id, ticket_type, agent_id, operator_id,
+                  mint_url, amount_sats, token_json, htlc_hash,
+                  timelock, danger_score, schema_id, action,
+                  status, created_at))
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: store_escrow_ticket error: {e}", level='error'
+            )
+            return False
+
+    def get_escrow_ticket(self, ticket_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single escrow ticket by ID."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM escrow_tickets WHERE ticket_id = ?",
+            (ticket_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_escrow_tickets(self, agent_id: Optional[str] = None,
+                            status: Optional[str] = None,
+                            limit: int = 100) -> List[Dict[str, Any]]:
+        """List escrow tickets with optional filters."""
+        conn = self._get_connection()
+        query = "SELECT * FROM escrow_tickets WHERE 1=1"
+        params: list = []
+        if agent_id:
+            query += " AND agent_id = ?"
+            params.append(agent_id)
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_escrow_ticket_status(self, ticket_id: str, status: str,
+                                     timestamp: int) -> bool:
+        """Update escrow ticket status with timestamp."""
+        conn = self._get_connection()
+        try:
+            if status == 'redeemed':
+                conn.execute(
+                    "UPDATE escrow_tickets SET status = ?, redeemed_at = ? WHERE ticket_id = ?",
+                    (status, timestamp, ticket_id)
+                )
+            elif status == 'refunded':
+                conn.execute(
+                    "UPDATE escrow_tickets SET status = ?, refunded_at = ? WHERE ticket_id = ?",
+                    (status, timestamp, ticket_id)
+                )
+            else:
+                conn.execute(
+                    "UPDATE escrow_tickets SET status = ? WHERE ticket_id = ?",
+                    (status, ticket_id)
+                )
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: update_escrow_ticket_status error: {e}", level='error'
+            )
+            return False
+
+    def count_escrow_tickets(self) -> int:
+        """Count total escrow tickets."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM escrow_tickets"
+        ).fetchone()
+        return row['cnt'] if row else 0
+
+    def store_escrow_secret(self, task_id: str, ticket_id: str,
+                            secret_hex: str, hash_hex: str) -> bool:
+        """Store an escrow HTLC secret. Returns True on success."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM escrow_secrets"
+            ).fetchone()
+            if row and row['cnt'] >= self.MAX_ESCROW_SECRET_ROWS:
+                self.plugin.log(
+                    f"HiveDatabase: escrow_secrets at cap ({self.MAX_ESCROW_SECRET_ROWS})",
+                    level='warn'
+                )
+                return False
+            conn.execute("""
+                INSERT OR IGNORE INTO escrow_secrets (
+                    task_id, ticket_id, secret_hex, hash_hex
+                ) VALUES (?, ?, ?, ?)
+            """, (task_id, ticket_id, secret_hex, hash_hex))
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: store_escrow_secret error: {e}", level='error'
+            )
+            return False
+
+    def get_escrow_secret(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Get an escrow secret by task ID."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM escrow_secrets WHERE task_id = ?",
+            (task_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_escrow_secret_by_ticket(self, ticket_id: str) -> Optional[Dict[str, Any]]:
+        """Get an escrow secret by ticket ID."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM escrow_secrets WHERE ticket_id = ?",
+            (ticket_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def reveal_escrow_secret(self, task_id: str, timestamp: int) -> bool:
+        """Mark an escrow secret as revealed."""
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "UPDATE escrow_secrets SET revealed_at = ? WHERE task_id = ?",
+                (timestamp, task_id)
+            )
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: reveal_escrow_secret error: {e}", level='error'
+            )
+            return False
+
+    def count_escrow_secrets(self) -> int:
+        """Count total escrow secrets."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM escrow_secrets"
+        ).fetchone()
+        return row['cnt'] if row else 0
+
+    def prune_escrow_secrets(self, before_ts: int) -> int:
+        """Delete revealed secrets older than threshold. Returns count deleted."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM escrow_secrets WHERE revealed_at IS NOT NULL AND revealed_at < ?",
+                (before_ts,)
+            )
+            return cursor.rowcount
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: prune_escrow_secrets error: {e}", level='error'
+            )
+            return 0
+
+    def store_escrow_receipt(self, receipt_id: str, ticket_id: str,
+                             schema_id: str, action: str,
+                             params_json: str, result_json: Optional[str],
+                             success: int, preimage_revealed: int,
+                             node_signature: str, created_at: int,
+                             agent_signature: Optional[str] = None) -> bool:
+        """Store an escrow receipt. Returns True on success."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM escrow_receipts"
+            ).fetchone()
+            if row and row['cnt'] >= self.MAX_ESCROW_RECEIPT_ROWS:
+                self.plugin.log(
+                    f"HiveDatabase: escrow_receipts at cap ({self.MAX_ESCROW_RECEIPT_ROWS})",
+                    level='warn'
+                )
+                return False
+            conn.execute("""
+                INSERT OR IGNORE INTO escrow_receipts (
+                    receipt_id, ticket_id, schema_id, action,
+                    params_json, result_json, success,
+                    preimage_revealed, agent_signature,
+                    node_signature, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (receipt_id, ticket_id, schema_id, action,
+                  params_json, result_json, success,
+                  preimage_revealed, agent_signature,
+                  node_signature, created_at))
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: store_escrow_receipt error: {e}", level='error'
+            )
+            return False
+
+    def get_escrow_receipts(self, ticket_id: str,
+                            limit: int = 100) -> List[Dict[str, Any]]:
+        """Get escrow receipts for a ticket."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT * FROM escrow_receipts WHERE ticket_id = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (ticket_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_escrow_receipts(self) -> int:
+        """Count total escrow receipts."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM escrow_receipts"
+        ).fetchone()
+        return row['cnt'] if row else 0
+
+    # =========================================================================
+    # PHASE 4B: SETTLEMENT BONDS
+    # =========================================================================
+
+    def store_bond(self, bond_id: str, peer_id: str, amount_sats: int,
+                   token_json: Optional[str], posted_at: int,
+                   timelock: int, tier: str) -> bool:
+        """Store a settlement bond. Returns True on success."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM settlement_bonds"
+            ).fetchone()
+            if row and row['cnt'] >= self.MAX_SETTLEMENT_BOND_ROWS:
+                self.plugin.log(
+                    f"HiveDatabase: settlement_bonds at cap ({self.MAX_SETTLEMENT_BOND_ROWS})",
+                    level='warn'
+                )
+                return False
+            conn.execute("""
+                INSERT OR REPLACE INTO settlement_bonds (
+                    bond_id, peer_id, amount_sats, token_json,
+                    posted_at, timelock, tier, slashed_amount, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'active')
+            """, (bond_id, peer_id, amount_sats, token_json,
+                  posted_at, timelock, tier))
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: store_bond error: {e}", level='error'
+            )
+            return False
+
+    def get_bond(self, bond_id: str) -> Optional[Dict[str, Any]]:
+        """Get a bond by ID."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM settlement_bonds WHERE bond_id = ?",
+            (bond_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_bond_for_peer(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """Get the active bond for a peer."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM settlement_bonds WHERE peer_id = ? AND status = 'active'",
+            (peer_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_bond_status(self, bond_id: str, status: str) -> bool:
+        """Update bond status."""
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "UPDATE settlement_bonds SET status = ? WHERE bond_id = ?",
+                (status, bond_id)
+            )
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: update_bond_status error: {e}", level='error'
+            )
+            return False
+
+    def slash_bond(self, bond_id: str, slash_amount: int) -> bool:
+        """Record a bond slash amount."""
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "UPDATE settlement_bonds SET slashed_amount = slashed_amount + ?, "
+                "status = 'slashed' WHERE bond_id = ?",
+                (slash_amount, bond_id)
+            )
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: slash_bond error: {e}", level='error'
+            )
+            return False
+
+    def count_bonds(self) -> int:
+        """Count total bonds."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM settlement_bonds"
+        ).fetchone()
+        return row['cnt'] if row else 0
+
+    # =========================================================================
+    # PHASE 4B: SETTLEMENT OBLIGATIONS
+    # =========================================================================
+
+    def store_obligation(self, obligation_id: str, settlement_type: str,
+                         from_peer: str, to_peer: str,
+                         amount_sats: int, window_id: str,
+                         receipt_id: Optional[str],
+                         created_at: int) -> bool:
+        """Store a settlement obligation. Returns True on success."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM settlement_obligations"
+            ).fetchone()
+            if row and row['cnt'] >= self.MAX_SETTLEMENT_OBLIGATION_ROWS:
+                self.plugin.log(
+                    f"HiveDatabase: settlement_obligations at cap ({self.MAX_SETTLEMENT_OBLIGATION_ROWS})",
+                    level='warn'
+                )
+                return False
+            conn.execute("""
+                INSERT OR IGNORE INTO settlement_obligations (
+                    obligation_id, settlement_type, from_peer, to_peer,
+                    amount_sats, window_id, receipt_id, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            """, (obligation_id, settlement_type, from_peer, to_peer,
+                  amount_sats, window_id, receipt_id, created_at))
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: store_obligation error: {e}", level='error'
+            )
+            return False
+
+    def get_obligations_for_window(self, window_id: str,
+                                    status: Optional[str] = None,
+                                    limit: int = 1000) -> List[Dict[str, Any]]:
+        """Get obligations for a settlement window."""
+        conn = self._get_connection()
+        query = "SELECT * FROM settlement_obligations WHERE window_id = ?"
+        params: list = [window_id]
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_obligations_between_peers(self, peer_a: str, peer_b: str,
+                                       window_id: Optional[str] = None,
+                                       limit: int = 1000) -> List[Dict[str, Any]]:
+        """Get obligations between two peers (in either direction)."""
+        conn = self._get_connection()
+        query = ("SELECT * FROM settlement_obligations WHERE "
+                 "((from_peer = ? AND to_peer = ?) OR (from_peer = ? AND to_peer = ?))")
+        params: list = [peer_a, peer_b, peer_b, peer_a]
+        if window_id:
+            query += " AND window_id = ?"
+            params.append(window_id)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_obligation_status(self, obligation_id: str, status: str) -> bool:
+        """Update obligation status."""
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "UPDATE settlement_obligations SET status = ? WHERE obligation_id = ?",
+                (status, obligation_id)
+            )
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: update_obligation_status error: {e}", level='error'
+            )
+            return False
+
+    def count_obligations(self) -> int:
+        """Count total obligations."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM settlement_obligations"
+        ).fetchone()
+        return row['cnt'] if row else 0
+
+    # =========================================================================
+    # PHASE 4B: SETTLEMENT DISPUTES
+    # =========================================================================
+
+    def store_dispute(self, dispute_id: str, obligation_id: str,
+                      filing_peer: str, respondent_peer: str,
+                      evidence_json: str, filed_at: int) -> bool:
+        """Store a settlement dispute. Returns True on success."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM settlement_disputes"
+            ).fetchone()
+            if row and row['cnt'] >= self.MAX_SETTLEMENT_DISPUTE_ROWS:
+                self.plugin.log(
+                    f"HiveDatabase: settlement_disputes at cap ({self.MAX_SETTLEMENT_DISPUTE_ROWS})",
+                    level='warn'
+                )
+                return False
+            conn.execute("""
+                INSERT OR IGNORE INTO settlement_disputes (
+                    dispute_id, obligation_id, filing_peer,
+                    respondent_peer, evidence_json, filed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (dispute_id, obligation_id, filing_peer,
+                  respondent_peer, evidence_json, filed_at))
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: store_dispute error: {e}", level='error'
+            )
+            return False
+
+    def get_dispute(self, dispute_id: str) -> Optional[Dict[str, Any]]:
+        """Get a dispute by ID."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM settlement_disputes WHERE dispute_id = ?",
+            (dispute_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_dispute_outcome(self, dispute_id: str, outcome: str,
+                                slash_amount: int,
+                                panel_members_json: Optional[str],
+                                votes_json: Optional[str],
+                                resolved_at: int) -> bool:
+        """Update dispute with outcome."""
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                UPDATE settlement_disputes
+                SET outcome = ?, slash_amount = ?,
+                    panel_members_json = ?, votes_json = ?,
+                    resolved_at = ?
+                WHERE dispute_id = ?
+            """, (outcome, slash_amount, panel_members_json,
+                  votes_json, resolved_at, dispute_id))
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: update_dispute_outcome error: {e}", level='error'
+            )
+            return False
+
+    def count_disputes(self) -> int:
+        """Count total disputes."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM settlement_disputes"
+        ).fetchone()
+        return row['cnt'] if row else 0

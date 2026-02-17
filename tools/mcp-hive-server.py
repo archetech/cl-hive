@@ -737,114 +737,6 @@ async def list_tools() -> List[Tool]:
                 "required": ["node", "peer_id", "amount_sats"]
             }
         ),
-        # =====================================================================
-        # Boltz Swap Tools
-        # =====================================================================
-        Tool(
-            name="boltz_quote",
-            description="Get current Boltz reverse swap (loop-out) pricing. Shows fees, on-chain amount, and limits. No side effects.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "amount_sats": {
-                        "type": "integer",
-                        "description": "Amount in sats to loop out (Lightning → on-chain)"
-                    },
-                    "node": {
-                        "type": "string",
-                        "description": "Node name (optional, defaults to first node)"
-                    }
-                },
-                "required": ["amount_sats"]
-            }
-        ),
-        Tool(
-            name="boltz_loop_out",
-            description="Execute a Boltz reverse swap (loop-out): send Lightning sats, receive on-chain BTC. Uses cl-revenue-ops on the node (no extra runes). Tracks all costs in the swap ledger.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "node": {
-                        "type": "string",
-                        "description": "Node name (e.g. hive-nexus-01)"
-                    },
-                    "amount_sats": {
-                        "type": "integer",
-                        "description": "Amount in sats to loop out"
-                    },
-                    "address": {
-                        "type": "string",
-                        "description": "Destination BTC address (optional, defaults to node's newaddr)"
-                    },
-                    "dry_run": {
-                        "type": "boolean",
-                        "description": "If true, only quote without executing (default: false)"
-                    }
-                },
-                "required": ["node", "amount_sats"]
-            }
-        ),
-        Tool(
-            name="boltz_loop_in",
-            description="Execute a Boltz submarine swap (loop-in): send on-chain BTC and receive Lightning liquidity. Optionally target channel_id or peer_id for inbound hints.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "node": {
-                        "type": "string",
-                        "description": "Node name (e.g. hive-nexus-01)"
-                    },
-                    "amount_sats": {
-                        "type": "integer",
-                        "description": "Amount in sats to receive over Lightning"
-                    },
-                    "channel_id": {
-                        "type": "string",
-                        "description": "Optional short_channel_id to target"
-                    },
-                    "peer_id": {
-                        "type": "string",
-                        "description": "Optional peer pubkey to target"
-                    }
-                },
-                "required": ["node", "amount_sats"]
-            }
-        ),
-        Tool(
-            name="boltz_swap_status",
-            description="Check status of a Boltz swap from local ledger and Boltz API.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "swap_id": {
-                        "type": "string",
-                        "description": "Boltz swap ID"
-                    },
-                    "node": {
-                        "type": "string",
-                        "description": "Node name (optional, defaults to first node)"
-                    }
-                },
-                "required": ["swap_id"]
-            }
-        ),
-        Tool(
-            name="boltz_swap_history",
-            description="View Boltz swap history with cost summary. Shows all loop-outs and cumulative costs.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "node": {
-                        "type": "string",
-                        "description": "Filter by node name (optional)"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max swaps to return (default: 20)"
-                    }
-                }
-            }
-        ),
         Tool(
             name="hive_members",
             description="List all members of the Hive with their status and health scores.",
@@ -5180,6 +5072,178 @@ Only the original issuer can revoke a management credential.""",
                 "required": ["node", "credential_id"]
             }
         ),
+        # Phase 4A: Cashu Escrow Tools
+        Tool(
+            name="hive_escrow_create",
+            description="Create a Cashu escrow ticket for agent task payment.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "agent_id": {"type": "string", "description": "Agent pubkey"},
+                    "schema_id": {"type": "string", "description": "Management schema ID"},
+                    "action": {"type": "string", "description": "Management action"},
+                    "danger_score": {"type": "integer", "description": "Danger level 1-10"},
+                    "amount_sats": {"type": "integer", "description": "Escrow amount in sats"},
+                    "mint_url": {"type": "string", "description": "Cashu mint URL"},
+                    "ticket_type": {"type": "string", "description": "single/batch/milestone/performance"}
+                },
+                "required": ["node", "agent_id"]
+            }
+        ),
+        Tool(
+            name="hive_escrow_list",
+            description="List escrow tickets with optional filters.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "agent_id": {"type": "string", "description": "Filter by agent pubkey"},
+                    "status": {"type": "string", "description": "Filter by status (active/redeemed/refunded/expired)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_escrow_redeem",
+            description="Redeem an escrow ticket with HTLC preimage.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "ticket_id": {"type": "string", "description": "Ticket ID"},
+                    "preimage": {"type": "string", "description": "HTLC preimage hex"}
+                },
+                "required": ["node", "ticket_id", "preimage"]
+            }
+        ),
+        Tool(
+            name="hive_escrow_refund",
+            description="Refund an escrow ticket after timelock expiry.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "ticket_id": {"type": "string", "description": "Ticket ID"}
+                },
+                "required": ["node", "ticket_id"]
+            }
+        ),
+        Tool(
+            name="hive_escrow_receipt",
+            description="Get escrow receipts for a ticket.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "ticket_id": {"type": "string", "description": "Ticket ID"}
+                },
+                "required": ["node", "ticket_id"]
+            }
+        ),
+        # Phase 4B: Extended Settlement Tools
+        Tool(
+            name="hive_bond_post",
+            description="Post a settlement bond.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "amount_sats": {"type": "integer", "description": "Bond amount in sats"},
+                    "tier": {"type": "string", "description": "Bond tier (observer/basic/full/liquidity/founding)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_bond_status",
+            description="Get bond status for a peer.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Peer pubkey (default: self)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_settlement_list",
+            description="List settlement obligations.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "window_id": {"type": "string", "description": "Settlement window ID"},
+                    "peer_id": {"type": "string", "description": "Filter by peer"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_settlement_net",
+            description="Compute netting for a settlement window.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "window_id": {"type": "string", "description": "Settlement window ID"},
+                    "peer_id": {"type": "string", "description": "Peer for bilateral netting"}
+                },
+                "required": ["node", "window_id"]
+            }
+        ),
+        Tool(
+            name="hive_dispute_file",
+            description="File a settlement dispute.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "obligation_id": {"type": "string", "description": "Obligation ID to dispute"},
+                    "evidence_json": {"type": "string", "description": "Evidence as JSON string"}
+                },
+                "required": ["node", "obligation_id"]
+            }
+        ),
+        Tool(
+            name="hive_dispute_vote",
+            description="Cast an arbitration panel vote.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "dispute_id": {"type": "string", "description": "Dispute ID"},
+                    "vote": {"type": "string", "description": "Vote: upheld/rejected/partial/abstain"},
+                    "reason": {"type": "string", "description": "Reason for vote"}
+                },
+                "required": ["node", "dispute_id", "vote"]
+            }
+        ),
+        Tool(
+            name="hive_dispute_status",
+            description="Get dispute status.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "dispute_id": {"type": "string", "description": "Dispute ID"}
+                },
+                "required": ["node", "dispute_id"]
+            }
+        ),
+        Tool(
+            name="hive_credit_tier",
+            description="Get credit tier information for a peer.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "peer_id": {"type": "string", "description": "Peer pubkey (default: self)"}
+                },
+                "required": ["node"]
+            }
+        ),
     ]
 
 
@@ -5309,6 +5373,164 @@ async def handle_hive_mgmt_credential_revoke(args: Dict) -> Dict:
     return await node.call("hive-mgmt-credential-revoke", {
         "credential_id": args["credential_id"],
     })
+
+
+# =============================================================================
+# Phase 4A: Cashu Escrow Handlers
+# =============================================================================
+
+async def handle_hive_escrow_create(args: Dict) -> Dict:
+    """Create a Cashu escrow ticket."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {"agent_id": args["agent_id"]}
+    for k in ("schema_id", "action", "danger_score", "amount_sats", "mint_url", "ticket_type"):
+        if args.get(k) is not None:
+            params[k] = args[k]
+    return await node.call("hive-escrow-create", params)
+
+
+async def handle_hive_escrow_list(args: Dict) -> Dict:
+    """List escrow tickets."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("agent_id"):
+        params["agent_id"] = args["agent_id"]
+    if args.get("status"):
+        params["status"] = args["status"]
+    return await node.call("hive-escrow-list", params)
+
+
+async def handle_hive_escrow_redeem(args: Dict) -> Dict:
+    """Redeem an escrow ticket."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-escrow-redeem", {
+        "ticket_id": args["ticket_id"],
+        "preimage": args["preimage"],
+    })
+
+
+async def handle_hive_escrow_refund(args: Dict) -> Dict:
+    """Refund an escrow ticket."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-escrow-refund", {
+        "ticket_id": args["ticket_id"],
+    })
+
+
+async def handle_hive_escrow_receipt(args: Dict) -> Dict:
+    """Get escrow receipts."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-escrow-receipt", {
+        "ticket_id": args["ticket_id"],
+    })
+
+
+# =============================================================================
+# Phase 4B: Extended Settlement Handlers
+# =============================================================================
+
+async def handle_hive_bond_post(args: Dict) -> Dict:
+    """Post a settlement bond."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("amount_sats") is not None:
+        params["amount_sats"] = args["amount_sats"]
+    if args.get("tier"):
+        params["tier"] = args["tier"]
+    return await node.call("hive-bond-post", params)
+
+
+async def handle_hive_bond_status(args: Dict) -> Dict:
+    """Get bond status."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("peer_id"):
+        params["peer_id"] = args["peer_id"]
+    return await node.call("hive-bond-status", params)
+
+
+async def handle_hive_settlement_list(args: Dict) -> Dict:
+    """List settlement obligations."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("window_id"):
+        params["window_id"] = args["window_id"]
+    if args.get("peer_id"):
+        params["peer_id"] = args["peer_id"]
+    return await node.call("hive-settlement-list", params)
+
+
+async def handle_hive_settlement_net(args: Dict) -> Dict:
+    """Compute netting."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {"window_id": args["window_id"]}
+    if args.get("peer_id"):
+        params["peer_id"] = args["peer_id"]
+    return await node.call("hive-settlement-net", params)
+
+
+async def handle_hive_dispute_file(args: Dict) -> Dict:
+    """File a dispute."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {"obligation_id": args["obligation_id"]}
+    if args.get("evidence_json"):
+        params["evidence_json"] = args["evidence_json"]
+    return await node.call("hive-dispute-file", params)
+
+
+async def handle_hive_dispute_vote(args: Dict) -> Dict:
+    """Cast arbitration vote."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {
+        "dispute_id": args["dispute_id"],
+        "vote": args["vote"],
+    }
+    if args.get("reason"):
+        params["reason"] = args["reason"]
+    return await node.call("hive-dispute-vote", params)
+
+
+async def handle_hive_dispute_status(args: Dict) -> Dict:
+    """Get dispute status."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-dispute-status", {
+        "dispute_id": args["dispute_id"],
+    })
+
+
+async def handle_hive_credit_tier(args: Dict) -> Dict:
+    """Get credit tier info."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("peer_id"):
+        params["peer_id"] = args["peer_id"]
+    return await node.call("hive-credit-tier", params)
 
 
 @server.call_tool()
@@ -6249,124 +6471,8 @@ async def handle_reject_action(args: Dict) -> Dict:
     return await node.call("hive-reject-action", params)
 
 
-# =============================================================================
-# Boltz Loop-Out Handlers (via cl-revenue-ops)
-# =============================================================================
-
-
 def _get_default_node() -> Optional[NodeConnection]:
     return next(iter(fleet.nodes.values()), None)
-
-
-async def handle_boltz_quote(args: Dict) -> Dict:
-    """Get Boltz reverse swap pricing."""
-    amount = args.get("amount_sats", 0)
-    node_name = args.get("node")
-
-    if amount < 1:
-        return {"error": "amount_sats must be positive"}
-
-    node = fleet.get_node(node_name) if node_name else _get_default_node()
-    if not node:
-        return {"error": "No nodes available"}
-
-    try:
-        return await node.call("revenue-boltz-quote", {"amount_sats": amount})
-    except Exception as e:
-        return {"error": str(e)}
-
-
-async def handle_boltz_loop_out(args: Dict) -> Dict:
-    """Execute a Boltz loop-out."""
-    node_name = args.get("node")
-    amount = args.get("amount_sats", 0)
-    address = args.get("address")
-    dry_run = args.get("dry_run", False)
-
-    if not node_name:
-        return {"error": "node is required"}
-    if amount < 25000:
-        return {"error": f"amount_sats must be at least 25,000 (got {amount})"}
-    if amount > 25000000:
-        return {"error": f"amount_sats must be at most 25,000,000 (got {amount})"}
-
-    node = fleet.get_node(node_name)
-    if not node:
-        return {"error": f"Unknown node: {node_name}"}
-
-    try:
-        return await node.call("revenue-boltz-loop-out", {
-            "amount_sats": amount,
-            "address": address,
-            "dry_run": dry_run
-        })
-    except Exception as e:
-        logger.error(f"Boltz loop-out error: {e}")
-        return {"error": str(e)}
-
-
-async def handle_boltz_loop_in(args: Dict) -> Dict:
-    """Execute a Boltz loop-in."""
-    node_name = args.get("node")
-    amount = args.get("amount_sats", 0)
-    channel_id = args.get("channel_id")
-    peer_id = args.get("peer_id")
-
-    if not node_name:
-        return {"error": "node is required"}
-    if amount < 25000:
-        return {"error": f"amount_sats must be at least 25,000 (got {amount})"}
-    if amount > 25000000:
-        return {"error": f"amount_sats must be at most 25,000,000 (got {amount})"}
-    if channel_id and peer_id:
-        return {"error": "Provide either channel_id or peer_id, not both"}
-
-    node = fleet.get_node(node_name)
-    if not node:
-        return {"error": f"Unknown node: {node_name}"}
-
-    try:
-        return await node.call("revenue-boltz-loop-in", {
-            "amount_sats": amount,
-            "channel_id": channel_id,
-            "peer_id": peer_id,
-        })
-    except Exception as e:
-        logger.error(f"Boltz loop-in error: {e}")
-        return {"error": str(e)}
-
-
-async def handle_boltz_swap_status(args: Dict) -> Dict:
-    """Check Boltz swap status."""
-    swap_id = args.get("swap_id")
-    node_name = args.get("node")
-
-    if not swap_id:
-        return {"error": "swap_id is required"}
-
-    node = fleet.get_node(node_name) if node_name else _get_default_node()
-    if not node:
-        return {"error": "No nodes available"}
-
-    try:
-        return await node.call("revenue-boltz-status", {"swap_id": swap_id})
-    except Exception as e:
-        return {"error": str(e)}
-
-
-async def handle_boltz_swap_history(args: Dict) -> Dict:
-    """Get Boltz swap history."""
-    node_name = args.get("node")
-    limit = args.get("limit", 20)
-
-    node = fleet.get_node(node_name) if node_name else _get_default_node()
-    if not node:
-        return {"error": "No nodes available"}
-
-    try:
-        return await node.call("revenue-boltz-history", {"limit": limit})
-    except Exception as e:
-        return {"error": str(e)}
 
 
 async def handle_connect(args: Dict) -> Dict:
@@ -14928,12 +15034,6 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "hive_reject_action": handle_reject_action,
     "hive_connect": handle_connect,
     "hive_open_channel": handle_open_channel,
-    # Boltz swaps
-    "boltz_quote": handle_boltz_quote,
-    "boltz_loop_out": handle_boltz_loop_out,
-    "boltz_loop_in": handle_boltz_loop_in,
-    "boltz_swap_status": handle_boltz_swap_status,
-    "boltz_swap_history": handle_boltz_swap_history,
     "hive_members": handle_members,
     "hive_onboard_new_members": handle_onboard_new_members,
     "hive_propose_promotion": handle_propose_promotion,
@@ -15157,6 +15257,21 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "hive_mgmt_credential_issue": handle_hive_mgmt_credential_issue,
     "hive_mgmt_credential_list": handle_hive_mgmt_credential_list,
     "hive_mgmt_credential_revoke": handle_hive_mgmt_credential_revoke,
+    # Phase 4A: Cashu Escrow Tools
+    "hive_escrow_create": handle_hive_escrow_create,
+    "hive_escrow_list": handle_hive_escrow_list,
+    "hive_escrow_redeem": handle_hive_escrow_redeem,
+    "hive_escrow_refund": handle_hive_escrow_refund,
+    "hive_escrow_receipt": handle_hive_escrow_receipt,
+    # Phase 4B: Extended Settlement Tools
+    "hive_bond_post": handle_hive_bond_post,
+    "hive_bond_status": handle_hive_bond_status,
+    "hive_settlement_list": handle_hive_settlement_list,
+    "hive_settlement_net": handle_hive_settlement_net,
+    "hive_dispute_file": handle_hive_dispute_file,
+    "hive_dispute_vote": handle_hive_dispute_vote,
+    "hive_dispute_status": handle_hive_dispute_status,
+    "hive_credit_tier": handle_hive_credit_tier,
 }
 
 

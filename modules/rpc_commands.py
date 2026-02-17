@@ -47,6 +47,7 @@ class HiveContext:
     anticipatory_manager: Any = None  # AnticipatoryLiquidityManager (Phase 7.1 - Anticipatory Liquidity)
     did_credential_mgr: Any = None  # DIDCredentialManager (Phase 16 - DID Credentials)
     management_schema_registry: Any = None  # ManagementSchemaRegistry (Phase 2 - Management Schemas)
+    cashu_escrow_mgr: Any = None  # CashuEscrowManager (Phase 4A - Cashu Escrow)
     our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
@@ -4886,3 +4887,274 @@ def mgmt_credential_revoke(ctx: HiveContext, credential_id: str) -> Dict[str, An
 
     success = ctx.management_schema_registry.revoke_credential(credential_id)
     return {"revoked": success, "credential_id": credential_id}
+
+
+# =============================================================================
+# PHASE 4A: CASHU ESCROW COMMANDS
+# =============================================================================
+
+def escrow_create(ctx: HiveContext, agent_id: str, schema_id: str = "",
+                  action: str = "", danger_score: int = 1,
+                  amount_sats: int = 0, mint_url: str = "",
+                  ticket_type: str = "single") -> Dict[str, Any]:
+    """Create a new Cashu escrow ticket."""
+    if not ctx.cashu_escrow_mgr:
+        return {"error": "cashu escrow manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not agent_id:
+        return {"error": "agent_id is required"}
+
+    # Generate a task_id
+    import hashlib as _hashlib
+    task_id = _hashlib.sha256(
+        f"{agent_id}:{schema_id}:{action}:{int(time.time())}".encode()
+    ).hexdigest()[:32]
+
+    ticket = ctx.cashu_escrow_mgr.create_ticket(
+        agent_id=agent_id,
+        task_id=task_id,
+        danger_score=danger_score,
+        amount_sats=amount_sats,
+        mint_url=mint_url,
+        ticket_type=ticket_type,
+        schema_id=schema_id or None,
+        action=action or None,
+    )
+
+    if not ticket:
+        return {"error": "failed to create escrow ticket"}
+
+    return {"ticket": ticket, "task_id": task_id}
+
+
+def escrow_list(ctx: HiveContext, agent_id: Optional[str] = None,
+                status: Optional[str] = None) -> Dict[str, Any]:
+    """List escrow tickets with optional filters."""
+    if not ctx.cashu_escrow_mgr:
+        return {"error": "cashu escrow manager not initialized"}
+
+    tickets = ctx.cashu_escrow_mgr.db.list_escrow_tickets(
+        agent_id=agent_id, status=status
+    )
+    return {"tickets": tickets, "count": len(tickets)}
+
+
+def escrow_redeem(ctx: HiveContext, ticket_id: str,
+                  preimage: str) -> Dict[str, Any]:
+    """Redeem an escrow ticket with HTLC preimage."""
+    if not ctx.cashu_escrow_mgr:
+        return {"error": "cashu escrow manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ticket_id or not preimage:
+        return {"error": "ticket_id and preimage are required"}
+
+    result = ctx.cashu_escrow_mgr.redeem_ticket(ticket_id, preimage)
+    return result if result else {"error": "redemption failed"}
+
+
+def escrow_refund(ctx: HiveContext, ticket_id: str) -> Dict[str, Any]:
+    """Refund an escrow ticket after timelock expiry."""
+    if not ctx.cashu_escrow_mgr:
+        return {"error": "cashu escrow manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ticket_id:
+        return {"error": "ticket_id is required"}
+
+    result = ctx.cashu_escrow_mgr.refund_ticket(ticket_id)
+    return result if result else {"error": "refund failed"}
+
+
+def escrow_get_receipt(ctx: HiveContext, ticket_id: str) -> Dict[str, Any]:
+    """Get escrow receipts for a ticket."""
+    if not ctx.cashu_escrow_mgr:
+        return {"error": "cashu escrow manager not initialized"}
+
+    if not ticket_id:
+        return {"error": "ticket_id is required"}
+
+    receipts = ctx.cashu_escrow_mgr.db.get_escrow_receipts(ticket_id)
+    ticket = ctx.cashu_escrow_mgr.db.get_escrow_ticket(ticket_id)
+    return {
+        "ticket": ticket,
+        "receipts": receipts,
+        "count": len(receipts),
+    }
+
+
+# =============================================================================
+# PHASE 4B: EXTENDED SETTLEMENT COMMANDS
+# =============================================================================
+
+def bond_post(ctx: HiveContext, amount_sats: int = 0,
+              tier: str = "") -> Dict[str, Any]:
+    """Post a settlement bond."""
+    from .settlement import BondManager
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    bond_mgr = BondManager(ctx.database, ctx.safe_plugin)
+    result = bond_mgr.post_bond(ctx.our_pubkey, amount_sats)
+    return result if result else {"error": "failed to post bond"}
+
+
+def bond_status(ctx: HiveContext, peer_id: Optional[str] = None) -> Dict[str, Any]:
+    """Get bond status for a peer."""
+    from .settlement import BondManager
+
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    target = peer_id or ctx.our_pubkey
+    bond_mgr = BondManager(ctx.database, ctx.safe_plugin)
+    result = bond_mgr.get_bond_status(target)
+    if not result:
+        return {"error": "no active bond found", "peer_id": target}
+    return result
+
+
+def settlement_obligations_list(ctx: HiveContext,
+                                 window_id: Optional[str] = None,
+                                 peer_id: Optional[str] = None) -> Dict[str, Any]:
+    """List settlement obligations."""
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    if window_id:
+        obligations = ctx.database.get_obligations_for_window(window_id)
+    elif peer_id:
+        obligations = ctx.database.get_obligations_between_peers(
+            peer_id, ctx.our_pubkey
+        )
+    else:
+        obligations = ctx.database.get_obligations_for_window("", limit=100)
+
+    return {"obligations": obligations, "count": len(obligations)}
+
+
+def settlement_net(ctx: HiveContext, window_id: str = "",
+                   peer_id: Optional[str] = None) -> Dict[str, Any]:
+    """Compute netting for a settlement window."""
+    from .settlement import NettingEngine
+
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not window_id:
+        return {"error": "window_id is required"}
+
+    obligations = ctx.database.get_obligations_for_window(window_id)
+
+    if peer_id:
+        result = NettingEngine.bilateral_net(obligations, ctx.our_pubkey, peer_id, window_id)
+        return {"netting_type": "bilateral", "result": result}
+    else:
+        payments = NettingEngine.multilateral_net(obligations, window_id)
+        obligations_hash = NettingEngine.compute_obligations_hash(obligations)
+        return {
+            "netting_type": "multilateral",
+            "payments": payments,
+            "payment_count": len(payments),
+            "obligations_hash": obligations_hash,
+        }
+
+
+def dispute_file(ctx: HiveContext, obligation_id: str = "",
+                 evidence_json: str = "{}") -> Dict[str, Any]:
+    """File a settlement dispute."""
+    from .settlement import DisputeResolver
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    if not obligation_id:
+        return {"error": "obligation_id is required"}
+
+    try:
+        evidence = json.loads(evidence_json)
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "invalid evidence_json"}
+
+    resolver = DisputeResolver(ctx.database, ctx.safe_plugin)
+    result = resolver.file_dispute(obligation_id, ctx.our_pubkey, evidence)
+    return result if result else {"error": "failed to file dispute"}
+
+
+def dispute_vote(ctx: HiveContext, dispute_id: str = "",
+                 vote: str = "", reason: str = "") -> Dict[str, Any]:
+    """Cast an arbitration panel vote."""
+    from .settlement import DisputeResolver
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    if not dispute_id or not vote:
+        return {"error": "dispute_id and vote are required"}
+
+    from .protocol import VALID_ARBITRATION_VOTES
+    if vote not in VALID_ARBITRATION_VOTES:
+        return {"error": f"vote must be one of: {', '.join(VALID_ARBITRATION_VOTES)}"}
+
+    resolver = DisputeResolver(ctx.database, ctx.safe_plugin)
+    result = resolver.record_vote(dispute_id, ctx.our_pubkey, vote, reason)
+    return result if result else {"error": "failed to record vote"}
+
+
+def dispute_status(ctx: HiveContext, dispute_id: str = "") -> Dict[str, Any]:
+    """Get dispute status."""
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    if not dispute_id:
+        return {"error": "dispute_id is required"}
+
+    dispute = ctx.database.get_dispute(dispute_id)
+    if not dispute:
+        return {"error": "dispute not found"}
+
+    # Parse JSON fields
+    for jf in ("evidence_json", "panel_members_json", "votes_json"):
+        if jf in dispute and dispute[jf]:
+            try:
+                dispute[jf.replace("_json", "")] = json.loads(dispute[jf])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    return dispute
+
+
+def credit_tier_info(ctx: HiveContext,
+                     peer_id: Optional[str] = None) -> Dict[str, Any]:
+    """Get credit tier information for a peer."""
+    from .settlement import get_credit_tier_info
+
+    target = peer_id or ctx.our_pubkey
+    return get_credit_tier_info(target, ctx.did_credential_mgr)

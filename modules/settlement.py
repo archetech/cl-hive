@@ -1673,3 +1673,763 @@ class SettlementManager:
             'ready': ready,
             'settled_periods': settled,
         }
+
+    def register_extended_types(self, cashu_escrow_mgr, did_credential_mgr):
+        """Wire Phase 4 managers after init."""
+        self.cashu_escrow_mgr = cashu_escrow_mgr
+        self.did_credential_mgr = did_credential_mgr
+        if hasattr(self, '_type_registry'):
+            self._type_registry.cashu_escrow_mgr = cashu_escrow_mgr
+            self._type_registry.did_credential_mgr = did_credential_mgr
+
+
+# =============================================================================
+# PHASE 4B: SETTLEMENT TYPE REGISTRY
+# =============================================================================
+
+VALID_SETTLEMENT_TYPE_IDS = frozenset([
+    "routing_revenue", "rebalancing_cost", "channel_lease",
+    "cooperative_splice", "shared_channel", "pheromone_market",
+    "intelligence", "penalty", "advisor_fee",
+])
+
+# Bond tier sizing (sats)
+BOND_TIER_SIZING = {
+    "observer": 0,
+    "basic": 50_000,
+    "full": 150_000,
+    "liquidity": 300_000,
+    "founding": 500_000,
+}
+
+# Credit tier definitions
+CREDIT_TIERS = {
+    "newcomer": {"credit_line": 0, "window": "per_event", "model": "prepaid_escrow"},
+    "recognized": {"credit_line": 10_000, "window": "hourly", "model": "escrow_above_credit"},
+    "trusted": {"credit_line": 50_000, "window": "daily", "model": "bilateral_netting"},
+    "senior": {"credit_line": 200_000, "window": "weekly", "model": "multilateral_netting"},
+}
+
+
+class SettlementTypeHandler:
+    """Base class for settlement type handlers."""
+
+    type_id: str = ""
+
+    def calculate(self, obligations: List[Dict], window_id: str) -> List[Dict]:
+        """Calculate settlement amounts for this type. Returns obligation dicts."""
+        return obligations
+
+    def verify_receipt(self, receipt_data: Dict) -> Tuple[bool, str]:
+        """Verify a settlement receipt for this type. Returns (valid, error_msg)."""
+        return True, ""
+
+    def execute(self, payment: Dict, rpc=None) -> Optional[Dict]:
+        """Execute a settlement payment. Returns result or None."""
+        return None
+
+
+class RoutingRevenueHandler(SettlementTypeHandler):
+    type_id = "routing_revenue"
+
+    def verify_receipt(self, receipt_data: Dict) -> Tuple[bool, str]:
+        if "htlc_forwards" not in receipt_data:
+            return False, "missing htlc_forwards"
+        if not isinstance(receipt_data.get("htlc_forwards"), (list, int)):
+            return False, "htlc_forwards must be list or count"
+        return True, ""
+
+
+class RebalancingCostHandler(SettlementTypeHandler):
+    type_id = "rebalancing_cost"
+
+    def verify_receipt(self, receipt_data: Dict) -> Tuple[bool, str]:
+        if "rebalance_amount_sats" not in receipt_data:
+            return False, "missing rebalance_amount_sats"
+        return True, ""
+
+
+class ChannelLeaseHandler(SettlementTypeHandler):
+    type_id = "channel_lease"
+
+    def verify_receipt(self, receipt_data: Dict) -> Tuple[bool, str]:
+        if "lease_start" not in receipt_data or "lease_end" not in receipt_data:
+            return False, "missing lease_start or lease_end"
+        return True, ""
+
+
+class CooperativeSpliceHandler(SettlementTypeHandler):
+    type_id = "cooperative_splice"
+
+    def verify_receipt(self, receipt_data: Dict) -> Tuple[bool, str]:
+        if "txid" not in receipt_data:
+            return False, "missing txid"
+        return True, ""
+
+
+class SharedChannelHandler(SettlementTypeHandler):
+    type_id = "shared_channel"
+
+    def verify_receipt(self, receipt_data: Dict) -> Tuple[bool, str]:
+        if "funding_txid" not in receipt_data:
+            return False, "missing funding_txid"
+        return True, ""
+
+
+class PheromoneMarketHandler(SettlementTypeHandler):
+    type_id = "pheromone_market"
+
+    def verify_receipt(self, receipt_data: Dict) -> Tuple[bool, str]:
+        if "performance_metric" not in receipt_data:
+            return False, "missing performance_metric"
+        return True, ""
+
+
+class IntelligenceHandler(SettlementTypeHandler):
+    type_id = "intelligence"
+
+    def calculate(self, obligations: List[Dict], window_id: str) -> List[Dict]:
+        """Apply 70/30 base/bonus split."""
+        result = []
+        for ob in obligations:
+            amount = ob.get("amount_sats", 0)
+            base = int(amount * 0.70)
+            bonus = amount - base
+            result.append({**ob, "base_sats": base, "bonus_sats": bonus})
+        return result
+
+    def verify_receipt(self, receipt_data: Dict) -> Tuple[bool, str]:
+        if "intelligence_type" not in receipt_data:
+            return False, "missing intelligence_type"
+        return True, ""
+
+
+class PenaltyHandler(SettlementTypeHandler):
+    type_id = "penalty"
+
+    def verify_receipt(self, receipt_data: Dict) -> Tuple[bool, str]:
+        if "quorum_confirmations" not in receipt_data:
+            return False, "missing quorum_confirmations"
+        confirmations = receipt_data["quorum_confirmations"]
+        if not isinstance(confirmations, int) or confirmations < 1:
+            return False, "quorum_confirmations must be >= 1"
+        return True, ""
+
+
+class AdvisorFeeHandler(SettlementTypeHandler):
+    type_id = "advisor_fee"
+
+    def verify_receipt(self, receipt_data: Dict) -> Tuple[bool, str]:
+        if "advisor_signature" not in receipt_data:
+            return False, "missing advisor_signature"
+        return True, ""
+
+
+class SettlementTypeRegistry:
+    """Registry of settlement type handlers."""
+
+    def __init__(self):
+        self.handlers: Dict[str, SettlementTypeHandler] = {}
+        self.cashu_escrow_mgr = None
+        self.did_credential_mgr = None
+        self._register_defaults()
+
+    def _register_defaults(self):
+        for handler_cls in [
+            RoutingRevenueHandler, RebalancingCostHandler, ChannelLeaseHandler,
+            CooperativeSpliceHandler, SharedChannelHandler, PheromoneMarketHandler,
+            IntelligenceHandler, PenaltyHandler, AdvisorFeeHandler,
+        ]:
+            handler = handler_cls()
+            self.handlers[handler.type_id] = handler
+
+    def get_handler(self, type_id: str) -> Optional[SettlementTypeHandler]:
+        return self.handlers.get(type_id)
+
+    def list_types(self) -> List[str]:
+        return list(self.handlers.keys())
+
+    def verify_receipt(self, type_id: str, receipt_data: Dict) -> Tuple[bool, str]:
+        handler = self.get_handler(type_id)
+        if not handler:
+            return False, f"unknown settlement type: {type_id}"
+        return handler.verify_receipt(receipt_data)
+
+
+# =============================================================================
+# PHASE 4B: NETTING ENGINE
+# =============================================================================
+
+import hashlib
+
+
+class NettingEngine:
+    """
+    Compute net payments from obligation sets.
+
+    All computations use integer sats (no floats).
+    Deterministic JSON serialization for obligation hashing.
+    """
+
+    @staticmethod
+    def compute_obligations_hash(obligations: List[Dict]) -> str:
+        """Compute deterministic hash of an obligation set."""
+        canonical = json.dumps(
+            sorted(obligations, key=lambda o: o.get("obligation_id", "")),
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+    @staticmethod
+    def bilateral_net(obligations: List[Dict],
+                      peer_a: str, peer_b: str,
+                      window_id: str) -> Dict[str, Any]:
+        """
+        Compute bilateral net between two peers.
+
+        Returns single net payment direction + amount.
+        """
+        a_to_b = 0  # total A owes B
+        b_to_a = 0  # total B owes A
+
+        for ob in obligations:
+            if ob.get("window_id") != window_id:
+                continue
+            if ob.get("status") not in ("pending", None):
+                continue
+            amount = ob.get("amount_sats", 0)
+            if ob.get("from_peer") == peer_a and ob.get("to_peer") == peer_b:
+                a_to_b += amount
+            elif ob.get("from_peer") == peer_b and ob.get("to_peer") == peer_a:
+                b_to_a += amount
+
+        net = a_to_b - b_to_a
+        if net > 0:
+            return {
+                "from_peer": peer_a,
+                "to_peer": peer_b,
+                "amount_sats": net,
+                "window_id": window_id,
+                "obligations_netted": a_to_b + b_to_a,
+            }
+        elif net < 0:
+            return {
+                "from_peer": peer_b,
+                "to_peer": peer_a,
+                "amount_sats": -net,
+                "window_id": window_id,
+                "obligations_netted": a_to_b + b_to_a,
+            }
+        else:
+            return {
+                "from_peer": peer_a,
+                "to_peer": peer_b,
+                "amount_sats": 0,
+                "window_id": window_id,
+                "obligations_netted": a_to_b + b_to_a,
+            }
+
+    @staticmethod
+    def multilateral_net(obligations: List[Dict],
+                         window_id: str) -> List[Dict[str, Any]]:
+        """
+        Compute multilateral net from obligation set.
+
+        Uses balance aggregation to find minimum payment set.
+        All integer arithmetic.
+
+        Returns list of net payments.
+        """
+        # Aggregate net balances per peer
+        balances: Dict[str, int] = {}
+        for ob in obligations:
+            if ob.get("window_id") != window_id:
+                continue
+            if ob.get("status") not in ("pending", None):
+                continue
+            amount = ob.get("amount_sats", 0)
+            from_p = ob.get("from_peer", "")
+            to_p = ob.get("to_peer", "")
+            if not from_p or not to_p:
+                continue
+            balances[from_p] = balances.get(from_p, 0) - amount
+            balances[to_p] = balances.get(to_p, 0) + amount
+
+        # Split into debtors (negative balance) and creditors (positive balance)
+        debtors = []
+        creditors = []
+        for peer, balance in sorted(balances.items()):
+            if balance < 0:
+                debtors.append([peer, -balance])  # amount they owe
+            elif balance > 0:
+                creditors.append([peer, balance])  # amount they're owed
+
+        # Greedy matching: match largest debtor with largest creditor
+        payments = []
+        di, ci = 0, 0
+        while di < len(debtors) and ci < len(creditors):
+            debtor_id, debt = debtors[di]
+            creditor_id, credit = creditors[ci]
+            pay = min(debt, credit)
+            if pay > 0:
+                payments.append({
+                    "from_peer": debtor_id,
+                    "to_peer": creditor_id,
+                    "amount_sats": pay,
+                    "window_id": window_id,
+                })
+            debtors[di][1] -= pay
+            creditors[ci][1] -= pay
+            if debtors[di][1] == 0:
+                di += 1
+            if creditors[ci][1] == 0:
+                ci += 1
+
+        return payments
+
+
+# =============================================================================
+# PHASE 4B: BOND MANAGER
+# =============================================================================
+
+class BondManager:
+    """
+    Manages settlement bonds: post, verify, slash, refund.
+
+    Bond sizing:
+        observer: 0, basic: 50K, full: 150K, liquidity: 300K, founding: 500K sats
+
+    Time-weighted staking:
+        effective_bond = amount * min(1.0, tenure_days / 180)
+
+    Slashing formula:
+        max(penalty * severity * repeat_mult, estimated_profit * 2.0)
+
+    Distribution: 50% aggrieved, 30% panel, 20% burned
+    """
+
+    TENURE_MATURITY_DAYS = 180
+    SLASH_DISTRIBUTION = {"aggrieved": 0.50, "panel": 0.30, "burned": 0.20}
+
+    def __init__(self, database, plugin, rpc=None):
+        self.db = database
+        self.plugin = plugin
+        self.rpc = rpc
+
+    def _log(self, msg: str, level: str = 'info') -> None:
+        self.plugin.log(f"cl-hive: bonds: {msg}", level=level)
+
+    def get_tier_for_amount(self, amount_sats: int) -> str:
+        """Determine bond tier based on amount."""
+        for tier in ["founding", "liquidity", "full", "basic", "observer"]:
+            if amount_sats >= BOND_TIER_SIZING[tier]:
+                return tier
+        return "observer"
+
+    def effective_bond(self, amount_sats: int, tenure_days: int) -> int:
+        """Calculate time-weighted effective bond amount."""
+        weight = min(1.0, tenure_days / self.TENURE_MATURITY_DAYS)
+        return int(amount_sats * weight)
+
+    def post_bond(self, peer_id: str, amount_sats: int,
+                  token_json: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Post a new bond for a peer."""
+        if amount_sats < 0:
+            return None
+
+        tier = self.get_tier_for_amount(amount_sats)
+        bond_id = hashlib.sha256(
+            f"bond:{peer_id}:{int(time.time())}".encode()
+        ).hexdigest()[:32]
+
+        # 6-month timelock for refund path
+        timelock = int(time.time()) + (180 * 86400)
+
+        success = self.db.store_bond(
+            bond_id=bond_id,
+            peer_id=peer_id,
+            amount_sats=amount_sats,
+            token_json=token_json,
+            posted_at=int(time.time()),
+            timelock=timelock,
+            tier=tier,
+        )
+
+        if not success:
+            return None
+
+        self._log(f"bond {bond_id[:16]}... posted by {peer_id[:16]}... "
+                  f"amount={amount_sats} tier={tier}")
+
+        return {
+            "bond_id": bond_id,
+            "peer_id": peer_id,
+            "amount_sats": amount_sats,
+            "tier": tier,
+            "timelock": timelock,
+            "status": "active",
+        }
+
+    def calculate_slash(self, penalty_base: int, severity: float = 1.0,
+                        repeat_count: int = 1,
+                        estimated_profit: int = 0) -> int:
+        """
+        Calculate slash amount.
+
+        Formula: max(penalty * severity * repeat_mult, estimated_profit * 2.0)
+        """
+        repeat_mult = 1.0 + (0.5 * max(0, repeat_count - 1))
+        option_a = int(penalty_base * severity * repeat_mult)
+        option_b = int(estimated_profit * 2.0)
+        return max(option_a, option_b)
+
+    def distribute_slash(self, slash_amount: int) -> Dict[str, int]:
+        """Distribute slashed funds per policy."""
+        aggrieved = int(slash_amount * self.SLASH_DISTRIBUTION["aggrieved"])
+        panel = int(slash_amount * self.SLASH_DISTRIBUTION["panel"])
+        burned = slash_amount - aggrieved - panel  # Remainder to burned
+        return {
+            "aggrieved": aggrieved,
+            "panel": panel,
+            "burned": burned,
+        }
+
+    def slash_bond(self, bond_id: str, slash_amount: int) -> Optional[Dict[str, Any]]:
+        """Execute a bond slash."""
+        bond = self.db.get_bond(bond_id)
+        if not bond:
+            return None
+
+        if bond['status'] != 'active':
+            return None
+
+        # Cap slash at bond amount
+        prior_slashed = bond['slashed_amount']
+        effective_slash = min(slash_amount, bond['amount_sats'] - prior_slashed)
+        if effective_slash <= 0:
+            return None
+
+        self.db.slash_bond(bond_id, effective_slash)
+        distribution = self.distribute_slash(effective_slash)
+
+        remaining = bond['amount_sats'] - prior_slashed - effective_slash
+        self._log(f"bond {bond_id[:16]}... slashed {effective_slash} sats")
+
+        return {
+            "bond_id": bond_id,
+            "slashed_amount": effective_slash,
+            "distribution": distribution,
+            "remaining": remaining,
+        }
+
+    def refund_bond(self, bond_id: str) -> Optional[Dict[str, Any]]:
+        """Refund a bond after timelock expiry."""
+        bond = self.db.get_bond(bond_id)
+        if not bond:
+            return None
+
+        now = int(time.time())
+        if now < bond['timelock']:
+            return {"error": "timelock not expired", "timelock": bond['timelock']}
+
+        remaining = bond['amount_sats'] - bond['slashed_amount']
+        self.db.update_bond_status(bond_id, 'refunded')
+
+        return {
+            "bond_id": bond_id,
+            "refund_amount": remaining,
+            "status": "refunded",
+        }
+
+    def get_bond_status(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """Get current bond status for a peer."""
+        bond = self.db.get_bond_for_peer(peer_id)
+        if not bond:
+            return None
+
+        tenure_days = (int(time.time()) - bond['posted_at']) // 86400
+        effective = self.effective_bond(bond['amount_sats'], tenure_days)
+
+        return {
+            **bond,
+            "tenure_days": tenure_days,
+            "effective_bond": effective,
+        }
+
+
+# =============================================================================
+# PHASE 4B: DISPUTE RESOLUTION
+# =============================================================================
+
+class DisputeResolver:
+    """
+    Deterministic dispute resolution with stake-weighted panel selection.
+
+    Panel sizes:
+    - >=15 eligible members: 7 members (5-of-7)
+    - 10-14 eligible: 5 members (3-of-5)
+    - 5-9 eligible: 3 members (2-of-3)
+
+    Selection seed: SHA256(dispute_id || block_hash_at_filing_height)
+    Weight: bond_amount + sqrt(tenure_days)
+    """
+
+    MIN_ELIGIBLE_FOR_PANEL = 5
+
+    def __init__(self, database, plugin, rpc=None):
+        self.db = database
+        self.plugin = plugin
+        self.rpc = rpc
+
+    def _log(self, msg: str, level: str = 'info') -> None:
+        self.plugin.log(f"cl-hive: disputes: {msg}", level=level)
+
+    def select_arbitration_panel(self, dispute_id: str, block_hash: str,
+                                  eligible_members: List[Dict]) -> Optional[Dict]:
+        """
+        Deterministic stake-weighted panel selection.
+
+        Args:
+            dispute_id: Unique dispute identifier
+            block_hash: Block hash at filing height for determinism
+            eligible_members: List of dicts with 'peer_id', 'bond_amount', 'tenure_days'
+
+        Returns:
+            Dict with panel_members, panel_size, quorum, seed.
+        """
+        if len(eligible_members) < self.MIN_ELIGIBLE_FOR_PANEL:
+            return None
+
+        # Determine panel size and quorum
+        n = len(eligible_members)
+        if n >= 15:
+            panel_size, quorum = 7, 5
+        elif n >= 10:
+            panel_size, quorum = 5, 3
+        else:
+            panel_size, quorum = 3, 2
+
+        # Compute deterministic seed
+        seed_input = f"{dispute_id}{block_hash}"
+        seed = hashlib.sha256(seed_input.encode()).digest()
+
+        # Weight: bond_amount + sqrt(tenure_days)
+        import math
+        weighted = []
+        for m in eligible_members:
+            bond = m.get("bond_amount", 0)
+            tenure = m.get("tenure_days", 0)
+            weight = bond + int(math.sqrt(max(0, tenure)))
+            weighted.append((m["peer_id"], max(1, weight)))
+
+        # Sort by peer_id for determinism
+        weighted.sort(key=lambda x: x[0])
+
+        # Deterministic weighted selection without replacement
+        selected = []
+        remaining = list(weighted)
+        seed_state = seed
+
+        for _ in range(min(panel_size, len(remaining))):
+            if not remaining:
+                break
+            # Use seed_state to pick index
+            total_weight = sum(w for _, w in remaining)
+            seed_state = hashlib.sha256(seed_state).digest()
+            pick_val = int.from_bytes(seed_state[:8], 'big') % total_weight
+
+            cumulative = 0
+            pick_idx = 0
+            for idx, (_, w) in enumerate(remaining):
+                cumulative += w
+                if cumulative > pick_val:
+                    pick_idx = idx
+                    break
+
+            selected.append(remaining[pick_idx][0])
+            remaining.pop(pick_idx)
+
+        return {
+            "panel_members": selected,
+            "panel_size": len(selected),
+            "quorum": quorum,
+            "seed": seed_input,
+            "dispute_id": dispute_id,
+        }
+
+    def file_dispute(self, obligation_id: str, filing_peer: str,
+                     evidence: Dict) -> Optional[Dict]:
+        """File a new dispute."""
+        obligation = None
+        try:
+            obligations = self.db.get_obligations_for_window("", status=None, limit=10000)
+            for ob in obligations:
+                if ob['obligation_id'] == obligation_id:
+                    obligation = ob
+                    break
+        except Exception:
+            pass
+
+        if not obligation:
+            return {"error": "obligation not found"}
+
+        respondent = obligation['from_peer'] if obligation['to_peer'] == filing_peer else obligation['to_peer']
+
+        dispute_id = hashlib.sha256(
+            f"dispute:{obligation_id}:{filing_peer}:{int(time.time())}".encode()
+        ).hexdigest()[:32]
+
+        evidence_json = json.dumps(evidence, sort_keys=True, separators=(',', ':'))
+
+        success = self.db.store_dispute(
+            dispute_id=dispute_id,
+            obligation_id=obligation_id,
+            filing_peer=filing_peer,
+            respondent_peer=respondent,
+            evidence_json=evidence_json,
+            filed_at=int(time.time()),
+        )
+
+        if not success:
+            return None
+
+        # Mark obligation as disputed
+        self.db.update_obligation_status(obligation_id, 'disputed')
+
+        self._log(f"dispute {dispute_id[:16]}... filed by {filing_peer[:16]}...")
+
+        return {
+            "dispute_id": dispute_id,
+            "obligation_id": obligation_id,
+            "filing_peer": filing_peer,
+            "respondent_peer": respondent,
+        }
+
+    def record_vote(self, dispute_id: str, voter_id: str,
+                    vote: str, reason: str = "") -> Optional[Dict]:
+        """Record an arbitration panel vote."""
+        dispute = self.db.get_dispute(dispute_id)
+        if not dispute:
+            return {"error": "dispute not found"}
+
+        if dispute.get('resolved_at'):
+            return {"error": "dispute already resolved"}
+
+        # Parse existing votes
+        votes = {}
+        if dispute.get('votes_json'):
+            try:
+                votes = json.loads(dispute['votes_json'])
+            except (json.JSONDecodeError, TypeError):
+                votes = {}
+
+        votes[voter_id] = {"vote": vote, "reason": reason, "timestamp": int(time.time())}
+
+        # Check if we have quorum
+        panel_members = []
+        if dispute.get('panel_members_json'):
+            try:
+                panel_members = json.loads(dispute['panel_members_json'])
+            except (json.JSONDecodeError, TypeError):
+                panel_members = []
+
+        votes_json = json.dumps(votes, sort_keys=True, separators=(',', ':'))
+
+        # Update votes
+        self.db.update_dispute_outcome(
+            dispute_id=dispute_id,
+            outcome=dispute.get('outcome'),
+            slash_amount=dispute.get('slash_amount', 0),
+            panel_members_json=dispute.get('panel_members_json'),
+            votes_json=votes_json,
+            resolved_at=dispute.get('resolved_at') or 0,
+        )
+
+        return {
+            "dispute_id": dispute_id,
+            "voter_id": voter_id,
+            "vote": vote,
+            "total_votes": len(votes),
+        }
+
+    def check_quorum(self, dispute_id: str, quorum: int) -> Optional[Dict]:
+        """Check if quorum reached and determine outcome."""
+        dispute = self.db.get_dispute(dispute_id)
+        if not dispute or dispute.get('resolved_at'):
+            return None
+
+        votes = {}
+        if dispute.get('votes_json'):
+            try:
+                votes = json.loads(dispute['votes_json'])
+            except (json.JSONDecodeError, TypeError):
+                return None
+
+        if len(votes) < quorum:
+            return None
+
+        # Count votes
+        counts = {"upheld": 0, "rejected": 0, "partial": 0, "abstain": 0}
+        for v in votes.values():
+            vtype = v.get("vote", "abstain")
+            if vtype in counts:
+                counts[vtype] += 1
+
+        # Determine outcome: majority of non-abstain votes
+        non_abstain = counts["upheld"] + counts["rejected"] + counts["partial"]
+        if non_abstain == 0:
+            outcome = "rejected"
+        elif counts["upheld"] > non_abstain / 2:
+            outcome = "upheld"
+        elif counts["partial"] > non_abstain / 2:
+            outcome = "partial"
+        else:
+            outcome = "rejected"
+
+        now = int(time.time())
+        self.db.update_dispute_outcome(
+            dispute_id=dispute_id,
+            outcome=outcome,
+            slash_amount=dispute.get('slash_amount', 0),
+            panel_members_json=dispute.get('panel_members_json'),
+            votes_json=dispute.get('votes_json'),
+            resolved_at=now,
+        )
+
+        self._log(f"dispute {dispute_id[:16]}... resolved: {outcome}")
+
+        return {
+            "dispute_id": dispute_id,
+            "outcome": outcome,
+            "vote_counts": counts,
+            "resolved_at": now,
+        }
+
+
+# =============================================================================
+# PHASE 4B: CREDIT TIER HELPER
+# =============================================================================
+
+def get_credit_tier_info(peer_id: str, did_credential_mgr=None) -> Dict[str, Any]:
+    """
+    Get credit tier information for a peer.
+
+    Uses DID credential manager's get_credit_tier() if available,
+    otherwise defaults to 'newcomer'.
+    """
+    tier = "newcomer"
+    if did_credential_mgr:
+        try:
+            tier = did_credential_mgr.get_credit_tier(peer_id)
+        except Exception:
+            pass
+
+    tier_info = CREDIT_TIERS.get(tier, CREDIT_TIERS["newcomer"])
+    return {
+        "peer_id": peer_id,
+        "tier": tier,
+        "credit_line": tier_info["credit_line"],
+        "window": tier_info["window"],
+        "model": tier_info["model"],
+    }

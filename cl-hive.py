@@ -112,6 +112,7 @@ from modules.idempotency import check_and_record, generate_event_id
 from modules.outbox import OutboxManager
 from modules.did_credentials import DIDCredentialManager
 from modules.management_schemas import ManagementSchemaRegistry
+from modules.cashu_escrow import CashuEscrowManager
 from modules import network_metrics
 from modules.rpc_commands import (
     HiveContext,
@@ -215,6 +216,21 @@ from modules.rpc_commands import (
     mgmt_credential_issue as rpc_mgmt_credential_issue,
     mgmt_credential_list as rpc_mgmt_credential_list,
     mgmt_credential_revoke as rpc_mgmt_credential_revoke,
+    # Phase 4A: Cashu Escrow
+    escrow_create as rpc_escrow_create,
+    escrow_list as rpc_escrow_list,
+    escrow_redeem as rpc_escrow_redeem,
+    escrow_refund as rpc_escrow_refund,
+    escrow_get_receipt as rpc_escrow_get_receipt,
+    # Phase 4B: Extended Settlements
+    bond_post as rpc_bond_post,
+    bond_status as rpc_bond_status,
+    settlement_obligations_list as rpc_settlement_obligations_list,
+    settlement_net as rpc_settlement_net,
+    dispute_file as rpc_dispute_file,
+    dispute_vote as rpc_dispute_vote,
+    dispute_status as rpc_dispute_status,
+    credit_tier_info as rpc_credit_tier_info,
 )
 
 # Initialize the plugin
@@ -585,6 +601,7 @@ relay_mgr: Optional[RelayManager] = None
 outbox_mgr: Optional[OutboxManager] = None
 did_credential_mgr: Optional[DIDCredentialManager] = None
 management_schema_registry: Optional[ManagementSchemaRegistry] = None
+cashu_escrow_mgr: Optional[CashuEscrowManager] = None
 our_pubkey: Optional[str] = None
 
 # Startup timestamp for lightweight health endpoint (Phase 4)
@@ -909,6 +926,7 @@ def _get_hive_context() -> HiveContext:
         anticipatory_manager=_anticipatory_liquidity_mgr,
         did_credential_mgr=did_credential_mgr,
         management_schema_registry=management_schema_registry,
+        cashu_escrow_mgr=cashu_escrow_mgr,
         our_id=_our_pubkey or "",
         log=_log,
     )
@@ -1127,6 +1145,13 @@ plugin.add_option(
     name='hive-vpn-bind',
     default='',
     description='VPN bind address for hive traffic (ip:port)',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-cashu-mints',
+    default='',
+    description='Comma-separated Cashu mint URLs for escrow tickets',
     dynamic=True
 )
 
@@ -1881,6 +1906,33 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     did_maintenance_thread.start()
     plugin.log("cl-hive: DID maintenance thread started")
 
+    # Phase 4A: Cashu Escrow Manager
+    global cashu_escrow_mgr
+    mint_urls_str = plugin.get_option('hive-cashu-mints')
+    acceptable_mints = [u.strip() for u in mint_urls_str.split(',') if u.strip()] if mint_urls_str else []
+    cashu_escrow_mgr = CashuEscrowManager(
+        database=database,
+        plugin=plugin,
+        rpc=plugin.rpc,
+        our_pubkey=our_pubkey,
+        acceptable_mints=acceptable_mints,
+    )
+    plugin.log("cl-hive: Cashu escrow manager initialized")
+
+    # Phase 4B: Wire extended settlement types into settlement manager
+    if settlement_mgr and cashu_escrow_mgr:
+        settlement_mgr.register_extended_types(cashu_escrow_mgr, did_credential_mgr)
+        plugin.log("cl-hive: Extended settlement types registered")
+
+    # Start escrow maintenance background thread
+    escrow_maintenance_thread = threading.Thread(
+        target=escrow_maintenance_loop,
+        name="cl-hive-escrow-maintenance",
+        daemon=True
+    )
+    escrow_maintenance_thread.start()
+    plugin.log("cl-hive: Escrow maintenance thread started")
+
     # Link anticipatory manager to fee coordination for time-based fees (Phase 7.4)
     if fee_coordination_mgr:
         fee_coordination_mgr.set_anticipatory_manager(anticipatory_liquidity_mgr)
@@ -2227,6 +2279,21 @@ def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Pl
             handle_mgmt_credential_present(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.MGMT_CREDENTIAL_REVOKE:
             handle_mgmt_credential_revoke(peer_id, msg_payload, plugin)
+        # Phase 4: Extended Settlements
+        elif msg_type == HiveMessageType.SETTLEMENT_RECEIPT:
+            handle_settlement_receipt(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.BOND_POSTING:
+            handle_bond_posting(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.BOND_SLASH:
+            handle_bond_slash(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.NETTING_PROPOSAL:
+            handle_netting_proposal(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.NETTING_ACK:
+            handle_netting_ack(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.VIOLATION_REPORT:
+            handle_violation_report(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.ARBITRATION_VOTE:
+            handle_arbitration_vote(peer_id, msg_payload, plugin)
         else:
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
 
@@ -4184,6 +4251,197 @@ def did_maintenance_loop():
             plugin.log(f"cl-hive: did_maintenance_loop error: {e}", level='warn')
 
         shutdown_event.wait(1800)  # 30 min cycle
+
+
+# =============================================================================
+# PHASE 4: EXTENDED SETTLEMENT MESSAGE HANDLERS
+# =============================================================================
+
+def handle_settlement_receipt(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle SETTLEMENT_RECEIPT message."""
+    from modules.protocol import validate_settlement_receipt
+    if not validate_settlement_receipt(payload):
+        plugin.log(f"cl-hive: invalid SETTLEMENT_RECEIPT from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    sender_id = payload.get("sender_id", "")
+    if sender_id != peer_id:
+        plugin.log(f"cl-hive: SETTLEMENT_RECEIPT sender mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if database:
+        is_new, _eid = check_and_record(database, "SETTLEMENT_RECEIPT", payload, peer_id)
+        if not is_new:
+            return {"result": "continue"}
+
+    plugin.log(f"cl-hive: SETTLEMENT_RECEIPT from {peer_id[:16]}... "
+               f"type={payload.get('settlement_type')} amount={payload.get('amount_sats')}")
+    return {"result": "continue"}
+
+
+def handle_bond_posting(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle BOND_POSTING message."""
+    from modules.protocol import validate_bond_posting
+    if not validate_bond_posting(payload):
+        plugin.log(f"cl-hive: invalid BOND_POSTING from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    sender_id = payload.get("sender_id", "")
+    if sender_id != peer_id:
+        plugin.log(f"cl-hive: BOND_POSTING sender mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if database:
+        is_new, _eid = check_and_record(database, "BOND_POSTING", payload, peer_id)
+        if not is_new:
+            return {"result": "continue"}
+
+    plugin.log(f"cl-hive: BOND_POSTING from {peer_id[:16]}... "
+               f"tier={payload.get('tier')} amount={payload.get('amount_sats')}")
+    return {"result": "continue"}
+
+
+def handle_bond_slash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle BOND_SLASH message."""
+    from modules.protocol import validate_bond_slash
+    if not validate_bond_slash(payload):
+        plugin.log(f"cl-hive: invalid BOND_SLASH from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    sender_id = payload.get("sender_id", "")
+    if sender_id != peer_id:
+        plugin.log(f"cl-hive: BOND_SLASH sender mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if database:
+        is_new, _eid = check_and_record(database, "BOND_SLASH", payload, peer_id)
+        if not is_new:
+            return {"result": "continue"}
+
+    plugin.log(f"cl-hive: BOND_SLASH from {peer_id[:16]}... "
+               f"bond={payload.get('bond_id', '')[:16]} amount={payload.get('slash_amount')}")
+    return {"result": "continue"}
+
+
+def handle_netting_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle NETTING_PROPOSAL message."""
+    from modules.protocol import validate_netting_proposal
+    if not validate_netting_proposal(payload):
+        plugin.log(f"cl-hive: invalid NETTING_PROPOSAL from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    sender_id = payload.get("sender_id", "")
+    if sender_id != peer_id:
+        plugin.log(f"cl-hive: NETTING_PROPOSAL sender mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if database:
+        is_new, _eid = check_and_record(database, "NETTING_PROPOSAL", payload, peer_id)
+        if not is_new:
+            return {"result": "continue"}
+
+    plugin.log(f"cl-hive: NETTING_PROPOSAL from {peer_id[:16]}... "
+               f"window={payload.get('window_id', '')[:16]} type={payload.get('netting_type')}")
+    return {"result": "continue"}
+
+
+def handle_netting_ack(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle NETTING_ACK message."""
+    from modules.protocol import validate_netting_ack
+    if not validate_netting_ack(payload):
+        plugin.log(f"cl-hive: invalid NETTING_ACK from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    sender_id = payload.get("sender_id", "")
+    if sender_id != peer_id:
+        plugin.log(f"cl-hive: NETTING_ACK sender mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if database:
+        is_new, _eid = check_and_record(database, "NETTING_ACK", payload, peer_id)
+        if not is_new:
+            return {"result": "continue"}
+
+    plugin.log(f"cl-hive: NETTING_ACK from {peer_id[:16]}... "
+               f"window={payload.get('window_id', '')[:16]} accepted={payload.get('accepted')}")
+    return {"result": "continue"}
+
+
+def handle_violation_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle VIOLATION_REPORT message."""
+    from modules.protocol import validate_violation_report
+    if not validate_violation_report(payload):
+        plugin.log(f"cl-hive: invalid VIOLATION_REPORT from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    sender_id = payload.get("sender_id", "")
+    if sender_id != peer_id:
+        plugin.log(f"cl-hive: VIOLATION_REPORT sender mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if database:
+        is_new, _eid = check_and_record(database, "VIOLATION_REPORT", payload, peer_id)
+        if not is_new:
+            return {"result": "continue"}
+
+    plugin.log(f"cl-hive: VIOLATION_REPORT from {peer_id[:16]}... "
+               f"violator={payload.get('violator_id', '')[:16]} type={payload.get('violation_type')}")
+    return {"result": "continue"}
+
+
+def handle_arbitration_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle ARBITRATION_VOTE message."""
+    from modules.protocol import validate_arbitration_vote
+    if not validate_arbitration_vote(payload):
+        plugin.log(f"cl-hive: invalid ARBITRATION_VOTE from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    sender_id = payload.get("sender_id", "")
+    if sender_id != peer_id:
+        plugin.log(f"cl-hive: ARBITRATION_VOTE sender mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if database:
+        is_new, _eid = check_and_record(database, "ARBITRATION_VOTE", payload, peer_id)
+        if not is_new:
+            return {"result": "continue"}
+
+    plugin.log(f"cl-hive: ARBITRATION_VOTE from {peer_id[:16]}... "
+               f"dispute={payload.get('dispute_id', '')[:16]} vote={payload.get('vote')}")
+    return {"result": "continue"}
+
+
+# =============================================================================
+# PHASE 4: ESCROW MAINTENANCE LOOP
+# =============================================================================
+
+def escrow_maintenance_loop():
+    """
+    Background thread for escrow maintenance.
+
+    15-minute cycle: expire tickets, retry mint ops, prune secrets.
+    """
+    shutdown_event.wait(30)
+
+    while not shutdown_event.is_set():
+        try:
+            if not cashu_escrow_mgr or not database:
+                shutdown_event.wait(60)
+                continue
+
+            # 1. Cleanup expired tickets
+            cashu_escrow_mgr.cleanup_expired_tickets()
+
+            # 2. Retry pending mint operations
+            cashu_escrow_mgr.retry_pending_operations()
+
+            # 3. Prune old revealed secrets
+            cashu_escrow_mgr.prune_old_secrets()
+
+        except Exception as e:
+            plugin.log(f"cl-hive: escrow_maintenance_loop error: {e}", level='warn')
+
+        shutdown_event.wait(900)  # 15 min cycle
 
 
 def outbox_retry_loop():
@@ -18627,6 +18885,184 @@ def hive_mgmt_credential_revoke(plugin: Plugin, credential_id: str):
     """
     ctx = _get_hive_context()
     return rpc_mgmt_credential_revoke(ctx, credential_id)
+
+
+# =============================================================================
+# PHASE 4A: CASHU ESCROW RPC METHODS
+# =============================================================================
+
+@plugin.method("hive-escrow-create")
+def hive_escrow_create(plugin: Plugin, agent_id: str, schema_id: str = "",
+                       action: str = "", danger_score: int = 1,
+                       amount_sats: int = 0, mint_url: str = "",
+                       ticket_type: str = "single"):
+    """
+    Create a Cashu escrow ticket for agent task payment.
+
+    Example:
+        lightning-cli hive-escrow-create agent_id=03abc... danger_score=5 amount_sats=100 mint_url=https://mint.example.com
+    """
+    ctx = _get_hive_context()
+    return rpc_escrow_create(ctx, agent_id, schema_id, action,
+                             danger_score, amount_sats, mint_url, ticket_type)
+
+
+@plugin.method("hive-escrow-list")
+def hive_escrow_list(plugin: Plugin, agent_id: str = None,
+                     status: str = None):
+    """
+    List escrow tickets with optional filters.
+
+    Example:
+        lightning-cli hive-escrow-list
+        lightning-cli hive-escrow-list status=active
+    """
+    ctx = _get_hive_context()
+    return rpc_escrow_list(ctx, agent_id, status)
+
+
+@plugin.method("hive-escrow-redeem")
+def hive_escrow_redeem(plugin: Plugin, ticket_id: str, preimage: str):
+    """
+    Redeem an escrow ticket with HTLC preimage.
+
+    Example:
+        lightning-cli hive-escrow-redeem ticket_id=abc123 preimage=deadbeef...
+    """
+    ctx = _get_hive_context()
+    return rpc_escrow_redeem(ctx, ticket_id, preimage)
+
+
+@plugin.method("hive-escrow-refund")
+def hive_escrow_refund(plugin: Plugin, ticket_id: str):
+    """
+    Refund an escrow ticket after timelock expiry.
+
+    Example:
+        lightning-cli hive-escrow-refund ticket_id=abc123
+    """
+    ctx = _get_hive_context()
+    return rpc_escrow_refund(ctx, ticket_id)
+
+
+@plugin.method("hive-escrow-receipt")
+def hive_escrow_receipt(plugin: Plugin, ticket_id: str):
+    """
+    Get escrow receipts for a ticket.
+
+    Example:
+        lightning-cli hive-escrow-receipt ticket_id=abc123
+    """
+    ctx = _get_hive_context()
+    return rpc_escrow_get_receipt(ctx, ticket_id)
+
+
+# =============================================================================
+# PHASE 4B: EXTENDED SETTLEMENT RPC METHODS
+# =============================================================================
+
+@plugin.method("hive-bond-post")
+def hive_bond_post(plugin: Plugin, amount_sats: int = 0,
+                   tier: str = ""):
+    """
+    Post a settlement bond.
+
+    Example:
+        lightning-cli hive-bond-post amount_sats=50000
+    """
+    ctx = _get_hive_context()
+    return rpc_bond_post(ctx, amount_sats, tier)
+
+
+@plugin.method("hive-bond-status")
+def hive_bond_status(plugin: Plugin, peer_id: str = None):
+    """
+    Get bond status for a peer.
+
+    Example:
+        lightning-cli hive-bond-status
+        lightning-cli hive-bond-status peer_id=03abc...
+    """
+    ctx = _get_hive_context()
+    return rpc_bond_status(ctx, peer_id)
+
+
+@plugin.method("hive-settlement-list")
+def hive_settlement_list(plugin: Plugin, window_id: str = None,
+                         peer_id: str = None):
+    """
+    List settlement obligations.
+
+    Example:
+        lightning-cli hive-settlement-list window_id=2024-W01
+    """
+    ctx = _get_hive_context()
+    return rpc_settlement_obligations_list(ctx, window_id, peer_id)
+
+
+@plugin.method("hive-settlement-net")
+def hive_settlement_net(plugin: Plugin, window_id: str = "",
+                        peer_id: str = None):
+    """
+    Compute netting for a settlement window.
+
+    Example:
+        lightning-cli hive-settlement-net window_id=2024-W01
+        lightning-cli hive-settlement-net window_id=2024-W01 peer_id=03abc...
+    """
+    ctx = _get_hive_context()
+    return rpc_settlement_net(ctx, window_id, peer_id)
+
+
+@plugin.method("hive-dispute-file")
+def hive_dispute_file(plugin: Plugin, obligation_id: str = "",
+                      evidence_json: str = "{}"):
+    """
+    File a settlement dispute.
+
+    Example:
+        lightning-cli hive-dispute-file obligation_id=abc123 evidence_json='{"reason":"underpayment"}'
+    """
+    ctx = _get_hive_context()
+    return rpc_dispute_file(ctx, obligation_id, evidence_json)
+
+
+@plugin.method("hive-dispute-vote")
+def hive_dispute_vote(plugin: Plugin, dispute_id: str = "",
+                      vote: str = "", reason: str = ""):
+    """
+    Cast an arbitration panel vote.
+
+    Example:
+        lightning-cli hive-dispute-vote dispute_id=abc123 vote=upheld reason="clear evidence"
+    """
+    ctx = _get_hive_context()
+    return rpc_dispute_vote(ctx, dispute_id, vote, reason)
+
+
+@plugin.method("hive-dispute-status")
+def hive_dispute_status(plugin: Plugin, dispute_id: str = ""):
+    """
+    Get dispute status.
+
+    Example:
+        lightning-cli hive-dispute-status dispute_id=abc123
+    """
+    ctx = _get_hive_context()
+    return rpc_dispute_status(ctx, dispute_id)
+
+
+@plugin.method("hive-credit-tier")
+def hive_credit_tier(plugin: Plugin, peer_id: str = None):
+    """
+    Get credit tier information for a peer.
+
+    Example:
+        lightning-cli hive-credit-tier
+        lightning-cli hive-credit-tier peer_id=03abc...
+    """
+    ctx = _get_hive_context()
+    return rpc_credit_tier_info(ctx, peer_id)
 
 
 # =============================================================================

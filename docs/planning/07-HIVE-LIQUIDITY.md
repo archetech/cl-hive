@@ -389,7 +389,7 @@ Node A                              Node B
 
 **Definition:** On-chain ↔ Lightning conversion as a service. The provider holds on-chain capital and creates Lightning liquidity on demand (or reverse: drains Lightning channels to on-chain).
 
-**Protocol:** Uses existing submarine swap protocols (Boltz-style) with DID authentication and reputation:
+**Protocol:** Uses existing submarine swap protocols with DID authentication and reputation:
 
 ```
 Client                              Provider (Swap Service)
@@ -1890,7 +1890,7 @@ The propagation dynamics impose specific design constraints:
 - Submarine swap protocol with DID authentication
 - Bilateral liquidity swap matching and settlement
 - Swap provider reputation tracking
-- Integration with existing swap protocols (Boltz API compatibility)
+- Integration with existing swap protocols (boltz-client compatibility)
 
 ### Phase 4: Sidecar & Balanced Channels (3–4 weeks)
 *Prerequisites: Phase 1, NUT-11 multisig support*
@@ -2012,7 +2012,6 @@ Hive intelligence      ──────────►  Liquidity Phase 7 (dyn
 
 - [Lightning Pool](https://lightning.engineering/pool/) — Lightning Labs' centralized liquidity auction
 - [Magma by Amboss](https://amboss.space/magma) — Amboss liquidity marketplace
-- [Boltz Exchange](https://boltz.exchange/) — Non-custodial submarine swap service
 - [Dual-Funding Proposal (BOLT draft)](https://github.com/lightning/bolts/pull/851) — Interactive channel funding protocol
 - [Liquidity Ads (Lisa Neigut / niftynei)](https://github.com/lightning/bolts/pull/878) — In-protocol liquidity advertising
 - [NIP-01: Nostr Basic Protocol](https://github.com/nostr-protocol/nips/blob/master/01.md) — Event kinds, relay protocol, replaceable events
