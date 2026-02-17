@@ -41,7 +41,7 @@ Core Lightning
 - **cl-revenue-ops**: Executes fee policies and rebalancing (called via RPC)
 - **Core Lightning**: Underlying node operations and HSM-based crypto
 
-### Module Organization (40 modules)
+### Module Organization (41 modules)
 
 | Module | Purpose |
 |--------|---------|
@@ -84,7 +84,8 @@ Core Lightning
 | `governance.py` | Decision engine (advisor/failsafe mode routing) |
 | `config.py` | Hot-reloadable configuration with snapshot pattern |
 | `did_credentials.py` | DID credential issuance, verification, reputation aggregation (Phase 16) |
-| `database.py` | SQLite with WAL mode, thread-local connections, 48 tables |
+| `management_schemas.py` | 15 management schema categories, danger scoring, credential lifecycle (Phase 2) |
+| `database.py` | SQLite with WAL mode, thread-local connections, 50 tables |
 
 ### Key Patterns
 
@@ -126,7 +127,7 @@ Core Lightning
 | `advisor` | **Primary mode** - Queue to pending_actions for AI/human approval via MCP server |
 | `failsafe` | Emergency mode - Auto-execute only critical safety actions (bans) within strict limits |
 
-### Database Tables (48 tables)
+### Database Tables (50 tables)
 
 Key tables (see `database.py` for complete schema):
 
@@ -158,6 +159,8 @@ Key tables (see `database.py` for complete schema):
 | `peer_capabilities` | Peer protocol capabilities |
 | `did_credentials` | DID reputation credentials (issued and received) |
 | `did_reputation_cache` | Cached aggregated reputation scores |
+| `management_credentials` | Management credentials (operator → agent permission) |
+| `management_receipts` | Signed receipts of management action executions |
 
 ## Safety Constraints
 
@@ -227,7 +230,7 @@ Note: Sling IS required for cl-revenue-ops itself.
 ```
 cl-hive/
 ├── cl-hive.py              # Main plugin entry point
-├── modules/                # 39 modules
+├── modules/                # 41 modules
 │   ├── protocol.py         # Message types and encoding
 │   ├── handshake.py        # PKI authentication
 │   ├── state_manager.py    # Distributed state (HiveMap)
@@ -266,8 +269,9 @@ cl-hive/
 │   ├── rpc_commands.py     # RPC command handlers
 │   ├── governance.py       # Decision engine (advisor/failsafe)
 │   ├── did_credentials.py  # DID credential issuance + reputation (Phase 16)
+│   ├── management_schemas.py # Management schemas + danger scoring (Phase 2)
 │   ├── config.py           # Configuration
-│   └── database.py         # Database layer (48 tables)
+│   └── database.py         # Database layer (50 tables)
 ├── tools/
 │   ├── mcp-hive-server.py  # MCP server for Claude Code integration
 │   ├── hive-monitor.py     # Real-time monitoring daemon
@@ -275,7 +279,7 @@ cl-hive/
 ├── config/
 │   ├── nodes.rest.example.json    # REST API config example
 │   └── nodes.docker.example.json  # Docker/Polar config example
-├── tests/                  # 1,826 tests across 47 files
+├── tests/                  # 1,918 tests across 48 files
 ├── docs/                   # Documentation
 │   ├── design/             # Design documents
 │   ├── planning/           # Implementation plans

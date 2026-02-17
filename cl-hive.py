@@ -111,6 +111,7 @@ from modules.relay import RelayManager
 from modules.idempotency import check_and_record, generate_event_id
 from modules.outbox import OutboxManager
 from modules.did_credentials import DIDCredentialManager
+from modules.management_schemas import ManagementSchemaRegistry
 from modules import network_metrics
 from modules.rpc_commands import (
     HiveContext,
@@ -208,6 +209,12 @@ from modules.rpc_commands import (
     did_revoke_credential as rpc_did_revoke_credential,
     did_get_reputation as rpc_did_get_reputation,
     did_list_profiles as rpc_did_list_profiles,
+    # Management Schemas (Phase 2)
+    schema_list as rpc_schema_list,
+    schema_validate as rpc_schema_validate,
+    mgmt_credential_issue as rpc_mgmt_credential_issue,
+    mgmt_credential_list as rpc_mgmt_credential_list,
+    mgmt_credential_revoke as rpc_mgmt_credential_revoke,
 )
 
 # Initialize the plugin
@@ -577,6 +584,7 @@ splice_mgr: Optional[SpliceManager] = None
 relay_mgr: Optional[RelayManager] = None
 outbox_mgr: Optional[OutboxManager] = None
 did_credential_mgr: Optional[DIDCredentialManager] = None
+management_schema_registry: Optional[ManagementSchemaRegistry] = None
 our_pubkey: Optional[str] = None
 
 # Startup timestamp for lightweight health endpoint (Phase 4)
@@ -900,6 +908,7 @@ def _get_hive_context() -> HiveContext:
         strategic_positioning_mgr=_strategic_positioning_mgr,
         anticipatory_manager=_anticipatory_liquidity_mgr,
         did_credential_mgr=did_credential_mgr,
+        management_schema_registry=management_schema_registry,
         our_id=_our_pubkey or "",
         log=_log,
     )
@@ -1839,6 +1848,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         our_pubkey=our_pubkey,
     )
     plugin.log("cl-hive: DID credential manager initialized")
+
+    # Phase 2: Management Schema Registry
+    global management_schema_registry
+    management_schema_registry = ManagementSchemaRegistry(
+        database=database,
+        plugin=plugin,
+        rpc=safe_rpc,
+        our_pubkey=our_pubkey,
+    )
+    plugin.log("cl-hive: Management schema registry initialized")
 
     # Start DID maintenance background thread
     did_maintenance_thread = threading.Thread(
@@ -18420,6 +18439,90 @@ def hive_did_profiles(plugin: Plugin):
     """
     ctx = _get_hive_context()
     return rpc_did_list_profiles(ctx)
+
+
+# =============================================================================
+# MANAGEMENT SCHEMA RPC (Phase 2)
+# =============================================================================
+
+@plugin.method("hive-schema-list")
+def hive_schema_list(plugin: Plugin):
+    """
+    List all management schemas with their actions and danger scores.
+
+    Returns the 15 management schema categories, each with its actions,
+    danger scores (5 dimensions), and required permission tiers.
+
+    Example:
+        lightning-cli hive-schema-list
+    """
+    ctx = _get_hive_context()
+    return rpc_schema_list(ctx)
+
+
+@plugin.method("hive-schema-validate")
+def hive_schema_validate(plugin: Plugin, schema_id: str, action: str,
+                         params_json: str = None):
+    """
+    Validate a command against its schema definition (dry run).
+
+    Checks that schema_id and action exist, validates parameter types,
+    and returns the danger score and required tier.
+
+    Example:
+        lightning-cli hive-schema-validate hive:fee-policy/v1 set_single
+    """
+    ctx = _get_hive_context()
+    return rpc_schema_validate(ctx, schema_id, action, params_json)
+
+
+@plugin.method("hive-mgmt-credential-issue")
+def hive_mgmt_credential_issue(plugin: Plugin, agent_id: str, tier: str,
+                                allowed_schemas_json: str,
+                                constraints_json: str = None,
+                                valid_days: int = 90):
+    """
+    Issue a management credential granting an agent permission to manage our node.
+
+    The credential is signed with our HSM and can be presented by the agent
+    to prove authorization for specific management actions.
+
+    Example:
+        lightning-cli hive-mgmt-credential-issue 03abc... standard '["hive:fee-policy/*","hive:monitor/*"]'
+    """
+    ctx = _get_hive_context()
+    return rpc_mgmt_credential_issue(ctx, agent_id, tier,
+                                      allowed_schemas_json,
+                                      constraints_json, valid_days)
+
+
+@plugin.method("hive-mgmt-credential-list")
+def hive_mgmt_credential_list(plugin: Plugin, agent_id: str = None,
+                               node_id: str = None):
+    """
+    List management credentials with optional filters.
+
+    Example:
+        lightning-cli hive-mgmt-credential-list
+        lightning-cli hive-mgmt-credential-list agent_id=03abc...
+    """
+    ctx = _get_hive_context()
+    return rpc_mgmt_credential_list(ctx, agent_id, node_id)
+
+
+@plugin.method("hive-mgmt-credential-revoke")
+def hive_mgmt_credential_revoke(plugin: Plugin, credential_id: str):
+    """
+    Revoke a management credential we issued.
+
+    Once revoked, the credential can no longer be used to authorize
+    management actions.
+
+    Example:
+        lightning-cli hive-mgmt-credential-revoke <credential-id>
+    """
+    ctx = _get_hive_context()
+    return rpc_mgmt_credential_revoke(ctx, credential_id)
 
 
 # =============================================================================

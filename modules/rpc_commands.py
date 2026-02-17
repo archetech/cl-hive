@@ -11,6 +11,7 @@ Design Pattern:
     - Permission checks are done via check_permission() helper
 """
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -45,6 +46,7 @@ class HiveContext:
     strategic_positioning_mgr: Any = None  # StrategicPositioningManager (Phase 5 - Strategic Positioning)
     anticipatory_manager: Any = None  # AnticipatoryLiquidityManager (Phase 7.1 - Anticipatory Liquidity)
     did_credential_mgr: Any = None  # DIDCredentialManager (Phase 16 - DID Credentials)
+    management_schema_registry: Any = None  # ManagementSchemaRegistry (Phase 2 - Management Schemas)
     our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
@@ -4765,3 +4767,119 @@ def did_list_profiles(ctx: HiveContext) -> Dict[str, Any]:
         }
 
     return {"profiles": profiles, "count": len(profiles)}
+
+
+# =========================================================================
+# MANAGEMENT SCHEMA COMMANDS (Phase 2)
+# =========================================================================
+
+def schema_list(ctx: HiveContext) -> Dict[str, Any]:
+    """List all management schemas with their actions and danger scores."""
+    if not ctx.management_schema_registry:
+        return {"error": "management schema registry not initialized"}
+
+    schemas = ctx.management_schema_registry.list_schemas()
+    return {"schemas": schemas, "count": len(schemas)}
+
+
+def schema_validate(ctx: HiveContext, schema_id: str, action: str,
+                    params_json: Optional[str] = None) -> Dict[str, Any]:
+    """Validate a command against its schema definition (dry run)."""
+    if not ctx.management_schema_registry:
+        return {"error": "management schema registry not initialized"}
+
+    params = None
+    if params_json:
+        try:
+            params = json.loads(params_json)
+        except (json.JSONDecodeError, TypeError):
+            return {"error": "invalid params_json"}
+
+    is_valid, reason = ctx.management_schema_registry.validate_command(
+        schema_id, action, params
+    )
+    danger = ctx.management_schema_registry.get_danger_score(schema_id, action)
+    required_tier = ctx.management_schema_registry.get_required_tier(schema_id, action)
+
+    result = {
+        "schema_id": schema_id,
+        "action": action,
+        "valid": is_valid,
+        "reason": reason,
+    }
+    if danger:
+        result["danger"] = danger.to_dict()
+        result["required_tier"] = required_tier
+    return result
+
+
+def mgmt_credential_issue(ctx: HiveContext, agent_id: str, tier: str,
+                           allowed_schemas_json: str,
+                           constraints_json: Optional[str] = None,
+                           valid_days: int = 90) -> Dict[str, Any]:
+    """Issue a management credential granting an agent permission to manage our node."""
+    if not ctx.management_schema_registry:
+        return {"error": "management schema registry not initialized"}
+
+    try:
+        allowed_schemas = json.loads(allowed_schemas_json)
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "invalid allowed_schemas_json"}
+
+    if not isinstance(allowed_schemas, list):
+        return {"error": "allowed_schemas must be a JSON array"}
+
+    constraints = {}
+    if constraints_json:
+        try:
+            constraints = json.loads(constraints_json)
+        except (json.JSONDecodeError, TypeError):
+            return {"error": "invalid constraints_json"}
+
+    node_id = ctx.our_pubkey or ""
+    cred = ctx.management_schema_registry.issue_credential(
+        agent_id=agent_id,
+        node_id=node_id,
+        tier=tier,
+        allowed_schemas=allowed_schemas,
+        constraints=constraints,
+        valid_days=valid_days,
+    )
+
+    if not cred:
+        return {"error": "failed to issue management credential"}
+
+    return {"credential": cred.to_dict()}
+
+
+def mgmt_credential_list(ctx: HiveContext, agent_id: Optional[str] = None,
+                          node_id: Optional[str] = None) -> Dict[str, Any]:
+    """List management credentials with optional filters."""
+    if not ctx.management_schema_registry:
+        return {"error": "management schema registry not initialized"}
+
+    creds = ctx.management_schema_registry.list_credentials(
+        agent_id=agent_id, node_id=node_id
+    )
+    # Parse JSON fields for display
+    results = []
+    for c in creds:
+        entry = dict(c)
+        for jf in ("allowed_schemas_json", "constraints_json"):
+            if jf in entry and entry[jf]:
+                try:
+                    entry[jf.replace("_json", "")] = json.loads(entry[jf])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        results.append(entry)
+
+    return {"credentials": results, "count": len(results)}
+
+
+def mgmt_credential_revoke(ctx: HiveContext, credential_id: str) -> Dict[str, Any]:
+    """Revoke a management credential we issued."""
+    if not ctx.management_schema_registry:
+        return {"error": "management schema registry not initialized"}
+
+    success = ctx.management_schema_registry.revoke_credential(credential_id)
+    return {"revoked": success, "credential_id": credential_id}

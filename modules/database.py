@@ -1346,6 +1346,54 @@ class HiveDatabase:
             )
         """)
 
+        # Phase 2: Management credentials (operator → agent permission)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS management_credentials (
+                credential_id TEXT PRIMARY KEY,
+                issuer_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                tier TEXT NOT NULL DEFAULT 'monitor',
+                allowed_schemas_json TEXT NOT NULL,
+                constraints_json TEXT NOT NULL,
+                valid_from INTEGER NOT NULL,
+                valid_until INTEGER NOT NULL,
+                signature TEXT NOT NULL,
+                revoked_at INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_mgmt_cred_agent
+            ON management_credentials(agent_id)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_mgmt_cred_node
+            ON management_credentials(node_id)
+        """)
+
+        # Phase 2: Management action receipts (audit trail)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS management_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                credential_id TEXT NOT NULL,
+                schema_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                danger_score INTEGER NOT NULL,
+                result_json TEXT,
+                state_hash_before TEXT,
+                state_hash_after TEXT,
+                executed_at INTEGER NOT NULL,
+                executor_signature TEXT NOT NULL,
+                FOREIGN KEY (credential_id) REFERENCES management_credentials(credential_id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_mgmt_receipt_cred
+            ON management_receipts(credential_id)
+        """)
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -1733,6 +1781,10 @@ class HiveDatabase:
 
     # Absolute cap on DID credential rows
     MAX_DID_CREDENTIAL_ROWS = 50000
+
+    # Absolute caps on management credential/receipt rows
+    MAX_MANAGEMENT_CREDENTIAL_ROWS = 1000
+    MAX_MANAGEMENT_RECEIPT_ROWS = 100000
 
     def record_contribution(self, peer_id: str, direction: str,
                             amount_sats: int) -> bool:
@@ -7308,5 +7360,153 @@ class HiveDatabase:
         rows = conn.execute(
             "SELECT * FROM did_reputation_cache WHERE computed_at < ? LIMIT ?",
             (before_ts, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # =========================================================================
+    # MANAGEMENT CREDENTIAL OPERATIONS
+    # =========================================================================
+
+    def store_management_credential(self, credential_id: str, issuer_id: str,
+                                     agent_id: str, node_id: str, tier: str,
+                                     allowed_schemas_json: str,
+                                     constraints_json: str,
+                                     valid_from: int, valid_until: int,
+                                     signature: str) -> bool:
+        """Store a management credential. Returns True on success."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM management_credentials"
+            ).fetchone()
+            if row and row['cnt'] >= self.MAX_MANAGEMENT_CREDENTIAL_ROWS:
+                self.plugin.log(
+                    f"HiveDatabase: management_credentials at cap "
+                    f"({self.MAX_MANAGEMENT_CREDENTIAL_ROWS}), rejecting",
+                    level='warn'
+                )
+                return False
+            conn.execute("""
+                INSERT OR IGNORE INTO management_credentials (
+                    credential_id, issuer_id, agent_id, node_id, tier,
+                    allowed_schemas_json, constraints_json,
+                    valid_from, valid_until, signature
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (credential_id, issuer_id, agent_id, node_id, tier,
+                  allowed_schemas_json, constraints_json,
+                  valid_from, valid_until, signature))
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: store_management_credential error: {e}",
+                level='error'
+            )
+            return False
+
+    def get_management_credential(self, credential_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single management credential by ID."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM management_credentials WHERE credential_id = ?",
+            (credential_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_management_credentials(self, agent_id: Optional[str] = None,
+                                    node_id: Optional[str] = None,
+                                    limit: int = 100) -> List[Dict[str, Any]]:
+        """Get management credentials with optional filters."""
+        conn = self._get_connection()
+        conditions = []
+        params = []
+        if agent_id:
+            conditions.append("agent_id = ?")
+            params.append(agent_id)
+        if node_id:
+            conditions.append("node_id = ?")
+            params.append(node_id)
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        params.append(limit)
+        rows = conn.execute(
+            f"SELECT * FROM management_credentials {where} "
+            f"ORDER BY created_at DESC LIMIT ?",
+            params
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def revoke_management_credential(self, credential_id: str,
+                                      revoked_at: int) -> bool:
+        """Revoke a management credential. Returns True on success."""
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "UPDATE management_credentials SET revoked_at = ? "
+                "WHERE credential_id = ? AND revoked_at IS NULL",
+                (revoked_at, credential_id)
+            )
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: revoke_management_credential error: {e}",
+                level='error'
+            )
+            return False
+
+    def count_management_credentials(self) -> int:
+        """Count total management credentials."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM management_credentials"
+        ).fetchone()
+        return row['cnt'] if row else 0
+
+    def store_management_receipt(self, receipt_id: str, credential_id: str,
+                                  schema_id: str, action: str,
+                                  params_json: str, danger_score: int,
+                                  result_json: Optional[str],
+                                  state_hash_before: Optional[str],
+                                  state_hash_after: Optional[str],
+                                  executed_at: int,
+                                  executor_signature: str) -> bool:
+        """Store a management action receipt. Returns True on success."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM management_receipts"
+            ).fetchone()
+            if row and row['cnt'] >= self.MAX_MANAGEMENT_RECEIPT_ROWS:
+                self.plugin.log(
+                    f"HiveDatabase: management_receipts at cap "
+                    f"({self.MAX_MANAGEMENT_RECEIPT_ROWS}), rejecting",
+                    level='warn'
+                )
+                return False
+            conn.execute("""
+                INSERT OR IGNORE INTO management_receipts (
+                    receipt_id, credential_id, schema_id, action,
+                    params_json, danger_score, result_json,
+                    state_hash_before, state_hash_after,
+                    executed_at, executor_signature
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (receipt_id, credential_id, schema_id, action,
+                  params_json, danger_score, result_json,
+                  state_hash_before, state_hash_after,
+                  executed_at, executor_signature))
+            return True
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: store_management_receipt error: {e}",
+                level='error'
+            )
+            return False
+
+    def get_management_receipts(self, credential_id: str,
+                                 limit: int = 100) -> List[Dict[str, Any]]:
+        """Get management receipts for a credential."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT * FROM management_receipts WHERE credential_id = ? "
+            "ORDER BY executed_at DESC LIMIT ?",
+            (credential_id, limit)
         ).fetchall()
         return [dict(r) for r in rows]
