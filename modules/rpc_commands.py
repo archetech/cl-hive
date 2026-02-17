@@ -4685,6 +4685,9 @@ def did_list_credentials(ctx: HiveContext, subject_id: str = "",
         creds = ctx.database.get_did_credentials_by_issuer(
             issuer_id, limit=100
         )
+        # Apply domain filter if specified (DB method doesn't support it)
+        if domain:
+            creds = [c for c in creds if c.get("domain") == domain]
     else:
         return {"error": "must specify subject_id or issuer_id"}
 

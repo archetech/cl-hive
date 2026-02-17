@@ -6092,10 +6092,14 @@ def validate_did_credential_present(payload: dict) -> bool:
         return False
 
     # Validate credential fields
-    for field in ["issuer_id", "subject_id", "domain", "period_start",
-                  "period_end", "metrics", "outcome", "signature"]:
+    for field in ["credential_id", "issuer_id", "subject_id", "domain",
+                  "period_start", "period_end", "metrics", "outcome", "signature"]:
         if field not in credential:
             return False
+
+    credential_id = credential.get("credential_id")
+    if not isinstance(credential_id, str) or not credential_id or len(credential_id) > 64:
+        return False
 
     issuer_id = credential.get("issuer_id")
     if not isinstance(issuer_id, str) or not _valid_pubkey(issuer_id):
@@ -6120,6 +6124,26 @@ def validate_did_credential_present(payload: dict) -> bool:
     metrics = credential.get("metrics")
     if not isinstance(metrics, dict):
         return False
+    # Enforce metrics size limit
+    import json as _json
+    try:
+        metrics_json = _json.dumps(metrics, separators=(',', ':'))
+        if len(metrics_json) > MAX_CREDENTIAL_METRICS_LEN:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    # Enforce evidence size limit if present
+    evidence = credential.get("evidence")
+    if evidence is not None:
+        if not isinstance(evidence, list):
+            return False
+        try:
+            evidence_json = _json.dumps(evidence, separators=(',', ':'))
+            if len(evidence_json) > MAX_CREDENTIAL_EVIDENCE_LEN:
+                return False
+        except (TypeError, ValueError):
+            return False
 
     period_start = credential.get("period_start")
     period_end = credential.get("period_end")

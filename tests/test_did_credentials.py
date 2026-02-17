@@ -1127,6 +1127,7 @@ class TestProtocolMessages:
             "event_id": str(uuid.uuid4()),
             "timestamp": now,
             "credential": {
+                "credential_id": str(uuid.uuid4()),
                 "issuer_id": ALICE_PUBKEY,
                 "subject_id": BOB_PUBKEY,
                 "domain": "hive:node",
@@ -1146,6 +1147,7 @@ class TestProtocolMessages:
             "event_id": str(uuid.uuid4()),
             "timestamp": now,
             "credential": {
+                "credential_id": str(uuid.uuid4()),
                 "issuer_id": ALICE_PUBKEY,
                 "subject_id": ALICE_PUBKEY,  # Self-issuance
                 "domain": "hive:node",

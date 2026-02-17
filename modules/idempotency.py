@@ -44,8 +44,11 @@ EVENT_ID_FIELDS: Dict[str, list] = {
     "SPLICE_SIGNED": ["session_id"],
     "SPLICE_ABORT": ["session_id"],
     # Phase 16: DID Credentials
+    # PRESENT: event_id is sender-generated UUID; handler has content-level
+    # dedup via credential_id check in handle_credential_present (M2 fix).
     "DID_CREDENTIAL_PRESENT": ["event_id"],
-    "DID_CREDENTIAL_REVOKE": ["event_id"],
+    # REVOKE: use domain-specific fields for content-based dedup
+    "DID_CREDENTIAL_REVOKE": ["credential_id", "issuer_id"],
 }
 
 
