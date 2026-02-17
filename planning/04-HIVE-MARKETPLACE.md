@@ -11,7 +11,7 @@
 
 ## Abstract
 
-This document defines the marketplace layer for the Lightning Hive protocol suite — how advisors advertise management services, how nodes discover and evaluate advisors, how they negotiate terms, and how contracts are formed. It bridges the existing protocol specifications ([Fleet Management](./DID-L402-FLEET-MANAGEMENT.md), [Reputation Schema](./DID-REPUTATION-SCHEMA.md), [Task Escrow](./DID-CASHU-TASK-ESCROW.md), [Settlements](./DID-HIVE-SETTLEMENTS.md)) into a functioning market for routing expertise.
+This document defines the marketplace layer for the Lightning Hive protocol suite — how advisors advertise management services, how nodes discover and evaluate advisors, how they negotiate terms, and how contracts are formed. It bridges the existing protocol specifications ([Fleet Management](./02-FLEET-MANAGEMENT.md), [Reputation Schema](./01-REPUTATION-SCHEMA.md), [Task Escrow](./03-CASHU-TASK-ESCROW.md), [Settlements](./06-HIVE-SETTLEMENTS.md)) into a functioning market for routing expertise.
 
 The result is a decentralized, peer-to-peer marketplace where AI advisors and human experts compete to manage Lightning nodes — authenticated by DIDs, ranked by verifiable reputation, contracted through signed credentials, and paid through Cashu escrow. No central marketplace operator. No platform fees. Just cryptography, gossip, and economic incentives.
 
@@ -27,7 +27,7 @@ Throughout this spec, marketplace interactions are described using DID reference
 - "Hire Hex Fleet Advisor" → not "issue `HiveManagementCredential` to `did:cid:bagaaiera...`"
 - "Rate your advisor ★★★★☆" → not "issue `DIDReputationCredential` with `outcome: renew`"
 
-Advisors are identified by `displayName`, profile pictures, and reputation badges. DIDs are resolved transparently by the client software. See [DID Hive Client](./DID-HIVE-CLIENT.md) for the user-facing abstraction layer.
+Advisors are identified by `displayName`, profile pictures, and reputation badges. DIDs are resolved transparently by the client software. See [DID Hive Client](./08-HIVE-CLIENT.md) for the user-facing abstraction layer.
 
 ### Payment Flexibility
 
@@ -218,7 +218,7 @@ Advisors declare specializations from a defined taxonomy. Specializations are no
 | `monitoring-only` | Read-only monitoring, alerting, reporting | `hive:monitor/*` |
 | `liquidity-services` | Liquidity provisioning — leasing, pools, JIT, swaps, insurance | `hive:liquidity/*` |
 
-New specializations can be proposed via hive governance, published as profile definitions on the Archon network. For liquidity-specific service profiles and the full liquidity marketplace, see the [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md).
+New specializations can be proposed via hive governance, published as profile definitions on the Archon network. For liquidity-specific service profiles and the full liquidity marketplace, see the [DID Hive Liquidity Protocol](./07-HIVE-LIQUIDITY.md).
 
 ### Profile Refresh & Update
 
@@ -265,7 +265,7 @@ For broader discovery beyond hive members, advisors can publish profiles to Nost
 
 Using NIP-78 (application-specific data) or a custom kind. The Nostr event contains the same profile credential, enabling nodes outside the hive gossip network to discover advisors. The DID-to-Nostr link is verified via the advisor's [Nostr attestation credential](https://github.com/archetech/archon) binding their DID to their Nostr pubkey.
 
-> **Liquidity marketplace on Nostr:** The [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md#11a-nostr-marketplace-protocol) extends this Nostr discovery pattern with six dedicated event kinds (38900–38905) for liquidity provider profiles, offers, RFPs, contract confirmations, heartbeat attestations, and reputation summaries. The same Nostr relay infrastructure serves both advisor and liquidity discovery.
+> **Liquidity marketplace on Nostr:** The [DID Hive Liquidity Protocol](./07-HIVE-LIQUIDITY.md#11a-nostr-marketplace-protocol) extends this Nostr discovery pattern with six dedicated event kinds (38900–38905) for liquidity provider profiles, offers, RFPs, contract confirmations, heartbeat attestations, and reputation summaries. The same Nostr relay infrastructure serves both advisor and liquidity discovery.
 
 ---
 
@@ -635,7 +635,7 @@ Negotiation rules:
 
 ### Contract Credential
 
-A contract is formalized as a signed Verifiable Credential binding both parties to agreed terms. The contract credential bundles together references to the Management Credential (from [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)) and Escrow Tickets (from [Task Escrow](./DID-CASHU-TASK-ESCROW.md)).
+A contract is formalized as a signed Verifiable Credential binding both parties to agreed terms. The contract credential bundles together references to the Management Credential (from [Fleet Management](./02-FLEET-MANAGEMENT.md)) and Escrow Tickets (from [Task Escrow](./03-CASHU-TASK-ESCROW.md)).
 
 ```json
 {
@@ -723,7 +723,7 @@ Service Level Agreements define measurable commitments:
 | Stagnant channels | Percentage of channels with zero forwards | <20% | Review trigger |
 | Action throughput | Minimum actions per settlement period | Varies | Contract review |
 
-SLA metrics are measured by the node and reported in the periodic reputation credential. Disputes over SLA measurement follow the [Dispute Resolution](./DID-HIVE-SETTLEMENTS.md#dispute-resolution) process from the Settlements spec.
+SLA metrics are measured by the node and reported in the periodic reputation credential. Disputes over SLA measurement follow the [Dispute Resolution](./06-HIVE-SETTLEMENTS.md#dispute-resolution) process from the Settlements spec.
 
 ### Activation Flow
 
@@ -789,7 +789,7 @@ Only the existence and scope are public — specific terms (pricing, SLA details
 
 First-time relationships carry inherent risk for both parties. The node doesn't know if the advisor is competent. The advisor doesn't know if the node has reasonable expectations. Trial periods reduce this risk by limiting scope, duration, and financial commitment.
 
-Trial periods also solve the [baseline integrity challenge](./DID-CASHU-TASK-ESCROW.md#performance-ticket) from the Task Escrow spec: the trial establishes performance baselines collaboratively before full performance-based compensation begins.
+Trial periods also solve the [baseline integrity challenge](./03-CASHU-TASK-ESCROW.md#performance-ticket) from the Task Escrow spec: the trial establishes performance baselines collaboratively before full performance-based compensation begins.
 
 ### Trial Terms
 
@@ -1075,7 +1075,7 @@ The overlap period (typically 3–7 days) ensures continuity. During overlap:
 
 ### Knowledge Transfer (Optional, Paid)
 
-The outgoing advisor can offer a paid knowledge transfer — sharing anonymized optimization insights with the incoming advisor. This is settled via [Intelligence Settlement (Type 7)](./DID-HIVE-SETTLEMENTS.md#7-intelligence-sharing) from the Settlements spec.
+The outgoing advisor can offer a paid knowledge transfer — sharing anonymized optimization insights with the incoming advisor. This is settled via [Intelligence Settlement (Type 7)](./06-HIVE-SETTLEMENTS.md#7-intelligence-sharing) from the Settlements spec.
 
 Knowledge transfer is opt-in for both parties. The outgoing advisor sets a price; the incoming advisor (or operator) decides whether the insights are worth paying for. This creates an incentive for departing advisors to cooperate gracefully — their knowledge has value even after the relationship ends.
 
@@ -1128,7 +1128,7 @@ An advisor can recommend another advisor for capabilities outside their speciali
 
 ### Referral Fee Settlement
 
-Referral fees are settled via [Type 9 (Advisor Fee Settlement)](./DID-HIVE-SETTLEMENTS.md#9-advisor-fee-settlement) from the Settlements spec. The referring advisor receives a percentage of the referred advisor's first contract revenue:
+Referral fees are settled via [Type 9 (Advisor Fee Settlement)](./06-HIVE-SETTLEMENTS.md#9-advisor-fee-settlement) from the Settlements spec. The referring advisor receives a percentage of the referred advisor's first contract revenue:
 
 ```
 referral_fee = referred_advisor.first_contract_revenue × referral_fee_pct / 100
@@ -1178,7 +1178,7 @@ After each contract period (or at termination), both parties issue reputation cr
 
 #### Node Rates Advisor
 
-Using the `hive:advisor` profile from the [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md):
+Using the `hive:advisor` profile from the [DID Reputation Schema](./01-REPUTATION-SCHEMA.md):
 
 ```json
 {
@@ -1210,7 +1210,7 @@ Using the `hive:advisor` profile from the [DID Reputation Schema](./DID-REPUTATI
 
 #### Advisor Rates Node
 
-Using the `hive:client` profile (see [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md#profile-hiveclient)):
+Using the `hive:client` profile (see [DID Reputation Schema](./01-REPUTATION-SCHEMA.md#profile-hiveclient)):
 
 ```json
 {
@@ -1239,7 +1239,7 @@ Using the `hive:client` profile (see [DID Reputation Schema](./DID-REPUTATION-SC
 }
 ```
 
-> **Note:** The `hive:client` profile used above is a new profile distinct from the `hive:node` profile defined in the [Reputation Schema](./DID-REPUTATION-SCHEMA.md#profile-hivenode). It captures marketplace-specific metrics (`payment_timeliness`, `sla_reasonableness`, `communication_quality`, `infrastructure_reliability`) from the advisor's perspective of the node operator as a client. This profile should be proposed to the Archon profile registry following the [Defining New Profiles](./DID-REPUTATION-SCHEMA.md#defining-new-profiles) process.
+> **Note:** The `hive:client` profile used above is a new profile distinct from the `hive:node` profile defined in the [Reputation Schema](./01-REPUTATION-SCHEMA.md#profile-hivenode). It captures marketplace-specific metrics (`payment_timeliness`, `sla_reasonableness`, `communication_quality`, `infrastructure_reliability`) from the advisor's perspective of the node operator as a client. This profile should be proposed to the Archon profile registry following the [Defining New Profiles](./01-REPUTATION-SCHEMA.md#defining-new-profiles) process.
 
 ### Why Mutual Reputation Matters
 
@@ -1342,7 +1342,7 @@ New advisors bootstrap reputation through:
 
 The marketplace described in sections 1–10 assumes hive membership — advisors and nodes discover each other through hive gossip, contract through hive PKI, and settle through the hive settlement protocol. But the real market is every Lightning node operator, most of whom will never join a hive.
 
-This section defines how non-hive nodes participate in the marketplace via the `cl-hive-comms` plugin (the entry point for all commercial customers) as specified in the [DID Hive Client](./DID-HIVE-CLIENT.md) spec. Non-hive nodes install `cl-hive-comms` — not the full `cl-hive` plugin — to get advisor management, marketplace access, and Nostr-based discovery.
+This section defines how non-hive nodes participate in the marketplace via the `cl-hive-comms` plugin (the entry point for all commercial customers) as specified in the [DID Hive Client](./08-HIVE-CLIENT.md) spec. Non-hive nodes install `cl-hive-comms` — not the full `cl-hive` plugin — to get advisor management, marketplace access, and Nostr-based discovery.
 
 ### Hive Marketplace vs Public Marketplace
 
@@ -1397,7 +1397,7 @@ Key differences from hive contracting:
 - **No settlement protocol** — Payments via standard Lightning (Bolt11/Bolt12) for simple fees, Cashu escrow for conditional payments. No netting, no credit tiers.
 - **No bond verification** — Reputation credentials are the primary trust signal.
 - **No gossip announcement** — The contract is private between the two parties.
-- **Flexible payment methods** — Operator and advisor negotiate payment method; not locked to Cashu. See the [Client spec Payment Manager](./DID-HIVE-CLIENT.md#payment-manager) for details.
+- **Flexible payment methods** — Operator and advisor negotiate payment method; not locked to Cashu. See the [Client spec Payment Manager](./08-HIVE-CLIENT.md#payment-manager) for details.
 - **Invisible identity** — DIDs are auto-provisioned; operators never see or manage cryptographic identifiers.
 
 ### Non-Hive Nodes in the Reputation Loop
@@ -1416,11 +1416,11 @@ Non-hive nodes install:
 
 `cl-hive-comms` auto-generates a Nostr keypair on first run — no DID or Archon node required. Add `cl-hive-archon` later for DID verification if desired.
 
-See the [DID Hive Client](./DID-HIVE-CLIENT.md) spec for full architecture, installation, and configuration details.
+See the [DID Hive Client](./08-HIVE-CLIENT.md) spec for full architecture, installation, and configuration details.
 
 ### Upgrade Path
 
-Non-hive nodes that want full marketplace features (gossip discovery, settlement netting, intelligence market, fleet rebalancing) can upgrade to hive membership. The migration preserves existing credentials, escrow state, and reputation history. See [DID Hive Client — Hive Membership Upgrade Path](./DID-HIVE-CLIENT.md#11-hive-membership-upgrade-path).
+Non-hive nodes that want full marketplace features (gossip discovery, settlement netting, intelligence market, fleet rebalancing) can upgrade to hive membership. The migration preserves existing credentials, escrow state, and reputation history. See [DID Hive Client — Hive Membership Upgrade Path](./08-HIVE-CLIENT.md#11-hive-membership-upgrade-path).
 
 ---
 
@@ -1577,10 +1577,10 @@ Reputation Schema      ──────────►  Marketplace Phase 6 (r
 
 ## 15. References
 
-- [DID + L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
-- [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
-- [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md)
-- [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
+- [DID + L402 Remote Fleet Management](./02-FLEET-MANAGEMENT.md)
+- [DID Reputation Schema](./01-REPUTATION-SCHEMA.md)
+- [DID + Cashu Task Escrow Protocol](./03-CASHU-TASK-ESCROW.md)
+- [DID + Cashu Hive Settlements Protocol](./06-HIVE-SETTLEMENTS.md)
 - [W3C DID Core 1.0](https://www.w3.org/TR/did-core/)
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)

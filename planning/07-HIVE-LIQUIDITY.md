@@ -15,9 +15,9 @@ This document defines a trustless marketplace for Lightning liquidity services �
 
 Liquidity is the most valuable resource in the Lightning Network. Without inbound capacity, a node cannot receive payments. Without balanced channels, a node loses routing revenue. Without strategic channel placement, a node is topologically irrelevant. Today, obtaining liquidity requires manual negotiation, trust in centralized platforms, or expensive on-chain capital commitment with no performance guarantees.
 
-This spec turns liquidity into a **commodity service** — priced, escrowed, delivered, verified, and settled through cryptographic protocols. It extends [Type 3 (Channel Leasing)](./DID-HIVE-SETTLEMENTS.md#3-channel-leasing--liquidity-rental) from the Settlements spec into a full liquidity marketplace encompassing nine distinct service types, six pricing models, and comprehensive proof/escrow mechanisms.
+This spec turns liquidity into a **commodity service** — priced, escrowed, delivered, verified, and settled through cryptographic protocols. It extends [Type 3 (Channel Leasing)](./06-HIVE-SETTLEMENTS.md#3-channel-leasing--liquidity-rental) from the Settlements spec into a full liquidity marketplace encompassing nine distinct service types, six pricing models, and comprehensive proof/escrow mechanisms.
 
-Liquidity services are delivered through the same client interface as management services — the `cl-hive-comms` plugin from the [DID Hive Client](./DID-HIVE-CLIENT.md) spec. **One plugin, all services.** An operator installs `cl-hive-comms` once and gains access to both advisor management and the full liquidity marketplace. The marketplace itself is discoverable via two complementary layers: **hive gossip** for members (requires `cl-hive` plugin) and **Nostr** as the open, public marketplace layer — enabling any Nostr client to browse available liquidity without hive infrastructure. `cl-hive-comms` handles all Nostr publishing and subscribing, sharing the same connection used for DM transport.
+Liquidity services are delivered through the same client interface as management services — the `cl-hive-comms` plugin from the [DID Hive Client](./08-HIVE-CLIENT.md) spec. **One plugin, all services.** An operator installs `cl-hive-comms` once and gains access to both advisor management and the full liquidity marketplace. The marketplace itself is discoverable via two complementary layers: **hive gossip** for members (requires `cl-hive` plugin) and **Nostr** as the open, public marketplace layer — enabling any Nostr client to browse available liquidity without hive infrastructure. `cl-hive-comms` handles all Nostr publishing and subscribing, sharing the same connection used for DM transport.
 
 ---
 
@@ -64,7 +64,7 @@ Existing liquidity solutions (Lightning Pool, Magma, LNBig) are centralized — 
 
 ### DID Transparency
 
-Liquidity operations use human-readable names and aliases. Operators "lease inbound from BigNode Liquidity" — never "issue `LiquidityLeaseCredential` to `did:cid:bagaaiera...`". Provider profiles show display names, capacity badges, and uptime ratings. DIDs are resolved transparently by the client software. See [DID Hive Client](./DID-HIVE-CLIENT.md) for the abstraction layer.
+Liquidity operations use human-readable names and aliases. Operators "lease inbound from BigNode Liquidity" — never "issue `LiquidityLeaseCredential` to `did:cid:bagaaiera...`". Provider profiles show display names, capacity badges, and uptime ratings. DIDs are resolved transparently by the client software. See [DID Hive Client](./08-HIVE-CLIENT.md) for the abstraction layer.
 
 ### Payment Flexibility
 
@@ -77,7 +77,7 @@ Each liquidity service type uses the payment method best suited to its settlemen
 | Recurring lease payments | **Bolt12 offers** | Reusable recurring payment codes |
 | Submarine swaps | **HTLC-native** | Naturally atomic; no additional escrow needed |
 | Insurance premiums | **Bolt11** or **Bolt12** | Regular payments; Cashu for top-up guarantee escrow |
-| Revenue-share settlements | **Settlement protocol** | Netting via [Settlements Type 1](./DID-HIVE-SETTLEMENTS.md#1-routing-revenue-sharing) |
+| Revenue-share settlements | **Settlement protocol** | Netting via [Settlements Type 1](./06-HIVE-SETTLEMENTS.md#1-routing-revenue-sharing) |
 
 ### Archon Integration Tiers
 
@@ -95,7 +95,7 @@ Non-hive nodes access liquidity services via `cl-hive-comms` with simplified con
 
 ### Unified Client Architecture
 
-Liquidity services are **not a separate product**. They are delivered through the same [DID Hive Client](./DID-HIVE-CLIENT.md) that handles advisor management. The client's existing components handle liquidity without modification:
+Liquidity services are **not a separate product**. They are delivered through the same [DID Hive Client](./08-HIVE-CLIENT.md) that handles advisor management. The client's existing components handle liquidity without modification:
 
 | Client Component | Management Use | Liquidity Use |
 |-----------------|---------------|---------------|
@@ -141,7 +141,7 @@ See [Section 11A: Nostr Marketplace Protocol](#11a-nostr-marketplace-protocol) f
 
 **Definition:** Provider opens a channel to the client's node (or maintains an existing one) with X sats of capacity directed toward the client, for Y days.
 
-**Extends:** [Settlements Type 3](./DID-HIVE-SETTLEMENTS.md#3-channel-leasing--liquidity-rental) with full marketplace integration.
+**Extends:** [Settlements Type 3](./06-HIVE-SETTLEMENTS.md#3-channel-leasing--liquidity-rental) with full marketplace integration.
 
 **Flow:**
 
@@ -262,9 +262,9 @@ Client                           Provider                       Mint
 }
 ```
 
-**Revenue distribution:** Pool revenue (lease fees collected from clients) is distributed proportionally via the [settlement protocol](./DID-HIVE-SETTLEMENTS.md). Each allocation generates routing revenue sharing receipts (`HTLCForwardReceipt`) that flow through the standard settlement netting process. Providers receive their share at each settlement window.
+**Revenue distribution:** Pool revenue (lease fees collected from clients) is distributed proportionally via the [settlement protocol](./06-HIVE-SETTLEMENTS.md). Each allocation generates routing revenue sharing receipts (`HTLCForwardReceipt`) that flow through the standard settlement netting process. Providers receive their share at each settlement window.
 
-**Pool manager compensation:** The pool manager takes a management fee (configurable, typically 5-15% of pool revenue) settled via [Type 9 (Advisor Fee Settlement)](./DID-HIVE-SETTLEMENTS.md#9-advisor-fee-settlement).
+**Pool manager compensation:** The pool manager takes a management fee (configurable, typically 5-15% of pool revenue) settled via [Type 9 (Advisor Fee Settlement)](./06-HIVE-SETTLEMENTS.md#9-advisor-fee-settlement).
 
 **Withdrawal:** Providers give notice (default: 7 days), and their capital is returned as existing allocations expire. Emergency withdrawal forfeits any pending revenue share for the current period.
 
@@ -310,7 +310,7 @@ Client/Advisor                   Provider                    Network
 
 **Time-critical settlement:** JIT requires fast escrow. The escrow ticket timelock is short (6 hours default). If the provider doesn't open the channel within the urgency window, the client reclaims via timelock.
 
-**Advisor integration:** The AI advisor (per [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)) can trigger JIT requests automatically when it detects a client node needs inbound for a specific corridor — using the monitoring credential to observe traffic patterns and the management credential to execute the liquidity purchase within budget constraints.
+**Advisor integration:** The AI advisor (per [Fleet Management](./02-FLEET-MANAGEMENT.md)) can trigger JIT requests automatically when it detects a client node needs inbound for a specific corridor — using the monitoring credential to observe traffic patterns and the management credential to execute the liquidity purchase within budget constraints.
 
 ### Type 4: Sidecar Channels
 
@@ -348,7 +348,7 @@ Funder (F)              Node A              Node B              Mint
 
 The escrow ticket uses NUT-11 multisig: `n_sigs: 2` with `pubkeys: [A_pubkey, B_pubkey]`. Both endpoint nodes must sign to redeem, ensuring both cooperated on the channel open. The HTLC hash is `H(funding_txid)`, verified on-chain.
 
-**Revenue sharing:** The funder earns a share of routing revenue flowing through the sidecar channel. This is settled via [Type 1 (Routing Revenue Sharing)](./DID-HIVE-SETTLEMENTS.md#1-routing-revenue-sharing) with the funder as a third participant.
+**Revenue sharing:** The funder earns a share of routing revenue flowing through the sidecar channel. This is settled via [Type 1 (Routing Revenue Sharing)](./06-HIVE-SETTLEMENTS.md#1-routing-revenue-sharing) with the funder as a third participant.
 
 **Use case:** A large routing node wants to improve connectivity between two well-positioned peers without committing its own channel slots. It funds a sidecar channel between them and earns passive routing revenue.
 
@@ -379,7 +379,7 @@ Node A                              Node B
   │                                    │
 ```
 
-**Settlement:** Both parties' obligations net to zero in the [bilateral netting](./DID-HIVE-SETTLEMENTS.md#bilateral-netting) process. If capacities are unequal (A opens 5M, B opens 3M), the difference is settled as a standard lease payment.
+**Settlement:** Both parties' obligations net to zero in the [bilateral netting](./06-HIVE-SETTLEMENTS.md#bilateral-netting) process. If capacities are unequal (A opens 5M, B opens 3M), the difference is settled as a standard lease payment.
 
 **Proof:** Both channels must exist and maintain capacity for the agreed duration. Heartbeat attestations (same as Type 1) confirm ongoing availability.
 
@@ -549,7 +549,7 @@ Example:
   Provider earns: 10,000 sats/month
 ```
 
-**Settlement:** Revenue share is settled via [Type 1 (Routing Revenue Sharing)](./DID-HIVE-SETTLEMENTS.md#1-routing-revenue-sharing) from the Settlements spec. Forwarding receipts through the leased channel are tagged with the lease ID, enabling attribution.
+**Settlement:** Revenue share is settled via [Type 1 (Routing Revenue Sharing)](./06-HIVE-SETTLEMENTS.md#1-routing-revenue-sharing) from the Settlements spec. Forwarding receipts through the leased channel are tagged with the lease ID, enabling attribution.
 
 **Minimum guarantee:** Providers may require a minimum monthly payment regardless of routing volume, with revenue share kicking in above the minimum. This protects against clients who lease capacity but don't route through it.
 
@@ -569,7 +569,7 @@ Longer commitments get lower rates. Incentivizes stability for providers (less c
 
 ### Auction-Based
 
-Nodes bid for liquidity from a pool or provider. Sealed-bid auction using the [marketplace's auction mechanism](./DID-HIVE-MARKETPLACE.md#sealed-bid-auctions).
+Nodes bid for liquidity from a pool or provider. Sealed-bid auction using the [marketplace's auction mechanism](./04-HIVE-MARKETPLACE.md#sealed-bid-auctions).
 
 **Flow:**
 1. Provider announces available capacity (e.g., "10M sats available for 30-day leases")
@@ -622,7 +622,7 @@ The market finds equilibrium through:
 
 ### LiquidityServiceProfile Credential
 
-Providers advertise services by publishing a `LiquidityServiceProfile` — extending the [HiveServiceProfile](./DID-HIVE-MARKETPLACE.md#hiveserviceprofile-credential) with liquidity-specific fields:
+Providers advertise services by publishing a `LiquidityServiceProfile` — extending the [HiveServiceProfile](./04-HIVE-MARKETPLACE.md#hiveserviceprofile-credential) with liquidity-specific fields:
 
 ```json
 {
@@ -760,7 +760,7 @@ A new reputation domain for liquidity providers, tracked via `DIDReputationCrede
 
 ## 5. Escrow for Liquidity Services
 
-Each service type uses the [Cashu escrow protocol](./DID-CASHU-TASK-ESCROW.md) adapted to its settlement pattern:
+Each service type uses the [Cashu escrow protocol](./03-CASHU-TASK-ESCROW.md) adapted to its settlement pattern:
 
 ### Channel Leasing Escrow
 
@@ -887,7 +887,7 @@ The `n_sigs: 1` with both pubkeys means **either** party can spend. The client c
 
 ### Routing Proof
 
-**Mechanism:** Signed forwarding receipts showing traffic flowed through leased capacity. Uses the same `HTLCForwardReceipt` format from [Settlements Type 1](./DID-HIVE-SETTLEMENTS.md#1-routing-revenue-sharing).
+**Mechanism:** Signed forwarding receipts showing traffic flowed through leased capacity. Uses the same `HTLCForwardReceipt` format from [Settlements Type 1](./06-HIVE-SETTLEMENTS.md#1-routing-revenue-sharing).
 
 **Purpose:** Required for revenue-share pricing models. The provider proves that their leased channel was actually used for routing (justifying their revenue share).
 
@@ -948,7 +948,7 @@ Liquidity services extend the existing settlement types rather than creating new
 
 ### Netting
 
-Liquidity obligations participate in standard [bilateral](./DID-HIVE-SETTLEMENTS.md#bilateral-netting) and [multilateral netting](./DID-HIVE-SETTLEMENTS.md#multilateral-netting):
+Liquidity obligations participate in standard [bilateral](./06-HIVE-SETTLEMENTS.md#bilateral-netting) and [multilateral netting](./06-HIVE-SETTLEMENTS.md#multilateral-netting):
 
 ```
 Example netting between Node A (client) and Node B (provider):
@@ -1014,7 +1014,7 @@ A meta-service: an advisor that manages a liquidity provider's portfolio. This a
 - Recommends reallocation of capital between service types
 - Optimizes the yield curve for the provider's risk tolerance
 
-This uses the same [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) credential and escrow infrastructure — the advisor manages the provider's liquidity portfolio under a management credential, paid via performance share of the provider's liquidity revenue.
+This uses the same [Fleet Management](./02-FLEET-MANAGEMENT.md) credential and escrow infrastructure — the advisor manages the provider's liquidity portfolio under a management credential, paid via performance share of the provider's liquidity revenue.
 
 ---
 
@@ -1068,7 +1068,7 @@ Lightning protocol requires each party to maintain a reserve (typically 1% of ch
 
 ### Advisor-Driven Liquidity Management
 
-The AI advisor (per [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)) uses liquidity services as a tool for node optimization:
+The AI advisor (per [Fleet Management](./02-FLEET-MANAGEMENT.md)) uses liquidity services as a tool for node optimization:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -1160,7 +1160,7 @@ The advisor continuously optimizes the node's liquidity position:
 
 ### One Plugin, All Services
 
-Non-hive nodes access liquidity services through the **same client software** they use for advisor management: `cl-hive-comms`, as specified in the [DID Hive Client](./DID-HIVE-CLIENT.md) spec.
+Non-hive nodes access liquidity services through the **same client software** they use for advisor management: `cl-hive-comms`, as specified in the [DID Hive Client](./08-HIVE-CLIENT.md) spec.
 
 There is no separate liquidity client. `cl-hive-comms` already includes every component needed for liquidity services:
 
@@ -1225,12 +1225,12 @@ Payment Balance:
   Management spend this month: 2,340 sats (limit: 50,000)
 ```
 
-> **Note:** LND support is deferred to a future project. When implemented, an LND companion daemon (`hive-lnd`) will provide equivalent functionality. See [DID Hive Client — LND Support](./DID-HIVE-CLIENT.md#lnd-support-deferred).
+> **Note:** LND support is deferred to a future project. When implemented, an LND companion daemon (`hive-lnd`) will provide equivalent functionality. See [DID Hive Client — LND Support](./08-HIVE-CLIENT.md#lnd-support-deferred).
 
 
 ### Schema Translation for Liquidity
 
-The [Schema Translation Layer](./DID-HIVE-CLIENT.md#5-schema-translation-layer) handles liquidity schemas the same way it handles management schemas — translating `hive:liquidity/*` actions to CLN RPC or LND gRPC calls:
+The [Schema Translation Layer](./08-HIVE-CLIENT.md#5-schema-translation-layer) handles liquidity schemas the same way it handles management schemas — translating `hive:liquidity/*` actions to CLN RPC or LND gRPC calls:
 
 | Schema | Action | CLN RPC | LND gRPC | Danger |
 |--------|--------|---------|----------|--------|
@@ -1255,7 +1255,7 @@ Non-hive nodes skip settlement protocol integration. All payments use direct esc
 
 ### Payment Methods for Non-Hive Clients
 
-The client's [Payment Manager](./DID-HIVE-CLIENT.md#payment-manager) handles all liquidity payments using the same method-selection logic as management payments:
+The client's [Payment Manager](./08-HIVE-CLIENT.md#payment-manager) handles all liquidity payments using the same method-selection logic as management payments:
 
 ```
 Is this a conditional payment (escrow)?
@@ -1269,7 +1269,7 @@ Is this a conditional payment (escrow)?
 
 ### Upgrade Path
 
-Non-hive nodes that want full liquidity marketplace features (gossip discovery, settlement netting, fleet-coordinated liquidity, provider-side pool participation) can upgrade to hive membership via the same [migration process](./DID-HIVE-CLIENT.md#11-hive-membership-upgrade-path) used for management services. All existing liquidity contracts, credentials, and escrow state are preserved.
+Non-hive nodes that want full liquidity marketplace features (gossip discovery, settlement netting, fleet-coordinated liquidity, provider-side pool participation) can upgrade to hive membership via the same [migration process](./08-HIVE-CLIENT.md#11-hive-membership-upgrade-path) used for management services. All existing liquidity contracts, credentials, and escrow state are preserved.
 
 ---
 
@@ -1283,7 +1283,7 @@ Nostr serves as the **public, open marketplace layer** for liquidity services. W
 
 ### Event Kind Allocation
 
-Liquidity marketplace events use **NIP-78 (Application-Specific Data)** with kind `30078` (parameterized replaceable events) for mutable state, and kind `1` notes with specific tags for immutable announcements. A custom kind range (`38900–38909`) is proposed for structured liquidity events, following the pattern established for marketplace profiles in the [Marketplace spec](./DID-HIVE-MARKETPLACE.md#advertising-via-nostr-optional):
+Liquidity marketplace events use **NIP-78 (Application-Specific Data)** with kind `30078` (parameterized replaceable events) for mutable state, and kind `1` notes with specific tags for immutable announcements. A custom kind range (`38900–38909`) is proposed for structured liquidity events, following the pattern established for marketplace profiles in the [Marketplace spec](./04-HIVE-MARKETPLACE.md#advertising-via-nostr-optional):
 
 | Kind | Purpose | Replaceable? | Lifetime |
 |------|---------|-------------|----------|
@@ -1407,7 +1407,7 @@ A node broadcasts its liquidity needs. Providers respond with quotes.
 **Privacy options:**
 - **Public RFP:** Client includes their `did` and `pubkey`. Providers respond via Nostr DM (NIP-04/NIP-44) or Bolt 8 custom message.
 - **Anonymous RFP:** Client omits `did`, uses a throwaway Nostr key. Providers post quotes as replies. Client reviews anonymously and initiates contact with preferred provider only when ready to contract.
-- **Sealed-bid RFP:** Client includes a `bid-pubkey` tag with a one-time key. Providers encrypt bids to this key. Same sealed-bid mechanism as the [Marketplace spec](./DID-HIVE-MARKETPLACE.md#sealed-bid-auctions) but via Nostr transport.
+- **Sealed-bid RFP:** Client includes a `bid-pubkey` tag with a one-time key. Providers encrypt bids to this key. Same sealed-bid mechanism as the [Marketplace spec](./04-HIVE-MARKETPLACE.md#sealed-bid-auctions) but via Nostr transport.
 
 **Response flow:**
 1. Provider sees RFP on Nostr
@@ -1604,7 +1604,7 @@ Providers should publish to at least 3 relays for redundancy. Clients should que
 
 ### Client Integration with Nostr
 
-The `cl-hive-comms` [Discovery](./DID-HIVE-CLIENT.md#9-discovery-for-non-hive-nodes) mechanism queries Nostr relays for liquidity events automatically (using the same Nostr connection as DM transport):
+The `cl-hive-comms` [Discovery](./08-HIVE-CLIENT.md#9-discovery-for-non-hive-nodes) mechanism queries Nostr relays for liquidity events automatically (using the same Nostr connection as DM transport):
 
 ```
 hive-client-discover --type="liquidity" --service="leasing" --min-capacity=5000000
@@ -1845,7 +1845,7 @@ Nostr's role in ecosystem propagation is strategic, not merely technical:
 
 The propagation dynamics impose specific design constraints:
 
-1. **Auto-provisioning must be frictionless.** Any friction in DID creation, Cashu wallet setup, or credential issuance blocks the funnel. The [DID Hive Client](./DID-HIVE-CLIENT.md) achieves this with zero-config auto-provisioning — but this must be rigorously tested. A single failure in auto-provisioning kills a potential ecosystem participant.
+1. **Auto-provisioning must be frictionless.** Any friction in DID creation, Cashu wallet setup, or credential issuance blocks the funnel. The [DID Hive Client](./08-HIVE-CLIENT.md) achieves this with zero-config auto-provisioning — but this must be rigorously tested. A single failure in auto-provisioning kills a potential ecosystem participant.
 
 2. **Nostr events must be self-contained.** A kind 38901 liquidity offer must contain enough information for a human to evaluate it without any hive software. The `alt` tag provides a human-readable summary. The tags provide structured data. The credential in `content` provides cryptographic verification. The offer is useful at every layer of sophistication.
 
@@ -1986,11 +1986,11 @@ Hive intelligence      ──────────►  Liquidity Phase 7 (dyn
 
 12. **Nostr relay spam:** Public liquidity offers (kind 38901) could be spammed to pollute the marketplace. Mitigations: relay-side filtering by DID reputation (relays could verify DID signatures and check reputation before accepting events), proof-of-work on events (NIP-13), or relay allowlists for verified providers.
 
-13. **Client plugin size budget:** Adding liquidity schemas, Nostr event handling, and discovery to `cl-hive-comms` increases the plugin size. The [Client spec](./DID-HIVE-CLIENT.md) targets a modular plugin stack. How much complexity can be added before the plugin needs further modularization?
+13. **Client plugin size budget:** Adding liquidity schemas, Nostr event handling, and discovery to `cl-hive-comms` increases the plugin size. The [Client spec](./08-HIVE-CLIENT.md) targets a modular plugin stack. How much complexity can be added before the plugin needs further modularization?
 
 14. **Nostr vs. Bolt 8 for negotiation:** Should the quote/accept negotiation happen entirely over Nostr (NIP-44 encrypted DMs), entirely over Bolt 8 (custom messages), or hybrid? Nostr is more accessible (no peer connection needed); Bolt 8 is more private (no relay involvement). The current spec supports both — is explicit guidance needed?
 
-15. **Dedicated Nostr marketplace spec:** The Nostr marketplace integration (event kinds, relay strategy, spam resistance, lifecycle management) spans both advisor and liquidity services. A dedicated `DID-NOSTR-MARKETPLACE.md` is planned to consolidate and extend the Nostr-specific protocol definitions currently split across this spec and the [Marketplace spec](./DID-HIVE-MARKETPLACE.md). That spec must ensure full compatibility with [NIP-15](https://github.com/nostr-protocol/nips/blob/master/15.md) and [NIP-99](https://github.com/nostr-protocol/nips/blob/master/99.md), and should draw implementation patterns from [Plebeian Market](https://github.com/PlebeianTech/plebeian-market) and [LNbits NostrMarket](https://github.com/lnbits/nostrmarket). Key questions: should the dual-publishing strategy (native kinds + NIP-15/NIP-99 kinds) be mandatory or optional? Should the NIP-15 checkout flow be extended for liquidity contracting, or is NIP-44 DM negotiation sufficient? Priority and timeline TBD.
+15. **Dedicated Nostr marketplace spec:** The Nostr marketplace integration (event kinds, relay strategy, spam resistance, lifecycle management) spans both advisor and liquidity services. A dedicated `DID-NOSTR-MARKETPLACE.md` is planned to consolidate and extend the Nostr-specific protocol definitions currently split across this spec and the [Marketplace spec](./04-HIVE-MARKETPLACE.md). That spec must ensure full compatibility with [NIP-15](https://github.com/nostr-protocol/nips/blob/master/15.md) and [NIP-99](https://github.com/nostr-protocol/nips/blob/master/99.md), and should draw implementation patterns from [Plebeian Market](https://github.com/PlebeianTech/plebeian-market) and [LNbits NostrMarket](https://github.com/lnbits/nostrmarket). Key questions: should the dual-publishing strategy (native kinds + NIP-15/NIP-99 kinds) be mandatory or optional? Should the NIP-15 checkout flow be extended for liquidity contracting, or is NIP-44 DM negotiation sufficient? Priority and timeline TBD.
 
 16. **Propagation metrics:** How do we measure ecosystem propagation effectiveness? Candidates: DIDs provisioned per month, Cashu wallets created, reputation credentials issued, consumer-to-provider conversion rate. Should these metrics be tracked on-chain, via Nostr event counts, or through hive gossip aggregation?
 
@@ -2000,12 +2000,12 @@ Hive intelligence      ──────────►  Liquidity Phase 7 (dyn
 
 ### Protocol Suite
 
-- [DID + L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) — Credential system, management schemas, danger scoring
-- [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md) — Escrow ticket format, NUT-10/11/14 conditions
-- [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md) — Settlement types, netting, bonds, credit tiers
-- [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) — Service advertising, discovery, contracting, reputation
-- [DID Hive Client: Universal Lightning Node Management](./DID-HIVE-CLIENT.md) — Client software for non-hive nodes
-- [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md) — Reputation credential format, profile definitions
+- [DID + L402 Remote Fleet Management](./02-FLEET-MANAGEMENT.md) — Credential system, management schemas, danger scoring
+- [DID + Cashu Task Escrow Protocol](./03-CASHU-TASK-ESCROW.md) — Escrow ticket format, NUT-10/11/14 conditions
+- [DID + Cashu Hive Settlements Protocol](./06-HIVE-SETTLEMENTS.md) — Settlement types, netting, bonds, credit tiers
+- [DID Hive Marketplace Protocol](./04-HIVE-MARKETPLACE.md) — Service advertising, discovery, contracting, reputation
+- [DID Hive Client: Universal Lightning Node Management](./08-HIVE-CLIENT.md) — Client software for non-hive nodes
+- [DID Reputation Schema](./01-REPUTATION-SCHEMA.md) — Reputation credential format, profile definitions
 - DID Nostr Marketplace Protocol (`DID-NOSTR-MARKETPLACE.md`) — Planned: dedicated Nostr integration spec for all marketplace services; must ensure NIP-15/NIP-99 compatibility and draw from Plebeian Market / LNbits NostrMarket patterns
 
 ### External References

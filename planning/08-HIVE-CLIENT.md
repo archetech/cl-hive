@@ -11,7 +11,7 @@
 
 ## Abstract
 
-This document specifies the client-side architecture for Lightning node management — a set of independently installable CLN plugins that enable **any** Lightning node to contract for professional management services from advisors and access the [liquidity marketplace](./DID-HIVE-LIQUIDITY.md) (leasing, pools, JIT, swaps, insurance). The client implements the management interface defined in the [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) spec without requiring hive membership, bonds, gossip participation, or the full `cl-hive` plugin.
+This document specifies the client-side architecture for Lightning node management — a set of independently installable CLN plugins that enable **any** Lightning node to contract for professional management services from advisors and access the [liquidity marketplace](./07-HIVE-LIQUIDITY.md) (leasing, pools, JIT, swaps, insurance). The client implements the management interface defined in the [Fleet Management](./02-FLEET-MANAGEMENT.md) spec without requiring hive membership, bonds, gossip participation, or the full `cl-hive` plugin.
 
 The CLN implementation is structured as **three separate, independently installable plugins**:
 
@@ -618,7 +618,7 @@ Used exclusively for conditional payments where payment must be contingent on ta
 
 ### Payment in the HiveServiceProfile
 
-Advisors advertise accepted payment methods in their service profile (extending the [Marketplace spec](./DID-HIVE-MARKETPLACE.md#hiveserviceprofile-credential)):
+Advisors advertise accepted payment methods in their service profile (extending the [Marketplace spec](./04-HIVE-MARKETPLACE.md#hiveserviceprofile-credential)):
 
 ```json
 {
@@ -678,7 +678,7 @@ The CLN implementation consists of three independently installable Python plugin
 
 #### Schema Handler
 
-Receives incoming management commands via **Nostr DM (NIP-44)** (primary transport) or **REST/rune** (secondary transport), validates the payload structure per the [Fleet Management spec](./DID-L402-FLEET-MANAGEMENT.md), and dispatches to the appropriate CLN RPC.
+Receives incoming management commands via **Nostr DM (NIP-44)** (primary transport) or **REST/rune** (secondary transport), validates the payload structure per the [Fleet Management spec](./02-FLEET-MANAGEMENT.md), and dispatches to the appropriate CLN RPC.
 
 ```python
 # Primary transport: Nostr DM (NIP-44)
@@ -715,12 +715,12 @@ Validates the credential attached to each management command. Verification level
 2. **Signature verification** — Verifies the credential's proof against the issuer's DID document
 3. **Scope check** — Confirms the credential grants the required permission tier for the requested schema
 4. **Constraint check** — Validates the command parameters against credential constraints (`max_fee_change_pct`, `max_rebalance_sats`, etc.)
-5. **Revocation check** — Queries Archon revocation status. **Fail-closed**: if Archon is unreachable, deny. Cache with 1-hour TTL per the [Fleet Management spec](./DID-L402-FLEET-MANAGEMENT.md#credential-lifecycle).
+5. **Revocation check** — Queries Archon revocation status. **Fail-closed**: if Archon is unreachable, deny. Cache with 1-hour TTL per the [Fleet Management spec](./02-FLEET-MANAGEMENT.md#credential-lifecycle).
 6. **Replay protection** — Monotonic nonce check per agent DID. Timestamp within ±5 minutes.
 
 #### Payment & Escrow Manager
 
-Handles all payment flows. Delegates to the [Payment Manager](#payment-manager) for method selection, and manages the Cashu escrow wallet for conditional payments per the [Task Escrow protocol](./DID-CASHU-TASK-ESCROW.md):
+Handles all payment flows. Delegates to the [Payment Manager](#payment-manager) for method selection, and manages the Cashu escrow wallet for conditional payments per the [Task Escrow protocol](./03-CASHU-TASK-ESCROW.md):
 
 - **Method selection** — Chooses Bolt11/Bolt12/L402/Cashu based on context and preferences
 - **Bolt11/Bolt12 payments** — Routes through the node's existing Lightning wallet
@@ -880,7 +880,7 @@ The plugins form a layered architecture where each layer adds capabilities:
 
 ## 5. Schema Translation Layer
 
-The management schemas defined in the [Fleet Management spec](./DID-L402-FLEET-MANAGEMENT.md#core-schemas) are implementation-agnostic. The client translates each schema action to the appropriate CLN RPC call or LND gRPC call. This section defines the full mapping for all 15 schema categories.
+The management schemas defined in the [Fleet Management spec](./02-FLEET-MANAGEMENT.md#core-schemas) are implementation-agnostic. The client translates each schema action to the appropriate CLN RPC call or LND gRPC call. This section defines the full mapping for all 15 schema categories.
 
 ### Translation Table
 
@@ -1001,7 +1001,7 @@ On startup, the client determines which schemas it can support based on the unde
 
 The advisor queries capabilities before sending commands. Commands for unsupported schemas return an error response with `status: 2` and a reason string.
 
-**Danger score preservation:** Danger scores are identical regardless of implementation. A `hive:fee-policy/v1 set_anchor` is danger 3 whether on CLN or LND. The Policy Engine uses the same scoring table from the [Fleet Management spec](./DID-L402-FLEET-MANAGEMENT.md#task-taxonomy--danger-scoring).
+**Danger score preservation:** Danger scores are identical regardless of implementation. A `hive:fee-policy/v1 set_anchor` is danger 3 whether on CLN or LND. The Policy Engine uses the same scoring table from the [Fleet Management spec](./02-FLEET-MANAGEMENT.md#task-taxonomy--danger-scoring).
 
 ---
 
@@ -1009,7 +1009,7 @@ The advisor queries capabilities before sending commands. Commands for unsupport
 
 ### Issuing Access (Management Credential)
 
-The operator grants an advisor access to their node. Under the hood, this issues a `HiveManagementCredential` (per the [Fleet Management spec](./DID-L402-FLEET-MANAGEMENT.md#management-credentials)) — but the operator never sees the credential format.
+The operator grants an advisor access to their node. Under the hood, this issues a `HiveManagementCredential` (per the [Fleet Management spec](./02-FLEET-MANAGEMENT.md#management-credentials)) — but the operator never sees the credential format.
 
 ```bash
 # CLN — authorize by name (from discovery results)
@@ -1086,7 +1086,7 @@ lightning-cli hive-client-authorize "NodeWatch" --access="monitoring"
 
 The Policy Engine enforces scope isolation — Advisor A cannot send `hive:rebalance/*` commands even if their credential somehow includes that scope, because the operator configured them for fee optimization only.
 
-For multi-advisor coordination details (conflict detection, shared state, action cooldowns), see the [Marketplace spec, Section 6](./DID-HIVE-MARKETPLACE.md#6-multi-advisor-coordination).
+For multi-advisor coordination details (conflict detection, shared state, action cooldowns), see the [Marketplace spec, Section 6](./04-HIVE-MARKETPLACE.md#6-multi-advisor-coordination).
 
 ### Emergency Revocation
 
@@ -1142,7 +1142,7 @@ Operator                     Client Plugin               Cashu Mint
     │                             │                          │
 ```
 
-For low-danger actions (score 1–2), the operator can configure **direct payment** (simple Cashu token, no HTLC escrow) to reduce overhead. For danger score 3+, full escrow is always used per the [Task Escrow spec](./DID-CASHU-TASK-ESCROW.md#danger-score-integration).
+For low-danger actions (score 1–2), the operator can configure **direct payment** (simple Cashu token, no HTLC escrow) to reduce overhead. For danger score 3+, full escrow is always used per the [Task Escrow spec](./03-CASHU-TASK-ESCROW.md#danger-score-integration).
 
 ### Auto-Replenishment
 
@@ -1368,7 +1368,7 @@ The client searches multiple sources in parallel and merges results:
 
 **1. Archon Network** — Queries for `HiveServiceProfile` credentials. Highest trust — profiles are cryptographically signed, reputation is verifiable.
 
-**2. Nostr** — `cl-hive-comms` subscribes to advisor profile events (kind `38383`, tag `t:hive-advisor`) using the same Nostr connection it uses for DM transport. Medium trust — the client verifies the embedded credential signature and DID-to-Nostr binding (if cl-hive-archon is installed) or Nostr signature (Nostr-only mode). `cl-hive-comms` also handles **marketplace event publishing** (kinds 38380+/38900+) — see the [Nostr Marketplace spec](./DID-NOSTR-MARKETPLACE.md).
+**2. Nostr** — `cl-hive-comms` subscribes to advisor profile events (kind `38383`, tag `t:hive-advisor`) using the same Nostr connection it uses for DM transport. Medium trust — the client verifies the embedded credential signature and DID-to-Nostr binding (if cl-hive-archon is installed) or Nostr signature (Nostr-only mode). `cl-hive-comms` also handles **marketplace event publishing** (kinds 38380+/38900+) — see the [Nostr Marketplace spec](./05-NOSTR-MARKETPLACE.md).
 
 **3. Curated Directories** — Optional web directories that aggregate profiles. Low trust for the directory; high trust for the verified credentials it surfaces.
 
@@ -1379,9 +1379,9 @@ The client searches multiple sources in parallel and merges results:
 lightning-cli hive-client-authorize --advisor-did="did:cid:bagaaiera..." --access="fee optimization"
 ```
 
-**5. Referrals** — An existing client or advisor refers someone. Referral reputation is tracked per the [Marketplace spec, Section 8](./DID-HIVE-MARKETPLACE.md#8-referral--affiliate-system).
+**5. Referrals** — An existing client or advisor refers someone. Referral reputation is tracked per the [Marketplace spec, Section 8](./04-HIVE-MARKETPLACE.md#8-referral--affiliate-system).
 
-All discovery results are ranked using the [Marketplace ranking algorithm](./DID-HIVE-MARKETPLACE.md#filtering--ranking-algorithm) and presented as a simple numbered list (see [Discovery Output](#discovery-output) in the Abstraction Layer section).
+All discovery results are ranked using the [Marketplace ranking algorithm](./04-HIVE-MARKETPLACE.md#filtering--ranking-algorithm) and presented as a simple numbered list (see [Discovery Output](#discovery-output) in the Abstraction Layer section).
 
 ---
 
@@ -1478,7 +1478,7 @@ Client-only nodes can upgrade to full hive membership when they want the benefit
 |--------|---------------------|-------------------|--------------------------|
 | Software | Single plugin | Two plugins | Three plugins |
 | Identity | Nostr keypair | Nostr + DID | Nostr + DID + hive PKI |
-| Bond | None | None | 50,000–500,000 sats (per [Settlements spec](./DID-HIVE-SETTLEMENTS.md#bond-sizing)) |
+| Bond | None | None | 50,000–500,000 sats (per [Settlements spec](./06-HIVE-SETTLEMENTS.md#bond-sizing)) |
 | Gossip | No participation | Full gossip network access |
 | Settlement | Direct escrow only | Netting, credit tiers, bilateral/multilateral |
 | Fleet rebalancing | N/A | Intra-hive paths (97% fee savings) |
@@ -2022,12 +2022,12 @@ Marketplace Phase 1    ──────────►  Phase 5 (discovery)
 
 ## 16. References
 
-- [DID + L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) — Schema definitions, credential format, transport protocol, danger scoring
-- [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md) — Escrow ticket format, HTLC conditions, ticket types
-- [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) — Service profiles, discovery, negotiation, contracting, multi-advisor coordination
-- [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md) — Bond system, settlement types, credit tiers
-- [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md) — Liquidity-as-a-service marketplace (leasing, pools, JIT, swaps, insurance)
-- [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md) — Reputation credential format, `hive:advisor` and `hive:client` profiles
+- [DID + L402 Remote Fleet Management](./02-FLEET-MANAGEMENT.md) — Schema definitions, credential format, transport protocol, danger scoring
+- [DID + Cashu Task Escrow Protocol](./03-CASHU-TASK-ESCROW.md) — Escrow ticket format, HTLC conditions, ticket types
+- [DID Hive Marketplace Protocol](./04-HIVE-MARKETPLACE.md) — Service profiles, discovery, negotiation, contracting, multi-advisor coordination
+- [DID + Cashu Hive Settlements Protocol](./06-HIVE-SETTLEMENTS.md) — Bond system, settlement types, credit tiers
+- [DID Hive Liquidity Protocol](./07-HIVE-LIQUIDITY.md) — Liquidity-as-a-service marketplace (leasing, pools, JIT, swaps, insurance)
+- [DID Reputation Schema](./01-REPUTATION-SCHEMA.md) — Reputation credential format, `hive:advisor` and `hive:client` profiles
 - [CLN Plugin Documentation](https://docs.corelightning.org/docs/plugin-development)
 - [CLN Custom Messages](https://docs.corelightning.org/reference/lightning-sendcustommsg)
 - [CLN `setchannel` RPC](https://docs.corelightning.org/reference/lightning-setchannel)
