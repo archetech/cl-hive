@@ -22,7 +22,6 @@ Security:
 import json
 import time
 import uuid
-import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -124,34 +123,41 @@ class SchemaCategory:
         }
 
 
-@dataclass
+@dataclass(frozen=True)
 class ManagementCredential:
     """
     HiveManagementCredential — operator grants agent permission to manage.
 
     Data model only in Phase 2 — no L402/Cashu payment gating yet.
+    Frozen to prevent post-issuance mutation of signed fields.
     """
     credential_id: str
     issuer_id: str          # node operator pubkey
     agent_id: str           # agent/advisor pubkey
     node_id: str            # managed node pubkey
     tier: str               # monitor/standard/advanced/admin
-    allowed_schemas: List[str]  # e.g. ["hive:fee-policy/*", "hive:monitor/*"]
-    constraints: Dict[str, Any]  # max_fee_change_pct, max_rebalance_sats, etc.
+    allowed_schemas: tuple  # e.g. ("hive:fee-policy/*", "hive:monitor/*")
+    constraints: str        # JSON string of constraints (frozen-compatible)
     valid_from: int         # epoch
     valid_until: int        # epoch
     signature: str = ""     # operator's HSM signature
     revoked_at: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
+        constraints = self.constraints
+        if isinstance(constraints, str):
+            try:
+                constraints = json.loads(constraints)
+            except (json.JSONDecodeError, TypeError):
+                constraints = {}
         return {
             "credential_id": self.credential_id,
             "issuer_id": self.issuer_id,
             "agent_id": self.agent_id,
             "node_id": self.node_id,
             "tier": self.tier,
-            "allowed_schemas": self.allowed_schemas,
-            "constraints": self.constraints,
+            "allowed_schemas": list(self.allowed_schemas),
+            "constraints": constraints,
             "valid_from": self.valid_from,
             "valid_until": self.valid_until,
             "signature": self.signature,
@@ -227,7 +233,7 @@ SCHEMA_REGISTRY: Dict[str, SchemaCategory] = {
             ),
             "set_bulk": SchemaAction(
                 danger=DangerScore(3, 4, 3, 5, 2),
-                required_tier="standard",
+                required_tier="advanced",
                 description="Set fees on multiple channels at once",
                 parameters={"channels": list, "policy": dict},
             ),
@@ -293,7 +299,7 @@ SCHEMA_REGISTRY: Dict[str, SchemaCategory] = {
         actions={
             "circular_rebalance": SchemaAction(
                 danger=DangerScore(4, 5, 3, 2, 3),
-                required_tier="standard",
+                required_tier="advanced",
                 description="Circular rebalance between channels",
                 parameters={"from_channel": str, "to_channel": str, "amount_sats": int, "max_fee_ppm": int},
             ),
@@ -572,6 +578,7 @@ TIER_HIERARCHY = {
 def get_credential_signing_payload(credential: Dict[str, Any]) -> str:
     """Build deterministic JSON string for management credential signing."""
     signing_data = {
+        "credential_id": credential.get("credential_id", ""),
         "issuer_id": credential.get("issuer_id", ""),
         "agent_id": credential.get("agent_id", ""),
         "node_id": credential.get("node_id", ""),
@@ -590,7 +597,8 @@ def _schema_matches(pattern: str, schema_id: str) -> bool:
         return True
     if pattern.endswith("/*"):
         prefix = pattern[:-2]  # e.g. "hive:fee-policy" from "hive:fee-policy/*"
-        return schema_id.startswith(prefix)
+        # Require exact category match: prefix must be followed by "/" in schema_id
+        return schema_id.startswith(prefix + "/")
     return pattern == schema_id
 
 
@@ -684,7 +692,9 @@ class ManagementSchemaRegistry:
         """
         Check if a management credential authorizes a specific action.
 
-        Validates tier, schema allowlist, and expiry.
+        Validates tier, schema allowlist, and expiry. Does NOT verify the
+        credential signature — callers must verify the signature via
+        checkmessage before calling this method.
 
         Returns:
             (authorized, reason)
@@ -754,7 +764,7 @@ class ManagementSchemaRegistry:
             tier: Permission tier (monitor/standard/advanced/admin)
             allowed_schemas: Schema patterns the agent can use
             constraints: Operational constraints (limits)
-            valid_days: Credential validity period in days
+            valid_days: Credential validity period in days (must be > 0)
 
         Returns:
             ManagementCredential on success, None on failure
@@ -771,8 +781,22 @@ class ManagementSchemaRegistry:
             self._log("allowed_schemas cannot be empty", "warn")
             return None
 
+        if not isinstance(valid_days, int) or valid_days <= 0:
+            self._log(f"invalid valid_days: {valid_days}", "warn")
+            return None
+
         if not agent_id or agent_id == self.our_pubkey:
             self._log("cannot issue credential to self", "warn")
+            return None
+
+        # Enforce size limits on serialized fields
+        schemas_json = json.dumps(allowed_schemas)
+        constraints_json = json.dumps(constraints)
+        if len(schemas_json) > MAX_ALLOWED_SCHEMAS_LEN:
+            self._log(f"allowed_schemas too large ({len(schemas_json)} > {MAX_ALLOWED_SCHEMAS_LEN})", "warn")
+            return None
+        if len(constraints_json) > MAX_CONSTRAINTS_LEN:
+            self._log(f"constraints too large ({len(constraints_json)} > {MAX_CONSTRAINTS_LEN})", "warn")
             return None
 
         # Check row cap
@@ -784,30 +808,45 @@ class ManagementSchemaRegistry:
         now = int(time.time())
         credential_id = str(uuid.uuid4())
 
+        # Build signing payload before constructing frozen credential
+        signing_data = {
+            "credential_id": credential_id,
+            "issuer_id": self.our_pubkey,
+            "agent_id": agent_id,
+            "node_id": node_id,
+            "tier": tier,
+            "allowed_schemas": allowed_schemas,
+            "constraints": constraints,
+            "valid_from": now,
+            "valid_until": now + (valid_days * 86400),
+        }
+        signing_payload = get_credential_signing_payload(signing_data)
+
+        # Sign with HSM
+        try:
+            result = self.rpc.signmessage(signing_payload)
+            signature = result.get("zbase", "") if isinstance(result, dict) else str(result)
+        except Exception as e:
+            self._log(f"HSM signing failed: {e}", "error")
+            return None
+
+        if not signature:
+            self._log("HSM returned empty signature", "error")
+            return None
+
+        # Construct frozen credential with signature
         cred = ManagementCredential(
             credential_id=credential_id,
             issuer_id=self.our_pubkey,
             agent_id=agent_id,
             node_id=node_id,
             tier=tier,
-            allowed_schemas=allowed_schemas,
-            constraints=constraints,
+            allowed_schemas=tuple(allowed_schemas),
+            constraints=constraints_json,
             valid_from=now,
             valid_until=now + (valid_days * 86400),
+            signature=signature,
         )
-
-        # Sign
-        signing_payload = get_credential_signing_payload(cred.to_dict())
-        try:
-            result = self.rpc.signmessage(signing_payload)
-            cred.signature = result.get("zbase", "") if isinstance(result, dict) else str(result)
-        except Exception as e:
-            self._log(f"HSM signing failed: {e}", "error")
-            return None
-
-        if not cred.signature:
-            self._log("HSM returned empty signature", "error")
-            return None
 
         # Store
         stored = self.db.store_management_credential(
@@ -816,8 +855,8 @@ class ManagementSchemaRegistry:
             agent_id=cred.agent_id,
             node_id=cred.node_id,
             tier=cred.tier,
-            allowed_schemas_json=json.dumps(cred.allowed_schemas),
-            constraints_json=json.dumps(cred.constraints),
+            allowed_schemas_json=schemas_json,
+            constraints_json=constraints_json,
             valid_from=cred.valid_from,
             valid_until=cred.valid_until,
             signature=cred.signature,

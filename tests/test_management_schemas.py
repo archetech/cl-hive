@@ -229,6 +229,16 @@ class TestSchemaRegistry:
         assert close_all.danger.total == 10
         assert close_all.required_tier == "admin"
 
+    def test_set_bulk_requires_advanced(self):
+        """set_bulk should require advanced tier (H6 fix)."""
+        fee = SCHEMA_REGISTRY["hive:fee-policy/v1"]
+        assert fee.actions["set_bulk"].required_tier == "advanced"
+
+    def test_circular_rebalance_requires_advanced(self):
+        """circular_rebalance should require advanced tier (H6 fix)."""
+        rebalance = SCHEMA_REGISTRY["hive:rebalance/v1"]
+        assert rebalance.actions["circular_rebalance"].required_tier == "advanced"
+
     def test_backup_restore_is_max_danger(self):
         backup = SCHEMA_REGISTRY["hive:backup/v1"]
         restore = backup.actions["restore"]
@@ -315,6 +325,11 @@ class TestSchemaMatching:
 
     def test_prefix_wildcard_no_match(self):
         assert not _schema_matches("hive:fee-policy/*", "hive:monitor/v1")
+
+    def test_prefix_wildcard_boundary(self):
+        """Ensure prefix wildcard doesn't match cross-category (C3 fix)."""
+        assert not _schema_matches("hive:fee-policy/*", "hive:fee-policy-extended/v1")
+        assert _schema_matches("hive:fee-policy/*", "hive:fee-policy/v2")
 
     def test_empty_pattern(self):
         assert not _schema_matches("", "hive:fee-policy/v1")
@@ -437,8 +452,8 @@ class TestAuthorization:
             agent_id=BOB_PUBKEY,
             node_id=ALICE_PUBKEY,
             tier=tier,
-            allowed_schemas=schemas or ["hive:fee-policy/*", "hive:monitor/*"],
-            constraints={},
+            allowed_schemas=tuple(schemas or ["hive:fee-policy/*", "hive:monitor/*"]),
+            constraints="{}",
             valid_from=valid_from or (now - 3600),
             valid_until=valid_until or (now + 86400),
             signature="fakesig",
@@ -658,6 +673,72 @@ class TestCredentialIssuance:
         # valid_until should be ~30 days from now
         assert cred.valid_until - cred.valid_from == 30 * 86400
 
+    def test_issue_rejects_zero_valid_days(self):
+        """valid_days must be > 0 (H4 fix)."""
+        reg, db = _make_registry()
+        cred = reg.issue_credential(
+            agent_id=BOB_PUBKEY,
+            node_id=ALICE_PUBKEY,
+            tier="standard",
+            allowed_schemas=["*"],
+            constraints={},
+            valid_days=0,
+        )
+        assert cred is None
+
+    def test_issue_rejects_negative_valid_days(self):
+        reg, db = _make_registry()
+        cred = reg.issue_credential(
+            agent_id=BOB_PUBKEY,
+            node_id=ALICE_PUBKEY,
+            tier="standard",
+            allowed_schemas=["*"],
+            constraints={},
+            valid_days=-1,
+        )
+        assert cred is None
+
+    def test_issue_rejects_oversized_schemas(self):
+        """allowed_schemas JSON must be within size limit (H5 fix)."""
+        reg, db = _make_registry()
+        # Create a schema list that exceeds MAX_ALLOWED_SCHEMAS_LEN
+        huge_schemas = [f"hive:schema-{i}/v1" for i in range(500)]
+        cred = reg.issue_credential(
+            agent_id=BOB_PUBKEY,
+            node_id=ALICE_PUBKEY,
+            tier="standard",
+            allowed_schemas=huge_schemas,
+            constraints={},
+        )
+        assert cred is None
+
+    def test_issue_rejects_oversized_constraints(self):
+        """constraints JSON must be within size limit (H5 fix)."""
+        reg, db = _make_registry()
+        huge_constraints = {f"key_{i}": "x" * 100 for i in range(100)}
+        cred = reg.issue_credential(
+            agent_id=BOB_PUBKEY,
+            node_id=ALICE_PUBKEY,
+            tier="standard",
+            allowed_schemas=["*"],
+            constraints=huge_constraints,
+        )
+        assert cred is None
+
+    def test_issue_credential_is_frozen(self):
+        """Issued credential should be immutable (C4 fix)."""
+        reg, db = _make_registry()
+        cred = reg.issue_credential(
+            agent_id=BOB_PUBKEY,
+            node_id=ALICE_PUBKEY,
+            tier="standard",
+            allowed_schemas=["hive:fee-policy/*"],
+            constraints={"max_fee_ppm": 1000},
+        )
+        assert cred is not None
+        with pytest.raises(AttributeError):
+            cred.tier = "admin"
+
     def test_issue_row_cap(self):
         reg, db = _make_registry()
         # Fill to cap
@@ -821,6 +902,7 @@ class TestReceiptRecording:
 class TestSigningPayload:
     def test_deterministic(self):
         cred = {
+            "credential_id": "test-cred-123",
             "issuer_id": ALICE_PUBKEY,
             "agent_id": BOB_PUBKEY,
             "node_id": ALICE_PUBKEY,
@@ -834,8 +916,27 @@ class TestSigningPayload:
         p2 = get_credential_signing_payload(cred)
         assert p1 == p2
 
+    def test_includes_credential_id(self):
+        """Signing payload must include credential_id (M3 fix)."""
+        cred = {
+            "credential_id": "unique-id-abc",
+            "issuer_id": ALICE_PUBKEY,
+            "agent_id": BOB_PUBKEY,
+            "node_id": ALICE_PUBKEY,
+            "tier": "standard",
+            "allowed_schemas": ["*"],
+            "constraints": {},
+            "valid_from": 1000000,
+            "valid_until": 2000000,
+        }
+        payload = get_credential_signing_payload(cred)
+        parsed = json.loads(payload)
+        assert "credential_id" in parsed
+        assert parsed["credential_id"] == "unique-id-abc"
+
     def test_different_fields_different_payload(self):
         cred1 = {
+            "credential_id": "cred-1",
             "issuer_id": ALICE_PUBKEY,
             "agent_id": BOB_PUBKEY,
             "node_id": ALICE_PUBKEY,
@@ -851,6 +952,7 @@ class TestSigningPayload:
 
     def test_sorted_keys(self):
         payload = get_credential_signing_payload({
+            "credential_id": "cred-123",
             "valid_until": 2000000,
             "valid_from": 1000000,
             "tier": "standard",
@@ -878,8 +980,8 @@ class TestManagementCredential:
             agent_id=BOB_PUBKEY,
             node_id=ALICE_PUBKEY,
             tier="standard",
-            allowed_schemas=["hive:fee-policy/*"],
-            constraints={"max_fee_ppm": 1000},
+            allowed_schemas=("hive:fee-policy/*",),
+            constraints='{"max_fee_ppm": 1000}',
             valid_from=now,
             valid_until=now + 86400,
             signature="sig123",
@@ -889,6 +991,25 @@ class TestManagementCredential:
         assert d["tier"] == "standard"
         assert d["revoked_at"] is None
         assert d["allowed_schemas"] == ["hive:fee-policy/*"]
+        assert d["constraints"] == {"max_fee_ppm": 1000}
+
+    def test_frozen_immutable(self):
+        """ManagementCredential should be frozen (C4 fix)."""
+        now = int(time.time())
+        cred = ManagementCredential(
+            credential_id="test-id",
+            issuer_id=ALICE_PUBKEY,
+            agent_id=BOB_PUBKEY,
+            node_id=ALICE_PUBKEY,
+            tier="standard",
+            allowed_schemas=("*",),
+            constraints="{}",
+            valid_from=now,
+            valid_until=now + 86400,
+            signature="sig123",
+        )
+        with pytest.raises(AttributeError):
+            cred.signature = "tampered"
 
 
 # =============================================================================

@@ -28,10 +28,12 @@ from modules.did_credentials import (
     VALID_OUTCOMES,
     MAX_CREDENTIALS_PER_PEER,
     MAX_TOTAL_CREDENTIALS,
+    MAX_AGGREGATION_CACHE_ENTRIES,
     AGGREGATION_CACHE_TTL,
     RECENCY_DECAY_LAMBDA,
     get_credential_signing_payload,
     validate_metrics_for_profile,
+    _is_valid_pubkey,
     _score_to_tier,
     _compute_confidence,
 )
@@ -255,6 +257,29 @@ class TestCredentialProfiles:
         for domain in VALID_DOMAINS:
             assert domain in CREDENTIAL_PROFILES
 
+    def test_validate_nan_metric_rejected(self):
+        """NaN values must be rejected (H1 fix)."""
+        metrics = _valid_node_metrics()
+        metrics["uptime"] = float("nan")
+        err = validate_metrics_for_profile("hive:node", metrics)
+        assert err is not None
+        assert "finite" in err
+
+    def test_validate_inf_metric_rejected(self):
+        """Infinity values must be rejected (H1 fix)."""
+        metrics = _valid_node_metrics()
+        metrics["uptime"] = float("inf")
+        err = validate_metrics_for_profile("hive:node", metrics)
+        assert err is not None
+        assert "finite" in err
+
+    def test_validate_neg_inf_metric_rejected(self):
+        metrics = _valid_node_metrics()
+        metrics["uptime"] = float("-inf")
+        err = validate_metrics_for_profile("hive:node", metrics)
+        assert err is not None
+        assert "finite" in err
+
 
 # =============================================================================
 # Signing Payload
@@ -299,6 +324,34 @@ class TestSigningPayload:
 # =============================================================================
 # Score and Tier Helpers
 # =============================================================================
+
+class TestPubkeyValidation:
+    """Test pubkey validation helper (C6 fix)."""
+
+    def test_valid_pubkey_02(self):
+        assert _is_valid_pubkey("02" + "ab" * 32) is True
+
+    def test_valid_pubkey_03(self):
+        assert _is_valid_pubkey("03" + "cd" * 32) is True
+
+    def test_too_short(self):
+        assert _is_valid_pubkey("03" + "ab" * 31) is False
+
+    def test_too_long(self):
+        assert _is_valid_pubkey("03" + "ab" * 33) is False
+
+    def test_wrong_prefix(self):
+        assert _is_valid_pubkey("04" + "ab" * 32) is False
+
+    def test_non_hex_chars(self):
+        assert _is_valid_pubkey("03" + "zz" * 32) is False
+
+    def test_empty_string(self):
+        assert _is_valid_pubkey("") is False
+
+    def test_short_string(self):
+        assert _is_valid_pubkey("abcdefghij") is False
+
 
 class TestScoreHelpers:
     """Test score-to-tier conversion and confidence calculation."""
@@ -457,6 +510,32 @@ class TestCredentialIssuance:
         assert cred.period_start == now - 86400
         assert cred.period_end == now
 
+    def test_issue_bad_period_order(self):
+        """period_end must be after period_start (H2 fix)."""
+        mgr, db = _make_manager()
+        now = int(time.time())
+        cred = mgr.issue_credential(
+            subject_id=BOB_PUBKEY,
+            domain="hive:node",
+            metrics=_valid_node_metrics(),
+            period_start=now,
+            period_end=now - 86400,
+        )
+        assert cred is None
+
+    def test_issue_equal_period(self):
+        """period_end == period_start should be rejected."""
+        mgr, db = _make_manager()
+        now = int(time.time())
+        cred = mgr.issue_credential(
+            subject_id=BOB_PUBKEY,
+            domain="hive:node",
+            metrics=_valid_node_metrics(),
+            period_start=now,
+            period_end=now,
+        )
+        assert cred is None
+
     def test_issue_renew_outcome(self):
         mgr, db = _make_manager()
         cred = mgr.issue_credential(
@@ -552,6 +631,23 @@ class TestCredentialVerification:
         assert is_valid is False
         assert "verification failed" in reason
 
+    def test_verify_invalid_pubkey_format(self):
+        """Pubkeys must be 66-char hex with 02/03 prefix (C6 fix)."""
+        mgr, _ = _make_manager()
+        cred = self._make_valid_credential()
+        cred["issuer_id"] = "not_a_valid_pubkey_string"
+        is_valid, reason = mgr.verify_credential(cred)
+        assert is_valid is False
+        assert "invalid issuer_id" in reason
+
+    def test_verify_invalid_subject_pubkey(self):
+        mgr, _ = _make_manager()
+        cred = self._make_valid_credential()
+        cred["subject_id"] = "04" + "ab" * 32  # Wrong prefix
+        is_valid, reason = mgr.verify_credential(cred)
+        assert is_valid is False
+        assert "invalid subject_id" in reason
+
     def test_verify_pubkey_mismatch(self):
         mgr, _ = _make_manager()
         mgr.rpc.checkmessage.return_value = {"verified": True, "pubkey": CHARLIE_PUBKEY}
@@ -560,11 +656,13 @@ class TestCredentialVerification:
         assert is_valid is False
         assert "pubkey" in reason
 
-    def test_verify_no_rpc_warns_but_accepts(self):
+    def test_verify_no_rpc_fails_closed(self):
+        """Without RPC, verification must fail-closed (C1 fix)."""
         mgr, _ = _make_manager(with_rpc=False)
         cred = self._make_valid_credential()
         is_valid, reason = mgr.verify_credential(cred)
-        assert is_valid is True
+        assert is_valid is False
+        assert "no RPC" in reason
 
 
 # =============================================================================
@@ -827,6 +925,16 @@ class TestHandleCredentialPresent:
         result = mgr.handle_credential_present(BOB_PUBKEY, payload)
         assert result is False
 
+    def test_handle_missing_credential_id(self):
+        """credential_id must be present — reject if missing (M2 fix)."""
+        mgr, db = _make_manager()
+        mgr.rpc.checkmessage.return_value = {"verified": True, "pubkey": BOB_PUBKEY}
+        payload = self._make_credential_payload()
+        # Remove credential_id from the credential dict
+        del payload["credential"]["credential_id"]
+        result = mgr.handle_credential_present(BOB_PUBKEY, payload)
+        assert result is False
+
     def test_handle_at_row_cap(self):
         mgr, db = _make_manager()
         for i in range(MAX_TOTAL_CREDENTIALS):
@@ -880,6 +988,46 @@ class TestHandleCredentialRevoke:
             "issuer_id": CHARLIE_PUBKEY,  # Not the issuer
             "reason": "bogus",
             "signature": "sig",
+        }
+        result = mgr.handle_credential_revoke(BOB_PUBKEY, payload)
+        assert result is False
+
+    def test_handle_revoke_empty_signature_rejected(self):
+        """Empty signature must be rejected (C2 fix)."""
+        mgr, db = _make_manager()
+        cred_id = str(uuid.uuid4())
+        db.credentials[cred_id] = {
+            "credential_id": cred_id,
+            "issuer_id": BOB_PUBKEY,
+            "subject_id": CHARLIE_PUBKEY,
+            "domain": "hive:node",
+            "revoked_at": None,
+        }
+        payload = {
+            "credential_id": cred_id,
+            "issuer_id": BOB_PUBKEY,
+            "reason": "offline",
+            "signature": "",  # Empty — should be rejected
+        }
+        result = mgr.handle_credential_revoke(BOB_PUBKEY, payload)
+        assert result is False
+
+    def test_handle_revoke_no_rpc_rejected(self):
+        """Revocation without RPC must be rejected (fail-closed)."""
+        mgr, db = _make_manager(with_rpc=False)
+        cred_id = str(uuid.uuid4())
+        db.credentials[cred_id] = {
+            "credential_id": cred_id,
+            "issuer_id": BOB_PUBKEY,
+            "subject_id": CHARLIE_PUBKEY,
+            "domain": "hive:node",
+            "revoked_at": None,
+        }
+        payload = {
+            "credential_id": cred_id,
+            "issuer_id": BOB_PUBKEY,
+            "reason": "offline",
+            "signature": "some_sig",
         }
         result = mgr.handle_credential_revoke(BOB_PUBKEY, payload)
         assert result is False

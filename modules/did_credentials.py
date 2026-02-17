@@ -22,7 +22,6 @@ import json
 import math
 import time
 import uuid
-import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +36,7 @@ TIMESTAMP_TOLERANCE = 300           # ±5 minutes for freshness checks
 MAX_METRICS_JSON_LEN = 4096
 MAX_EVIDENCE_JSON_LEN = 8192
 MAX_REASON_LEN = 500
+MAX_AGGREGATION_CACHE_ENTRIES = 10_000
 
 # Tier thresholds
 TIER_NEWCOMER_MAX = 59
@@ -184,6 +184,19 @@ CREDENTIAL_PROFILES: Dict[str, CredentialProfile] = {
 
 # --- Helper functions ---
 
+def _is_valid_pubkey(value: str) -> bool:
+    """Validate a Lightning node pubkey (66-char hex starting with 02 or 03)."""
+    if len(value) != 66:
+        return False
+    if not value.startswith(("02", "03")):
+        return False
+    try:
+        int(value, 16)
+        return True
+    except ValueError:
+        return False
+
+
 def _score_to_tier(score: int) -> str:
     """Convert a 0-100 score to a reputation tier."""
     if score <= TIER_NEWCOMER_MAX:
@@ -250,6 +263,8 @@ def validate_metrics_for_profile(domain: str, metrics: Dict[str, Any]) -> Option
             lo, hi = profile.metric_ranges[key]
             if not isinstance(value, (int, float)):
                 return f"metric {key} must be numeric, got {type(value).__name__}"
+            if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                return f"metric {key} must be finite"
             if value < lo or value > hi:
                 return f"metric {key} value {value} out of range [{lo}, {hi}]"
 
@@ -280,8 +295,8 @@ class DIDCredentialManager:
         self.plugin = plugin
         self.rpc = rpc
         self.our_pubkey = our_pubkey
-        self._local = threading.local()
         self._aggregation_cache: Dict[str, AggregatedReputation] = {}
+        import threading
         self._cache_lock = threading.Lock()
 
     def _log(self, msg: str, level: str = "info"):
@@ -366,6 +381,10 @@ class DIDCredentialManager:
             period_start = now - 30 * 86400  # 30 days ago
         if period_end is None:
             period_end = now
+
+        if period_end <= period_start:
+            self._log("period_end must be after period_start", "warn")
+            return None
 
         credential_id = str(uuid.uuid4())
         evidence = evidence or []
@@ -462,10 +481,10 @@ class DIDCredentialManager:
         outcome = credential["outcome"]
         metrics = credential["metrics"]
 
-        # Type checks
-        if not isinstance(issuer_id, str) or len(issuer_id) < 10:
+        # Type checks — pubkeys must be 66-char hex starting with 02 or 03
+        if not isinstance(issuer_id, str) or not _is_valid_pubkey(issuer_id):
             return False, "invalid issuer_id"
-        if not isinstance(subject_id, str) or len(subject_id) < 10:
+        if not isinstance(subject_id, str) or not _is_valid_pubkey(subject_id):
             return False, "invalid subject_id"
         if not isinstance(signature, str) or not signature:
             return False, "invalid signature"
@@ -508,25 +527,24 @@ class DIDCredentialManager:
         if revoked_at is not None:
             return False, "credential revoked"
 
-        # Signature verification via CLN checkmessage
-        if self.rpc:
-            signing_payload = get_credential_signing_payload(credential)
-            try:
-                result = self.rpc.checkmessage(signing_payload, signature)
-                if isinstance(result, dict):
-                    verified = result.get("verified", False)
-                    pubkey = result.get("pubkey", "")
-                    if not verified:
-                        return False, "signature verification failed"
-                    if pubkey and pubkey != issuer_id:
-                        return False, f"signature pubkey {pubkey[:16]}... != issuer {issuer_id[:16]}..."
-                else:
-                    return False, "unexpected checkmessage response"
-            except Exception as e:
-                return False, f"checkmessage error: {e}"
-        else:
-            # No RPC — can't verify signature, accept with warning
-            self._log("no RPC available for signature verification", "warn")
+        # Signature verification via CLN checkmessage (fail-closed)
+        if not self.rpc:
+            return False, "no RPC available for signature verification"
+
+        signing_payload = get_credential_signing_payload(credential)
+        try:
+            result = self.rpc.checkmessage(signing_payload, signature)
+            if isinstance(result, dict):
+                verified = result.get("verified", False)
+                pubkey = result.get("pubkey", "")
+                if not verified:
+                    return False, "signature verification failed"
+                if pubkey and pubkey != issuer_id:
+                    return False, f"signature pubkey {pubkey[:16]}... != issuer {issuer_id[:16]}..."
+            else:
+                return False, "unexpected checkmessage response"
+        except Exception as e:
+            return False, f"checkmessage error: {e}"
 
         return True, "valid"
 
@@ -700,8 +718,16 @@ class DIDCredentialManager:
             components=component_avgs,
         )
 
-        # Update cache
+        # Update cache (bounded)
         with self._cache_lock:
+            if len(self._aggregation_cache) >= MAX_AGGREGATION_CACHE_ENTRIES:
+                # Evict oldest entries
+                sorted_keys = sorted(
+                    self._aggregation_cache.keys(),
+                    key=lambda k: self._aggregation_cache[k].computed_at,
+                )
+                for k in sorted_keys[:len(sorted_keys) // 2]:
+                    del self._aggregation_cache[k]
             self._aggregation_cache[cache_key] = result
 
         # Persist to DB cache
@@ -794,8 +820,12 @@ class DIDCredentialManager:
             self._log(f"credentials for {subject_id[:16]}... at cap", "warn")
             return False
 
-        # Check for duplicate credential_id
-        credential_id = credential.get("credential_id", str(uuid.uuid4()))
+        # Require credential_id (reject if missing to preserve dedup)
+        credential_id = credential.get("credential_id")
+        if not credential_id or not isinstance(credential_id, str):
+            self._log("credential_present: missing credential_id", "warn")
+            return False
+
         existing = self.db.get_did_credential(credential_id)
         if existing:
             return True  # Idempotent — already have it
@@ -864,25 +894,31 @@ class DIDCredentialManager:
         if cred.get("revoked_at") is not None:
             return True  # Idempotent
 
-        # Verify revocation signature
-        if self.rpc and signature:
-            revoke_payload = json.dumps({
-                "credential_id": credential_id,
-                "action": "revoke",
-                "reason": reason,
-            }, sort_keys=True, separators=(',', ':'))
-            try:
-                result = self.rpc.checkmessage(revoke_payload, signature)
-                if isinstance(result, dict):
-                    if not result.get("verified", False):
-                        self._log(f"revoke: signature verification failed", "warn")
-                        return False
-                    if result.get("pubkey", "") != issuer_id:
-                        self._log(f"revoke: signature pubkey mismatch", "warn")
-                        return False
-            except Exception as e:
-                self._log(f"revoke: checkmessage error: {e}", "warn")
-                return False
+        # Verify revocation signature (fail-closed)
+        if not signature:
+            self._log("revoke: missing signature", "warn")
+            return False
+        if not self.rpc:
+            self._log("revoke: no RPC for signature verification", "warn")
+            return False
+
+        revoke_payload = json.dumps({
+            "credential_id": credential_id,
+            "action": "revoke",
+            "reason": reason,
+        }, sort_keys=True, separators=(',', ':'))
+        try:
+            result = self.rpc.checkmessage(revoke_payload, signature)
+            if isinstance(result, dict):
+                if not result.get("verified", False):
+                    self._log(f"revoke: signature verification failed", "warn")
+                    return False
+                if result.get("pubkey", "") != issuer_id:
+                    self._log(f"revoke: signature pubkey mismatch", "warn")
+                    return False
+        except Exception as e:
+            self._log(f"revoke: checkmessage error: {e}", "warn")
+            return False
 
         now = int(time.time())
         success = self.db.revoke_did_credential(credential_id, reason, now)

@@ -7436,15 +7436,15 @@ class HiveDatabase:
 
     def revoke_management_credential(self, credential_id: str,
                                       revoked_at: int) -> bool:
-        """Revoke a management credential. Returns True on success."""
+        """Revoke a management credential. Returns True if a row was updated."""
         conn = self._get_connection()
         try:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE management_credentials SET revoked_at = ? "
                 "WHERE credential_id = ? AND revoked_at IS NULL",
                 (revoked_at, credential_id)
             )
-            return True
+            return cursor.rowcount > 0
         except Exception as e:
             self.plugin.log(
                 f"HiveDatabase: revoke_management_credential error: {e}",
