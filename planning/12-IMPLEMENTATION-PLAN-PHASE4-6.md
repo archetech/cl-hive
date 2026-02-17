@@ -30,16 +30,17 @@ class CashuEscrowManager:
     """Cashu NUT-10/11/14 escrow ticket management."""
 
     MAX_ACTIVE_TICKETS = 500
-    MAX_TICKET_ROWS = 50_000
-    MAX_SECRET_ROWS = 50_000
-    MAX_RECEIPT_ROWS = 100_000
+    MAX_ESCROW_TICKET_ROWS = 50_000
+    MAX_ESCROW_SECRET_ROWS = 50_000
+    MAX_ESCROW_RECEIPT_ROWS = 100_000
     SECRET_RETENTION_DAYS = 90
 
     # Rate limits for mint HTTP calls (circuit breaker pattern)
     MINT_REQUEST_TIMEOUT = 10  # seconds
     MINT_MAX_RETRIES = 3
-    MINT_CIRCUIT_BREAKER_THRESHOLD = 5  # failures before opening
-    MINT_CIRCUIT_BREAKER_RESET = 60     # seconds in OPEN before HALF_OPEN
+    MINT_CIRCUIT_BREAKER_THRESHOLD = 5   # failures before opening
+    MINT_CIRCUIT_BREAKER_RESET = 60      # seconds in OPEN before HALF_OPEN
+    MINT_HALF_OPEN_SUCCESS_THRESHOLD = 3 # successes in HALF_OPEN before CLOSED
 
     def __init__(self, database, plugin, rpc=None, our_pubkey="",
                  acceptable_mints=None):
@@ -81,6 +82,8 @@ class CashuEscrowManager:
 - `check_refund_eligible(token)` → check if timelock has passed for operator reclaim
 - `get_pricing(danger_score, reputation_tier)` → dynamic pricing based on [02-FLEET-MANAGEMENT.md](./02-FLEET-MANAGEMENT.md)
 - `cleanup_expired_tickets()` → mark expired tickets, attempt refund via timelock path
+- `retry_pending_operations()` → retry failed mint operations (create/redeem) for tickets in `pending` status, respecting circuit breaker state per mint
+- `prune_old_secrets()` → delete revealed secrets older than `SECRET_RETENTION_DAYS` (90 days) from `escrow_secrets`
 - `get_mint_status(mint_url)` → return circuit breaker state for a mint
 
 **Danger-to-pricing mapping**:
@@ -176,8 +179,12 @@ Row caps: `MAX_ESCROW_TICKET_ROWS = 50_000`, `MAX_ESCROW_SECRET_ROWS = 50_000`, 
 ```python
 def escrow_maintenance_loop():
     """15-minute maintenance cycle for escrow ticket lifecycle."""
+    shutdown_event.wait(30)  # startup delay
     while not shutdown_event.is_set():
         try:
+            if not database or not cashu_escrow_mgr:
+                shutdown_event.wait(900)
+                continue
             # 1. Check for expired tickets → attempt timelock refund
             cashu_escrow_mgr.cleanup_expired_tickets()
             # 2. Retry failed mint operations (circuit breaker permitting)
@@ -224,6 +231,10 @@ Extend the existing settlement module with 8 additional settlement types beyond 
 | `ARBITRATION_VOTE` | 32903 | Cast arbitration vote | 5/peer/hour |
 
 All 7 message types added to `RELIABLE_MESSAGE_TYPES`. Rate limits enforced per-peer via sliding window.
+
+`NETTING_ACK` (32899) is a direct response to `NETTING_PROPOSAL` (32897), so add to `IMPLICIT_ACK_MAP`: `32899: 32897` with `IMPLICIT_ACK_MATCH_FIELD[32899] = "window_id"`. This allows the outbox to match netting acknowledgements to their proposals.
+
+Factory functions follow the same pattern as Phase 1-3: `create_*()` returns unsigned serialized bytes with a `str(uuid.uuid4())` event_id. Signing payloads use `json.dumps(..., sort_keys=True, separators=(',',':'))` for deterministic serialization.
 
 **Handler security chain for BOND_SLASH** (critical — involves fund forfeiture):
 
@@ -427,6 +438,19 @@ class MarketplaceManager:
                  management_schema_registry, cashu_escrow_mgr):
 ```
 
+**Key methods**:
+- `discover_advisors(criteria)` → search cached profiles matching criteria (specialization, min_reputation, price range), return ranked list
+- `publish_profile(profile)` → publish own advisor profile to Nostr relays (kind 38380)
+- `propose_contract(advisor_did, node_id, scope, tier, pricing)` → send contract proposal via NIP-44 DM
+- `accept_contract(contract_id)` → accept proposal, publish contract confirmation (kind 38383)
+- `start_trial(contract_id)` → transition contract to trial status, create escrow ticket
+- `evaluate_trial(contract_id)` → evaluate trial metrics against thresholds, return pass/fail/extended
+- `terminate_contract(contract_id, reason)` → terminate contract, revoke management credential
+- `cleanup_stale_profiles()` → expire profiles older than `PROFILE_STALE_DAYS` (90 days)
+- `evaluate_expired_trials()` → auto-evaluate trials past their `end_at` deadline
+- `check_contract_renewals()` → notify operator of contracts expiring within `notice_days`
+- `republish_profile()` → re-publish own profile to Nostr (every 4h, tracked via timestamp)
+
 **Nostr event kinds — Advisor services (38380-38389)**:
 
 | Kind | Type | Content |
@@ -545,8 +569,12 @@ Row caps: `MAX_MARKETPLACE_PROFILE_ROWS = 5_000`, `MAX_MARKETPLACE_CONTRACT_ROWS
 ```python
 def marketplace_maintenance_loop():
     """1-hour maintenance cycle for marketplace state."""
+    shutdown_event.wait(30)  # startup delay
     while not shutdown_event.is_set():
         try:
+            if not database or not marketplace_mgr:
+                shutdown_event.wait(3600)
+                continue
             # 1. Expire stale profiles (>PROFILE_STALE_DAYS)
             marketplace_mgr.cleanup_stale_profiles()
             # 2. Check trial deadlines → auto-evaluate expired trials
@@ -575,6 +603,18 @@ class LiquidityMarketplaceManager:
     def __init__(self, database, plugin, nostr_transport, cashu_escrow_mgr,
                  settlement_mgr, did_credential_mgr):
 ```
+
+**Key methods**:
+- `discover_offers(service_type, min_capacity, max_rate)` → search cached offers matching criteria
+- `publish_offer(service_type, capacity, duration, pricing)` → publish offer to Nostr (kind 38901)
+- `accept_offer(offer_id)` → accept offer, create lease, mint escrow tickets
+- `send_heartbeat(lease_id)` → create and publish heartbeat attestation (kind 38904)
+- `verify_heartbeat(lease_id, heartbeat)` → verify heartbeat, reveal preimage if valid
+- `check_heartbeat_deadlines()` → increment `missed_heartbeats` for overdue leases
+- `terminate_dead_leases()` → terminate leases exceeding `HEARTBEAT_MISS_THRESHOLD` (3 misses)
+- `expire_stale_offers()` → mark offers past their `expires_at` as expired
+- `republish_offers()` → re-publish active offers to Nostr (every 2h, tracked via timestamp)
+- `get_lease_status(lease_id)` → return lease details with heartbeat history
 
 **9 liquidity service types**:
 
@@ -708,8 +748,12 @@ Row caps: `MAX_LIQUIDITY_OFFER_ROWS = 10_000`, `MAX_LIQUIDITY_LEASE_ROWS = 10_00
 ```python
 def liquidity_maintenance_loop():
     """10-minute maintenance cycle for liquidity lease lifecycle."""
+    shutdown_event.wait(30)  # startup delay
     while not shutdown_event.is_set():
         try:
+            if not database or not liquidity_mgr:
+                shutdown_event.wait(600)
+                continue
             # 1. Check heartbeat deadlines → increment missed_heartbeats
             liquidity_mgr.check_heartbeat_deadlines()
             # 2. Terminate leases with >= HEARTBEAT_MISS_THRESHOLD consecutive misses
@@ -722,6 +766,62 @@ def liquidity_maintenance_loop():
             plugin.log(f"cl-hive: liquidity_maintenance error: {e}", level='error')
         shutdown_event.wait(600)  # 10 min cycle
 ```
+
+---
+
+## Wiring: Phase 4-5 in `cl-hive.py`
+
+### HiveContext additions
+
+Add the following fields to `HiveContext` in `rpc_commands.py` (extending Phase 1-3 additions):
+
+| Field | Type | Phase | Initialized After |
+|-------|------|-------|-------------------|
+| `cashu_escrow_mgr` | `Optional[CashuEscrowManager]` | 4A | `did_credential_mgr` |
+| `nostr_transport` | `Optional[NostrTransport]` | 5A | `cashu_escrow_mgr` |
+| `marketplace_mgr` | `Optional[MarketplaceManager]` | 5B | `nostr_transport` |
+| `liquidity_mgr` | `Optional[LiquidityMarketplaceManager]` | 5C | `marketplace_mgr` |
+
+### Initialization order in `init()`
+
+```python
+# Phase 4A: Cashu escrow (after did_credential_mgr)
+cashu_escrow_mgr = CashuEscrowManager(
+    database, plugin, rpc, our_pubkey,
+    acceptable_mints=plugin.get_option('hive-cashu-mints', '').split(',')
+)
+
+# Phase 4B: Extended settlement types (extend existing settlement_mgr)
+settlement_mgr.register_extended_types(cashu_escrow_mgr, did_credential_mgr)
+
+# Phase 5A: Nostr transport (start daemon thread)
+nostr_transport = NostrTransport(plugin, database)
+nostr_transport.start()
+
+# Phase 5B: Marketplace (after nostr + escrow + credentials)
+marketplace_mgr = MarketplaceManager(
+    database, plugin, nostr_transport, did_credential_mgr,
+    management_schema_registry, cashu_escrow_mgr
+)
+
+# Phase 5C: Liquidity marketplace (after marketplace + settlements)
+liquidity_mgr = LiquidityMarketplaceManager(
+    database, plugin, nostr_transport, cashu_escrow_mgr,
+    settlement_mgr, did_credential_mgr
+)
+```
+
+### Shutdown additions
+
+```python
+# In shutdown handler, before database close:
+if nostr_transport:
+    nostr_transport.stop()  # signal WebSocket thread shutdown, join with 5s timeout
+```
+
+### Dispatch additions
+
+Add dispatch entries in `_dispatch_hive_message()` for all 7 Phase 4B protocol message types (32891-32903).
 
 ---
 
@@ -780,7 +880,47 @@ The lightweight client entry point. Contains:
 - `modules/liquidity_marketplace.py` (Phase 5C)
 - `modules/config.py` (existing)
 - `modules/database.py` (existing, creates only its own tables)
-- NEW: `modules/policy_engine.py` (operator policy rules)
+- NEW: `modules/policy_engine.py` (operator policy rules — see specification below)
+
+#### New file: `modules/policy_engine.py`
+
+```python
+class PolicyEngine:
+    """Operator's last-defense policy layer for management commands.
+
+    Evaluates every incoming management command against operator-defined
+    rules before execution. This is the final gate after credential
+    verification and danger scoring.
+    """
+
+    PRESETS = {
+        "conservative": {"max_danger": 4, "quiet_hours": True, "require_confirmation_above": 3},
+        "moderate": {"max_danger": 6, "quiet_hours": False, "require_confirmation_above": 5},
+        "aggressive": {"max_danger": 8, "quiet_hours": False, "require_confirmation_above": 7},
+    }
+
+    def __init__(self, database, plugin, preset="moderate"):
+```
+
+**Key methods**:
+- `evaluate(schema_id, action, params, danger_score, agent_id)` → `PolicyResult(allowed, reason, requires_confirmation)`
+- `set_preset(preset_name)` → apply a preset configuration
+- `add_rule(rule)` → add custom policy rule (e.g. "block channel closes on weekends")
+- `remove_rule(rule_id)` → remove a custom rule
+- `set_protected_channels(channel_ids)` → channels that cannot be closed by any advisor
+- `set_quiet_hours(start_hour, end_hour, timezone)` → block non-monitor actions during quiet hours
+- `get_policy()` → return current policy configuration
+- `list_rules()` → list all active rules (preset + custom)
+
+**Policy rule types**:
+- `max_danger`: Block actions above this danger score
+- `quiet_hours`: Time window where only `hive:monitor/*` actions are allowed
+- `protected_channels`: Channel IDs that cannot be targeted by `hive:channel/v1` close actions
+- `daily_budget_sats`: Maximum sats in management fees per day
+- `require_confirmation_above`: Danger score threshold for interactive confirmation
+- `blocked_schemas`: Schemas entirely blocked from remote execution
+
+**Storage**: Policy rules stored in `nostr_state` table (bounded KV store) with `policy:` key prefix.
 
 **CLI commands**:
 - `hive-client-discover` — search for advisors/liquidity
@@ -822,6 +962,17 @@ Adds DID identity layer on top of `cl-hive-comms`. See [09-ARCHON-INTEGRATION.md
 | **Vault Backup** | Archon group vault for DID wallet, credentials, receipt chain, Cashu tokens | Archon vault API |
 | **Shamir Recovery** | k-of-n threshold recovery for distributed trust | Archon recovery API |
 
+**CLI commands** (from [09-ARCHON-INTEGRATION.md](./09-ARCHON-INTEGRATION.md)):
+- `hive-archon-provision` — provision `did:cid:*` identity via gateway
+- `hive-archon-bind-nostr` — create DID-Nostr binding attestation
+- `hive-archon-bind-cln` — create DID-CLN binding attestation
+- `hive-archon-status` — show DID identity status, bindings, governance tier
+- `hive-archon-upgrade` — upgrade from Basic to Governance tier (requires DID + bond)
+- `hive-poll-create` — create a governance poll (governance tier only)
+- `hive-poll-status` — view poll status and vote tally
+- `hive-vote` — cast a vote on an active poll (governance tier only)
+- `hive-my-votes` — list own voting history
+
 **Module dependencies for cl-hive-archon**:
 - `modules/did_credentials.py` (Phase 1)
 - `modules/config.py` (existing)
@@ -862,7 +1013,9 @@ Add the following to `_check_method_allowed()` in `tools/mcp-hive-server.py`:
 
 **Phase 5C (Liquidity)**: `hive-liquidity-discover`, `hive-liquidity-offer`, `hive-liquidity-request`, `hive-liquidity-lease`, `hive-liquidity-heartbeat`, `hive-liquidity-lease-status`, `hive-liquidity-terminate`
 
-**Phase 6 (Client)**: `hive-client-discover`, `hive-client-authorize`, `hive-client-revoke`, `hive-client-receipts`, `hive-client-policy`, `hive-client-status`, `hive-client-payments`, `hive-client-trial`, `hive-client-alias`, `hive-client-identity`
+**Phase 6A (Client)**: `hive-client-discover`, `hive-client-authorize`, `hive-client-revoke`, `hive-client-receipts`, `hive-client-policy`, `hive-client-status`, `hive-client-payments`, `hive-client-trial`, `hive-client-alias`, `hive-client-identity`
+
+**Phase 6B (Archon)**: `hive-archon-provision`, `hive-archon-bind-nostr`, `hive-archon-bind-cln`, `hive-archon-status`, `hive-archon-upgrade`, `hive-poll-create`, `hive-poll-status`, `hive-vote`, `hive-my-votes`
 
 ---
 
@@ -928,12 +1081,12 @@ Add the following to `_check_method_allowed()` in `tools/mcp-hive-server.py`:
 | File | Type | Changes |
 |------|------|---------|
 | **NEW** `cl-hive-comms.py` | New | Client plugin: transport, schema, policy, payments |
-| **NEW** `cl-hive-archon.py` | New | Identity plugin: DID, credentials, vault, governance tier |
-| **NEW** `modules/policy_engine.py` | New | Operator policy rules, presets, quiet hours |
+| **NEW** `cl-hive-archon.py` | New | Identity plugin: DID, credentials, vault, governance tier, polls |
+| **NEW** `modules/policy_engine.py` | New | Operator policy rules, presets, quiet hours, protected channels |
 | `cl-hive.py` | Refactor | Extract shared code, detect sibling plugins |
-| `tools/mcp-hive-server.py` | Modify | Add 10 client RPC methods to allowlist |
+| `tools/mcp-hive-server.py` | Modify | Add 10 client + 9 archon RPC methods to allowlist |
 | **NEW** `tests/test_hive_comms.py` | New | Transport, schema translation, policy engine |
-| **NEW** `tests/test_hive_archon.py` | New | DID provisioning, binding, vault, governance tier |
+| **NEW** `tests/test_hive_archon.py` | New | DID provisioning, binding, vault, governance tier, polls |
 
 ---
 
@@ -977,6 +1130,8 @@ Add the following to `_check_method_allowed()` in `tools/mcp-hive-server.py`:
 2. Standalone test: `cl-hive-comms` operates without `cl-hive` installed
 3. Upgrade test: install comms → add archon → add cl-hive → verify state preserved
 4. Schema translation: all 15 categories correctly map to CLN RPC
-5. Policy engine: conservative preset blocks danger > 4, aggressive allows danger ≤ 7
-6. Database: verify each plugin creates only its own tables, cross-plugin reads work
-7. Regression: all existing tests pass
+5. Policy engine: conservative preset blocks danger > 4, aggressive allows danger ≤ 7, quiet hours block non-monitor actions
+6. Protected channels: verify `hive:channel/v1` close actions are blocked for protected channel IDs
+7. Governance polls: `hive-poll-create` → `hive-vote` → `hive-poll-status` shows correct tally (governance tier only)
+8. Database: verify each plugin creates only its own tables, cross-plugin reads work
+9. Regression: all existing tests pass
