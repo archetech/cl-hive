@@ -11,7 +11,7 @@
 
 ## Abstract
 
-This document is the **authoritative specification** for all Nostr-based marketplace integration in the Lightning Hive protocol suite. It consolidates, extends, and supersedes the Nostr sections in the [Marketplace spec](./DID-HIVE-MARKETPLACE.md) (Section 7 / Nostr advertising) and the [Liquidity spec](./DID-HIVE-LIQUIDITY.md) (Section 11A / Nostr Marketplace Protocol).
+This document is the **authoritative specification** for all Nostr-based marketplace integration in the Lightning Hive protocol suite. It consolidates, extends, and supersedes the Nostr sections in the [Marketplace spec](./04-HIVE-MARKETPLACE.md) (Section 7 / Nostr advertising) and the [Liquidity spec](./07-HIVE-LIQUIDITY.md) (Section 11A / Nostr Marketplace Protocol).
 
 The Nostr layer serves as the **public, open marketplace** for Lightning Hive services — the interface that makes advisor management and liquidity services discoverable by the entire Lightning Network without requiring hive membership, custom infrastructure, or platform accounts. Any Nostr client can browse services, view provider profiles, and initiate contracts.
 
@@ -35,17 +35,17 @@ This spec does **not** duplicate content from companion specifications. It refer
 
 | Spec | What It Defines | What This Spec Adds |
 |------|----------------|---------------------|
-| [Marketplace](./DID-HIVE-MARKETPLACE.md) | Advisor profiles, discovery, negotiation, contracts | Nostr event kinds for advisor services; dual-publishing |
-| [Liquidity](./DID-HIVE-LIQUIDITY.md) | Liquidity service types, escrow, proofs, settlement | Nostr event kinds for liquidity services (originated there, formalized here) |
-| [Client](./DID-HIVE-CLIENT.md) | Plugin architecture, discovery pipeline, UX | Nostr subscription/publishing integration |
-| [Reputation](./DID-REPUTATION-SCHEMA.md) | Credential schema, scoring, aggregation | Nostr-published reputation summaries |
-| [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) | RPC, delegation, policy enforcement | N/A (internal, not Nostr-facing) |
-| [Task Escrow](./DID-CASHU-TASK-ESCROW.md) | Cashu escrow mechanics | Payment method tags in Nostr events |
-| [Settlements](./DID-HIVE-SETTLEMENTS.md) | Netting, settlement types | N/A (bilateral, not Nostr-facing) |
+| [Marketplace](./04-HIVE-MARKETPLACE.md) | Advisor profiles, discovery, negotiation, contracts | Nostr event kinds for advisor services; dual-publishing |
+| [Liquidity](./07-HIVE-LIQUIDITY.md) | Liquidity service types, escrow, proofs, settlement | Nostr event kinds for liquidity services (originated there, formalized here) |
+| [Client](./08-HIVE-CLIENT.md) | Plugin architecture, discovery pipeline, UX | Nostr subscription/publishing integration |
+| [Reputation](./01-REPUTATION-SCHEMA.md) | Credential schema, scoring, aggregation | Nostr-published reputation summaries |
+| [Fleet Management](./02-FLEET-MANAGEMENT.md) | RPC, delegation, policy enforcement | N/A (internal, not Nostr-facing) |
+| [Task Escrow](./03-CASHU-TASK-ESCROW.md) | Cashu escrow mechanics | Payment method tags in Nostr events |
+| [Settlements](./06-HIVE-SETTLEMENTS.md) | Netting, settlement types | N/A (bilateral, not Nostr-facing) |
 
 **Supersession:** Once this spec is accepted, the following sections become informational references only:
-- [DID-HIVE-MARKETPLACE.md § "Advertising via Nostr"](./DID-HIVE-MARKETPLACE.md#advertising-via-nostr-optional)
-- [DID-HIVE-LIQUIDITY.md § 11A "Nostr Marketplace Protocol"](./DID-HIVE-LIQUIDITY.md#11a-nostr-marketplace-protocol)
+- [DID-HIVE-MARKETPLACE.md § "Advertising via Nostr"](./04-HIVE-MARKETPLACE.md#advertising-via-nostr-optional)
+- [DID-HIVE-LIQUIDITY.md § 11A "Nostr Marketplace Protocol"](./07-HIVE-LIQUIDITY.md#11a-nostr-marketplace-protocol)
 
 ---
 
@@ -130,7 +130,7 @@ Advisor services and liquidity services use **separate kind ranges** within the 
 | `38905` | Liquidity | Reputation Summary | Yes (`d` tag) | Until updated |
 | `38906–38909` | Liquidity | Reserved | — | — |
 
-> **Migration note:** Kind `38383` was previously used for advisor profiles in the [Marketplace spec](./DID-HIVE-MARKETPLACE.md#advertising-via-nostr-optional). This allocation reassigns `38383` to Contract Confirmation within the advisor range and introduces `38380` for profiles. Existing `38383` profile events should be re-published as `38380` during the migration period. Clients SHOULD accept both kinds during transition.
+> **Migration note:** Kind `38383` was previously used for advisor profiles in the [Marketplace spec](./04-HIVE-MARKETPLACE.md#advertising-via-nostr-optional). This allocation reassigns `38383` to Contract Confirmation within the advisor range and introduces `38380` for profiles. Existing `38383` profile events should be re-published as `38380` during the migration period. Clients SHOULD accept both kinds during transition.
 
 ### Kind Symmetry
 
@@ -151,11 +151,11 @@ This symmetry simplifies client code — a single event handler parameterized by
 
 ## 2. Advisor Event Kinds (NEW)
 
-The [Liquidity spec § 11A](./DID-HIVE-LIQUIDITY.md#11a-nostr-marketplace-protocol) defines liquidity kinds 38900–38905 in full detail. This section defines the **parallel advisor kinds** that did not previously exist.
+The [Liquidity spec § 11A](./07-HIVE-LIQUIDITY.md#11a-nostr-marketplace-protocol) defines liquidity kinds 38900–38905 in full detail. This section defines the **parallel advisor kinds** that did not previously exist.
 
 ### Kind 38380: Advisor Service Profile
 
-The advisor's storefront on Nostr. Contains the same information as the `HiveServiceProfile` credential from the [Marketplace spec § 1](./DID-HIVE-MARKETPLACE.md#1-service-advertising), formatted for Nostr consumption.
+The advisor's storefront on Nostr. Contains the same information as the `HiveServiceProfile` credential from the [Marketplace spec § 1](./04-HIVE-MARKETPLACE.md#1-service-advertising), formatted for Nostr consumption.
 
 ```json
 {
@@ -186,7 +186,7 @@ The advisor's storefront on Nostr. Contains the same information as the `HiveSer
 ```
 
 **Key design decisions:**
-- **`capabilities` tag** lists specific management domains (from [Marketplace spec § 1](./DID-HIVE-MARKETPLACE.md#1-service-advertising)). Clients filter by capability to find specialists.
+- **`capabilities` tag** lists specific management domains (from [Marketplace spec § 1](./04-HIVE-MARKETPLACE.md#1-service-advertising)). Clients filter by capability to find specialists.
 - **`pricing-model` tag** indicates the advisor's preferred billing model. Multiple models can be advertised; specific terms appear in offers (kind 38381).
 - **`content` carries the full signed credential** — verifiable independently of the Nostr event signature.
 - **`did-nostr-proof` tag** prevents impersonation (see [Section 9: DID-Nostr Binding](#9-did-nostr-binding)).
@@ -256,7 +256,7 @@ A node operator broadcasts their need for management services.
 }
 ```
 
-**Privacy options** mirror the liquidity RFP ([Liquidity spec § 11A](./DID-HIVE-LIQUIDITY.md#11a-nostr-marketplace-protocol)):
+**Privacy options** mirror the liquidity RFP ([Liquidity spec § 11A](./07-HIVE-LIQUIDITY.md#11a-nostr-marketplace-protocol)):
 - **Public RFP:** Client includes `did` and `pubkey`. Advisors respond via NIP-44 DM.
 - **Anonymous RFP:** Client uses throwaway Nostr key, omits `did`. See [Section 7: Privacy](#7-privacy).
 - **Sealed-bid RFP:** Client includes `bid-pubkey` for encrypted responses.
@@ -482,7 +482,7 @@ Hive marketplace events share tag conventions with NIP-99 for maximum interopera
 | `t` | `t` tags | Yes — `hive-advisor`, `hive-liquidity`, etc. |
 | `image` | — | Optional (provider avatar or graph visualization) |
 
-**Dual-publishing to NIP-99:** Providers MAY publish offers as both native kinds AND kind 30402. The kind 30402 version uses NIP-99's standard structure with hive-specific metadata in additional tags. See the [Liquidity spec § NIP Compatibility](./DID-HIVE-LIQUIDITY.md#nip-compatibility) for the full kind 30402 example.
+**Dual-publishing to NIP-99:** Providers MAY publish offers as both native kinds AND kind 30402. The kind 30402 version uses NIP-99's standard structure with hive-specific metadata in additional tags. See the [Liquidity spec § NIP Compatibility](./07-HIVE-LIQUIDITY.md#nip-compatibility) for the full kind 30402 example.
 
 **Advisor NIP-99 example:**
 
@@ -652,7 +652,7 @@ For competitive bidding where providers should not see each other's quotes:
 2. Providers encrypt their bids to this key
 3. Bids appear as opaque encrypted blobs to other participants
 4. Client decrypts all bids after the deadline
-5. Same mechanism as [Marketplace spec sealed-bid auctions](./DID-HIVE-MARKETPLACE.md#sealed-bid-auctions), using Nostr as transport
+5. Same mechanism as [Marketplace spec sealed-bid auctions](./04-HIVE-MARKETPLACE.md#sealed-bid-auctions), using Nostr as transport
 
 ### What Remains Private
 
@@ -1047,13 +1047,13 @@ Complete tag reference for all hive marketplace Nostr events:
 ## References
 
 ### Companion Specs
-- [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md)
-- [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md)
-- [DID Hive Client Protocol](./DID-HIVE-CLIENT.md)
-- [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
-- [DID L402 Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
-- [DID Cashu Task Escrow](./DID-CASHU-TASK-ESCROW.md)
-- [DID Hive Settlements](./DID-HIVE-SETTLEMENTS.md)
+- [DID Hive Marketplace Protocol](./04-HIVE-MARKETPLACE.md)
+- [DID Hive Liquidity Protocol](./07-HIVE-LIQUIDITY.md)
+- [DID Hive Client Protocol](./08-HIVE-CLIENT.md)
+- [DID Reputation Schema](./01-REPUTATION-SCHEMA.md)
+- [DID L402 Fleet Management](./02-FLEET-MANAGEMENT.md)
+- [DID Cashu Task Escrow](./03-CASHU-TASK-ESCROW.md)
+- [DID Hive Settlements](./06-HIVE-SETTLEMENTS.md)
 
 ### Nostr NIPs
 - [NIP-01: Basic Protocol Flow](https://github.com/nostr-protocol/nips/blob/master/01.md)

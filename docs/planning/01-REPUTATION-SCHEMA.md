@@ -32,7 +32,7 @@ The schema is designed for the Archon decentralized identity network but is port
 
 ### DID Transparency
 
-While this schema references DIDs as subject and issuer identifiers (necessary for implementers), **end users interact with reputation through human-readable interfaces**: star ratings, trust badges, advisor rankings, and performance summaries. Raw DID strings never appear in user-facing displays. Client software (see [DID Hive Client](./DID-HIVE-CLIENT.md)) resolves DIDs to display names and presents reputation as intuitive scores.
+While this schema references DIDs as subject and issuer identifiers (necessary for implementers), **end users interact with reputation through human-readable interfaces**: star ratings, trust badges, advisor rankings, and performance summaries. Raw DID strings never appear in user-facing displays. Client software (see [DID Hive Client](./08-HIVE-CLIENT.md)) resolves DIDs to display names and presents reputation as intuitive scores.
 
 ### Payment Context
 
@@ -130,7 +130,7 @@ A `revoke` outcome doesn't mean the credential itself is revoked — it means th
 
 | Type | Description | Example |
 |------|-------------|---------|
-| `SignedReceipt` | A countersigned record of an action taken. Both parties signed. | Management command receipts from [DID+L402 Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) |
+| `SignedReceipt` | A countersigned record of an action taken. Both parties signed. | Management command receipts from [DID+L402 Fleet Management](./02-FLEET-MANAGEMENT.md) |
 | `MetricSnapshot` | A signed measurement at a point in time (e.g., revenue, uptime). | Node revenue at period start vs end |
 | `Attestation` | A third-party statement vouching for a claim. | Another node confirming routing reliability |
 | `AuditLog` | A signed log or merkle root covering a set of operations. | Hash of all agent actions during period |
@@ -160,7 +160,7 @@ Profile identifiers follow the pattern `<namespace>:<type>`:
 
 **Subject type:** DID of a Lightning fleet advisor (agent or human)  
 **Issuer type:** DID of a node operator whose fleet was managed  
-**Reference:** [DID+L402 Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
+**Reference:** [DID+L402 Fleet Management](./02-FLEET-MANAGEMENT.md)
 
 | Metric Key | Type | Unit | Description |
 |------------|------|------|-------------|
@@ -169,7 +169,7 @@ Profile identifiers follow the pattern `<namespace>:<type>`:
 | `uptime_pct` | number | percent | Percentage of period the advisor was responsive and active. |
 | `channels_managed` | integer | count | Number of channels under active management. |
 
-**Example evidence:** Signed management receipts (per [DID+L402 protocol](./DID-L402-FLEET-MANAGEMENT.md)), revenue snapshots at period boundaries.
+**Example evidence:** Signed management receipts (per [DID+L402 protocol](./02-FLEET-MANAGEMENT.md)), revenue snapshots at period boundaries.
 
 **Outcome interpretation:**
 - `renew` — Operator extends the management credential
@@ -189,9 +189,9 @@ Profile identifiers follow the pattern `<namespace>:<type>`:
 | `avg_fee_ppm` | number | ppm | Average fee rate charged during period. (optional) |
 | `capacity_sats` | integer | sats | Total channel capacity during period. (optional) |
 
-**Example evidence:** Probe results, forwarding statistics, gossip uptime measurements, settlement receipts from the [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md).
+**Example evidence:** Probe results, forwarding statistics, gossip uptime measurements, settlement receipts from the [DID + Cashu Hive Settlements Protocol](./06-HIVE-SETTLEMENTS.md).
 
-The `hive:node` profile is central to the hive settlements protocol — bond amounts, slash history, and settlement dispute outcomes are recorded as metrics in this profile, and the aggregated reputation score determines [credit and trust tiers](./DID-HIVE-SETTLEMENTS.md#credit-and-trust-tiers) for settlement terms.
+The `hive:node` profile is central to the hive settlements protocol — bond amounts, slash history, and settlement dispute outcomes are recorded as metrics in this profile, and the aggregated reputation score determines [credit and trust tiers](./06-HIVE-SETTLEMENTS.md#credit-and-trust-tiers) for settlement terms.
 
 **Outcome interpretation:**
 - `renew` — Peer maintains or opens channels with this node
@@ -202,7 +202,7 @@ The `hive:node` profile is central to the hive settlements protocol — bond amo
 
 **Subject type:** DID of a node operator (as a client of advisory services)  
 **Issuer type:** DID of an advisor who managed the operator's fleet  
-**Reference:** [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md)
+**Reference:** [DID Hive Marketplace Protocol](./04-HIVE-MARKETPLACE.md)
 
 | Metric Key | Type | Unit | Description |
 |------------|------|------|-------------|
@@ -421,7 +421,7 @@ Cross-domain aggregation normalizes domain-specific metrics to a 0–100 score u
 
 ### Score Threshold Interpretation
 
-This schema produces 0–100 aggregate scores but does **not** prescribe threshold meanings. Consumers apply domain-specific interpretations. For reference, the [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md#credit-and-trust-tiers) uses these thresholds for node trust tiers:
+This schema produces 0–100 aggregate scores but does **not** prescribe threshold meanings. Consumers apply domain-specific interpretations. For reference, the [DID + Cashu Hive Settlements Protocol](./06-HIVE-SETTLEMENTS.md#credit-and-trust-tiers) uses these thresholds for node trust tiers:
 
 | Score Range | Tier | Meaning |
 |-------------|------|---------|
@@ -438,7 +438,7 @@ Other consumers may define different thresholds appropriate to their risk tolera
 
 ### DID+L402 Fleet Management
 
-The [DID+L402 Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) spec defines `HiveAdvisorReputationCredential` for Lightning fleet advisors. That credential is a **domain-specific instance** of this general schema, using the `hive:advisor` profile.
+The [DID+L402 Fleet Management](./02-FLEET-MANAGEMENT.md) spec defines `HiveAdvisorReputationCredential` for Lightning fleet advisors. That credential is a **domain-specific instance** of this general schema, using the `hive:advisor` profile.
 
 The fleet management spec's reputation system implements this schema's base structure with Lightning-specific evidence types (management receipts, revenue snapshots) and outcome semantics (credential renewal/revocation).
 
@@ -545,11 +545,11 @@ A reputation system only works if participants issue credentials. Why would an o
 
 ### Automated Issuance at Credential Renewal
 
-The primary mechanism: reputation credential issuance is **automated** as part of the management credential lifecycle. When a management credential (per [DID+L402 Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)) expires or renews, the node's cl-hive plugin automatically generates a `DIDReputationCredential` (with `domain: "hive:advisor"`) based on measured metrics (actions taken, revenue delta, uptime). The operator need only approve the renewal — the reputation credential is a byproduct, not extra work.
+The primary mechanism: reputation credential issuance is **automated** as part of the management credential lifecycle. When a management credential (per [DID+L402 Fleet Management](./02-FLEET-MANAGEMENT.md)) expires or renews, the node's cl-hive plugin automatically generates a `DIDReputationCredential` (with `domain: "hive:advisor"`) based on measured metrics (actions taken, revenue delta, uptime). The operator need only approve the renewal — the reputation credential is a byproduct, not extra work.
 
 ### Protocol Requirement for Performance Settlement
 
-Performance-based payment (see [Task Escrow — Performance Ticket](./DID-CASHU-TASK-ESCROW.md#performance-ticket)) requires a signed metric attestation to trigger bonus release. This attestation **is** a reputation credential. Operators who use performance-based pricing are already issuing reputation data as part of the payment flow.
+Performance-based payment (see [Task Escrow — Performance Ticket](./03-CASHU-TASK-ESCROW.md#performance-ticket)) requires a signed metric attestation to trigger bonus release. This attestation **is** a reputation credential. Operators who use performance-based pricing are already issuing reputation data as part of the payment flow.
 
 ### Reputation Reciprocity
 
@@ -567,10 +567,10 @@ Operators are incentivized to issue `revoke` credentials against bad advisors to
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [Archon Reputation Schemas (canonical)](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)
-- [DID+L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
-- [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
-- [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) — Primary consumer of reputation credentials for advisor discovery, ranking, and contract formation
-- [DID Hive Client: Universal Lightning Node Management](./DID-HIVE-CLIENT.md) — Client plugin/daemon for non-hive nodes
+- [DID+L402 Remote Fleet Management](./02-FLEET-MANAGEMENT.md)
+- [DID + Cashu Hive Settlements Protocol](./06-HIVE-SETTLEMENTS.md)
+- [DID Hive Marketplace Protocol](./04-HIVE-MARKETPLACE.md) — Primary consumer of reputation credentials for advisor discovery, ranking, and contract formation
+- [DID Hive Client: Universal Lightning Node Management](./08-HIVE-CLIENT.md) — Client plugin/daemon for non-hive nodes
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 
 ---

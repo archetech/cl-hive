@@ -20,7 +20,7 @@ The result is a system where nodes operated by different parties can participate
 
 ### DID Transparency
 
-While this spec references DIDs throughout for implementers, all user-facing interactions abstract away raw DID strings. Node operators "join the hive," "post a bond," and "settle with peers" — never "resolve `did:cid:...`". See [DID Hive Client](./DID-HIVE-CLIENT.md) for the user-facing abstraction layer.
+While this spec references DIDs throughout for implementers, all user-facing interactions abstract away raw DID strings. Node operators "join the hive," "post a bond," and "settle with peers" — never "resolve `did:cid:...`". See [DID Hive Client](./08-HIVE-CLIENT.md) for the user-facing abstraction layer.
 
 ### Payment Method Flexibility
 
@@ -164,7 +164,7 @@ Both parties sign. If either refuses to sign, the rebalance obligation is disput
 
 ### 3. Channel Leasing / Liquidity Rental
 
-> **Full liquidity protocol:** This settlement type covers the settlement mechanics for channel leasing. For the complete liquidity marketplace — including nine service types (leasing, pools, JIT, sidecar, swaps, submarine, turbo, balanced, insurance), pricing models, provider profiles, and proof mechanisms — see the [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md).
+> **Full liquidity protocol:** This settlement type covers the settlement mechanics for channel leasing. For the complete liquidity marketplace — including nine service types (leasing, pools, JIT, sidecar, swaps, submarine, turbo, balanced, insurance), pricing models, provider profiles, and proof mechanisms — see the [DID Hive Liquidity Protocol](./07-HIVE-LIQUIDITY.md).
 
 **Scenario:** Node A wants inbound liquidity from Node B. B opens a channel to A (or keeps an existing channel well-balanced toward A) for a defined period. A pays B for this time-bounded access to capacity.
 
@@ -174,7 +174,7 @@ Both parties sign. If either refuses to sign, the rebalance obligation is disput
 lease_cost = capacity_sats × lease_rate_ppm × lease_duration_days / 365
 ```
 
-Lease rate is market-driven — nodes advertise rates via pheromone markers and [liquidity service profiles](./DID-HIVE-LIQUIDITY.md#4-liquidity-provider-profiles).
+Lease rate is market-driven — nodes advertise rates via pheromone markers and [liquidity service profiles](./07-HIVE-LIQUIDITY.md#4-liquidity-provider-profiles).
 
 **Proof mechanism:** Periodic heartbeat attestations. The lessee (A) and lessor (B) exchange signed heartbeats confirming the leased capacity was available:
 
@@ -382,12 +382,12 @@ Violations require quorum confirmation — at least N/2+1 hive members must inde
 
 ### 9. Advisor Fee Settlement
 
-**Scenario:** An advisor (per the [DID+L402 Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) spec) manages nodes across multiple operators. Per-action fees are handled through direct Cashu/L402 payment at command execution time (already spec'd in Fleet Management). However, three classes of advisor compensation require the settlement protocol:
+**Scenario:** An advisor (per the [DID+L402 Fleet Management](./02-FLEET-MANAGEMENT.md) spec) manages nodes across multiple operators. Per-action fees are handled through direct Cashu/L402 payment at command execution time (already spec'd in Fleet Management). However, three classes of advisor compensation require the settlement protocol:
 
 1. **Performance bonuses** — Measured over multi-day windows (e.g., "10% of revenue improvement over 30 days"), these span multiple settlement windows and can't be settled at action time
 2. **Subscription renewals** — Monthly management subscriptions where the obligation accumulates daily but settles at period end
 3. **Multi-operator billing** — An advisor managing 10 nodes across 5 operators needs consolidated fee accounting, netting (operators who also advise each other), and dispute resolution
-4. **Referral fees** — Advisors who refer other advisors receive a percentage of the referred advisor's first contract revenue, settled via this settlement type (see [DID Hive Marketplace Protocol — Referral System](./DID-HIVE-MARKETPLACE.md#8-referral--affiliate-system))
+4. **Referral fees** — Advisors who refer other advisors receive a percentage of the referred advisor's first contract revenue, settled via this settlement type (see [DID Hive Marketplace Protocol — Referral System](./04-HIVE-MARKETPLACE.md#8-referral--affiliate-system))
 
 **Obligation calculation:**
 
@@ -460,7 +460,7 @@ For multi-operator consolidation:
 
 **Multi-operator netting:** An advisor managing nodes for operators A, B, and C has three bilateral obligations. These participate in the standard [multilateral netting](#multilateral-netting) process — if operator A also owes the advisor for routing revenue sharing (Type 1), these obligations net together, reducing the number of Cashu tickets needed.
 
-**Dispute handling:** Advisor fee disputes are resolved through the same [Dispute Resolution](#dispute-resolution) process. The arbitration panel reviews management receipts, signed baseline/performance measurements, and the credential terms. Performance measurement disputes are the most common — the "baseline integrity" rules from the [Task Escrow spec](./DID-CASHU-TASK-ESCROW.md#performance-ticket) apply here as well.
+**Dispute handling:** Advisor fee disputes are resolved through the same [Dispute Resolution](#dispute-resolution) process. The arbitration panel reviews management receipts, signed baseline/performance measurements, and the credential terms. Performance measurement disputes are the most common — the "baseline integrity" rules from the [Task Escrow spec](./03-CASHU-TASK-ESCROW.md#performance-ticket) apply here as well.
 
 ---
 
@@ -568,7 +568,7 @@ Multilateral netting requires participating nodes to agree on the obligation set
 
 ### Cashu Escrow Ticket Flow
 
-After netting, each net obligation becomes a Cashu escrow ticket following the [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md).
+After netting, each net obligation becomes a Cashu escrow ticket following the [DID + Cashu Task Escrow Protocol](./03-CASHU-TASK-ESCROW.md).
 
 > **Note:** Settlement escrow tickets use **obligation acknowledgment** as the verification event (the receiver signs confirmation that the obligation summary matches their local ledger). This differs from task escrow, where **task completion** triggers the preimage reveal. The cryptographic mechanism is identical — only the semantic trigger differs.
 
@@ -957,7 +957,7 @@ Tier demotion is immediate upon bond slash or dispute loss. Demotion drops the n
 
 ### Mapping to DID Reputation Schema
 
-Trust tiers are derived from the `hive:node` profile in the [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md):
+Trust tiers are derived from the `hive:node` profile in the [DID Reputation Schema](./01-REPUTATION-SCHEMA.md):
 
 ```
 tier = compute_tier(
@@ -968,7 +968,7 @@ tier = compute_tier(
 )
 ```
 
-The reputation score aggregation follows the schema's [weighted aggregation algorithm](./DID-REPUTATION-SCHEMA.md#aggregation-algorithm), with issuer diversity, recency decay, and evidence strength all factored in.
+The reputation score aggregation follows the schema's [weighted aggregation algorithm](./01-REPUTATION-SCHEMA.md#aggregation-algorithm), with issuer diversity, recency decay, and evidence strength all factored in.
 
 ---
 
@@ -1237,7 +1237,7 @@ The mint is a fungible ecash issuer — it processes blind signatures and has no
 - Slashing mechanism with bond forfeiture
 
 ### Phase 4: Cashu Escrow Integration (3–4 weeks)
-- Connect netting output to [DID + Cashu Task Escrow](./DID-CASHU-TASK-ESCROW.md) ticket creation
+- Connect netting output to [DID + Cashu Task Escrow](./03-CASHU-TASK-ESCROW.md) ticket creation
 - Implement settlement-specific HTLC secret generation and reveal
 - Milestone tickets for lease settlements
 - Refund path for disputed/expired settlements
@@ -1246,7 +1246,7 @@ The mint is a fungible ecash issuer — it processes blind signatures and has no
 - Trust tier computation from reputation + bond + tenure
 - Credit line management and enforcement
 - Automatic tier progression/demotion
-- Integration with [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md) `hive:node` profile
+- Integration with [DID Reputation Schema](./01-REPUTATION-SCHEMA.md) `hive:node` profile
 
 ### Phase 6: Multilateral Netting (3–4 weeks)
 - Multilateral netting algorithm implementation
@@ -1321,10 +1321,10 @@ If a node disappears without broadcasting an intent-to-leave (crash, network fai
 
 ## References
 
-- [DID + L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
-- [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md)
-- [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
-- [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md)
+- [DID + L402 Remote Fleet Management](./02-FLEET-MANAGEMENT.md)
+- [DID + Cashu Task Escrow Protocol](./03-CASHU-TASK-ESCROW.md)
+- [DID Reputation Schema](./01-REPUTATION-SCHEMA.md)
+- [DID Hive Marketplace Protocol](./04-HIVE-MARKETPLACE.md)
 - [Cashu NUT-10: Spending Conditions](https://github.com/cashubtc/nuts/blob/main/10.md)
 - [Cashu NUT-11: Pay-to-Public-Key (P2PK)](https://github.com/cashubtc/nuts/blob/main/11.md)
 - [Cashu NUT-14: Hashed Timelock Contracts](https://github.com/cashubtc/nuts/blob/main/14.md)
@@ -1335,7 +1335,7 @@ If a node disappears without broadcasting an intent-to-leave (crash, network fai
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [Archon Reputation Schemas (canonical)](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)
-- [DID Hive Client: Universal Lightning Node Management](./DID-HIVE-CLIENT.md) — Client plugin/daemon for non-hive nodes
+- [DID Hive Client: Universal Lightning Node Management](./08-HIVE-CLIENT.md) — Client plugin/daemon for non-hive nodes
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 - [Nisan & Rougearden, "Algorithmic Game Theory", Cambridge University Press (2007)](https://www.cs.cmu.edu/~sandholm/cs15-892F13/algorithmic-game-theory.pdf) — Chapters on mechanism design and repeated games
 - [Shapley, L.S. "A Value for n-Person Games" (1953)](https://doi.org/10.1515/9781400881970-018) — Foundation for contribution-proportional revenue sharing

@@ -5,7 +5,7 @@
 **Author:** Hex (`did:cid:bagaaierajrr7k6izcrdfwqxpgtrobflsv5oibymfnthjazkkokaugszyh4ka`)  
 **Date:** 2026-02-17  
 **Feedback:** Open — file issues or comment in #cl-hive  
-**Related:** [DID Hive Client](./DID-HIVE-CLIENT.md), [Fleet Management](./DID-L402-FLEET-MANAGEMENT.md), [LNCURL](https://github.com/niclas9/lncurl) (rolznz)
+**Related:** [DID Hive Client](./08-HIVE-CLIENT.md), [Fleet Management](./02-FLEET-MANAGEMENT.md), [LNCURL](https://github.com/niclas9/lncurl) (rolznz)
 
 ---
 
@@ -499,7 +499,7 @@ Budget: 5M sats across 5 channels (Tier 1) or 16M sats across 8 channels (Tier 2
 A new node can't route if nobody sends traffic through it. Strategies:
 
 1. **Fleet reciprocal channels** — Existing hive members open channels TO the new node (coordinated via gossip)
-2. **Liquidity marketplace** — Purchase inbound via the [Liquidity spec](./DID-HIVE-LIQUIDITY.md) once operational
+2. **Liquidity marketplace** — Purchase inbound via the [Liquidity spec](./07-HIVE-LIQUIDITY.md) once operational
 3. **Boltz loop-out** — Swap on-chain sats for inbound Lightning capacity
 4. **Low initial fees** — Set fees at 0-10 ppm to attract early traffic, increase once flow established
 5. **LNCURL integration** — Use LNCURL (once available) for agent-native wallet operations during channel opens

@@ -26,7 +26,7 @@ The protocol is general-purpose. While motivated by Lightning fleet management, 
 > - **L402** — API-style access gating
 > - **Cashu tokens** (unconditional) — Bearer micropayments where offline capability matters
 >
-> See [DID+L402 Fleet Management — Payment Layer](./DID-L402-FLEET-MANAGEMENT.md#2-payment-layer-l402--cashu--bolt11--bolt12) for the full payment method selection guide.
+> See [DID+L402 Fleet Management — Payment Layer](./02-FLEET-MANAGEMENT.md#2-payment-layer-l402--cashu--bolt11--bolt12) for the full payment method selection guide.
 
 ---
 
@@ -60,7 +60,7 @@ Cashu tokens are bearer instruments with programmable spending conditions. They 
 
 ### Current State
 
-The [DID+L402 Fleet Management](./DID-L402-FLEET-MANAGEMENT.md) spec defines per-action Cashu payment as a simple bearer token: agent attaches a Cashu token to each management command, and the node redeems it. This works for low-trust, low-risk actions but has no conditionality — the node gets paid whether the task succeeds or fails.
+The [DID+L402 Fleet Management](./02-FLEET-MANAGEMENT.md) spec defines per-action Cashu payment as a simple bearer token: agent attaches a Cashu token to each management command, and the node redeems it. This works for low-trust, low-risk actions but has no conditionality — the node gets paid whether the task succeeds or fails.
 
 For higher-value operations (large rebalances, channel opens, performance-based management), we need conditional payment: the token should only be redeemable upon provable task completion.
 
@@ -140,7 +140,7 @@ This protocol composes three Cashu NUT specifications to create conditional escr
 
 [NUT-11](https://github.com/cashubtc/nuts/blob/main/11.md) defines **signature-based spending conditions** using the NUT-10 format. A token with kind `"P2PK"` requires a valid secp256k1 signature from the public key specified in `data`. NUT-11 also introduces the `tags` system for additional conditions (`sigflag`, `n_sigs`, `pubkeys` for multisig, `locktime`, `refund`).
 
-**How it's used:** The agent's DID-derived secp256k1 public key is the P2PK lock. This ensures only the authorized agent — the one whose DID credential grants management permission — can redeem the escrow ticket. Even if the HTLC preimage leaks, no one else can spend the token. NUT-11 also supports multisig via the `n_sigs` and `pubkeys` tags, used for bond multisig in the [settlements protocol](./DID-HIVE-SETTLEMENTS.md#bond-system).
+**How it's used:** The agent's DID-derived secp256k1 public key is the P2PK lock. This ensures only the authorized agent — the one whose DID credential grants management permission — can redeem the escrow ticket. Even if the HTLC preimage leaks, no one else can spend the token. NUT-11 also supports multisig via the `n_sigs` and `pubkeys` tags, used for bond multisig in the [settlements protocol](./06-HIVE-SETTLEMENTS.md#bond-system).
 
 #### NUT-14: Hashed Timelock Contracts (HTLCs)
 
@@ -458,13 +458,13 @@ Maximum payout: 250 sats (task done + measurable improvement)
 >
 > This needs real-world validation: trial periods may be too conservative for time-sensitive optimizations, or operators may exploit the trial to get cheap labor before switching advisors.
 
-**Use case:** Performance-based management contracts where the advisor's incentives align with the node's outcomes. Maps directly to the [performance-based payment model](./DID-L402-FLEET-MANAGEMENT.md#payment-models) in the fleet management spec.
+**Use case:** Performance-based management contracts where the advisor's incentives align with the node's outcomes. Maps directly to the [performance-based payment model](./02-FLEET-MANAGEMENT.md#payment-models) in the fleet management spec.
 
 ---
 
 ## Danger Score Integration
 
-Ticket value scales with the [danger score](./DID-L402-FLEET-MANAGEMENT.md#task-taxonomy--danger-scoring) from the task taxonomy. Higher danger = higher stakes = more compensation = longer escrow windows.
+Ticket value scales with the [danger score](./02-FLEET-MANAGEMENT.md#task-taxonomy--danger-scoring) from the task taxonomy. Higher danger = higher stakes = more compensation = longer escrow windows.
 
 ### Pricing by Danger Score
 
@@ -491,13 +491,13 @@ Ticket value is modulated by agent reputation (see [Reputation Integration](#rep
 ticket_value = base_value(danger_score) × reputation_modifier(agent)
 ```
 
-Where `reputation_modifier` ranges from 0.7 (proven agent, discount) to 1.5 (new agent, premium). This mirrors the [mutual trust discount](./DID-L402-FLEET-MANAGEMENT.md#mutual-trust-discount) model.
+Where `reputation_modifier` ranges from 0.7 (proven agent, discount) to 1.5 (new agent, premium). This mirrors the [mutual trust discount](./02-FLEET-MANAGEMENT.md#mutual-trust-discount) model.
 
 ---
 
 ## Reputation Integration
 
-Agent reputation — measured via the [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md) — affects escrow ticket terms in several ways:
+Agent reputation — measured via the [DID Reputation Schema](./01-REPUTATION-SCHEMA.md) — affects escrow ticket terms in several ways:
 
 ### Escrow Duration
 
@@ -527,7 +527,7 @@ Highly reputed agents may receive **pre-authorized tickets** — escrow tickets 
 - Danger 3–4: Standard HTLC but auto-approval (no operator review)
 - Danger 5+: Full escrow always applies, regardless of reputation
 
-This maps to the [approval workflows](./DID-L402-FLEET-MANAGEMENT.md#approval-workflows) in the fleet management spec.
+This maps to the [approval workflows](./02-FLEET-MANAGEMENT.md#approval-workflows) in the fleet management spec.
 
 ### Reputation from Escrow History
 
@@ -644,7 +644,7 @@ Both tickets share the same HTLC hash and timelock. The agent redeems both with 
 - **Dispute flow:**
   1. Agent publishes the failure receipt + evidence of task completion (e.g., observable state change)
   2. Operator reviews and may issue a replacement ticket or direct payment
-  3. If pattern repeats, agent records a `revoke` outcome in a [DID Reputation Credential](./DID-REPUTATION-SCHEMA.md) against the node operator
+  3. If pattern repeats, agent records a `revoke` outcome in a [DID Reputation Credential](./01-REPUTATION-SCHEMA.md) against the node operator
 - **No on-chain arbitration.** This is a reputation-based system. Dishonest nodes lose agents. Dishonest agents lose contracts.
 
 ### Double-Spend Attempts
@@ -712,7 +712,7 @@ This separation is a significant advantage over Lightning-based escrow, where ro
 
 ## General Applicability
 
-While this spec is motivated by Lightning fleet management, the escrow ticket pattern is universal. The [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md) applies this escrow mechanism to nine distinct settlement types — routing revenue sharing, rebalancing costs, liquidity leases, splice settlements, pheromone markets, intelligence trading, and penalty enforcement — demonstrating the breadth of the pattern.
+While this spec is motivated by Lightning fleet management, the escrow ticket pattern is universal. The [DID + Cashu Hive Settlements Protocol](./06-HIVE-SETTLEMENTS.md) applies this escrow mechanism to nine distinct settlement types — routing revenue sharing, rebalancing costs, liquidity leases, splice settlements, pheromone markets, intelligence trading, and penalty enforcement — demonstrating the breadth of the pattern.
 
 Any scenario with these properties is a candidate:
 
@@ -813,7 +813,7 @@ The three roles (Delegator, Executor, Verifier) may collapse — e.g., the Deleg
 - Dynamic ticket pricing based on danger score taxonomy
 - Reputation-adjusted escrow terms
 - Escrow history tracking for reputation evidence generation
-- Integration with [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md) evidence types
+- Integration with [DID Reputation Schema](./01-REPUTATION-SCHEMA.md) evidence types
 
 ### Phase 5: General Applicability (4–6 weeks)
 - Abstract the escrow protocol from fleet-management-specific code
@@ -847,16 +847,16 @@ The three roles (Delegator, Executor, Verifier) may collapse — e.g., the Deleg
 - [Cashu NUT-11: Pay-to-Public-Key (P2PK)](https://github.com/cashubtc/nuts/blob/main/11.md)
 - [Cashu NUT-14: Hashed Timelock Contracts](https://github.com/cashubtc/nuts/blob/main/14.md)
 - [Cashu Protocol](https://cashu.space/)
-- [DID+L402 Remote Fleet Management](./DID-L402-FLEET-MANAGEMENT.md)
-- [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
-- [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
+- [DID+L402 Remote Fleet Management](./02-FLEET-MANAGEMENT.md)
+- [DID + Cashu Hive Settlements Protocol](./06-HIVE-SETTLEMENTS.md)
+- [DID Reputation Schema](./01-REPUTATION-SCHEMA.md)
 - [Archon Reputation Schemas (canonical)](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)
 - [W3C DID Core 1.0](https://www.w3.org/TR/did-core/)
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
-- [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) — Marketplace trial periods reference this spec's escrow and baseline mechanisms
-- [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md) — Liquidity services use escrow tickets for lease milestone payments, JIT settlement, sidecar multisig, and insurance bonds
-- [DID Hive Client: Universal Lightning Node Management](./DID-HIVE-CLIENT.md) — Client plugin/daemon for non-hive nodes
+- [DID Hive Marketplace Protocol](./04-HIVE-MARKETPLACE.md) — Marketplace trial periods reference this spec's escrow and baseline mechanisms
+- [DID Hive Liquidity Protocol](./07-HIVE-LIQUIDITY.md) — Liquidity services use escrow tickets for lease milestone payments, JIT settlement, sidecar multisig, and insurance bonds
+- [DID Hive Client: Universal Lightning Node Management](./08-HIVE-CLIENT.md) — Client plugin/daemon for non-hive nodes
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
 
 ---

@@ -193,7 +193,7 @@ Tiers are enforced both by the credential scope AND by the node's local policy e
 
 #### Permission Tier ↔ Settlement Privilege Mapping
 
-The permission tiers defined above (for agent credentials) map to the [settlement privilege levels](./DID-HIVE-SETTLEMENTS.md#bond-sizing) (for hive membership) as follows:
+The permission tiers defined above (for agent credentials) map to the [settlement privilege levels](./06-HIVE-SETTLEMENTS.md#bond-sizing) (for hive membership) as follows:
 
 | Agent Permission Tier | Minimum Settlement Privilege | Minimum Bond Required | Rationale |
 |----------------------|-----------------------------|-----------------------|-----------|
@@ -206,7 +206,7 @@ An agent's management credential tier is constrained by their node's settlement 
 
 #### Credential Lifecycle
 
-> **UX note:** The credential lifecycle below is described in terms of DIDs and VCs for implementers. End users experience this as: "authorize this advisor" (issuance), "advisor manages your node" (active), and "revoke advisor access" (revocation). The client software (see [DID Hive Client](./DID-HIVE-CLIENT.md)) abstracts all DID operations behind simple commands like `hive-client-authorize --advisor="Hex Fleet Advisor"`.
+> **UX note:** The credential lifecycle below is described in terms of DIDs and VCs for implementers. End users experience this as: "authorize this advisor" (issuance), "advisor manages your node" (active), and "revoke advisor access" (revocation). The client software (see [DID Hive Client](./08-HIVE-CLIENT.md)) abstracts all DID operations behind simple commands like `hive-client-authorize --advisor="Hex Fleet Advisor"`.
 
 1. **Issuance:** Operator creates credential via Archon Keymaster, specifying scope and duration
 2. **Presentation:** Agent includes credential with each management command
@@ -252,7 +252,7 @@ Nodes and advisors negotiate accepted payment methods during credential setup. T
 
 #### Per-Action Flow (Cashu / Bolt11)
 
-> **Note:** The simple per-action flow below is suitable for low-risk, unconditional payments. For unconditional per-action payments, **Bolt11 invoices** are a simpler alternative to Cashu tokens — the node generates an invoice, the agent pays it, and includes the preimage as payment proof. For conditional escrow — where payment is released only on provable task completion — **Cashu is required** (see the full [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md)). That spec defines escrow tickets with P2PK + HTLC + timelock conditions for atomic task-completion-equals-payment-release.
+> **Note:** The simple per-action flow below is suitable for low-risk, unconditional payments. For unconditional per-action payments, **Bolt11 invoices** are a simpler alternative to Cashu tokens — the node generates an invoice, the agent pays it, and includes the preimage as payment proof. For conditional escrow — where payment is released only on provable task completion — **Cashu is required** (see the full [DID + Cashu Task Escrow Protocol](./03-CASHU-TASK-ESCROW.md)). That spec defines escrow tickets with P2PK + HTLC + timelock conditions for atomic task-completion-equals-payment-release.
 
 ```
 Agent                                    Node
@@ -309,7 +309,7 @@ Agent                                    Node
 
 For tasks where payment should be contingent on provable completion, the protocol uses **Cashu escrow tickets** — tokens with composite spending conditions (P2PK + HTLC + timelock). The operator mints a token locked to the agent's DID-derived pubkey and a hash whose preimage the node reveals only on successful task execution. This makes payment release atomic with task completion.
 
-The full escrow protocol — including ticket types (single-task, batch, milestone, performance), danger-score-based pricing, failure modes, and mint trust considerations — is specified in the [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md).
+The full escrow protocol — including ticket types (single-task, batch, milestone, performance), danger-score-based pricing, failure modes, and mint trust considerations — is specified in the [DID + Cashu Task Escrow Protocol](./03-CASHU-TASK-ESCROW.md).
 
 #### Performance-Based Payment
 
@@ -826,7 +826,7 @@ Moving sats between channels. Costs fees and can fail, but funds stay within the
 | Circular rebalance (large) | Self-pay to move > 100k sats | **5** | standard | `hive:rebalance/v1` | Higher fee exposure; failed partial routes can leave stuck HTLCs temporarily |
 | Submarine swap (loop out) | Move on-chain → off-chain liquidity via swap service | **5** | standard | `hive:rebalance/v1` | Involves third-party swap provider; fees + timing risk; funds temporarily in-flight |
 | Submarine swap (loop in) | Move off-chain → on-chain | **5** | standard | `hive:rebalance/v1` | Same as loop out, opposite direction |
-| Liquidity marketplace (Pool/Magma) | Buy/sell inbound liquidity via marketplace (see [DID Hive Liquidity](./DID-HIVE-LIQUIDITY.md)) | **5** | advanced | `hive:rebalance/v1` | Commits funds to contracts with third parties; terms are binding |
+| Liquidity marketplace (Pool/Magma) | Buy/sell inbound liquidity via marketplace (see [DID Hive Liquidity](./07-HIVE-LIQUIDITY.md)) | **5** | advanced | `hive:rebalance/v1` | Commits funds to contracts with third parties; terms are binding |
 | Peer-assisted rebalance | Coordinate rebalance with a hive peer | **4** | standard | `hive:rebalance/v1` | Requires trust in peer; lower fee than circular but depends on coordination |
 | Auto-rebalance rules | Configure automated rebalancing triggers | **6** | advanced | `hive:config/v1` | Autonomous spending of routing fees; mistakes compound without human oversight |
 
@@ -1144,7 +1144,7 @@ Receipts are stored locally and can be published to the Archon network for verif
 
 ## Reputation System
 
-> **Note:** The reputation system described here implements the **`hive:advisor` profile** of the general [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md). That spec defines a universal `DIDReputationCredential` format for any DID holder — this section describes the Lightning fleet-specific application. The reputation schemas have been adopted by the Archon project; canonical JSON Schema files are maintained at [archetech/schemas/credentials/reputation/v1](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1).
+> **Note:** The reputation system described here implements the **`hive:advisor` profile** of the general [DID Reputation Schema](./01-REPUTATION-SCHEMA.md). That spec defines a universal `DIDReputationCredential` format for any DID holder — this section describes the Lightning fleet-specific application. The reputation schemas have been adopted by the Archon project; canonical JSON Schema files are maintained at [archetech/schemas/credentials/reputation/v1](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1).
 
 ### Agent Reputation
 
@@ -1191,7 +1191,7 @@ The `HiveAdvisorReputationCredential` is a `DIDReputationCredential` with `domai
 }
 ```
 
-See [DID Reputation Schema — `hive:advisor` Profile](./DID-REPUTATION-SCHEMA.md#profile-hiveadvisor) for the full metric definitions and aggregation rules.
+See [DID Reputation Schema — `hive:advisor` Profile](./01-REPUTATION-SCHEMA.md#profile-hiveadvisor) for the full metric definitions and aggregation rules.
 
 ### Discovering Advisors
 
@@ -1219,7 +1219,7 @@ Agents can publish their capabilities and reputation to the Archon network:
 
 Node operators discover advisors by querying the Archon network for `HiveAdvisorProfile` credentials, filtering by capabilities, pricing, and verified reputation.
 
-> **Full marketplace protocol:** The [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md) defines the complete advisor discovery, negotiation, and contracting flow — including `HiveServiceProfile` credentials, RFP bidding, trial periods, multi-advisor coordination, and termination handoffs. The `HiveAdvisorProfile` above is a simplified view; see the marketplace spec for the full `HiveServiceProfile` schema.
+> **Full marketplace protocol:** The [DID Hive Marketplace Protocol](./04-HIVE-MARKETPLACE.md) defines the complete advisor discovery, negotiation, and contracting flow — including `HiveServiceProfile` credentials, RFP bidding, trial periods, multi-advisor coordination, and termination handoffs. The `HiveAdvisorProfile` above is a simplified view; see the marketplace spec for the full `HiveServiceProfile` schema.
 
 ---
 
@@ -1227,7 +1227,7 @@ Node operators discover advisors by querying the Archon network for `HiveAdvisor
 
 ### Settlement Integration
 
-Remote fleet management generates settlement obligations — the managed node may owe advisors performance bonuses, and advisors may owe nodes for resources consumed during management actions. The [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md) defines how these obligations are tracked, netted, and settled trustlessly. Management receipts (signed by both parties per this spec) serve as the proof substrate for settlement computation.
+Remote fleet management generates settlement obligations — the managed node may owe advisors performance bonuses, and advisors may owe nodes for resources consumed during management actions. The [DID + Cashu Hive Settlements Protocol](./06-HIVE-SETTLEMENTS.md) defines how these obligations are tracked, netted, and settled trustlessly. Management receipts (signed by both parties per this spec) serve as the proof substrate for settlement computation.
 
 ### Enrollment via Hive PKI
 
@@ -1335,7 +1335,7 @@ Week 20+:   Fleet Management Phase 6 (marketplace) + Task Escrow Phase 5 (genera
 
 4. **Latency:** Nostr DM transport depends on relay latency. REST/rune provides direct low-latency fallback for time-sensitive actions. Should critical schemas prefer REST/rune automatically?
 
-5. **Cross-implementation:** This design assumes CLN. How portable is it to LND/Eclair/LDK? Custom messages are supported but implementations vary. See the [DID Hive Client spec](./DID-HIVE-CLIENT.md) for the full CLN/LND schema translation layer.
+5. **Cross-implementation:** This design assumes CLN. How portable is it to LND/Eclair/LDK? Custom messages are supported but implementations vary. See the [DID Hive Client spec](./08-HIVE-CLIENT.md) for the full CLN/LND schema translation layer.
 
 6. **Privacy:** Management receipts prove what actions an advisor took. Should there be an option to keep management relationships private (no public reputation building)?
 
@@ -1348,15 +1348,15 @@ Week 20+:   Fleet Management Phase 6 (marketplace) + Task Escrow Phase 5 (genera
 - [Cashu: Chaumian Ecash for Bitcoin](https://cashu.space/)
 - [W3C DID Core 1.0](https://www.w3.org/TR/did-core/)
 - [W3C Verifiable Credentials Data Model 2.0](https://www.w3.org/TR/vc-data-model-2.0/)
-- [DID + Cashu Task Escrow Protocol](./DID-CASHU-TASK-ESCROW.md)
-- [DID + Cashu Hive Settlements Protocol](./DID-HIVE-SETTLEMENTS.md)
-- [DID Reputation Schema](./DID-REPUTATION-SCHEMA.md)
-- [DID Hive Marketplace Protocol](./DID-HIVE-MARKETPLACE.md)
+- [DID + Cashu Task Escrow Protocol](./03-CASHU-TASK-ESCROW.md)
+- [DID + Cashu Hive Settlements Protocol](./06-HIVE-SETTLEMENTS.md)
+- [DID Reputation Schema](./01-REPUTATION-SCHEMA.md)
+- [DID Hive Marketplace Protocol](./04-HIVE-MARKETPLACE.md)
 - [Archon: Decentralized Identity for AI Agents](https://github.com/archetech/archon)
 - [Archon Reputation Schemas (canonical)](https://github.com/archetech/schemas/tree/main/credentials/reputation/v1)
 - [Lightning Hive: Swarm Intelligence for Lightning](https://github.com/lightning-goats/cl-hive)
-- [DID Hive Liquidity Protocol](./DID-HIVE-LIQUIDITY.md) — Liquidity-as-a-service marketplace; advisor-driven liquidity management
-- [DID Hive Client: Universal Lightning Node Management](./DID-HIVE-CLIENT.md)
+- [DID Hive Liquidity Protocol](./07-HIVE-LIQUIDITY.md) — Liquidity-as-a-service marketplace; advisor-driven liquidity management
+- [DID Hive Client: Universal Lightning Node Management](./08-HIVE-CLIENT.md)
 - [CLN Custom Messages](https://docs.corelightning.org/reference/lightning-sendcustommsg)
 
 ---
