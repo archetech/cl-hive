@@ -18118,4 +18118,5 @@ def hive_get_channel_ages(plugin: Plugin, scid: str = None):
 # MAIN
 # =============================================================================
 
-plugin.run()
+if __name__ == "__main__":
+    plugin.run()

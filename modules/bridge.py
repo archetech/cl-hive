@@ -249,18 +249,39 @@ class Bridge:
 
     def _resolve_rpc_socket(self) -> Optional[str]:
         """Resolve the Core Lightning RPC socket path if available."""
-        if hasattr(self.rpc, "get_socket_path"):
-            path = self.rpc.get_socket_path()
-            if isinstance(path, str) and path:
-                return path
-        if hasattr(self.rpc, "socket_path"):
-            path = self.rpc.socket_path
-            if isinstance(path, str) and path:
-                return path
-        if hasattr(self.rpc, "_rpc") and hasattr(self.rpc._rpc, "socket_path"):
-            path = self.rpc._rpc.socket_path
-            if isinstance(path, str) and path:
-                return path
+        # Check direct attribute access (not __getattr__ magic methods).
+        # LightningRpc.__getattr__ turns any attribute into an RPC call,
+        # so hasattr() alone is unreliable — use type(obj).__dict__ checks
+        # and wrap calls in try/except to avoid spurious RPC calls.
+        try:
+            # Check instance/class dict directly to avoid __getattr__
+            rpc_type = type(self.rpc)
+            if "get_socket_path" in dir(rpc_type) or "get_socket_path" in getattr(self.rpc, "__dict__", {}):
+                path = self.rpc.get_socket_path()
+                if isinstance(path, str) and path:
+                    return path
+        except Exception:
+            pass
+        try:
+            if "socket_path" in getattr(self.rpc, "__dict__", {}):
+                path = self.rpc.__dict__["socket_path"]
+                if isinstance(path, str) and path:
+                    return path
+            # Also check class-level descriptor/property
+            if hasattr(type(self.rpc), "socket_path"):
+                path = self.rpc.socket_path
+                if isinstance(path, str) and path:
+                    return path
+        except Exception:
+            pass
+        try:
+            rpc_inner = getattr(self.rpc, "_rpc", None)
+            if rpc_inner is not None:
+                inner_path = getattr(rpc_inner, "socket_path", None)
+                if isinstance(inner_path, str) and inner_path:
+                    return inner_path
+        except Exception:
+            pass
         return None
     
     def _log(self, msg: str, level: str = "info") -> None:
