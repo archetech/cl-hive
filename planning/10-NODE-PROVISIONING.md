@@ -5,7 +5,7 @@
 **Author:** Hex (`did:cid:bagaaierajrr7k6izcrdfwqxpgtrobflsv5oibymfnthjazkkokaugszyh4ka`)  
 **Date:** 2026-02-17  
 **Feedback:** Open — file issues or comment in #cl-hive  
-**Related:** [DID Hive Client](./08-HIVE-CLIENT.md), [Fleet Management](./02-FLEET-MANAGEMENT.md), [LNCURL](https://github.com/niclas9/lncurl) (rolznz)
+**Related:** [DID Hive Client](./08-HIVE-CLIENT.md), [Fleet Management](./02-FLEET-MANAGEMENT.md), [LNCURL](https://github.com/rolznz/lncurl) (rolznz)
 
 ---
 
@@ -13,7 +13,7 @@
 
 This document specifies a workflow for provisioning, operating, and decommissioning Lightning Hive nodes on VPS infrastructure — paid entirely with Bitcoin over Lightning. Each provisioned node runs an OpenClaw agent ("multi") with the full Hive skill set, an Archon DID identity, and cl-hive/cl-revenue-ops plugins. The node is economically sovereign: it must earn enough routing fees to cover its own VPS costs, or it dies.
 
-The system draws inspiration from [LNCURL](https://x.com/rolznz/status/2023428008602980548) — Lightning wallets for agents — which demonstrates autonomous agent onboarding where agents provision their own Lightning infrastructure. This spec extends that vision to full node lifecycle management within a cooperative fleet.
+The system draws inspiration from [LNCURL](https://github.com/rolznz/lncurl) — Lightning wallets for agents — which demonstrates autonomous agent onboarding where agents provision their own Lightning infrastructure. This spec extends that vision to full node lifecycle management within a cooperative fleet.
 
 **Core invariant:** No node receives subsidy. Revenue ≥ costs, or graceful shutdown. Digital natural selection.
 
@@ -41,7 +41,7 @@ The system draws inspiration from [LNCURL](https://x.com/rolznz/status/202342800
 
 ### 1.1 Economic Sovereignty
 
-Every node is a business entity. It has income (routing fees, liquidity lease fees, service fees) and expenses (VPS cost, on-chain fees, channel opening costs). The agent managing the node is responsible for maintaining profitability. There is no fleet treasury, no bailouts, no shared revenue pool.
+Every node is a business entity. It has income (routing fees, liquidity lease fees, service fees) and expenses (VPS cost, on-chain fees, channel opening costs). The agent managing the node is responsible for maintaining profitability. There are no bailouts. While hive members may optionally participate in routing pools for collective revenue sharing (see `routing_pool.py`), each provisioned node must be self-sustaining — pool distributions do not constitute subsidy, they are earned proportional to contribution.
 
 ### 1.2 Survival Pressure as Quality Signal
 
@@ -70,7 +70,7 @@ A node approaching insolvency doesn't crash — it executes an orderly shutdown:
 | **Lightning payment** | Economic loop must stay on-network |
 | **API for provisioning** | Agents must self-provision without human intervention |
 | **API for billing status** | Agent must monitor costs and detect upcoming bills |
-| **Linux (Ubuntu 22.04+)** | CLN + Bitcoin Core compatibility |
+| **Linux (Ubuntu 24.04 LTS preferred, 22.04+ supported)** | CLN + Bitcoin Core compatibility |
 | **≥2 vCPU, 4GB RAM, 80GB SSD** | Minimum for pruned Bitcoin Core + CLN |
 | **Static IPv4 or IPv6** | Lightning nodes need stable addresses for peer connections |
 | **Unmetered or ≥2TB bandwidth** | Routing nodes generate significant traffic |
@@ -190,7 +190,7 @@ Before creating a VPS, the provisioning agent verifies:
 POST /api/v1/servers
 {
   "name": "hive-{region}-{seq}",
-  "image": "ubuntu-22.04",
+  "image": "ubuntu-24.04",
   "size": "s-2vcpu-4gb",
   "region": "tor1",
   "ssh_keys": ["provisioner-key"],
@@ -220,7 +220,7 @@ The bootstrap script:
 2. Installs WireGuard, configures fleet VPN
 3. Installs Bitcoin Core (pruned, `prune=50000`)
 4. Installs CLN from official release
-5. Installs Python 3.11+, cl-hive, cl-revenue-ops, cl-hive-comms
+5. Installs Python 3.11+, cl-hive, cl-revenue-ops (cl-hive-comms when available)
 6. Configures UFW firewall (LN port + WireGuard + SSH only)
 7. Sets up systemd services for bitcoind + lightningd
 8. Waits for Bitcoin IBD to complete (pruned: ~4-8 hours on good hardware)
@@ -245,16 +245,24 @@ See [Section 8](#8-channel-strategy-cold-start).
 
 #### Step 6: Register with Fleet
 
+Fleet registration uses the existing `hive-join` ticket workflow:
+
 ```bash
-# Agent announces itself to the fleet via cl-hive gossip
-lightning-cli hive-announce \
-  --did "did:cid:..." \
-  --address "{ipv4}:9735" \
-  --capacity "{initial_capacity}" \
-  --region "{datacenter_region}"
+# 1. An existing fleet member generates an invitation ticket
+#    (on an existing node, e.g. nexus-01):
+lightning-cli hive-vouch <new_node_pubkey>
+# → Returns an invitation ticket string
+
+# 2. The new node joins using the ticket:
+lightning-cli hive-join <ticket>
+# → Node enters as "neophyte" tier with 90-day probation
+
+# 3. Existing members vouch for the new node:
+lightning-cli hive-propose-promotion <new_node_pubkey>
+# → After quorum reached, node is promoted to "member"
 ```
 
-Fleet peers validate the announcement, optionally open reciprocal channels.
+Fleet peers validate the join request, then optionally open reciprocal channels. The new node's `getinfo` address and capacity are shared automatically via cl-hive gossip once membership is established.
 
 ---
 
@@ -264,15 +272,17 @@ Fleet peers validate the announcement, optionally open reciprocal channels.
 
 | Layer | Component | Version | Purpose |
 |-------|-----------|---------|---------|
-| OS | Ubuntu 22.04 LTS | Latest | Stable base |
+| OS | Ubuntu 24.04 LTS | Latest | Stable base (22.04 also supported) |
 | Bitcoin | Bitcoin Core | 27.x+ | Pruned blockchain (50GB) |
 | Lightning | CLN | 24.x+ | Lightning node daemon |
-| Fleet | cl-hive | 2.7.0+ | Hive coordination + gossip |
-| Revenue | cl-revenue-ops | 2.7.0+ | Fee optimization + rebalancing |
-| Comms | cl-hive-comms | 0.1.0+ | Nostr DM + REST transport |
-| Identity | cl-hive-archon | 0.1.0+ | DID + VC + dmail (optional) |
+| Fleet | cl-hive | Latest | Hive coordination + gossip |
+| Revenue | cl-revenue-ops | Latest | Fee optimization + rebalancing |
+| Comms | cl-hive-comms | 0.1.0+ | Nostr DM + REST transport (**Phase 6 — not yet implemented**) |
+| Identity | cl-hive-archon | 0.1.0+ | DID + VC + dmail (**Phase 6 — not yet implemented**, optional) |
 | Agent | OpenClaw | Latest | Autonomous management |
 | VPN | WireGuard | Latest | Fleet private network |
+
+**Note:** `cl-hive-comms` and `cl-hive-archon` are defined in the [3-plugin architecture](./08-HIVE-CLIENT.md) but not yet implemented (see [Phase 6 plan](./12-IMPLEMENTATION-PLAN-PHASE4-6.md)). Until then, cl-hive provides all coordination functionality as a monolithic plugin, and Archon DID features are deferred.
 
 ### 5.2 Minimum Hardware
 
@@ -422,7 +432,7 @@ The new node requests a fleet membership credential:
 
 ```json
 {
-  "@context": ["https://www.w3.org/2018/credentials/v1"],
+  "@context": ["https://www.w3.org/ns/credentials/v2"],
   "type": ["VerifiableCredential", "HiveMembershipCredential"],
   "issuer": "did:cid:... (fleet coordinator)",
   "credentialSubject": {
@@ -450,7 +460,7 @@ If a node dies and its passphrase may be compromised, the fleet coordinator issu
 
 ```json
 {
-  "@context": ["https://www.w3.org/2018/credentials/v1"],
+  "@context": ["https://www.w3.org/ns/credentials/v2"],
   "type": ["VerifiableCredential", "HiveMembershipRevocation"],
   "issuer": "did:cid:... (fleet coordinator)",
   "credentialSubject": {
@@ -520,14 +530,16 @@ A new node can't route if nobody sends traffic through it. Strategies:
 
 ```
 monthly_revenue = sum(routing_fees) + sum(liquidity_lease_income) + sum(service_fees)
+                + sum(pool_distributions)  # if participating in routing pool
 monthly_cost = vps_cost + on_chain_fees + rebalancing_costs
+             + liquidity_service_costs     # inbound leases, swaps, insurance
 
 survival_ratio = monthly_revenue / monthly_cost
 
-if survival_ratio >= 1.0: PROFITABLE (thriving)
-if survival_ratio >= 0.8: WARNING (declining, optimize)
-if survival_ratio >= 0.5: CRITICAL (14-day shutdown clock starts)
-if survival_ratio < 0.5:  TERMINAL (begin graceful shutdown immediately)
+ratio >= 1.0:          PROFITABLE (thriving)
+0.8 <= ratio < 1.0:    WARNING (declining, optimize)
+0.5 <= ratio < 0.8:    CRITICAL (14-day shutdown clock starts)
+ratio < 0.5:           TERMINAL (begin graceful shutdown immediately)
 ```
 
 ### 9.2 Revenue Allocation Priority
@@ -568,8 +580,10 @@ Acceptable outcome: fleet ROI positive within 12 months
   - 5 survive at 2,500 sats/day = 12,500 sats/day fleet revenue
   - 12,500 × 365 = 4,562,500 sats/year
   - 5 nodes × 30,000 sats/mo VPS = 1,800,000 sats/year cost
-  - Net: +2,762,500 sats/year (but 30M sats lost to failed nodes)
-  - Break-even on total investment: ~22 months
+  - Net operating profit: +2,762,500 sats/year
+  - Capital loss from 5 dead nodes: ~30M sats (surviving nodes retain their 30M in channels)
+  - Break-even on lost capital: 30M / 2,762,500 = ~11 months
+  - Break-even on total deployed capital (60M): ~22 months
 
 Reality: fleet scaling only makes sense when per-node economics are proven.
 Don't scale to 10 before 1 node is sustainably profitable.
@@ -612,17 +626,18 @@ Graceful shutdown begins when ANY of these are true:
 
 ```bash
 # Notify fleet peers via cl-hive gossip
-lightning-cli hive-announce --type "shutdown" --reason "economic" --timeline "14d"
+# (hive-leave triggers graceful shutdown announcement to all connected peers)
+lightning-cli hive-leave
 
-# Notify via Nostr
-archon nostr publish "Shutting down in 14 days. Closing channels cooperatively."
+# Notify via Nostr (if cl-hive-comms available)
+# archon nostr publish "Shutting down in 14 days. Closing channels cooperatively."
 ```
 
 #### Phase 2: Close Channels (Days 1-10)
 
 - Initiate cooperative closes on all channels
 - Start with lowest-value channels, end with fleet peers
-- Use `close --unilateraltimeout 172800` (48h cooperative window before force close)
+- Use `lightning-cli close <peer_id> 172800` (48h cooperative window before force close)
 - Log each closure: amount recovered, fees paid, peer notified
 
 #### Phase 3: Settle Debts (Days 10-12)
@@ -634,7 +649,7 @@ archon nostr publish "Shutting down in 14 days. Closing channels cooperatively."
 #### Phase 4: Transfer Funds (Days 12-13)
 
 - Sweep remaining on-chain balance to designated recovery address
-- Transfer any LNbits/wallet balance via Lightning to fleet treasury or operator wallet
+- Transfer any LNbits/wallet balance via Lightning to operator wallet
 - Log final balance sheet
 
 #### Phase 5: Backup & Archive (Day 13)
@@ -754,19 +769,21 @@ The OpenClaw agent runs with a **restricted CLN rune** that limits its capabilit
 
 ```bash
 # Create restricted rune for agent
+# Each inner array is an OR group (alternatives); outer arrays are AND conditions
 lightning-cli createrune restrictions='[
-  ["method^list|method^get|method=pay|method=invoice|method=connect|method=fundchannel|method=close"],
-  ["method/close&pnameamountsat<5000000"]
+  ["method^list","method^get","method=pay","method=invoice","method=connect","method=fundchannel","method=close","method=setchannel"]
 ]'
 ```
+
+**Note on close limits:** CLN rune restrictions cannot express conditional logic like "if method=close then amount < 5M." To enforce spending limits on channel closes, use the policy engine (see [08-HIVE-CLIENT.md](./08-HIVE-CLIENT.md)) or governance mode (`hive-governance-mode=advisor`) which queues all fund-moving actions for human approval.
 
 The agent rune **cannot**:
 - Export or access `hsm_secret`
 - Execute `dev-*` commands
-- Close channels above the spending limit without human approval
-- Modify node configuration
+- Run `withdraw` (no on-chain sends without human-held admin rune)
+- Modify node configuration (`setconfig` excluded from rune)
 
-Large operations (channel closes > 5M sats, `withdraw` to external addresses) require a human-held admin rune.
+Large operations (`withdraw` to external addresses, `close` on high-value channels) require a human-held admin rune.
 
 ### 12.4 Invoice Verification
 
@@ -830,8 +847,8 @@ RestartSec=30
 
 ### Phase 0: Prerequisites (Current)
 
-- [x] cl-hive v2.7.0 with fleet coordination
-- [x] cl-revenue-ops v2.7.0 with fee optimization
+- [x] cl-hive with fleet coordination (gossip, topology, settlements)
+- [x] cl-revenue-ops with fee optimization (sling, askrene)
 - [x] Archon DID tooling (archon-keymaster skill)
 - [x] OpenClaw agent framework
 - [ ] BitLaunch API client library (Python)
@@ -878,7 +895,7 @@ RestartSec=30
 
 ## Appendix A: LNCURL Integration
 
-[LNCURL](https://x.com/rolznz/status/2023428008602980548) by @rolznz introduces Lightning wallets designed specifically for AI agents — enabling autonomous onboarding where agents provision their own Lightning infrastructure. Key concepts:
+[LNCURL](https://github.com/rolznz/lncurl) by @rolznz introduces Lightning wallets designed specifically for AI agents — enabling autonomous onboarding where agents provision their own Lightning infrastructure. Key concepts:
 
 - **Agent wallet creation** — Programmatic wallet setup without human KYC
 - **Lightning-native identity** — Wallet as identity anchor (complements DID)
@@ -906,7 +923,7 @@ Our provisioning flow should integrate LNCURL patterns where they align with the
 |------|--------|-------|
 | VPS runway (6 months) | 180,000 sats | 30,000/mo × 6 — strict earmark |
 | Channel opens (5 × 1M sats) | 5,000,000 sats | Minimum competitive size |
-| On-chain fees (5 opens) | 100,000 sats | ~20,000/open at moderate fees (~10 sat/vB, ~200 vB) |
+| On-chain fees (5 opens) | 100,000 sats | ~20,000/open budget (covers fee spikes up to ~100 sat/vB × ~200 vB) |
 | On-chain reserve (emergency closes) | 200,000 sats | Force-close fallback |
 | Rebalancing budget | 500,000 sats | Circular rebalancing, Boltz swaps |
 | Emergency fund | 200,000 sats | Unexpected costs |
@@ -928,22 +945,31 @@ Our provisioning flow should integrate LNCURL patterns where they align with the
 
 ### On-Chain Fee Guidance
 
-Realistic channel open cost: **~20,000 sats** at moderate fees (~10 sat/vB, ~200 vB per funding transaction). The old estimate of ~5,000 sats per open was unrealistically low.
+A typical Lightning funding transaction is ~150-220 vB (1 P2WPKH input → P2WSH/P2TR funding output + change). Realistic costs:
+- **Low fees (~10 sat/vB):** ~2,000 sats per open
+- **Moderate fees (~50 sat/vB):** ~10,000 sats per open
+- **High fees (~100 sat/vB):** ~20,000 sats per open
 
-**Fee spike protection:** If mempool fee rate exceeds 50 sat/vB, pause all channel opens until fees normalize. Monitor via `mempool.space/api/v1/fees/recommended`.
+The capital budgets above allocate ~20,000 sats/open as a conservative buffer that covers fee spikes without stalling provisioning.
+
+**Fee spike protection:** If mempool fee rate exceeds the `hive-max-expansion-feerate` setting (default: 5000 sat/kB ≈ ~20 sat/vB), pause all channel opens until fees normalize. This aligns with cl-hive's existing feerate gate for cooperative expansion. Monitor via `mempool.space/api/v1/fees/recommended`.
 
 ### Realistic Growth Path
 
 ```
-Month 1-2: 0 revenue (IBD + cold start + routing table propagation). Burn: 50,000 sats.
+Month 1-2: 0 revenue (IBD + cold start + routing table propagation).
+            VPS: 50,000. Rebalancing: 10,000. On-chain fees: 40,000.  Burn: ~100,000 sats.
 Month 3:   300 sats/day.   Revenue: 9,000.  VPS: 25,000.  Net: -16,000.
 Month 4:   800 sats/day.   Revenue: 24,000. VPS: 25,000.  Net: -1,000.
 Month 5:   1,500 sats/day. Revenue: 45,000. VPS: 25,000.  Net: +20,000.
 Month 6+:  2,500+ sats/day if channels grow. Sustainable.
 
-Total burn before break-even: ~120,000 sats
+Total operating burn before break-even: ~117,000 sats
+  (50k VPS + 10k rebalancing + 40k on-chain + 16k + 1k = 117k)
 Total seed capital needed: 6,180,000+ sats (Tier 1)
 ```
+
+**Note:** VPS costs vary by provider (15,000-30,000 sats/mo per Section 5.3). The growth path uses 25,000/mo (mid-range). Tier 1 capital allocation budgets the higher 30,000/mo figure for safety margin.
 
 **Key insight:** The first 4 months are an investment period. Seed capital must cover this burn. Nodes that survive the cold-start period and find good routing positions become sustainable. Those that don't, die — and that's the correct outcome.
 
