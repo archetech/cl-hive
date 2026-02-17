@@ -1845,7 +1845,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     did_credential_mgr = DIDCredentialManager(
         database=database,
         plugin=plugin,
-        rpc=safe_rpc,
+        rpc=plugin.rpc,
         our_pubkey=our_pubkey,
     )
     plugin.log("cl-hive: DID credential manager initialized")
@@ -1855,7 +1855,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     management_schema_registry = ManagementSchemaRegistry(
         database=database,
         plugin=plugin,
-        rpc=safe_rpc,
+        rpc=plugin.rpc,
         our_pubkey=our_pubkey,
     )
     plugin.log("cl-hive: Management schema registry initialized")
