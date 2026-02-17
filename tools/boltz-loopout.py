@@ -334,7 +334,7 @@ def boltz_create_reverse_swap(
 
 def boltz_get_status(swap_id: str) -> Dict:
     """Get swap status."""
-    return _http_get(f"{BOLTZ_API}/swap/status?id={swap_id}")
+    return _http_get(f"{BOLTZ_API}/swap/{swap_id}")
 
 
 def boltz_get_transaction(swap_id: str) -> Dict:
@@ -449,7 +449,8 @@ def execute_loop_out(
         "lockup_txid": None,
         "claim_txid": None,
         "completed_at": None,
-        # Store secrets for recovery (file should be protected)
+        # Secrets stored temporarily for recovery; stripped after completion
+        # NEVER log or print these values
         "_preimage": preimage.hex(),
         "_claim_privkey": claim_privkey.hex(),
     }
@@ -461,18 +462,10 @@ def execute_loop_out(
     add_swap_record(record)
 
     try:
-        # Try xpay first (newer), fall back to pay
-        try:
-            pay_result = _cln_call(node_url, rune, "xpay", {
-                "invstring": invoice,
-            }, timeout=PAY_TIMEOUT)
-        except Exception as e:
-            if "Unknown command" in str(e) or "not in allowlist" in str(e):
-                pay_result = _cln_call(node_url, rune, "pay", {
-                    "bolt11": invoice,
-                }, timeout=PAY_TIMEOUT)
-            else:
-                raise
+        # Use pay (xpay not available on this CLN version)
+        pay_result = _cln_call(node_url, rune, "pay", {
+            "bolt11": invoice,
+        }, timeout=PAY_TIMEOUT)
 
         if "error" in pay_result:
             record["status"] = "failed"
@@ -550,8 +543,9 @@ def execute_loop_out(
         record["completed_at"] = datetime.now(timezone.utc).isoformat()
         add_swap_record(record)
 
-        # Clean up secrets from the record after success
-        # (keep them in case we need recovery, but mark complete)
+        # Strip secrets after successful claim
+        record.pop("_preimage", None)
+        record.pop("_claim_privkey", None)
 
     except Exception as e:
         logger.error(f"Cooperative claim failed: {e}")
