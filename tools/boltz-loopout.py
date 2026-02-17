@@ -109,12 +109,36 @@ def _http_post(url: str, data: Dict, timeout: int = 30, headers: Optional[Dict] 
 
 
 def _cln_call(node_url: str, rune: str, method: str, params: Dict = None, timeout: int = 60) -> Dict:
-    """Call CLN REST API."""
+    """Call CLN REST API via curl (bypasses httpx SSL issues over WireGuard)."""
+    import subprocess
     url = f"{node_url}/v1/{method}"
-    hdrs = {"Rune": rune, "Content-Type": "application/json"}
-    status, body = _http_post(url, params or {}, timeout=timeout, headers=hdrs)
-    if status >= 400:
-        raise RuntimeError(f"CLN {method} failed ({status}): {json.dumps(body)}")
+    cmd = [
+        "curl", "-sk", "-X", "POST",
+        "-H", f"Rune: {rune}",
+        "-H", "Content-Type: application/json",
+        "-d", json.dumps(params or {}),
+        "--max-time", str(max(timeout, 180)),
+        url
+    ]
+    logger.info(f"CLN call: {method} timeout={max(timeout, 180)}s url={url}")
+    # Retry up to 3 times on connection errors (WireGuard flakiness)
+    last_err = None
+    for attempt in range(3):
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=max(timeout, 180) + 30)
+        if result.returncode == 0 and result.stdout.strip():
+            break
+        last_err = f"rc={result.returncode} stderr={result.stderr[:200]} stdout={result.stdout[:200]}"
+        logger.warning(f"CLN {method} attempt {attempt+1}/3 failed: {last_err}")
+        if attempt < 2:
+            import time as _time
+            _time.sleep(2)
+    else:
+        raise RuntimeError(f"CLN {method} curl failed after 3 attempts: {last_err}")
+    if not result.stdout.strip():
+        raise RuntimeError(f"CLN {method} returned empty response")
+    body = json.loads(result.stdout)
+    if "error" in body:
+        raise RuntimeError(f"CLN {method} error: {json.dumps(body)}")
     return body
 
 
@@ -129,12 +153,16 @@ def generate_claim_keypair() -> Tuple[bytes, bytes]:
     sk = SigningKey.generate(curve=SECP256k1)
     privkey = sk.to_string()  # 32 bytes
 
-    # Get the uncompressed public key point
+    # Get the compressed public key (33 bytes: 02/03 prefix + x coordinate)
     vk = sk.get_verifying_key()
-    # x-only pubkey (BIP340 / Taproot): just the 32-byte x coordinate
-    x_only = vk.to_string()[:32]
+    point = vk.to_string()  # 64 bytes: x (32) + y (32)
+    x_bytes = point[:32]
+    y_bytes = point[32:]
+    # Even y → 02 prefix, odd y → 03 prefix
+    prefix = b'\x02' if y_bytes[-1] % 2 == 0 else b'\x03'
+    compressed = prefix + x_bytes
 
-    return privkey, x_only
+    return privkey, compressed
 
 
 def generate_preimage() -> Tuple[bytes, bytes]:
@@ -164,6 +192,9 @@ def get_node_url(node: Dict) -> str:
     """Get the REST URL for a node."""
     if node.get("docker_container"):
         raise ValueError(f"Docker nodes not supported for loop-out (need REST API)")
+    # Prefer rest_url if present (new config format)
+    if node.get("rest_url"):
+        return node["rest_url"].rstrip("/")
     host = node.get("host", "localhost")
     port = node.get("port", 3010)
     return f"https://{host}:{port}"
