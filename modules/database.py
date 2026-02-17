@@ -1296,6 +1296,56 @@ class HiveDatabase:
             )
         """)
 
+        # DID credentials received from peers or issued locally
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS did_credentials (
+                credential_id TEXT PRIMARY KEY,
+                issuer_id TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                period_start INTEGER NOT NULL,
+                period_end INTEGER NOT NULL,
+                metrics_json TEXT NOT NULL,
+                outcome TEXT NOT NULL DEFAULT 'neutral',
+                evidence_json TEXT,
+                signature TEXT NOT NULL,
+                issued_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                revoked_at INTEGER,
+                revocation_reason TEXT,
+                received_from TEXT,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_did_cred_subject
+            ON did_credentials(subject_id, domain)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_did_cred_issuer
+            ON did_credentials(issuer_id)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_did_cred_domain
+            ON did_credentials(domain, issued_at)
+        """)
+
+        # Cached aggregated reputation scores (recomputed periodically)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS did_reputation_cache (
+                subject_id TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                score INTEGER NOT NULL DEFAULT 50,
+                tier TEXT NOT NULL DEFAULT 'newcomer',
+                confidence TEXT NOT NULL DEFAULT 'low',
+                credential_count INTEGER NOT NULL DEFAULT 0,
+                issuer_count INTEGER NOT NULL DEFAULT 0,
+                computed_at INTEGER NOT NULL,
+                components_json TEXT,
+                PRIMARY KEY (subject_id, domain)
+            )
+        """)
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -1680,6 +1730,9 @@ class HiveDatabase:
     # Absolute caps on protocol tables to prevent unbounded DB growth
     MAX_PROTO_EVENT_ROWS = 500000
     MAX_PROTO_OUTBOX_ROWS = 100000
+
+    # Absolute cap on DID credential rows
+    MAX_DID_CREDENTIAL_ROWS = 50000
 
     def record_contribution(self, peer_id: str, direction: str,
                             amount_sats: int) -> bool:
@@ -7090,4 +7143,170 @@ class HiveDatabase:
         """Load all persisted fee observations."""
         conn = self._get_connection()
         rows = conn.execute("SELECT * FROM fee_observations LIMIT 10000").fetchall()
+        return [dict(r) for r in rows]
+
+    # =========================================================================
+    # DID CREDENTIAL OPERATIONS
+    # =========================================================================
+
+    def store_did_credential(self, credential_id: str, issuer_id: str,
+                             subject_id: str, domain: str, period_start: int,
+                             period_end: int, metrics_json: str, outcome: str,
+                             evidence_json: Optional[str], signature: str,
+                             issued_at: int, expires_at: Optional[int],
+                             received_from: Optional[str]) -> bool:
+        """Store a DID credential. Returns True on success."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute("SELECT COUNT(*) as cnt FROM did_credentials").fetchone()
+            if row and row['cnt'] >= self.MAX_DID_CREDENTIAL_ROWS:
+                self.plugin.log(
+                    f"HiveDatabase: did_credentials at cap ({self.MAX_DID_CREDENTIAL_ROWS}), rejecting",
+                    level='warn'
+                )
+                return False
+            conn.execute("""
+                INSERT OR IGNORE INTO did_credentials (
+                    credential_id, issuer_id, subject_id, domain,
+                    period_start, period_end, metrics_json, outcome,
+                    evidence_json, signature, issued_at, expires_at,
+                    received_from
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (credential_id, issuer_id, subject_id, domain,
+                  period_start, period_end, metrics_json, outcome,
+                  evidence_json, signature, issued_at, expires_at,
+                  received_from))
+            return True
+        except Exception as e:
+            self.plugin.log(f"HiveDatabase: store_did_credential error: {e}", level='error')
+            return False
+
+    def get_did_credential(self, credential_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single credential by ID."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM did_credentials WHERE credential_id = ?",
+            (credential_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_did_credentials_for_subject(self, subject_id: str,
+                                         domain: Optional[str] = None,
+                                         limit: int = 100) -> List[Dict[str, Any]]:
+        """Get credentials for a subject, optionally filtered by domain."""
+        conn = self._get_connection()
+        if domain:
+            rows = conn.execute(
+                "SELECT * FROM did_credentials WHERE subject_id = ? AND domain = ? "
+                "ORDER BY issued_at DESC LIMIT ?",
+                (subject_id, domain, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM did_credentials WHERE subject_id = ? "
+                "ORDER BY issued_at DESC LIMIT ?",
+                (subject_id, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_did_credentials_by_issuer(self, issuer_id: str,
+                                       subject_id: Optional[str] = None,
+                                       limit: int = 100) -> List[Dict[str, Any]]:
+        """Get credentials issued by a specific issuer."""
+        conn = self._get_connection()
+        if subject_id:
+            rows = conn.execute(
+                "SELECT * FROM did_credentials WHERE issuer_id = ? AND subject_id = ? "
+                "ORDER BY issued_at DESC LIMIT ?",
+                (issuer_id, subject_id, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM did_credentials WHERE issuer_id = ? "
+                "ORDER BY issued_at DESC LIMIT ?",
+                (issuer_id, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def revoke_did_credential(self, credential_id: str, reason: str,
+                               timestamp: int) -> bool:
+        """Mark a credential as revoked. Returns True on success."""
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "UPDATE did_credentials SET revoked_at = ?, revocation_reason = ? "
+                "WHERE credential_id = ? AND revoked_at IS NULL",
+                (timestamp, reason, credential_id)
+            )
+            return True
+        except Exception as e:
+            self.plugin.log(f"HiveDatabase: revoke_did_credential error: {e}", level='error')
+            return False
+
+    def count_did_credentials(self) -> int:
+        """Count total DID credentials."""
+        conn = self._get_connection()
+        row = conn.execute("SELECT COUNT(*) as cnt FROM did_credentials").fetchone()
+        return row['cnt'] if row else 0
+
+    def count_did_credentials_for_subject(self, subject_id: str) -> int:
+        """Count credentials for a specific subject."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM did_credentials WHERE subject_id = ?",
+            (subject_id,)
+        ).fetchone()
+        return row['cnt'] if row else 0
+
+    def cleanup_expired_did_credentials(self, before_ts: int) -> int:
+        """Remove credentials that expired before the given timestamp. Returns count removed."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM did_credentials WHERE expires_at IS NOT NULL AND expires_at < ?",
+                (before_ts,)
+            )
+            return cursor.rowcount
+        except Exception:
+            return 0
+
+    def store_did_reputation_cache(self, subject_id: str, domain: str,
+                                    score: int, tier: str, confidence: str,
+                                    credential_count: int, issuer_count: int,
+                                    computed_at: int,
+                                    components_json: Optional[str] = None) -> bool:
+        """Store or update a reputation cache entry."""
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO did_reputation_cache (
+                    subject_id, domain, score, tier, confidence,
+                    credential_count, issuer_count, computed_at, components_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (subject_id, domain, score, tier, confidence,
+                  credential_count, issuer_count, computed_at, components_json))
+            return True
+        except Exception as e:
+            self.plugin.log(f"HiveDatabase: store_did_reputation_cache error: {e}", level='error')
+            return False
+
+    def get_did_reputation_cache(self, subject_id: str,
+                                  domain: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Get cached reputation for a subject. If domain is None, returns '_all'."""
+        conn = self._get_connection()
+        target_domain = domain or "_all"
+        row = conn.execute(
+            "SELECT * FROM did_reputation_cache WHERE subject_id = ? AND domain = ?",
+            (subject_id, target_domain)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_stale_did_reputation_cache(self, before_ts: int,
+                                        limit: int = 50) -> List[Dict[str, Any]]:
+        """Get reputation cache entries computed before the given timestamp."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT * FROM did_reputation_cache WHERE computed_at < ? LIMIT ?",
+            (before_ts, limit)
+        ).fetchall()
         return [dict(r) for r in rows]

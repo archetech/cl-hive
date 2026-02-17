@@ -110,6 +110,7 @@ from modules.splice_manager import SpliceManager
 from modules.relay import RelayManager
 from modules.idempotency import check_and_record, generate_event_id
 from modules.outbox import OutboxManager
+from modules.did_credentials import DIDCredentialManager
 from modules import network_metrics
 from modules.rpc_commands import (
     HiveContext,
@@ -201,6 +202,12 @@ from modules.rpc_commands import (
     get_mcf_targets as rpc_get_mcf_targets,
     get_nnlb_opportunities as rpc_get_nnlb_opportunities,
     get_channel_ages as rpc_get_channel_ages,
+    # DID Credentials (Phase 16)
+    did_issue_credential as rpc_did_issue_credential,
+    did_list_credentials as rpc_did_list_credentials,
+    did_revoke_credential as rpc_did_revoke_credential,
+    did_get_reputation as rpc_did_get_reputation,
+    did_list_profiles as rpc_did_list_profiles,
 )
 
 # Initialize the plugin
@@ -569,6 +576,7 @@ task_mgr: Optional[TaskManager] = None
 splice_mgr: Optional[SpliceManager] = None
 relay_mgr: Optional[RelayManager] = None
 outbox_mgr: Optional[OutboxManager] = None
+did_credential_mgr: Optional[DIDCredentialManager] = None
 our_pubkey: Optional[str] = None
 
 # Startup timestamp for lightweight health endpoint (Phase 4)
@@ -891,6 +899,7 @@ def _get_hive_context() -> HiveContext:
         rationalization_mgr=_rationalization_mgr,
         strategic_positioning_mgr=_strategic_positioning_mgr,
         anticipatory_manager=_anticipatory_liquidity_mgr,
+        did_credential_mgr=did_credential_mgr,
         our_id=_our_pubkey or "",
         log=_log,
     )
@@ -1822,6 +1831,24 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     outbox_thread.start()
     plugin.log("cl-hive: Outbox retry thread started")
 
+    # Phase 16: DID Credential Manager
+    did_credential_mgr = DIDCredentialManager(
+        database=database,
+        plugin=plugin,
+        rpc=safe_rpc,
+        our_pubkey=our_pubkey,
+    )
+    plugin.log("cl-hive: DID credential manager initialized")
+
+    # Start DID maintenance background thread
+    did_maintenance_thread = threading.Thread(
+        target=did_maintenance_loop,
+        name="cl-hive-did-maintenance",
+        daemon=True
+    )
+    did_maintenance_thread.start()
+    plugin.log("cl-hive: DID maintenance thread started")
+
     # Link anticipatory manager to fee coordination for time-based fees (Phase 7.4)
     if fee_coordination_mgr:
         fee_coordination_mgr.set_anticipatory_manager(anticipatory_liquidity_mgr)
@@ -2158,6 +2185,11 @@ def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Pl
         # Phase D: Reliable Delivery
         elif msg_type == HiveMessageType.MSG_ACK:
             handle_msg_ack(peer_id, msg_payload, plugin)
+        # Phase 16: DID Credentials
+        elif msg_type == HiveMessageType.DID_CREDENTIAL_PRESENT:
+            handle_did_credential_present(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.DID_CREDENTIAL_REVOKE:
+            handle_did_credential_revoke(peer_id, msg_payload, plugin)
         else:
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
 
@@ -3934,6 +3966,101 @@ def handle_msg_ack(peer_id: str, payload: Dict, plugin) -> Dict:
         outbox_mgr.process_ack(sender_id, ack_msg_id, status)
 
     return {"result": "continue"}
+
+
+# =============================================================================
+# PHASE 16: DID CREDENTIAL HANDLERS
+# =============================================================================
+
+def handle_did_credential_present(peer_id: str, payload: Dict, plugin) -> Dict:
+    """Handle incoming DID_CREDENTIAL_PRESENT from a peer."""
+    from modules.protocol import validate_did_credential_present
+
+    if not validate_did_credential_present(payload):
+        plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT invalid payload from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Identity binding: sender_id must match peer_id
+    sender_id = payload.get("sender_id", "")
+    if sender_id != peer_id:
+        plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT identity mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # Dedup via proto_events
+    if database:
+        is_new, _eid = check_and_record(database, "DID_CREDENTIAL_PRESENT", payload, peer_id)
+        if not is_new:
+            return {"result": "continue"}  # Already processed
+
+    # Membership check
+    if database:
+        member = database.get_member(peer_id)
+        if not member:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+
+    # Process credential
+    if did_credential_mgr:
+        did_credential_mgr.handle_credential_present(peer_id, payload)
+
+    return {"result": "continue"}
+
+
+def handle_did_credential_revoke(peer_id: str, payload: Dict, plugin) -> Dict:
+    """Handle incoming DID_CREDENTIAL_REVOKE from a peer."""
+    from modules.protocol import validate_did_credential_revoke
+
+    if not validate_did_credential_revoke(payload):
+        plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE invalid payload from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Identity binding
+    sender_id = payload.get("sender_id", "")
+    if sender_id != peer_id:
+        plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE identity mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # Dedup
+    if database:
+        is_new, _eid = check_and_record(database, "DID_CREDENTIAL_REVOKE", payload, peer_id)
+        if not is_new:
+            return {"result": "continue"}
+
+    # Membership check
+    if database:
+        member = database.get_member(peer_id)
+        if not member:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+
+    # Process revocation
+    if did_credential_mgr:
+        did_credential_mgr.handle_credential_revoke(peer_id, payload)
+
+    return {"result": "continue"}
+
+
+def did_maintenance_loop():
+    """Background thread for DID credential maintenance."""
+    # Wait for initialization
+    shutdown_event.wait(60)
+
+    while not shutdown_event.is_set():
+        try:
+            if not did_credential_mgr or not database:
+                shutdown_event.wait(60)
+                continue
+
+            # 1. Cleanup expired credentials
+            did_credential_mgr.cleanup_expired()
+
+            # 2. Refresh stale aggregation cache entries
+            did_credential_mgr.refresh_stale_aggregations()
+
+        except Exception as e:
+            plugin.log(f"cl-hive: did_maintenance_loop error: {e}", level='warn')
+
+        shutdown_event.wait(1800)  # 30 min cycle
 
 
 def outbox_retry_loop():
@@ -18201,6 +18328,98 @@ def hive_get_channel_ages(plugin: Plugin, scid: str = None):
     """
     ctx = _get_hive_context()
     return rpc_get_channel_ages(ctx, scid)
+
+
+# =============================================================================
+# DID CREDENTIAL RPC COMMANDS (Phase 16)
+# =============================================================================
+
+@plugin.method("hive-did-issue")
+def hive_did_issue(plugin: Plugin, subject_id: str, domain: str,
+                   metrics_json: str, outcome: str = "neutral",
+                   evidence_json: str = "[]"):
+    """
+    Issue a DID reputation credential for a subject.
+
+    Args:
+        subject_id: Pubkey of the credential subject
+        domain: Credential domain (hive:advisor, hive:node, hive:client, agent:general)
+        metrics_json: JSON string of domain-specific metrics
+        outcome: 'renew', 'revoke', or 'neutral'
+        evidence_json: JSON array of evidence references
+
+    Example:
+        lightning-cli hive-did-issue 03abc... hive:node '{"routing_reliability":0.95,"uptime":0.99,"htlc_success_rate":0.98,"avg_fee_ppm":50}'
+    """
+    ctx = _get_hive_context()
+    return rpc_did_issue_credential(ctx, subject_id, domain, metrics_json, outcome, evidence_json)
+
+
+@plugin.method("hive-did-list")
+def hive_did_list(plugin: Plugin, subject_id: str = "", domain: str = "",
+                  issuer_id: str = ""):
+    """
+    List DID credentials with optional filters.
+
+    Args:
+        subject_id: Filter by subject pubkey
+        domain: Filter by domain
+        issuer_id: Filter by issuer pubkey
+
+    Example:
+        lightning-cli hive-did-list 03abc...
+        lightning-cli hive-did-list subject_id=03abc... domain=hive:node
+    """
+    ctx = _get_hive_context()
+    return rpc_did_list_credentials(ctx, subject_id, domain, issuer_id)
+
+
+@plugin.method("hive-did-revoke")
+def hive_did_revoke(plugin: Plugin, credential_id: str, reason: str):
+    """
+    Revoke a DID credential we issued.
+
+    Args:
+        credential_id: UUID of the credential to revoke
+        reason: Revocation reason
+
+    Example:
+        lightning-cli hive-did-revoke "a1b2c3d4-..." "peer went offline permanently"
+    """
+    ctx = _get_hive_context()
+    return rpc_did_revoke_credential(ctx, credential_id, reason)
+
+
+@plugin.method("hive-did-reputation")
+def hive_did_reputation(plugin: Plugin, subject_id: str, domain: str = ""):
+    """
+    Get aggregated reputation score for a subject.
+
+    Args:
+        subject_id: Pubkey of the subject
+        domain: Optional domain filter (empty = cross-domain)
+
+    Example:
+        lightning-cli hive-did-reputation 03abc...
+        lightning-cli hive-did-reputation 03abc... hive:node
+    """
+    ctx = _get_hive_context()
+    return rpc_did_get_reputation(ctx, subject_id, domain)
+
+
+@plugin.method("hive-did-profiles")
+def hive_did_profiles(plugin: Plugin):
+    """
+    List supported DID credential profiles.
+
+    Returns all 4 credential domains with their required metrics,
+    optional metrics, and valid ranges.
+
+    Example:
+        lightning-cli hive-did-profiles
+    """
+    ctx = _get_hive_context()
+    return rpc_did_list_profiles(ctx)
 
 
 # =============================================================================

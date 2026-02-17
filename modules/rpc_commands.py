@@ -44,6 +44,7 @@ class HiveContext:
     rationalization_mgr: Any = None  # RationalizationManager (Channel Rationalization)
     strategic_positioning_mgr: Any = None  # StrategicPositioningManager (Phase 5 - Strategic Positioning)
     anticipatory_manager: Any = None  # AnticipatoryLiquidityManager (Phase 7.1 - Anticipatory Liquidity)
+    did_credential_mgr: Any = None  # DIDCredentialManager (Phase 16 - DID Credentials)
     our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
@@ -4615,3 +4616,152 @@ def get_channel_ages(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
 
     except Exception as e:
         return {"error": f"Failed to get channel ages: {e}"}
+
+
+# =============================================================================
+# DID CREDENTIAL COMMANDS (Phase 16)
+# =============================================================================
+
+def did_issue_credential(ctx: HiveContext, subject_id: str, domain: str,
+                         metrics_json: str, outcome: str = "neutral",
+                         evidence_json: str = "[]") -> Dict[str, Any]:
+    """Issue a DID reputation credential for a subject."""
+    perm = check_permission(ctx, "member")
+    if perm:
+        return perm
+
+    if not ctx.did_credential_mgr:
+        return {"error": "DID credential manager not initialized"}
+
+    try:
+        import json
+        metrics = json.loads(metrics_json)
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "invalid metrics_json: must be valid JSON"}
+
+    try:
+        evidence = json.loads(evidence_json) if evidence_json else []
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "invalid evidence_json: must be valid JSON array"}
+
+    if not isinstance(evidence, list):
+        return {"error": "evidence must be a JSON array"}
+
+    credential = ctx.did_credential_mgr.issue_credential(
+        subject_id=subject_id,
+        domain=domain,
+        metrics=metrics,
+        outcome=outcome,
+        evidence=evidence,
+    )
+
+    if not credential:
+        return {"error": "failed to issue credential (check logs for details)"}
+
+    return {
+        "credential_id": credential.credential_id,
+        "issuer_id": credential.issuer_id,
+        "subject_id": credential.subject_id,
+        "domain": credential.domain,
+        "outcome": credential.outcome,
+        "issued_at": credential.issued_at,
+        "signature": credential.signature,
+    }
+
+
+def did_list_credentials(ctx: HiveContext, subject_id: str = "",
+                         domain: str = "", issuer_id: str = "") -> Dict[str, Any]:
+    """List DID credentials with optional filters."""
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    if subject_id:
+        creds = ctx.database.get_did_credentials_for_subject(
+            subject_id, domain=domain or None, limit=100
+        )
+    elif issuer_id:
+        creds = ctx.database.get_did_credentials_by_issuer(
+            issuer_id, limit=100
+        )
+    else:
+        return {"error": "must specify subject_id or issuer_id"}
+
+    return {
+        "credentials": creds,
+        "count": len(creds),
+    }
+
+
+def did_revoke_credential(ctx: HiveContext, credential_id: str,
+                          reason: str) -> Dict[str, Any]:
+    """Revoke a DID credential we issued."""
+    perm = check_permission(ctx, "member")
+    if perm:
+        return perm
+
+    if not ctx.did_credential_mgr:
+        return {"error": "DID credential manager not initialized"}
+
+    success = ctx.did_credential_mgr.revoke_credential(credential_id, reason)
+
+    if not success:
+        return {"error": "failed to revoke credential (not found, not issuer, or already revoked)"}
+
+    return {
+        "credential_id": credential_id,
+        "revoked": True,
+        "reason": reason,
+    }
+
+
+def did_get_reputation(ctx: HiveContext, subject_id: str,
+                       domain: str = "") -> Dict[str, Any]:
+    """Get aggregated reputation score for a subject."""
+    if not ctx.did_credential_mgr:
+        return {"error": "DID credential manager not initialized"}
+
+    result = ctx.did_credential_mgr.aggregate_reputation(
+        subject_id, domain=domain or None
+    )
+
+    if not result:
+        return {
+            "subject_id": subject_id,
+            "domain": domain or "_all",
+            "score": 50,
+            "tier": "newcomer",
+            "confidence": "none",
+            "credential_count": 0,
+            "issuer_count": 0,
+            "message": "no credentials found for this subject",
+        }
+
+    return {
+        "subject_id": result.subject_id,
+        "domain": result.domain,
+        "score": result.score,
+        "tier": result.tier,
+        "confidence": result.confidence,
+        "credential_count": result.credential_count,
+        "issuer_count": result.issuer_count,
+        "computed_at": result.computed_at,
+        "components": result.components,
+    }
+
+
+def did_list_profiles(ctx: HiveContext) -> Dict[str, Any]:
+    """List supported DID credential profiles."""
+    from modules.did_credentials import CREDENTIAL_PROFILES
+
+    profiles = {}
+    for domain, profile in CREDENTIAL_PROFILES.items():
+        profiles[domain] = {
+            "description": profile.description,
+            "subject_type": profile.subject_type,
+            "issuer_type": profile.issuer_type,
+            "required_metrics": profile.required_metrics,
+            "optional_metrics": profile.optional_metrics,
+            "metric_ranges": {k: list(v) for k, v in profile.metric_ranges.items()},
+        }
+
+    return {"profiles": profiles, "count": len(profiles)}

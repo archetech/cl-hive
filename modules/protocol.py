@@ -158,6 +158,10 @@ class HiveMessageType(IntEnum):
     # Phase D: Reliable Delivery
     MSG_ACK = 32881  # Generic acknowledgment for reliable messages
 
+    # Phase 16: DID Credentials
+    DID_CREDENTIAL_PRESENT = 32883  # Gossip a DID credential to hive members
+    DID_CREDENTIAL_REVOKE = 32885   # Announce credential revocation
+
 
 # =============================================================================
 # PHASE D: RELIABLE DELIVERY CONSTANTS
@@ -181,6 +185,8 @@ RELIABLE_MESSAGE_TYPES = frozenset({
     HiveMessageType.SPLICE_UPDATE,
     HiveMessageType.SPLICE_SIGNED,
     HiveMessageType.SPLICE_ABORT,
+    HiveMessageType.DID_CREDENTIAL_PRESENT,
+    HiveMessageType.DID_CREDENTIAL_REVOKE,
 })
 
 # Implicit ack mapping: response type -> request type it satisfies
@@ -6019,3 +6025,205 @@ def validate_msg_ack(payload: Dict[str, Any]) -> bool:
         return False
 
     return True
+
+
+# =============================================================================
+# PHASE 16: DID CREDENTIAL MESSAGES
+# =============================================================================
+
+# Rate limits
+DID_CREDENTIAL_PRESENT_RATE_LIMIT = 60    # seconds between credential presents per peer
+DID_CREDENTIAL_REVOKE_RATE_LIMIT = 60     # seconds between revoke messages per peer
+
+# Size limits
+MAX_CREDENTIAL_METRICS_LEN = 4096
+MAX_CREDENTIAL_EVIDENCE_LEN = 8192
+MAX_REVOCATION_REASON_LEN = 500
+
+VALID_CREDENTIAL_DOMAINS = frozenset([
+    "hive:advisor", "hive:node", "hive:client", "agent:general",
+])
+VALID_CREDENTIAL_OUTCOMES = frozenset(["renew", "revoke", "neutral"])
+
+
+def create_did_credential_present(
+    sender_id: str,
+    credential: dict,
+    event_id: str = "",
+    timestamp: int = 0,
+) -> bytes:
+    """Create a DID_CREDENTIAL_PRESENT message to gossip a credential."""
+    if not timestamp:
+        import time
+        timestamp = int(time.time())
+    if not event_id:
+        import uuid
+        event_id = str(uuid.uuid4())
+
+    return serialize(HiveMessageType.DID_CREDENTIAL_PRESENT, {
+        "sender_id": sender_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "credential": credential,
+    })
+
+
+def validate_did_credential_present(payload: dict) -> bool:
+    """Validate DID_CREDENTIAL_PRESENT payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not sender_id:
+        return False
+    if not _valid_pubkey(sender_id):
+        return False
+
+    event_id = payload.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    credential = payload.get("credential")
+    if not isinstance(credential, dict):
+        return False
+
+    # Validate credential fields
+    for field in ["issuer_id", "subject_id", "domain", "period_start",
+                  "period_end", "metrics", "outcome", "signature"]:
+        if field not in credential:
+            return False
+
+    issuer_id = credential.get("issuer_id")
+    if not isinstance(issuer_id, str) or not _valid_pubkey(issuer_id):
+        return False
+
+    subject_id = credential.get("subject_id")
+    if not isinstance(subject_id, str) or not _valid_pubkey(subject_id):
+        return False
+
+    # Self-issuance rejection
+    if issuer_id == subject_id:
+        return False
+
+    domain = credential.get("domain")
+    if domain not in VALID_CREDENTIAL_DOMAINS:
+        return False
+
+    outcome = credential.get("outcome")
+    if outcome not in VALID_CREDENTIAL_OUTCOMES:
+        return False
+
+    metrics = credential.get("metrics")
+    if not isinstance(metrics, dict):
+        return False
+
+    period_start = credential.get("period_start")
+    period_end = credential.get("period_end")
+    if not isinstance(period_start, int) or not isinstance(period_end, int):
+        return False
+    if period_end <= period_start:
+        return False
+
+    signature = credential.get("signature")
+    if not isinstance(signature, str) or not signature:
+        return False
+
+    return True
+
+
+def get_did_credential_present_signing_payload(payload: dict) -> str:
+    """Get deterministic signing payload from a credential present message."""
+    import json
+    credential = payload.get("credential", {})
+    signing_data = {
+        "issuer_id": credential.get("issuer_id", ""),
+        "subject_id": credential.get("subject_id", ""),
+        "domain": credential.get("domain", ""),
+        "period_start": credential.get("period_start", 0),
+        "period_end": credential.get("period_end", 0),
+        "metrics": credential.get("metrics", {}),
+        "outcome": credential.get("outcome", "neutral"),
+    }
+    return json.dumps(signing_data, sort_keys=True, separators=(',', ':'))
+
+
+def create_did_credential_revoke(
+    sender_id: str,
+    credential_id: str,
+    issuer_id: str,
+    reason: str,
+    signature: str,
+    event_id: str = "",
+    timestamp: int = 0,
+) -> bytes:
+    """Create a DID_CREDENTIAL_REVOKE message."""
+    if not timestamp:
+        import time
+        timestamp = int(time.time())
+    if not event_id:
+        import uuid
+        event_id = str(uuid.uuid4())
+
+    return serialize(HiveMessageType.DID_CREDENTIAL_REVOKE, {
+        "sender_id": sender_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "credential_id": credential_id,
+        "issuer_id": issuer_id,
+        "reason": reason,
+        "signature": signature,
+    })
+
+
+def validate_did_credential_revoke(payload: dict) -> bool:
+    """Validate DID_CREDENTIAL_REVOKE payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not sender_id:
+        return False
+    if not _valid_pubkey(sender_id):
+        return False
+
+    event_id = payload.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    credential_id = payload.get("credential_id")
+    if not isinstance(credential_id, str) or not credential_id:
+        return False
+
+    issuer_id = payload.get("issuer_id")
+    if not isinstance(issuer_id, str) or not _valid_pubkey(issuer_id):
+        return False
+
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason:
+        return False
+    if len(reason) > MAX_REVOCATION_REASON_LEN:
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str) or not signature:
+        return False
+
+    return True
+
+
+def get_did_credential_revoke_signing_payload(credential_id: str, reason: str) -> str:
+    """Get deterministic signing payload for a credential revocation."""
+    import json
+    return json.dumps({
+        "credential_id": credential_id,
+        "action": "revoke",
+        "reason": reason,
+    }, sort_keys=True, separators=(',', ':'))

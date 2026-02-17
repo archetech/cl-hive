@@ -43,6 +43,9 @@ EVENT_ID_FIELDS: Dict[str, list] = {
     "SPLICE_UPDATE": ["session_id", "update_seq"],
     "SPLICE_SIGNED": ["session_id"],
     "SPLICE_ABORT": ["session_id"],
+    # Phase 16: DID Credentials
+    "DID_CREDENTIAL_PRESENT": ["event_id"],
+    "DID_CREDENTIAL_REVOKE": ["event_id"],
 }
 
 
