@@ -291,17 +291,30 @@ class RpcPool:
 
             req_id = req.get("id")
             method = req.get("method")
-            kwargs = req.get("kwargs") or {}
             payload = req.get("payload")
+            args = req.get("args") or []
+            kwargs = req.get("kwargs") or {}
 
             try:
-                # Always use rpc.call() to bypass explicit LightningRpc method
-                # signatures (e.g. listnodes(node_id=) vs id=). The call()
-                # method sends kwargs directly as the JSON-RPC payload dict.
                 if payload is not None:
+                    # Explicit rpc.call(method, payload) — pass through
                     result = rpc.call(method, payload)
                 else:
-                    result = rpc.call(method, kwargs if kwargs else {})
+                    # Attribute-style: rpc.method(*args, **kwargs)
+                    # Use getattr to match pyln-client's natural calling
+                    # convention (handles positional args, __getattr__).
+                    # Fall back to rpc.call() on TypeError for methods where
+                    # pyln-client has explicit signatures with different param
+                    # names (e.g. listnodes(node_id=) vs caller passing id=).
+                    try:
+                        result = getattr(rpc, method)(*args, **kwargs)
+                    except TypeError:
+                        if kwargs:
+                            result = rpc.call(method, kwargs)
+                        elif args:
+                            result = rpc.call(method, args[0] if len(args) == 1 else args)
+                        else:
+                            result = rpc.call(method, {})
                 resp_q.put({"id": req_id, "ok": True, "result": result})
             except _RpcError as e:
                 resp_q.put({
@@ -414,8 +427,8 @@ class RpcPool:
         self.start()
 
     def request(self, *, method: str,
-                payload: Any = None, kwargs: dict = None,
-                timeout: int = 30):
+                payload: Any = None, args: list = None,
+                kwargs: dict = None, timeout: int = 30):
         """Send an RPC request through the pool. Blocks only this caller."""
         req_id = uuid.uuid4().hex
         slot = {"event": threading.Event(), "resp": None}
@@ -425,7 +438,8 @@ class RpcPool:
 
         req = {
             "id": req_id, "method": method,
-            "payload": payload, "kwargs": kwargs or {},
+            "payload": payload, "args": args or [],
+            "kwargs": kwargs or {},
         }
 
         try:
@@ -486,9 +500,11 @@ class RpcPoolProxy:
         if name.startswith("_"):
             raise AttributeError(name)
 
-        def _method_proxy(**kwargs):
+        def _method_proxy(*args, **kwargs):
             return self._pool.request(
-                method=name, kwargs=kwargs,
+                method=name,
+                args=list(args) if args else None,
+                kwargs=kwargs if kwargs else None,
                 timeout=self._timeout,
             )
 
