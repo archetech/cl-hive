@@ -1,12 +1,16 @@
-# DID Ecosystem — Phased Implementation Plan
+# DID Ecosystem — Phased Implementation Plan (Phases 1-3)
 
 ## Context
 
-8 DID specification documents in `docs/planning/` define a decentralized identity, reputation, marketplace, and settlement ecosystem for cl-hive. These specs depend on the Archon DID infrastructure (`@didcid/keymaster`, Gatekeeper) which is a Node.js ecosystem tool not yet integrated. The practical approach is to build the Python data models, credential logic, and protocol layer first using CLN's existing HSM crypto (`signmessage`/`checkmessage`), then wire in Archon integration later.
+12 specification documents in `docs/planning/` (see [00-INDEX.md](./00-INDEX.md)) define a decentralized identity, reputation, marketplace, and settlement ecosystem for cl-hive. These specs depend on the Archon DID infrastructure (`@didcid/keymaster`, Gatekeeper) which is a Node.js ecosystem tool not yet integrated. The practical approach is to build the Python data models, credential logic, and protocol layer first using CLN's existing HSM crypto (`signmessage`/`checkmessage`), then wire in Archon integration later (see [09-ARCHON-INTEGRATION.md](./09-ARCHON-INTEGRATION.md) for the integration plan and governance tier model).
 
-**Dependency order**: Reputation Schema → Fleet Management Schemas → Cashu Task Escrow → Marketplace → Nostr Transport + Settlements → Liquidity → Client (3-plugin split).
+**Dependency order**: [01-REPUTATION-SCHEMA](./01-REPUTATION-SCHEMA.md) → [02-FLEET-MANAGEMENT](./02-FLEET-MANAGEMENT.md) Schemas → [03-CASHU-TASK-ESCROW](./03-CASHU-TASK-ESCROW.md) → [04-HIVE-MARKETPLACE](./04-HIVE-MARKETPLACE.md) → [05-NOSTR-MARKETPLACE](./05-NOSTR-MARKETPLACE.md) + [06-HIVE-SETTLEMENTS](./06-HIVE-SETTLEMENTS.md) → [07-HIVE-LIQUIDITY](./07-HIVE-LIQUIDITY.md) → [08-HIVE-CLIENT](./08-HIVE-CLIENT.md) (3-plugin split).
 
-**This plan covers Phases 1-3** (the foundation layers that can be built with zero new external dependencies). Phases 4-5 (Cashu/Nostr) require external libraries and will be planned separately once the foundation is deployed.
+**This plan covers Phases 1-3** (the foundation layers that can be built with zero new external dependencies). Phases 4-6 (Cashu/Nostr/plugin split) require external libraries and are planned in [12-IMPLEMENTATION-PLAN-PHASE4-6.md](./12-IMPLEMENTATION-PLAN-PHASE4-6.md).
+
+**Relationship to Archon (09) and Node Provisioning (10)**:
+- [09-ARCHON-INTEGRATION.md](./09-ARCHON-INTEGRATION.md): Defines the optional Archon DID integration layer and tiered participation model (Basic → Governance). Phases 1-3 implement the credential foundation using CLN HSM, enabling a clean migration path to Archon `did:cid:*` identifiers later. The `governance_tier` column defined in 09 will be added to `hive_members` in Phase 3 integration.
+- [10-NODE-PROVISIONING.md](./10-NODE-PROVISIONING.md): Defines autonomous VPS lifecycle management. Provisioned nodes will consume reputation credentials (Phase 1) and management credentials (Phase 2) to establish trust, and will use the credential exchange protocol (Phase 3) to participate in the fleet reputation system. The provisioning system's "Revenue ≥ costs or graceful shutdown" invariant can use reputation scores as a signal for node health.
 
 ---
 
@@ -23,9 +27,14 @@ class DIDCredentialManager:
     """DID credential issuance, verification, storage, and aggregation."""
 
     MAX_CREDENTIALS_PER_PEER = 100
-    MAX_TOTAL_CREDENTIALS = 10_000
-    AGGREGATION_CACHE_TTL = 3600  # 1 hour
-    RECENCY_DECAY_LAMBDA = 0.01  # half-life ~69 days
+    MAX_CREDENTIAL_ROWS = 50_000       # DB row cap
+    MAX_REPUTATION_CACHE_ROWS = 10_000 # DB row cap for aggregation cache
+    AGGREGATION_CACHE_TTL = 3600       # 1 hour
+    RECENCY_DECAY_LAMBDA = 0.01        # half-life ~69 days
+
+    # Rate limits for incoming protocol messages
+    MAX_CREDENTIAL_PRESENTS_PER_PEER_PER_HOUR = 20
+    MAX_CREDENTIAL_REVOKES_PER_PEER_PER_HOUR = 10
 
     def __init__(self, database, plugin, rpc=None, our_pubkey=""):
 ```
@@ -36,6 +45,7 @@ class DIDCredentialManager:
 |-------|---------|
 | `DIDCredential` | Single credential: issuer, subject, domain, period, metrics, outcome, evidence, signature |
 | `AggregatedReputation` | Cached aggregation for a subject: domain, score (0-100), confidence, tier, component scores |
+| `CreditTierResult` | Result of `get_credit_tier()`: tier (str), score (int), confidence (str), credential_count (int) |
 | `CredentialProfile` | Profile definition (one of 4 domains): required metrics, valid ranges, evidence types |
 
 **4 credential profiles** (hardcoded, not DB-driven):
@@ -49,9 +59,9 @@ class DIDCredentialManager:
 
 **Aggregation algorithm**:
 - `score = Σ(credential_weight × metric_score)` where `credential_weight = issuer_weight × recency_factor × evidence_strength`
-- Issuer weight: 1.0 default, up to 3.0 for issuers with open channels to subject (proof-of-stake)
+- Issuer weight: 1.0 default, up to 3.0 for issuers with open channels to subject (proof-of-stake). **For credentials received from remote peers**, issuer weight is verified by checking our local `listpeers` / `listchannels` for the claimed issuer↔subject channel relationship. If the channel cannot be verified locally, issuer weight falls back to 1.0.
 - Recency factor: `e^(-λ × age_days)` with λ=0.01
-- Evidence strength: ×0.3 (no evidence), ×0.7 (1-5 refs), ×1.0 (5+ signed receipts)
+- Evidence strength: ×0.3 (no evidence), ×0.7 (1-5 refs), ×1.0 (5+ signed receipts). The `evidence_json` field must be a JSON array of objects; non-array values are rejected during validation.
 - Self-issuance rejected (`issuer == subject`)
 - Output: 0-100 score → tier: Newcomer (0-59), Recognized (60-74), Trusted (75-84), Senior (85-100)
 
@@ -60,10 +70,13 @@ class DIDCredentialManager:
 - `verify_credential(credential)` → check signature, expiry, self-issuance, schema
 - `revoke_credential(credential_id, reason)` → mark revoked, broadcast
 - `aggregate_reputation(subject_id, domain=None)` → weighted aggregation with caching
-- `get_credit_tier(subject_id)` → Newcomer/Recognized/Trusted/Senior
-- `handle_credential_present(peer_id, payload, rpc)` → validate incoming credential gossip
+- `get_credit_tier(subject_id)` → returns `CreditTierResult(tier, score, confidence, credential_count)` — never just a string
+- `handle_credential_present(peer_id, payload, rpc)` → validate incoming credential gossip (see security chain below)
 - `handle_credential_revoke(peer_id, payload, rpc)` → process revocation
 - `cleanup_expired()` → remove expired credentials, refresh stale aggregations
+- `refresh_stale_aggregations()` → recompute cache entries older than `AGGREGATION_CACHE_TTL`
+- `auto_issue_node_credentials(rpc)` → issue `hive:node` credentials for peers with sufficient forwarding history (from `contribution.py`)
+- `rebroadcast_own_credentials(rpc)` → re-gossip our issued credentials to hive members (every 4 hours, tracked via `_last_rebroadcast` timestamp)
 
 ### New DB tables (in `database.py` `initialize()`)
 
@@ -77,8 +90,8 @@ CREATE TABLE IF NOT EXISTS did_credentials (
     period_start INTEGER NOT NULL,        -- epoch
     period_end INTEGER NOT NULL,          -- epoch
     metrics_json TEXT NOT NULL,           -- JSON: domain-specific metrics
-    outcome TEXT NOT NULL DEFAULT 'neutral', -- 'renew', 'revoke', 'neutral'
-    evidence_json TEXT,                   -- JSON array of evidence refs
+    outcome TEXT NOT NULL,                -- 'renew', 'revoke', 'neutral' (no DEFAULT — force explicit)
+    evidence_json TEXT,                   -- JSON array of evidence refs (validated as array)
     signature TEXT NOT NULL,              -- zbase signature from issuer
     issued_at INTEGER NOT NULL,
     expires_at INTEGER,
@@ -106,9 +119,9 @@ CREATE TABLE IF NOT EXISTS did_reputation_cache (
 );
 ```
 
-**New `HiveDatabase` methods**: `store_credential()`, `get_credentials_for_subject(subject_id, domain=None, limit=100)`, `get_credential(credential_id)`, `revoke_credential(credential_id, reason, timestamp)`, `count_credentials()`, `store_reputation_cache(subject_id, domain, score, tier, ...)`, `get_reputation_cache(subject_id, domain=None)`, `cleanup_expired_credentials(before_ts)`, `count_credentials_by_issuer(issuer_id)`.
+**New `HiveDatabase` methods**: `store_credential()`, `get_credentials_for_subject(subject_id, domain=None, limit=100)`, `get_credential(credential_id)`, `revoke_credential(credential_id, reason, timestamp)`, `count_credentials()`, `count_credentials_by_issuer(issuer_id)`, `store_reputation_cache(subject_id, domain, score, tier, ...)`, `get_reputation_cache(subject_id, domain=None)`, `cleanup_expired_credentials(before_ts)`, `count_reputation_cache_rows()`.
 
-Row cap: `MAX_DID_CREDENTIAL_ROWS = 50_000` checked before insert.
+Row caps: `MAX_CREDENTIAL_ROWS = 50_000` (checked before insert in `store_credential()`), `MAX_REPUTATION_CACHE_ROWS = 10_000` (checked before insert in `store_reputation_cache()`).
 
 ### New protocol messages (in `protocol.py`)
 
@@ -117,9 +130,13 @@ Row cap: `MAX_DID_CREDENTIAL_ROWS = 50_000` checked before insert.
 | `DID_CREDENTIAL_PRESENT` | 32883 | Gossip a credential to hive members | Yes |
 | `DID_CREDENTIAL_REVOKE` | 32885 | Announce credential revocation | Yes |
 
+Both types added to `RELIABLE_MESSAGE_TYPES` frozenset and `IMPLICIT_ACK_MAP`.
+
 Factory functions: `create_did_credential_present(...)`, `validate_did_credential_present(payload)`, `get_did_credential_present_signing_payload(payload)`. Same pattern for revoke.
 
 Signing payload for credentials: `json.dumps({"issuer_id":..., "subject_id":..., "domain":..., "period_start":..., "period_end":..., "metrics":..., "outcome":...}, sort_keys=True)` — deterministic JSON for reproducible signatures.
+
+**Rate limiting**: All incoming DID protocol messages are rate-limited per peer using the same sliding-window pattern as existing gossip messages. Limits: 20 presents/peer/hour, 10 revokes/peer/hour. Exceeding the limit logs a warning and drops the message silently (no error response that could be used for probing).
 
 ### New RPC commands
 
@@ -136,13 +153,16 @@ Signing payload for credentials: `json.dumps({"issuer_id":..., "subject_id":...,
 1. Import `DIDCredentialManager` from `modules.did_credentials`
 2. Declare `did_credential_mgr: Optional[DIDCredentialManager] = None` global
 3. Initialize in `init()` after database, pass `database, plugin, rpc, our_pubkey`
-4. Add `did_credential_mgr` field to `HiveContext` in `rpc_commands.py`
+4. Add `did_credential_mgr` field to `HiveContext` in `rpc_commands.py` (also add the currently missing `settlement_mgr` field)
 5. Add dispatch entries for `DID_CREDENTIAL_PRESENT` and `DID_CREDENTIAL_REVOKE` in `_dispatch_hive_message()`
 6. Add `did_maintenance_loop` background thread: cleanup expired credentials, refresh stale aggregation cache (runs every 30 min)
+7. Add thin `@plugin.method()` wrappers in `cl-hive.py` for all 5 RPC commands
 
 ### MCP server
 
-Add `hive-did-issue`, `hive-did-list`, `hive-did-revoke`, `hive-did-reputation`, `hive-did-profiles` to `_check_method_allowed()` in `tools/mcp-hive-server.py`.
+Add the following to `_check_method_allowed()` in `tools/mcp-hive-server.py`:
+- Phase 1: `hive-did-issue`, `hive-did-list`, `hive-did-revoke`, `hive-did-reputation`, `hive-did-profiles`
+- Phase 2: `hive-schema-list`, `hive-schema-validate`, `hive-mgmt-credential-issue`, `hive-mgmt-credential-list`, `hive-mgmt-credential-revoke`
 
 ---
 
@@ -303,29 +323,46 @@ Row caps: `MAX_MANAGEMENT_CREDENTIAL_ROWS = 1_000`, `MAX_MANAGEMENT_RECEIPT_ROWS
 | `MGMT_CREDENTIAL_PRESENT` | 32887 | Share a management credential with hive | Yes |
 | `MGMT_CREDENTIAL_REVOKE` | 32889 | Announce management credential revocation | Yes |
 
-### Handler functions (in `cl-hive.py`)
+Rate limits: 10 presents/peer/hour, 5 revokes/peer/hour (same sliding-window pattern as Phase 1 messages).
+
+### Handler security chain (in `cl-hive.py`)
+
+All 4 new protocol message handlers follow the same 10-step security chain:
 
 ```
 handle_did_credential_present(peer_id, payload, plugin):
     1. Dedup (proto_events)
-    2. Timestamp freshness check (±300s)
-    3. Membership verification
-    4. Identity binding (peer_id == sender claimed in payload)
-    5. Schema validation
-    6. Signature verification (checkmessage)
-    7. Self-issuance rejection
-    8. Store credential
-    9. Update aggregation cache
-    10. Relay to other members
-```
+    2. Rate limit check (per-peer sliding window)
+    3. Timestamp freshness check (±300s)
+    4. Membership verification (sender must be a hive member)
+    5. Identity binding (peer_id == sender claimed in payload)
+    6. Schema validation (domain is one of the 4 known profiles)
+    7. Signature verification (checkmessage via RPC)
+    8. Self-issuance rejection (issuer != subject)
+    9. Row cap check → store credential
+    10. Update aggregation cache → relay to other members
 
-Same pattern for revoke and management credential messages.
+handle_did_credential_revoke(peer_id, payload, plugin):
+    Steps 1-5 same as above
+    6. Verify revocation is for a credential we have stored
+    7. Verify revoker == original issuer (only issuers can revoke)
+    8. Signature verification of revocation message
+    9. Mark credential as revoked (set revoked_at, revocation_reason)
+    10. Relay revocation to other members
+
+handle_mgmt_credential_present(peer_id, payload, plugin):
+    Same 10-step chain as handle_did_credential_present
+
+handle_mgmt_credential_revoke(peer_id, payload, plugin):
+    Same chain as handle_did_credential_revoke, additionally:
+    6b. Immediately invalidate any active sessions using this credential
+```
 
 ### Integration with existing modules
 
 **`planner.py`**: Before proposing expansion to a target, check `did_credential_mgr.get_credit_tier(target)`. Prefer targets with Recognized+ tier. Log reputation score in `hive_planner_log`.
 
-**`membership.py`**: During auto-promotion evaluation, incorporate `hive:node` reputation from peer credentials as supplementary signal (not sole criterion — existing forwarding/uptime metrics remain primary).
+**`membership.py`**: During auto-promotion evaluation, incorporate `hive:node` reputation from peer credentials as supplementary signal (not sole criterion — existing forwarding/uptime metrics remain primary). Add `governance_tier` column to `hive_members` table per [09-ARCHON-INTEGRATION.md](./09-ARCHON-INTEGRATION.md): `ALTER TABLE hive_members ADD COLUMN governance_tier TEXT NOT NULL DEFAULT 'basic'` (values: `basic`, `governance`).
 
 **`settlement.py`**: Reputation tier determines settlement terms. Newcomer: full escrow required. Senior: extended credit lines. Store tier alongside settlement proposal.
 
@@ -333,17 +370,20 @@ Same pattern for revoke and management credential messages.
 
 ```python
 def did_maintenance_loop():
+    """30-minute maintenance cycle for DID credential system."""
     while not shutdown_event.is_set():
         try:
             snap = config.snapshot()
-            # 1. Cleanup expired credentials
+            # 1. Cleanup expired credentials (remove expired_at < now)
             did_credential_mgr.cleanup_expired()
-            # 2. Refresh stale aggregation cache entries
+            # 2. Refresh stale aggregation cache entries (older than AGGREGATION_CACHE_TTL)
             did_credential_mgr.refresh_stale_aggregations()
             # 3. Auto-issue hive:node credentials for peers we have data on
             #    (forwarding stats from contribution.py, uptime from state_manager)
+            #    Rate-limited: max 10 auto-issuances per cycle
             did_credential_mgr.auto_issue_node_credentials(rpc)
             # 4. Rebroadcast our credentials periodically (every 4h)
+            #    Tracked via _last_rebroadcast timestamp to avoid redundant sends
             did_credential_mgr.rebroadcast_own_credentials(rpc)
         except Exception as e:
             plugin.log(f"cl-hive: did_maintenance error: {e}", level='error')
@@ -352,41 +392,63 @@ def did_maintenance_loop():
 
 ---
 
+## HSM → DID Migration Path
+
+Phases 1-3 use CLN's `signmessage`/`checkmessage` for all credential signatures. This produces zbase-encoded signatures over the lightning message prefix (`"Lightning Signed Message:"` + payload).
+
+When Archon integration is deployed (see [09-ARCHON-INTEGRATION.md](./09-ARCHON-INTEGRATION.md)), the migration path is:
+
+1. **Dual-signature period**: New credentials carry both a CLN HSM zbase signature and an Archon DID signature. Verifiers accept either.
+2. **DID-to-pubkey binding**: A one-time `DID_BINDING_ATTESTATION` credential links the node's CLN pubkey to its `did:cid:*` identifier. This credential is signed by the CLN HSM and registered with the Archon gateway.
+3. **Credential format upgrade**: Once all hive members support DID verification, new credentials are issued as W3C Verifiable Credentials (VC 2.0 JSON-LD) with DID signatures only. Old credentials remain valid until expiry.
+4. **HSM sunset**: After a configurable migration window (default: 180 days), HSM-only credentials are no longer accepted for new issuance. Existing stored credentials retain their HSM signatures.
+
+The `CredentialProfile` dataclass includes a `signature_type` field (`"hsm"` or `"did"` or `"dual"`) to track which regime each credential was issued under.
+
+---
+
 ## Files Modified Summary
 
 | File | Phase | Changes |
 |------|-------|---------|
-| **NEW** `modules/did_credentials.py` | 1 | DIDCredentialManager, credential profiles, aggregation |
+| **NEW** `modules/did_credentials.py` | 1 | DIDCredentialManager, credential profiles, aggregation, CreditTierResult |
 | **NEW** `modules/management_schemas.py` | 2 | Schema registry, danger scoring, ManagementCredential |
-| `modules/database.py` | 1-2 | 4 new tables, ~15 new methods, row caps |
-| `modules/protocol.py` | 1, 3 | 4 new message types (32883-32889), factory/validation functions |
-| `modules/rpc_commands.py` | 1-2 | `did_credential_mgr` + `management_schema_registry` on HiveContext, ~10 handler functions |
-| `cl-hive.py` | 1-3 | Import, init, dispatch entries, background loop, RPC wrappers |
-| `tools/mcp-hive-server.py` | 1-2 | Add new RPC methods to allowlist |
-| **NEW** `tests/test_did_credentials.py` | 1 | Credential issuance, verification, aggregation, revocation |
+| `modules/database.py` | 1-2 | 4 new tables, ~17 new methods, row caps (50K credentials, 10K cache, 1K mgmt creds, 100K receipts) |
+| `modules/protocol.py` | 1, 3 | 4 new message types (32883-32889), factory/validation functions, rate limit constants |
+| `modules/rpc_commands.py` | 1-2 | `did_credential_mgr` + `management_schema_registry` + `settlement_mgr` on HiveContext, ~10 handler functions |
+| `cl-hive.py` | 1-3 | Import, init, dispatch entries, background loop, RPC wrappers, rate limiting |
+| `tools/mcp-hive-server.py` | 1-2 | Add 10 new RPC methods to allowlist |
+| **NEW** `tests/test_did_credentials.py` | 1 | Credential issuance, verification, aggregation, revocation, CreditTierResult |
 | **NEW** `tests/test_management_schemas.py` | 2 | Schema validation, danger scoring, credential checks |
-| **NEW** `tests/test_did_protocol.py` | 3 | Protocol message handling, relay, idempotency |
+| **NEW** `tests/test_did_protocol.py` | 3 | Protocol message handling, relay, idempotency, rate limiting |
 
 ---
 
 ## Verification
 
 1. **Unit tests**: `python3 -m pytest tests/test_did_credentials.py tests/test_management_schemas.py tests/test_did_protocol.py -v`
-2. **Regression**: `python3 -m pytest tests/ -v` (all 1749+ existing tests must pass)
+2. **Regression**: `python3 -m pytest tests/ -v` (all existing tests must pass)
 3. **RPC smoke test**: `lightning-cli hive-did-profiles`, `lightning-cli hive-schema-list`
 4. **Integration**: Issue credential via `hive-did-issue`, verify it appears in `hive-did-list`, check reputation via `hive-did-reputation`
-5. **Backwards compatibility**: Nodes without DID support must still participate in hive normally (all DID features are additive, never blocking)
+5. **Rate limiting**: Verify that exceeding 20 presents/peer/hour results in silent drop
+6. **Backwards compatibility**: Nodes without DID support must still participate in hive normally (all DID features are additive, never blocking)
+7. **Migration prep**: Verify `CreditTierResult` includes all fields needed by settlement/planner integrations
 
 ---
 
-## What's Deferred (Phases 4-5, planned separately)
+## What's Deferred (Phases 4-6)
+
+See [12-IMPLEMENTATION-PLAN-PHASE4-6.md](./12-IMPLEMENTATION-PLAN-PHASE4-6.md) for the complete plan.
 
 | Phase | Spec | Requires |
 |-------|------|----------|
-| 4 | DID-CASHU-TASK-ESCROW | Cashu Python SDK (NUT-10/11/14), mint integration |
-| 4 | DID-HIVE-SETTLEMENTS (extended) | Extends existing settlement.py with 9 new types |
-| 5 | DID-NOSTR-MARKETPLACE | Nostr Python library (NIP-44), relay connections |
-| 5 | DID-HIVE-LIQUIDITY | Depends on settlements + escrow |
-| 6 | DID-HIVE-CLIENT | 3-plugin split (cl-hive-comms, cl-hive-archon, cl-hive) |
+| 4A | [03-CASHU-TASK-ESCROW](./03-CASHU-TASK-ESCROW.md) | Cashu Python SDK (NUT-10/11/14), mint integration |
+| 4B | [06-HIVE-SETTLEMENTS](./06-HIVE-SETTLEMENTS.md) (extended) | Extends existing settlement.py with 8 new types |
+| 5A | Nostr Transport | Nostr Python library (NIP-44), relay connections |
+| 5B | [04-HIVE-MARKETPLACE](./04-HIVE-MARKETPLACE.md) + [05-NOSTR-MARKETPLACE](./05-NOSTR-MARKETPLACE.md) | Nostr transport + escrow |
+| 5C | [07-HIVE-LIQUIDITY](./07-HIVE-LIQUIDITY.md) | Marketplace + settlements |
+| 6 | [08-HIVE-CLIENT](./08-HIVE-CLIENT.md) | 3-plugin split (cl-hive-comms, cl-hive-archon, cl-hive) |
 
 These require external Python libraries not currently in the dependency set. They will be planned once Phases 1-3 are deployed and validated.
+
+**Node Provisioning** ([10-NODE-PROVISIONING.md](./10-NODE-PROVISIONING.md)) is operational infrastructure that runs alongside all phases. Provisioned nodes consume credentials from Phase 1 onward.
