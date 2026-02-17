@@ -4910,8 +4910,410 @@ Use before approving/rejecting channel opens or policy changes.""",
                 },
                 "required": ["node", "action_id"]
             }
-        )
+        ),
+        # Phase 16: DID Credential Tools
+        Tool(
+            name="hive_did_issue",
+            description="""Issue a DID credential for a peer.
+
+Issues a signed credential in one of 4 domains:
+- hive:advisor - Fleet advisor performance
+- hive:node - Lightning node routing reliability
+- hive:client - Node operator behavior
+- agent:general - AI agent task performance
+
+The credential is signed via CLN HSM and stored locally.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "subject_id": {
+                        "type": "string",
+                        "description": "Pubkey of the credential subject"
+                    },
+                    "domain": {
+                        "type": "string",
+                        "description": "Credential domain (hive:advisor, hive:node, hive:client, agent:general)"
+                    },
+                    "metrics_json": {
+                        "type": "string",
+                        "description": "JSON object with domain-specific metrics"
+                    },
+                    "outcome": {
+                        "type": "string",
+                        "description": "Credential outcome: renew, revoke, or neutral (default: neutral)"
+                    },
+                    "evidence_json": {
+                        "type": "string",
+                        "description": "Optional JSON array of evidence references"
+                    }
+                },
+                "required": ["node", "subject_id", "domain", "metrics_json"]
+            }
+        ),
+        Tool(
+            name="hive_did_list",
+            description="""List DID credentials with optional filters.
+
+Returns credentials filtered by subject, domain, and/or issuer.
+Shows credential details including metrics, outcome, and signature status.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "subject_id": {
+                        "type": "string",
+                        "description": "Filter by subject pubkey"
+                    },
+                    "domain": {
+                        "type": "string",
+                        "description": "Filter by credential domain"
+                    },
+                    "issuer_id": {
+                        "type": "string",
+                        "description": "Filter by issuer pubkey"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_did_revoke",
+            description="""Revoke a DID credential we issued.
+
+Marks the credential as revoked with a reason. Only the original issuer
+can revoke a credential.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "credential_id": {
+                        "type": "string",
+                        "description": "ID of the credential to revoke"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Reason for revocation"
+                    }
+                },
+                "required": ["node", "credential_id", "reason"]
+            }
+        ),
+        Tool(
+            name="hive_did_reputation",
+            description="""Get aggregated reputation score for a peer.
+
+Returns weighted reputation aggregation including:
+- Overall score (0-100)
+- Tier (newcomer/recognized/trusted/senior)
+- Confidence level
+- Component score breakdown""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "subject_id": {
+                        "type": "string",
+                        "description": "Pubkey of the peer to check"
+                    },
+                    "domain": {
+                        "type": "string",
+                        "description": "Optional domain filter"
+                    }
+                },
+                "required": ["node", "subject_id"]
+            }
+        ),
+        Tool(
+            name="hive_did_profiles",
+            description="""List supported DID credential profiles.
+
+Shows the 4 credential domains with their required metrics,
+valid ranges, and evidence types.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        # Phase 16: Management Schema Tools
+        Tool(
+            name="hive_schema_list",
+            description="""List all management schemas with actions and danger scores.
+
+Shows the 15 management schema categories, each with their
+available actions, danger scores (1-10), and required permission tiers.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_schema_validate",
+            description="""Validate a command against a management schema (dry run).
+
+Checks if the specified action and parameters are valid for the schema,
+without executing anything.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "schema_id": {
+                        "type": "string",
+                        "description": "Schema ID (e.g. hive:fee-policy/v1)"
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": "Action name within the schema"
+                    },
+                    "params_json": {
+                        "type": "string",
+                        "description": "JSON object with action parameters"
+                    }
+                },
+                "required": ["node", "schema_id", "action"]
+            }
+        ),
+        Tool(
+            name="hive_mgmt_credential_issue",
+            description="""Issue a management credential granting an agent permission to manage a node.
+
+Creates a signed credential specifying allowed schemas, tier, and constraints.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Pubkey of the agent/advisor"
+                    },
+                    "node_id": {
+                        "type": "string",
+                        "description": "Pubkey of the managed node"
+                    },
+                    "tier": {
+                        "type": "string",
+                        "description": "Permission tier: monitor, standard, advanced, or admin"
+                    },
+                    "allowed_schemas_json": {
+                        "type": "string",
+                        "description": "JSON array of allowed schema patterns"
+                    },
+                    "valid_days": {
+                        "type": "integer",
+                        "description": "Number of days the credential is valid (default: 90)"
+                    },
+                    "constraints_json": {
+                        "type": "string",
+                        "description": "Optional JSON constraints (max_fee_change_pct, etc.)"
+                    }
+                },
+                "required": ["node", "agent_id", "node_id", "tier", "allowed_schemas_json"]
+            }
+        ),
+        Tool(
+            name="hive_mgmt_credential_list",
+            description="""List management credentials with optional filters.
+
+Shows issued management credentials filtered by agent or node.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Filter by agent pubkey"
+                    },
+                    "node_id": {
+                        "type": "string",
+                        "description": "Filter by managed node pubkey"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_mgmt_credential_revoke",
+            description="""Revoke a management credential we issued.
+
+Only the original issuer can revoke a management credential.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "credential_id": {
+                        "type": "string",
+                        "description": "ID of the credential to revoke"
+                    }
+                },
+                "required": ["node", "credential_id"]
+            }
+        ),
     ]
+
+
+# =============================================================================
+# Phase 16: DID Credential and Management Schema Handlers
+# =============================================================================
+
+async def handle_hive_did_issue(args: Dict) -> Dict:
+    """Issue a DID credential for a peer."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {
+        "subject_id": args["subject_id"],
+        "domain": args["domain"],
+        "metrics_json": args["metrics_json"],
+    }
+    if args.get("outcome"):
+        params["outcome"] = args["outcome"]
+    if args.get("evidence_json"):
+        params["evidence_json"] = args["evidence_json"]
+    return await node.call("hive-did-issue", params)
+
+
+async def handle_hive_did_list(args: Dict) -> Dict:
+    """List DID credentials with optional filters."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("subject_id"):
+        params["subject_id"] = args["subject_id"]
+    if args.get("domain"):
+        params["domain"] = args["domain"]
+    if args.get("issuer_id"):
+        params["issuer_id"] = args["issuer_id"]
+    return await node.call("hive-did-list", params)
+
+
+async def handle_hive_did_revoke(args: Dict) -> Dict:
+    """Revoke a DID credential we issued."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-did-revoke", {
+        "credential_id": args["credential_id"],
+        "reason": args["reason"],
+    })
+
+
+async def handle_hive_did_reputation(args: Dict) -> Dict:
+    """Get aggregated reputation score for a peer."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {"subject_id": args["subject_id"]}
+    if args.get("domain"):
+        params["domain"] = args["domain"]
+    return await node.call("hive-did-reputation", params)
+
+
+async def handle_hive_did_profiles(args: Dict) -> Dict:
+    """List supported DID credential profiles."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-did-profiles")
+
+
+async def handle_hive_schema_list(args: Dict) -> Dict:
+    """List all management schemas."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-schema-list")
+
+
+async def handle_hive_schema_validate(args: Dict) -> Dict:
+    """Validate a command against a management schema."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {
+        "schema_id": args["schema_id"],
+        "action": args["action"],
+    }
+    if args.get("params_json"):
+        params["params_json"] = args["params_json"]
+    return await node.call("hive-schema-validate", params)
+
+
+async def handle_hive_mgmt_credential_issue(args: Dict) -> Dict:
+    """Issue a management credential for an agent."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {
+        "agent_id": args["agent_id"],
+        "node_id": args["node_id"],
+        "tier": args["tier"],
+        "allowed_schemas_json": args["allowed_schemas_json"],
+    }
+    if args.get("valid_days"):
+        params["valid_days"] = args["valid_days"]
+    if args.get("constraints_json"):
+        params["constraints_json"] = args["constraints_json"]
+    return await node.call("hive-mgmt-credential-issue", params)
+
+
+async def handle_hive_mgmt_credential_list(args: Dict) -> Dict:
+    """List management credentials."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("agent_id"):
+        params["agent_id"] = args["agent_id"]
+    if args.get("node_id"):
+        params["node_id"] = args["node_id"]
+    return await node.call("hive-mgmt-credential-list", params)
+
+
+async def handle_hive_mgmt_credential_revoke(args: Dict) -> Dict:
+    """Revoke a management credential."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-mgmt-credential-revoke", {
+        "credential_id": args["credential_id"],
+    })
 
 
 @server.call_tool()
@@ -14748,6 +15150,18 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "bulk_policy": handle_bulk_policy,
     "enrich_peer": handle_enrich_peer,
     "enrich_proposal": handle_enrich_proposal,
+    # Phase 16: DID Credential Tools
+    "hive_did_issue": handle_hive_did_issue,
+    "hive_did_list": handle_hive_did_list,
+    "hive_did_revoke": handle_hive_did_revoke,
+    "hive_did_reputation": handle_hive_did_reputation,
+    "hive_did_profiles": handle_hive_did_profiles,
+    # Phase 16: Management Schema Tools
+    "hive_schema_list": handle_hive_schema_list,
+    "hive_schema_validate": handle_hive_schema_validate,
+    "hive_mgmt_credential_issue": handle_hive_mgmt_credential_issue,
+    "hive_mgmt_credential_list": handle_hive_mgmt_credential_list,
+    "hive_mgmt_credential_revoke": handle_hive_mgmt_credential_revoke,
 }
 
 

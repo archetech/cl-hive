@@ -984,6 +984,263 @@ class DIDCredentialManager:
             result.append(cred)
         return result
 
+    # --- Auto-Issuance and Rebroadcast (Phase 3) ---
+
+    # Minimum interval between auto-issuing credentials for the same peer
+    AUTO_ISSUE_INTERVAL = 7 * 86400  # 7 days
+    # Minimum interval between rebroadcasts
+    REBROADCAST_INTERVAL = 4 * 3600  # 4 hours
+
+    def auto_issue_node_credentials(
+        self,
+        state_manager,
+        contribution_tracker=None,
+        broadcast_fn=None,
+    ) -> int:
+        """
+        Auto-issue hive:node credentials for peers we have forwarding data on.
+
+        Uses peer state (uptime, forwarding stats) and contribution data to
+        populate the credential metrics. Only issues if no recent credential
+        exists for the peer.
+
+        Args:
+            state_manager: StateManager instance for peer state data
+            contribution_tracker: ContributionTracker for forwarding stats
+            broadcast_fn: Callable(bytes) -> int to broadcast to fleet
+
+        Returns:
+            Number of credentials issued
+        """
+        if not state_manager or not self.rpc:
+            return 0
+
+        issued = 0
+        now = int(time.time())
+        period_start = now - 30 * 86400  # 30-day evaluation window
+
+        try:
+            all_peers = state_manager.get_all_peer_states()
+        except Exception as e:
+            self._log(f"auto_issue: cannot get peer states: {e}", "warn")
+            return 0
+
+        for peer_id, peer_state in all_peers.items():
+            if peer_id == self.our_pubkey:
+                continue
+
+            # Check if we already have a recent credential for this peer
+            existing = self.db.get_did_credentials_by_issuer(
+                self.our_pubkey, subject_id=peer_id, limit=1
+            )
+            if existing:
+                latest = existing[0]
+                if latest.get("revoked_at") is None:
+                    issued_at = latest.get("issued_at", 0)
+                    if now - issued_at < self.AUTO_ISSUE_INTERVAL:
+                        continue  # Too recent, skip
+
+            # Compute metrics from available data
+            try:
+                metrics = self._compute_node_metrics(
+                    peer_id, peer_state, contribution_tracker, now
+                )
+            except Exception as e:
+                self._log(f"auto_issue: metrics error for {peer_id[:16]}...: {e}", "debug")
+                continue
+
+            if not metrics:
+                continue
+
+            # Determine outcome based on overall performance
+            avg_score = sum(metrics.get(k, 0) for k in [
+                "routing_reliability", "uptime", "htlc_success_rate"
+            ]) / 3.0
+            if avg_score >= 0.7:
+                outcome = "renew"
+            elif avg_score < 0.3:
+                outcome = "revoke"
+            else:
+                outcome = "neutral"
+
+            # Issue the credential
+            cred = self.issue_credential(
+                subject_id=peer_id,
+                domain="hive:node",
+                metrics=metrics,
+                outcome=outcome,
+                period_start=period_start,
+                period_end=now,
+                expires_at=now + 90 * 86400,  # 90-day expiry
+            )
+
+            if cred:
+                issued += 1
+
+                # Broadcast to fleet if we have a broadcast function
+                if broadcast_fn:
+                    try:
+                        from modules.protocol import create_did_credential_present
+                        cred_dict = cred.to_dict() if hasattr(cred, 'to_dict') else {
+                            "credential_id": cred.credential_id,
+                            "issuer_id": cred.issuer_id,
+                            "subject_id": cred.subject_id,
+                            "domain": cred.domain,
+                            "period_start": cred.period_start,
+                            "period_end": cred.period_end,
+                            "metrics": cred.metrics,
+                            "outcome": cred.outcome,
+                            "evidence": cred.evidence or [],
+                            "signature": cred.signature,
+                            "issued_at": cred.issued_at,
+                            "expires_at": cred.expires_at,
+                        }
+                        msg = create_did_credential_present(
+                            sender_id=self.our_pubkey,
+                            credential=cred_dict,
+                        )
+                        broadcast_fn(msg)
+                    except Exception as e:
+                        self._log(f"auto_issue: broadcast error: {e}", "warn")
+
+        if issued > 0:
+            self._log(f"auto-issued {issued} hive:node credentials")
+        return issued
+
+    def _compute_node_metrics(
+        self,
+        peer_id: str,
+        peer_state,
+        contribution_tracker,
+        now: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Compute hive:node metrics from available peer data."""
+        metrics = {}
+
+        # Uptime: based on last_update freshness
+        last_update = getattr(peer_state, 'last_update', 0)
+        if last_update <= 0:
+            return None  # No state data
+
+        # Estimate uptime as fraction of time peer has been active
+        # (updated within stale threshold of 1 hour)
+        staleness = now - last_update
+        if staleness < 3600:
+            uptime = 0.99
+        elif staleness < 7200:
+            uptime = 0.9
+        elif staleness < 86400:
+            uptime = 0.7
+        else:
+            uptime = 0.3
+        metrics["uptime"] = round(uptime, 3)
+
+        # Routing reliability from contribution stats
+        if contribution_tracker:
+            try:
+                stats = contribution_tracker.get_contribution_stats(peer_id, window_days=30)
+                forwarded = stats.get("forwarded", 0)
+                received = stats.get("received", 0)
+                total = forwarded + received
+                if total > 0:
+                    metrics["routing_reliability"] = round(min(forwarded / max(total, 1), 1.0), 3)
+                else:
+                    metrics["routing_reliability"] = 0.5  # No data
+            except Exception:
+                metrics["routing_reliability"] = 0.5
+        else:
+            metrics["routing_reliability"] = 0.5  # Default
+
+        # HTLC success rate: derived from forward count vs capacity utilization
+        forward_count = getattr(peer_state, 'fees_forward_count', 0)
+        if forward_count > 100:
+            metrics["htlc_success_rate"] = 0.95
+        elif forward_count > 10:
+            metrics["htlc_success_rate"] = 0.85
+        elif forward_count > 0:
+            metrics["htlc_success_rate"] = 0.7
+        else:
+            metrics["htlc_success_rate"] = 0.5
+
+        # Average fee PPM from fee policy
+        fee_policy = getattr(peer_state, 'fee_policy', {})
+        if isinstance(fee_policy, dict):
+            metrics["avg_fee_ppm"] = fee_policy.get("fee_ppm", 0)
+        else:
+            metrics["avg_fee_ppm"] = 0
+
+        # Optional metrics
+        metrics["capacity_sats"] = getattr(peer_state, 'capacity_sats', 0)
+        metrics["forward_count"] = forward_count
+
+        return metrics
+
+    def rebroadcast_own_credentials(self, broadcast_fn=None) -> int:
+        """
+        Rebroadcast our issued credentials to fleet members.
+
+        Used periodically (every 4 hours) to ensure new members receive
+        existing credentials.
+
+        Args:
+            broadcast_fn: Callable(bytes) -> int to broadcast to fleet
+
+        Returns:
+            Number of credentials rebroadcast
+        """
+        if not broadcast_fn or not self.our_pubkey:
+            return 0
+
+        credentials = self.get_credentials_for_relay()
+        if not credentials:
+            return 0
+
+        from modules.protocol import create_did_credential_present
+
+        count = 0
+        for cred in credentials:
+            try:
+                # Convert DB row to credential dict for protocol message
+                metrics = cred.get("metrics_json", "{}")
+                if isinstance(metrics, str):
+                    metrics = json.loads(metrics)
+
+                evidence = cred.get("evidence_json")
+                if isinstance(evidence, str):
+                    try:
+                        evidence = json.loads(evidence)
+                    except (json.JSONDecodeError, TypeError):
+                        evidence = []
+                elif evidence is None:
+                    evidence = []
+
+                cred_dict = {
+                    "credential_id": cred["credential_id"],
+                    "issuer_id": cred["issuer_id"],
+                    "subject_id": cred["subject_id"],
+                    "domain": cred["domain"],
+                    "period_start": cred["period_start"],
+                    "period_end": cred["period_end"],
+                    "metrics": metrics,
+                    "outcome": cred.get("outcome", "neutral"),
+                    "evidence": evidence,
+                    "signature": cred["signature"],
+                    "issued_at": cred.get("issued_at", 0),
+                    "expires_at": cred.get("expires_at"),
+                }
+                msg = create_did_credential_present(
+                    sender_id=self.our_pubkey,
+                    credential=cred_dict,
+                )
+                broadcast_fn(msg)
+                count += 1
+            except Exception as e:
+                self._log(f"rebroadcast error for {cred.get('credential_id', '?')[:8]}...: {e}", "warn")
+
+        if count > 0:
+            self._log(f"rebroadcast {count} credentials to fleet")
+        return count
+
     # --- Internal Helpers ---
 
     def _get_issuer_weight(self, issuer_id: str, subject_id: str) -> float:

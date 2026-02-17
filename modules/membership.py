@@ -43,6 +43,7 @@ class MembershipManager:
         self.config = config
         self.plugin = plugin
         self.metrics_calculator = metrics_calculator
+        self.did_credential_mgr = None  # Set after DID init (Phase 16)
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
@@ -219,8 +220,17 @@ class MembershipManager:
         hive_centrality = hive_metrics.get("hive_centrality", 0.0)
         hive_peer_count = hive_metrics.get("hive_peer_count", 0)
 
-        # Check for fast-track eligibility (high connectivity)
+        # Phase 16: Get DID reputation tier (supplementary signal)
+        reputation_tier = "newcomer"
+        if self.did_credential_mgr:
+            try:
+                reputation_tier = self.did_credential_mgr.get_credit_tier(peer_id)
+            except Exception:
+                pass
+
+        # Check for fast-track eligibility (high connectivity or strong reputation)
         fast_track_eligible = False
+        fast_track_reason = None
         fast_track_min_days = 30
         if hive_centrality >= 0.5:
             joined_at = member.get("joined_at")
@@ -228,6 +238,16 @@ class MembershipManager:
                 days_as_member = (int(time.time()) - joined_at) / (24 * 3600)
                 if days_as_member >= fast_track_min_days:
                     fast_track_eligible = True
+                    fast_track_reason = "high_hive_centrality"
+
+        # Reputation can also enable fast-track (Trusted/Senior tier)
+        if not fast_track_eligible and reputation_tier in ("trusted", "senior"):
+            joined_at = member.get("joined_at")
+            if joined_at:
+                days_as_member = (int(time.time()) - joined_at) / (24 * 3600)
+                if days_as_member >= fast_track_min_days:
+                    fast_track_eligible = True
+                    fast_track_reason = f"reputation_{reputation_tier}"
 
         # Check probation period (can be bypassed with fast-track)
         probation_complete = self.is_probation_complete(peer_id)
@@ -261,9 +281,10 @@ class MembershipManager:
             "unique_peers": unique_peers,
             "hive_centrality": round(hive_centrality, 3),
             "hive_peer_count": hive_peer_count,
+            "reputation_tier": reputation_tier,
             "fast_track": {
                 "eligible": fast_track_eligible,
-                "reason": "high_hive_centrality" if fast_track_eligible else None,
+                "reason": fast_track_reason,
                 "min_days": fast_track_min_days,
                 "min_centrality": 0.5
             },
@@ -341,9 +362,16 @@ class MembershipManager:
             contrib_score = min(ratio / min_ratio, 1.0) if min_ratio > 0 else 0
             score += contrib_score * 20
 
-            # Hive connectivity bonus (0-20 points)
+            # Hive connectivity bonus (0-15 points)
             hive_centrality = evaluation.get("hive_centrality", 0)
-            score += hive_centrality * 20
+            score += hive_centrality * 15
+
+            # Phase 16: Reputation bonus (0-5 points)
+            reputation_tier = evaluation.get("reputation_tier", "newcomer")
+            _rep_points = {
+                "newcomer": 0, "recognized": 2, "trusted": 4, "senior": 5
+            }
+            score += _rep_points.get(reputation_tier, 0)
 
             neophytes.append({
                 "peer_id": peer_id,
@@ -356,6 +384,7 @@ class MembershipManager:
                 "contribution_ratio": evaluation.get("contribution_ratio", 0),
                 "hive_centrality": hive_centrality,
                 "hive_peer_count": evaluation.get("hive_peer_count", 0),
+                "reputation_tier": reputation_tier,
                 "blocking_reasons": evaluation.get("reasons", [])
             })
 

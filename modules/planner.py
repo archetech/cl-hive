@@ -153,6 +153,7 @@ class UnderservedResult:
     quality_score: float = 0.5  # Peer quality score (Phase 6.2)
     quality_confidence: float = 0.0  # Confidence in quality score
     quality_recommendation: str = "neutral"  # Quality recommendation
+    reputation_tier: str = "newcomer"  # DID reputation tier (Phase 16)
 
 
 @dataclass
@@ -672,6 +673,9 @@ class Planner:
             self.quality_scorer = PeerQualityScorer(database, plugin)
         else:
             self.quality_scorer = None
+
+        # DID credential manager for reputation checks (Phase 16)
+        self.did_credential_mgr = None
 
         # Network cache (refreshed each cycle).
         # NOTE: Only accessed from planner_loop's single thread — no snapshot needed.
@@ -1705,7 +1709,20 @@ class Planner:
                 # Low confidence - use neutral multiplier
                 quality_multiplier = 1.0
 
-            combined_score = adjusted_score * quality_multiplier
+            # Phase 16: Reputation boost — prefer targets with Recognized+ tier
+            reputation_tier = "newcomer"
+            if self.did_credential_mgr:
+                try:
+                    reputation_tier = self.did_credential_mgr.get_credit_tier(target)
+                except Exception:
+                    pass
+            # Reputation multiplier: newcomer=1.0, recognized=1.1, trusted=1.2, senior=1.3
+            _rep_multipliers = {
+                "newcomer": 1.0, "recognized": 1.1, "trusted": 1.2, "senior": 1.3
+            }
+            reputation_multiplier = _rep_multipliers.get(reputation_tier, 1.0)
+
+            combined_score = adjusted_score * quality_multiplier * reputation_multiplier
 
             underserved.append(UnderservedResult(
                 target=target,
@@ -1714,7 +1731,8 @@ class Planner:
                 score=combined_score,
                 quality_score=quality_score,
                 quality_confidence=quality_confidence,
-                quality_recommendation=quality_recommendation
+                quality_recommendation=quality_recommendation,
+                reputation_tier=reputation_tier,
             ))
 
         # Sort by combined score (highest first)
@@ -2168,6 +2186,7 @@ class Planner:
                     'quality_score': round(selected_target.quality_score, 3),
                     'quality_confidence': round(selected_target.quality_confidence, 3),
                     'quality_recommendation': selected_target.quality_recommendation,
+                    'reputation_tier': selected_target.reputation_tier,
                     'onchain_balance': onchain_balance,
                     'run_id': run_id
                 }

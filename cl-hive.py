@@ -1860,6 +1860,18 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Management schema registry initialized")
 
+    # Wire DID credential manager into planner for reputation-weighted expansion
+    if planner and did_credential_mgr:
+        planner.did_credential_mgr = did_credential_mgr
+
+    # Wire DID credential manager into membership manager for promotion signals
+    if membership_mgr and did_credential_mgr:
+        membership_mgr.did_credential_mgr = did_credential_mgr
+
+    # Wire DID credential manager into settlement manager for reputation metadata
+    if settlement_mgr and did_credential_mgr:
+        settlement_mgr.did_credential_mgr = did_credential_mgr
+
     # Start DID maintenance background thread
     did_maintenance_thread = threading.Thread(
         target=did_maintenance_loop,
@@ -2210,6 +2222,11 @@ def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Pl
             handle_did_credential_present(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.DID_CREDENTIAL_REVOKE:
             handle_did_credential_revoke(peer_id, msg_payload, plugin)
+        # Phase 16: Management Credentials
+        elif msg_type == HiveMessageType.MGMT_CREDENTIAL_PRESENT:
+            handle_mgmt_credential_present(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.MGMT_CREDENTIAL_REVOKE:
+            handle_mgmt_credential_revoke(peer_id, msg_payload, plugin)
         else:
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
 
@@ -4060,10 +4077,80 @@ def handle_did_credential_revoke(peer_id: str, payload: Dict, plugin) -> Dict:
     return {"result": "continue"}
 
 
+def handle_mgmt_credential_present(peer_id: str, payload: Dict, plugin) -> Dict:
+    """Handle incoming MGMT_CREDENTIAL_PRESENT from a peer."""
+    from modules.protocol import validate_mgmt_credential_present
+
+    if not validate_mgmt_credential_present(payload):
+        plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT invalid payload from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Identity binding: sender_id must match peer_id
+    sender_id = payload.get("sender_id", "")
+    if sender_id != peer_id:
+        plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT identity mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # Dedup via proto_events
+    if database:
+        is_new, _eid = check_and_record(database, "MGMT_CREDENTIAL_PRESENT", payload, peer_id)
+        if not is_new:
+            return {"result": "continue"}
+
+    # Membership check
+    if database:
+        member = database.get_member(peer_id)
+        if not member:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+
+    # Process credential
+    if management_schema_registry:
+        management_schema_registry.handle_mgmt_credential_present(peer_id, payload)
+
+    return {"result": "continue"}
+
+
+def handle_mgmt_credential_revoke(peer_id: str, payload: Dict, plugin) -> Dict:
+    """Handle incoming MGMT_CREDENTIAL_REVOKE from a peer."""
+    from modules.protocol import validate_mgmt_credential_revoke
+
+    if not validate_mgmt_credential_revoke(payload):
+        plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE invalid payload from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Identity binding
+    sender_id = payload.get("sender_id", "")
+    if sender_id != peer_id:
+        plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE identity mismatch from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # Dedup
+    if database:
+        is_new, _eid = check_and_record(database, "MGMT_CREDENTIAL_REVOKE", payload, peer_id)
+        if not is_new:
+            return {"result": "continue"}
+
+    # Membership check
+    if database:
+        member = database.get_member(peer_id)
+        if not member:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE from non-member {peer_id[:16]}...", level='debug')
+            return {"result": "continue"}
+
+    # Process revocation
+    if management_schema_registry:
+        management_schema_registry.handle_mgmt_credential_revoke(peer_id, payload)
+
+    return {"result": "continue"}
+
+
 def did_maintenance_loop():
     """Background thread for DID credential maintenance."""
     # Wait for initialization
     shutdown_event.wait(60)
+
+    last_rebroadcast = 0
 
     while not shutdown_event.is_set():
         try:
@@ -4071,11 +4158,27 @@ def did_maintenance_loop():
                 shutdown_event.wait(60)
                 continue
 
+            now = int(time.time())
+
             # 1. Cleanup expired credentials
             did_credential_mgr.cleanup_expired()
 
             # 2. Refresh stale aggregation cache entries
             did_credential_mgr.refresh_stale_aggregations()
+
+            # 3. Auto-issue hive:node credentials for peers we have data on
+            did_credential_mgr.auto_issue_node_credentials(
+                state_manager=state_manager,
+                contribution_tracker=contribution_mgr,
+                broadcast_fn=_broadcast_to_members,
+            )
+
+            # 4. Rebroadcast our credentials periodically (every 4h)
+            if now - last_rebroadcast >= did_credential_mgr.REBROADCAST_INTERVAL:
+                did_credential_mgr.rebroadcast_own_credentials(
+                    broadcast_fn=_broadcast_to_members,
+                )
+                last_rebroadcast = now
 
         except Exception as e:
             plugin.log(f"cl-hive: did_maintenance_loop error: {e}", level='warn')

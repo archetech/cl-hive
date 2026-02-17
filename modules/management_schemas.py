@@ -952,3 +952,206 @@ class ManagementSchemaRegistry:
         )
 
         return receipt_id if stored else None
+
+    # --- Protocol Gossip Handlers ---
+
+    def handle_mgmt_credential_present(
+        self, peer_id: str, payload: dict
+    ) -> bool:
+        """
+        Handle an incoming MGMT_CREDENTIAL_PRESENT message.
+
+        Validates credential structure, verifies issuer signature,
+        stores if new, and returns True if accepted.
+        """
+        credential = payload.get("credential")
+        if not isinstance(credential, dict):
+            self._log("invalid mgmt_credential_present: missing credential dict", "warn")
+            return False
+
+        # Extract fields
+        credential_id = credential.get("credential_id")
+        if not credential_id or not isinstance(credential_id, str):
+            self._log("mgmt_credential_present: missing credential_id", "warn")
+            return False
+
+        issuer_id = credential.get("issuer_id", "")
+        agent_id = credential.get("agent_id", "")
+        node_id = credential.get("node_id", "")
+        tier = credential.get("tier", "")
+        allowed_schemas = credential.get("allowed_schemas", [])
+        constraints = credential.get("constraints", {})
+        valid_from = credential.get("valid_from", 0)
+        valid_until = credential.get("valid_until", 0)
+        signature = credential.get("signature", "")
+
+        # Basic field validation
+        if tier not in VALID_TIERS:
+            self._log(f"mgmt_credential_present: invalid tier {tier!r}", "warn")
+            return False
+
+        if not isinstance(allowed_schemas, list) or not allowed_schemas:
+            self._log("mgmt_credential_present: bad allowed_schemas", "warn")
+            return False
+
+        if not isinstance(valid_from, int) or not isinstance(valid_until, int):
+            self._log("mgmt_credential_present: bad validity period", "warn")
+            return False
+
+        if valid_until <= valid_from:
+            self._log("mgmt_credential_present: valid_until <= valid_from", "warn")
+            return False
+
+        # Self-issuance of management credential: issuer == agent is not
+        # inherently invalid (operator can credential their own agent),
+        # but issuer == node_id is also fine. No self-issuance rejection here.
+
+        # Verify issuer signature (fail-closed)
+        if not signature:
+            self._log("mgmt_credential_present: missing signature", "warn")
+            return False
+
+        if not self.rpc:
+            self._log("mgmt_credential_present: no RPC for sig verification", "warn")
+            return False
+
+        # Build signing payload matching get_credential_signing_payload()
+        constraints_for_payload = constraints
+        if isinstance(constraints_for_payload, str):
+            try:
+                constraints_for_payload = json.loads(constraints_for_payload)
+            except (json.JSONDecodeError, TypeError):
+                constraints_for_payload = {}
+
+        signing_data = {
+            "credential_id": credential_id,
+            "issuer_id": issuer_id,
+            "agent_id": agent_id,
+            "node_id": node_id,
+            "tier": tier,
+            "allowed_schemas": allowed_schemas,
+            "constraints": constraints_for_payload,
+            "valid_from": valid_from,
+            "valid_until": valid_until,
+        }
+        signing_payload = json.dumps(signing_data, sort_keys=True, separators=(',', ':'))
+
+        try:
+            result = self.rpc.checkmessage(signing_payload, signature)
+            if isinstance(result, dict):
+                if not result.get("verified", False):
+                    self._log("mgmt_credential_present: signature verification failed", "warn")
+                    return False
+                if result.get("pubkey", "") != issuer_id:
+                    self._log("mgmt_credential_present: signature pubkey mismatch", "warn")
+                    return False
+        except Exception as e:
+            self._log(f"mgmt_credential_present: checkmessage error: {e}", "warn")
+            return False
+
+        # Check row cap
+        count = self.db.count_management_credentials()
+        if count >= MAX_MANAGEMENT_CREDENTIALS:
+            self._log("mgmt credential store at cap, rejecting", "warn")
+            return False
+
+        # Content-level dedup: already have this credential?
+        existing = self.db.get_management_credential(credential_id)
+        if existing:
+            return True  # Idempotent
+
+        # Serialize for storage
+        allowed_schemas_json = json.dumps(allowed_schemas)
+        constraints_json = (
+            constraints if isinstance(constraints, str)
+            else json.dumps(constraints)
+        )
+
+        stored = self.db.store_management_credential(
+            credential_id=credential_id,
+            issuer_id=issuer_id,
+            agent_id=agent_id,
+            node_id=node_id,
+            tier=tier,
+            allowed_schemas_json=allowed_schemas_json,
+            constraints_json=constraints_json,
+            valid_from=valid_from,
+            valid_until=valid_until,
+            signature=signature,
+        )
+
+        if stored:
+            self._log(f"stored mgmt credential {credential_id[:8]}... from {peer_id[:16]}...")
+
+        return stored
+
+    def handle_mgmt_credential_revoke(
+        self, peer_id: str, payload: dict
+    ) -> bool:
+        """
+        Handle an incoming MGMT_CREDENTIAL_REVOKE message.
+
+        Verifies issuer signature and marks credential as revoked.
+        """
+        credential_id = payload.get("credential_id")
+        reason = payload.get("reason", "")
+        issuer_id = payload.get("issuer_id", "")
+        signature = payload.get("signature", "")
+
+        if not credential_id or not isinstance(credential_id, str):
+            self._log("invalid mgmt_credential_revoke: missing credential_id", "warn")
+            return False
+
+        if not reason or len(reason) > 500:
+            self._log("invalid mgmt_credential_revoke: bad reason", "warn")
+            return False
+
+        # Fetch credential
+        cred = self.db.get_management_credential(credential_id)
+        if not cred:
+            self._log(f"mgmt revoke: credential {credential_id[:8]}... not found", "debug")
+            return False
+
+        # Verify issuer matches
+        if cred.get("issuer_id") != issuer_id:
+            self._log(f"mgmt revoke: issuer mismatch for {credential_id[:8]}...", "warn")
+            return False
+
+        # Already revoked?
+        if cred.get("revoked_at") is not None:
+            return True  # Idempotent
+
+        # Verify revocation signature (fail-closed)
+        if not signature:
+            self._log("mgmt revoke: missing signature", "warn")
+            return False
+        if not self.rpc:
+            self._log("mgmt revoke: no RPC for signature verification", "warn")
+            return False
+
+        revoke_payload = json.dumps({
+            "credential_id": credential_id,
+            "action": "mgmt_revoke",
+            "reason": reason,
+        }, sort_keys=True, separators=(',', ':'))
+
+        try:
+            result = self.rpc.checkmessage(revoke_payload, signature)
+            if isinstance(result, dict):
+                if not result.get("verified", False):
+                    self._log("mgmt revoke: signature verification failed", "warn")
+                    return False
+                if result.get("pubkey", "") != issuer_id:
+                    self._log("mgmt revoke: signature pubkey mismatch", "warn")
+                    return False
+        except Exception as e:
+            self._log(f"mgmt revoke: checkmessage error: {e}", "warn")
+            return False
+
+        now = int(time.time())
+        success = self.db.revoke_management_credential(credential_id, now)
+
+        if success:
+            self._log(f"processed mgmt revocation for {credential_id[:8]}...")
+
+        return success

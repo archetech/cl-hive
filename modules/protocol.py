@@ -162,6 +162,10 @@ class HiveMessageType(IntEnum):
     DID_CREDENTIAL_PRESENT = 32883  # Gossip a DID credential to hive members
     DID_CREDENTIAL_REVOKE = 32885   # Announce credential revocation
 
+    # Phase 16: Management Credentials
+    MGMT_CREDENTIAL_PRESENT = 32887  # Share a management credential with hive
+    MGMT_CREDENTIAL_REVOKE = 32889   # Announce management credential revocation
+
 
 # =============================================================================
 # PHASE D: RELIABLE DELIVERY CONSTANTS
@@ -187,6 +191,8 @@ RELIABLE_MESSAGE_TYPES = frozenset({
     HiveMessageType.SPLICE_ABORT,
     HiveMessageType.DID_CREDENTIAL_PRESENT,
     HiveMessageType.DID_CREDENTIAL_REVOKE,
+    HiveMessageType.MGMT_CREDENTIAL_PRESENT,
+    HiveMessageType.MGMT_CREDENTIAL_REVOKE,
 })
 
 # Implicit ack mapping: response type -> request type it satisfies
@@ -6249,5 +6255,229 @@ def get_did_credential_revoke_signing_payload(credential_id: str, reason: str) -
     return json.dumps({
         "credential_id": credential_id,
         "action": "revoke",
+        "reason": reason,
+    }, sort_keys=True, separators=(',', ':'))
+
+
+# =============================================================================
+# PHASE 16: MANAGEMENT CREDENTIAL MESSAGES
+# =============================================================================
+
+# Rate limits
+MGMT_CREDENTIAL_PRESENT_RATE_LIMIT = 60    # seconds between mgmt credential presents per peer
+MGMT_CREDENTIAL_REVOKE_RATE_LIMIT = 60     # seconds between mgmt revoke messages per peer
+
+# Size limits
+MAX_MGMT_ALLOWED_SCHEMAS_LEN = 4096
+MAX_MGMT_CONSTRAINTS_LEN = 4096
+
+VALID_MGMT_TIERS = frozenset(["monitor", "standard", "advanced", "admin"])
+
+
+def create_mgmt_credential_present(
+    sender_id: str,
+    credential: dict,
+    event_id: str = "",
+    timestamp: int = 0,
+) -> bytes:
+    """Create a MGMT_CREDENTIAL_PRESENT message to share a management credential."""
+    if not timestamp:
+        import time
+        timestamp = int(time.time())
+    if not event_id:
+        import uuid
+        event_id = str(uuid.uuid4())
+
+    return serialize(HiveMessageType.MGMT_CREDENTIAL_PRESENT, {
+        "sender_id": sender_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "credential": credential,
+    })
+
+
+def validate_mgmt_credential_present(payload: dict) -> bool:
+    """Validate MGMT_CREDENTIAL_PRESENT payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not sender_id:
+        return False
+    if not _valid_pubkey(sender_id):
+        return False
+
+    event_id = payload.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    credential = payload.get("credential")
+    if not isinstance(credential, dict):
+        return False
+
+    # Validate required credential fields
+    for field in ["credential_id", "issuer_id", "agent_id", "node_id",
+                  "tier", "allowed_schemas", "constraints",
+                  "valid_from", "valid_until", "signature"]:
+        if field not in credential:
+            return False
+
+    credential_id = credential.get("credential_id")
+    if not isinstance(credential_id, str) or not credential_id or len(credential_id) > 64:
+        return False
+
+    issuer_id = credential.get("issuer_id")
+    if not isinstance(issuer_id, str) or not _valid_pubkey(issuer_id):
+        return False
+
+    agent_id = credential.get("agent_id")
+    if not isinstance(agent_id, str) or not _valid_pubkey(agent_id):
+        return False
+
+    node_id = credential.get("node_id")
+    if not isinstance(node_id, str) or not _valid_pubkey(node_id):
+        return False
+
+    tier = credential.get("tier")
+    if tier not in VALID_MGMT_TIERS:
+        return False
+
+    allowed_schemas = credential.get("allowed_schemas")
+    if not isinstance(allowed_schemas, list):
+        return False
+    import json as _json
+    try:
+        schemas_json = _json.dumps(allowed_schemas, separators=(',', ':'))
+        if len(schemas_json) > MAX_MGMT_ALLOWED_SCHEMAS_LEN:
+            return False
+    except (TypeError, ValueError):
+        return False
+    for s in allowed_schemas:
+        if not isinstance(s, str) or not s:
+            return False
+
+    constraints = credential.get("constraints")
+    if not isinstance(constraints, (dict, str)):
+        return False
+    try:
+        if isinstance(constraints, dict):
+            constraints_json = _json.dumps(constraints, separators=(',', ':'))
+        else:
+            constraints_json = constraints
+        if len(constraints_json) > MAX_MGMT_CONSTRAINTS_LEN:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    valid_from = credential.get("valid_from")
+    valid_until = credential.get("valid_until")
+    if not isinstance(valid_from, int) or not isinstance(valid_until, int):
+        return False
+    if valid_until <= valid_from:
+        return False
+
+    signature = credential.get("signature")
+    if not isinstance(signature, str) or not signature:
+        return False
+
+    return True
+
+
+def get_mgmt_credential_present_signing_payload(payload: dict) -> str:
+    """Get deterministic signing payload from a management credential present message."""
+    import json
+    credential = payload.get("credential", {})
+    signing_data = {
+        "credential_id": credential.get("credential_id", ""),
+        "issuer_id": credential.get("issuer_id", ""),
+        "agent_id": credential.get("agent_id", ""),
+        "node_id": credential.get("node_id", ""),
+        "tier": credential.get("tier", ""),
+        "allowed_schemas": credential.get("allowed_schemas", []),
+        "constraints": credential.get("constraints", {}),
+        "valid_from": credential.get("valid_from", 0),
+        "valid_until": credential.get("valid_until", 0),
+    }
+    return json.dumps(signing_data, sort_keys=True, separators=(',', ':'))
+
+
+def create_mgmt_credential_revoke(
+    sender_id: str,
+    credential_id: str,
+    issuer_id: str,
+    reason: str,
+    signature: str,
+    event_id: str = "",
+    timestamp: int = 0,
+) -> bytes:
+    """Create a MGMT_CREDENTIAL_REVOKE message."""
+    if not timestamp:
+        import time
+        timestamp = int(time.time())
+    if not event_id:
+        import uuid
+        event_id = str(uuid.uuid4())
+
+    return serialize(HiveMessageType.MGMT_CREDENTIAL_REVOKE, {
+        "sender_id": sender_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "credential_id": credential_id,
+        "issuer_id": issuer_id,
+        "reason": reason,
+        "signature": signature,
+    })
+
+
+def validate_mgmt_credential_revoke(payload: dict) -> bool:
+    """Validate MGMT_CREDENTIAL_REVOKE payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not sender_id:
+        return False
+    if not _valid_pubkey(sender_id):
+        return False
+
+    event_id = payload.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    credential_id = payload.get("credential_id")
+    if not isinstance(credential_id, str) or not credential_id:
+        return False
+
+    issuer_id = payload.get("issuer_id")
+    if not isinstance(issuer_id, str) or not _valid_pubkey(issuer_id):
+        return False
+
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason:
+        return False
+    if len(reason) > MAX_REVOCATION_REASON_LEN:
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str) or not signature:
+        return False
+
+    return True
+
+
+def get_mgmt_credential_revoke_signing_payload(credential_id: str, reason: str) -> str:
+    """Get deterministic signing payload for a management credential revocation."""
+    import json
+    return json.dumps({
+        "credential_id": credential_id,
+        "action": "mgmt_revoke",
         "reason": reason,
     }, sort_keys=True, separators=(',', ':'))

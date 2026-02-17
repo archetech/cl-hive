@@ -152,6 +152,7 @@ class SettlementManager:
         self.plugin = plugin
         self.rpc = rpc
         self._local = threading.local()
+        self.did_credential_mgr = None  # Set after DID init (Phase 16)
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get thread-local database connection."""
@@ -1103,6 +1104,14 @@ class SettlementManager:
             except Exception:
                 uptime = 100
 
+            # Phase 16: Get reputation tier for settlement terms metadata
+            reputation_tier = "newcomer"
+            if self.did_credential_mgr:
+                try:
+                    reputation_tier = self.did_credential_mgr.get_credit_tier(peer_id)
+                except Exception:
+                    pass
+
             contributions.append({
                 'peer_id': peer_id,
                 'fees_earned': fees_earned,
@@ -1110,6 +1119,7 @@ class SettlementManager:
                 'capacity': peer_state.capacity_sats if peer_state else 0,
                 'uptime': uptime,
                 'forward_count': forward_count,
+                'reputation_tier': reputation_tier,
             })
 
         return contributions

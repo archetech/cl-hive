@@ -49,6 +49,12 @@ EVENT_ID_FIELDS: Dict[str, list] = {
     "DID_CREDENTIAL_PRESENT": ["event_id"],
     # REVOKE: use domain-specific fields for content-based dedup
     "DID_CREDENTIAL_REVOKE": ["credential_id", "issuer_id"],
+    # Phase 16: Management Credentials
+    # PRESENT: event_id is sender-generated UUID; handler has content-level
+    # dedup via credential_id check in store_management_credential.
+    "MGMT_CREDENTIAL_PRESENT": ["event_id"],
+    # REVOKE: use domain-specific fields for content-based dedup
+    "MGMT_CREDENTIAL_REVOKE": ["credential_id", "issuer_id"],
 }
 
 
