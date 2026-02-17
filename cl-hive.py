@@ -1841,6 +1841,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     plugin.log("cl-hive: Outbox retry thread started")
 
     # Phase 16: DID Credential Manager
+    global did_credential_mgr
     did_credential_mgr = DIDCredentialManager(
         database=database,
         plugin=plugin,
