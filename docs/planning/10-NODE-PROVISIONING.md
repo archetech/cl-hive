@@ -244,15 +244,21 @@ Three strategies, in priority order:
    ```
    The UTXO snapshot is ~10GB and can be downloaded from any source — the hash is compiled into the binary, so it's trustless. Fleet nodes can host snapshots for fast provisioning.
 
-   **Creating and hosting fleet snapshots:**
+   **Creating and hosting fleet snapshots via Archon (IPFS):**
    ```bash
    # On any fully-synced fleet node, create a snapshot:
    bitcoin-cli dumptxoutset /var/lib/bitcoind/utxo-snapshot.dat
-   # → Produces a ~10GB file with a hash matching the one hardcoded in Bitcoin Core
-   # → This file can be served to new nodes over HTTP, rsync, or IPFS
-   # → Because the hash is compiled into the binary, ANY source is equally trustless
+
+   # Pin to IPFS via Archon — content-addressed, globally available:
+   archon ipfs pin /var/lib/bitcoind/utxo-snapshot.dat
+   # → Returns CID (e.g. bafybeig5...)
+   # → Archon's IPFS layer handles replication across fleet nodes
+
+   # Publish CID to fleet so provisioning agents can find it:
+   archon credential issue --type "HiveSnapshotPointer" \
+     --data '{"cid":"bafybeig5...","block_height":840000,"bitcoin_core":"28.x"}'
    ```
-   Fleet nodes SHOULD host the latest snapshot for their Bitcoin Core version. The provisioning agent downloads from the nearest fleet peer, verifies the hash matches what's hardcoded in the binary, and loads it. No trust required beyond the Bitcoin Core binary itself.
+   Archon's IPFS storage is ideal here: content-addressing provides integrity verification independent of source, and fleet nodes automatically replicate pinned content. The snapshot requires no encryption — it's public data with tamper-proofing built into the Bitcoin Core binary (hardcoded hash). The provisioning agent resolves the CID from Archon, fetches via IPFS, and loads it. No trust required beyond the Bitcoin Core binary itself.
 
 2. **Pre-synced datadir snapshot (fallback):**
    ```bash
