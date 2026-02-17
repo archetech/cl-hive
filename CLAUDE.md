@@ -41,7 +41,7 @@ Core Lightning
 - **cl-revenue-ops**: Executes fee policies and rebalancing (called via RPC)
 - **Core Lightning**: Underlying node operations and HSM-based crypto
 
-### Module Organization (39 modules)
+### Module Organization (40 modules)
 
 | Module | Purpose |
 |--------|---------|
@@ -83,7 +83,8 @@ Core Lightning
 | `yield_metrics.py` | Yield tracking and optimization metrics |
 | `governance.py` | Decision engine (advisor/failsafe mode routing) |
 | `config.py` | Hot-reloadable configuration with snapshot pattern |
-| `database.py` | SQLite with WAL mode, thread-local connections, 46 tables |
+| `did_credentials.py` | DID credential issuance, verification, reputation aggregation (Phase 16) |
+| `database.py` | SQLite with WAL mode, thread-local connections, 48 tables |
 
 ### Key Patterns
 
@@ -125,7 +126,7 @@ Core Lightning
 | `advisor` | **Primary mode** - Queue to pending_actions for AI/human approval via MCP server |
 | `failsafe` | Emergency mode - Auto-execute only critical safety actions (bans) within strict limits |
 
-### Database Tables (46 tables)
+### Database Tables (48 tables)
 
 Key tables (see `database.py` for complete schema):
 
@@ -155,6 +156,8 @@ Key tables (see `database.py` for complete schema):
 | `proto_outbox` | Reliable message delivery outbox |
 | `peer_presence` | Peer online/offline tracking |
 | `peer_capabilities` | Peer protocol capabilities |
+| `did_credentials` | DID reputation credentials (issued and received) |
+| `did_reputation_cache` | Cached aggregated reputation scores |
 
 ## Safety Constraints
 
@@ -210,7 +213,7 @@ Note: Sling IS required for cl-revenue-ops itself.
 - Only external dependency: `pyln-client>=24.0`
 - All crypto done via CLN HSM (signmessage/checkmessage) - no crypto libs imported
 - Plugin options defined at top of `cl-hive.py` (30 configurable parameters)
-- Background loops (8): gossip_loop, membership_maintenance_loop, planner_loop, intent_monitor_loop, fee_intelligence_loop, settlement_loop, mcf_optimization_loop, outbox_retry_loop
+- Background loops (9): gossip_loop, membership_maintenance_loop, planner_loop, intent_monitor_loop, fee_intelligence_loop, settlement_loop, mcf_optimization_loop, outbox_retry_loop, did_maintenance_loop
 
 ## Testing Conventions
 
@@ -262,8 +265,9 @@ cl-hive/
 │   ├── vpn_transport.py    # VPN transport layer
 │   ├── rpc_commands.py     # RPC command handlers
 │   ├── governance.py       # Decision engine (advisor/failsafe)
+│   ├── did_credentials.py  # DID credential issuance + reputation (Phase 16)
 │   ├── config.py           # Configuration
-│   └── database.py         # Database layer (46 tables)
+│   └── database.py         # Database layer (48 tables)
 ├── tools/
 │   ├── mcp-hive-server.py  # MCP server for Claude Code integration
 │   ├── hive-monitor.py     # Real-time monitoring daemon
@@ -271,7 +275,7 @@ cl-hive/
 ├── config/
 │   ├── nodes.rest.example.json    # REST API config example
 │   └── nodes.docker.example.json  # Docker/Polar config example
-├── tests/                  # 1,340 tests across 46 files
+├── tests/                  # 1,826 tests across 47 files
 ├── docs/                   # Documentation
 │   ├── design/             # Design documents
 │   ├── planning/           # Implementation plans
