@@ -296,6 +296,33 @@ class TestProposalCreation:
 
         assert proposal is None
 
+    def test_create_proposal_skips_zero_fee_period(
+        self, settlement_manager, mock_database, mock_rpc
+    ):
+        """Should skip creating proposals when total_fees_sats is zero."""
+        mock_state_manager = MagicMock()
+        mock_state_manager.get_peer_state.return_value = None
+        mock_state_manager.get_peer_fees.return_value = {
+            "fees_earned_sats": 0,
+            "forward_count": 0,
+            "rebalance_costs_sats": 0,
+        }
+        mock_database.get_all_members.return_value = [
+            {'peer_id': '02' + 'a' * 64, 'tier': 'member', 'uptime_pct': 99.5},
+            {'peer_id': '02' + 'b' * 64, 'tier': 'member', 'uptime_pct': 98.0},
+        ]
+        mock_database.get_fee_reports_for_period.return_value = []
+
+        proposal = settlement_manager.create_proposal(
+            period="2024-05",
+            our_peer_id='02' + 'a' * 64,
+            state_manager=mock_state_manager,
+            rpc=mock_rpc
+        )
+
+        assert proposal is None
+        mock_database.add_settlement_proposal.assert_not_called()
+
 
 # =============================================================================
 # VOTING TESTS

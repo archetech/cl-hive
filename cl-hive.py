@@ -3503,11 +3503,32 @@ def on_peer_disconnected(**kwargs):
     database.update_presence(peer_id, is_online=False, now_ts=now, window_seconds=30 * 86400)
 
 
+def _parse_msat_value(value: Any) -> int:
+    """
+    Parse msat values from CLN notifications (int, "123msat", nested dict).
+    """
+    for _ in range(3):  # bounded unwrapping for nested {"msat": "..."}
+        if isinstance(value, int):
+            return value
+        if isinstance(value, dict) and "msat" in value:
+            value = value.get("msat")
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if text.endswith("msat"):
+                text = text[:-4]
+            return int(text) if text.isdigit() else 0
+        break
+    return 0
+
+
 @plugin.subscribe("forward_event")
 def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
     """Track forwarding events for contribution, leech detection, and route probing."""
     status = forward_event.get("status", "unknown")
-    fee_msat = forward_event.get("fee_msat", 0)
+    fee_msat = _parse_msat_value(
+        forward_event.get("fee_msat", forward_event.get("fee_msatoshi", 0))
+    )
 
     # Handle contribution tracking
     if contribution_mgr:
@@ -3530,7 +3551,9 @@ def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
     if routing_pool and our_pubkey:
         try:
             if status == "settled":
-                fee_msat = forward_event.get("fee_msat", 0)
+                fee_msat = _parse_msat_value(
+                    forward_event.get("fee_msat", forward_event.get("fee_msatoshi", 0))
+                )
                 fee_sats = fee_msat // 1000
                 if fee_msat > 0 and fee_sats > 0:
                     routing_pool.record_revenue(
@@ -9098,8 +9121,21 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
         f"SETTLEMENT: Received proposal {proposal_id[:16]}... for {period} from {peer_id[:16]}..."
     )
 
-    # Store the proposal if we don't have one for this period
-    if not database.get_settlement_proposal_by_period(period):
+    # Store the proposal if we don't have one for this period.
+    # If we already have a different proposal_id for the same period, ignore
+    # this payload for local voting/execution to avoid orphaned votes.
+    existing_for_period = database.get_settlement_proposal_by_period(period)
+    if existing_for_period and existing_for_period.get("proposal_id") != proposal_id:
+        plugin.log(
+            f"SETTLEMENT: Ignoring competing proposal {proposal_id[:16]}... for {period}; "
+            f"already tracking {existing_for_period.get('proposal_id', '')[:16]}...",
+            level='warn'
+        )
+        _emit_ack(peer_id, payload.get("_event_id"))
+        _relay_message(HiveMessageType.SETTLEMENT_PROPOSE, payload, peer_id)
+        return {"result": "continue"}
+
+    if not existing_for_period:
         database.add_settlement_proposal(
             proposal_id=proposal_id,
             period=period,
@@ -9327,6 +9363,14 @@ def handle_settlement_executed(peer_id: str, payload: Dict, plugin: Plugin) -> D
     payment_hash = payload.get("payment_hash")
     plan_hash = payload.get("plan_hash")
     amount_paid = payload.get("total_sent_sats", payload.get("amount_paid_sats", 0)) or 0
+
+    # Ignore executions for unknown proposals.
+    if not database.get_settlement_proposal(proposal_id):
+        plugin.log(
+            f"cl-hive: SETTLEMENT_EXECUTED for unknown proposal {proposal_id[:16]}...",
+            level='debug'
+        )
+        return {"result": "continue"}
 
     # Record the execution
     if database.add_settlement_execution(
@@ -11005,6 +11049,27 @@ def settlement_loop():
             if not settlement_mgr or not database or not state_manager or not plugin or not our_pubkey:
                 shutdown_event.wait(60)
                 continue
+
+            # Step 0: Ensure routing-pool contribution snapshots exist for current
+            # and previous settlement periods. This keeps hive-pool-status usable
+            # without requiring manual hive-pool-snapshot calls.
+            try:
+                if routing_pool:
+                    current_period = settlement_mgr.get_period_string()
+                    previous_period = settlement_mgr.get_previous_period()
+                    for period_to_snapshot in (current_period, previous_period):
+                        existing = database.get_pool_contributions(period_to_snapshot)
+                        if existing:
+                            continue
+                        snap = routing_pool.snapshot_contributions(period_to_snapshot)
+                        if snap:
+                            plugin.log(
+                                f"SETTLEMENT: Auto-snapshotted routing pool for {period_to_snapshot} "
+                                f"({len(snap)} members)",
+                                level='info'
+                            )
+            except Exception as e:
+                plugin.log(f"SETTLEMENT: Pool snapshot ensure error: {e}", level='warn')
 
             # Step 1: Check if we should propose settlement for previous week
             try:
@@ -16822,65 +16887,34 @@ def hive_settlement_calculate(plugin: Plugin):
             "Settlement requires cl-revenue-ops for accurate fee distribution."
         )
 
-    # Get pool status with member contributions
-    pool_status = routing_pool.get_pool_status()
-    pool_contributions = pool_status.get("contributions", [])
+    # Canonical settlement period and fee-report-driven contribution view.
+    current_period = settlement_mgr.get_period_string()
+    pool_status = routing_pool.get_pool_status(period=current_period)
+    gathered = settlement_mgr.gather_contributions_from_gossip(state_manager, current_period)
 
-    # Convert pool data to MemberContribution objects
     member_contributions = []
-    for contrib in pool_contributions:
-        peer_id = contrib.get("member_id_full", contrib.get("member_id", ""))
+    for contrib in gathered:
+        peer_id = str(contrib.get("peer_id", ""))
         if not peer_id:
             continue
 
-        # Get forwarding stats from contribution ledger
-        contrib_stats = database.get_contribution_stats(peer_id, window_days=7)
-        forwards_sats = contrib_stats.get("forwarded", 0)
-
-        # Get fees earned from gossiped fee reports or local revenue-ops
-        fees_earned = 0
-        if peer_id == node_pubkey:
-            # For our own node, use local revenue-ops (most accurate)
-            if bridge and bridge.status == BridgeStatus.ENABLED:
-                try:
-                    dashboard = bridge.safe_call("revenue-dashboard", {"window_days": 7})
-                    if dashboard and "error" not in dashboard:
-                        period_data = dashboard.get("period", {})
-                        fees_earned = period_data.get("gross_revenue_sats", 0)
-                except Exception:
-                    pass
-            # Fallback to our own gossiped state
-            if fees_earned == 0 and state_manager:
-                peer_fees = state_manager.get_peer_fees(peer_id)
-                fees_earned = peer_fees.get("fees_earned_sats", 0)
-        else:
-            # For other nodes, check persisted fee_reports first (survives restarts)
-            from modules.settlement import SettlementManager
-            current_period = SettlementManager.get_period_string()
-            db_reports = database.get_fee_reports_for_period(current_period)
-            for report in db_reports:
-                if report.get('peer_id') == peer_id:
-                    fees_earned = report.get('fees_earned_sats', 0)
-                    break
-            # Fallback to in-memory state_manager
-            if fees_earned == 0 and state_manager:
-                peer_fees = state_manager.get_peer_fees(peer_id)
-                fees_earned = peer_fees.get("fees_earned_sats", 0)
-            # Final fallback to contribution data
-            if fees_earned == 0:
-                fees_earned = contrib.get("fees_earned_sats", 0)
-
-        # Get BOLT12 offer if registered
+        uptime = int(contrib.get("uptime", 100) or 100)
         offer = settlement_mgr.get_offer(peer_id)
-
         member_contributions.append(MemberContribution(
             peer_id=peer_id,
-            capacity_sats=contrib.get("capacity_sats", 0),
-            forwards_sats=forwards_sats,
-            fees_earned_sats=fees_earned,
-            uptime_pct=contrib.get("uptime_pct", 0.0),
+            capacity_sats=int(contrib.get("capacity", 0) or 0),
+            forwards_sats=int(contrib.get("forward_count", 0) or 0),
+            fees_earned_sats=int(contrib.get("fees_earned", 0) or 0),
+            rebalance_costs_sats=int(contrib.get("rebalance_costs", 0) or 0),
+            uptime_pct=max(0.0, min(1.0, float(uptime) / 100.0)),
             bolt12_offer=offer
         ))
+
+    if not member_contributions:
+        warnings.append(
+            "No settlement contributions found for current period. "
+            "Fee reports may not have been received yet."
+        )
 
     # Validate state data quality
     zero_capacity = sum(1 for c in member_contributions if c.capacity_sats == 0)
@@ -16985,64 +17019,23 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
                       "Ensure cl-revenue-ops plugin is running and bridge is ENABLED."
         }
 
-    # Get pool status with member contributions
-    pool_status = routing_pool.get_pool_status()
-    pool_contributions = pool_status.get("contributions", [])
-    period = pool_status.get("period", "unknown")
+    period = settlement_mgr.get_period_string()
+    gathered = settlement_mgr.gather_contributions_from_gossip(state_manager, period)
 
-    # Convert pool data to MemberContribution objects
     member_contributions = []
-    for contrib in pool_contributions:
-        peer_id = contrib.get("member_id_full", contrib.get("member_id", ""))
+    for contrib in gathered:
+        peer_id = str(contrib.get("peer_id", ""))
         if not peer_id:
             continue
-
-        # Get forwarding stats from contribution ledger
-        contrib_stats = database.get_contribution_stats(peer_id, window_days=7)
-        forwards_sats = contrib_stats.get("forwarded", 0)
-
-        # Get fees earned from gossiped fee reports or local revenue-ops
-        fees_earned = 0
-        if peer_id == node_pubkey:
-            # For our own node, use local revenue-ops (most accurate)
-            if bridge and bridge.status == BridgeStatus.ENABLED:
-                try:
-                    dashboard = bridge.safe_call("revenue-dashboard", {"window_days": 7})
-                    if dashboard and "error" not in dashboard:
-                        period_data = dashboard.get("period", {})
-                        fees_earned = period_data.get("gross_revenue_sats", 0)
-                except Exception:
-                    pass
-            # Fallback to our own gossiped state
-            if fees_earned == 0 and state_manager:
-                peer_fees = state_manager.get_peer_fees(peer_id)
-                fees_earned = peer_fees.get("fees_earned_sats", 0)
-        else:
-            # For other nodes, check persisted fee_reports first (survives restarts)
-            from modules.settlement import SettlementManager
-            current_period = SettlementManager.get_period_string()
-            db_reports = database.get_fee_reports_for_period(current_period)
-            for report in db_reports:
-                if report.get('peer_id') == peer_id:
-                    fees_earned = report.get('fees_earned_sats', 0)
-                    break
-            # Fallback to in-memory state_manager
-            if fees_earned == 0 and state_manager:
-                peer_fees = state_manager.get_peer_fees(peer_id)
-                fees_earned = peer_fees.get("fees_earned_sats", 0)
-            # Final fallback to contribution data
-            if fees_earned == 0:
-                fees_earned = contrib.get("fees_earned_sats", 0)
-
-        # Get BOLT12 offer if registered
+        uptime = int(contrib.get("uptime", 100) or 100)
         offer = settlement_mgr.get_offer(peer_id)
-
         member_contributions.append(MemberContribution(
             peer_id=peer_id,
-            capacity_sats=contrib.get("capacity_sats", 0),
-            forwards_sats=forwards_sats,
-            fees_earned_sats=fees_earned,
-            uptime_pct=contrib.get("uptime_pct", 0.0),  # Already in 0-100 format
+            capacity_sats=int(contrib.get("capacity", 0) or 0),
+            forwards_sats=int(contrib.get("forward_count", 0) or 0),
+            fees_earned_sats=int(contrib.get("fees_earned", 0) or 0),
+            rebalance_costs_sats=int(contrib.get("rebalance_costs", 0) or 0),
+            uptime_pct=max(0.0, min(1.0, float(uptime) / 100.0)),
             bolt12_offer=offer
         ))
 

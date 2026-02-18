@@ -1174,7 +1174,7 @@ def set_mode(ctx: HiveContext, mode: str) -> Dict[str, Any]:
 
     Permission: Member only
     """
-    from modules.config import VALID_GOVERNANCE_MODES
+    from modules.config import VALID_GOVERNANCE_MODES, LEGACY_GOVERNANCE_ALIASES
 
     # Permission check: Member only
     perm_error = check_permission(ctx, 'member')
@@ -1185,7 +1185,8 @@ def set_mode(ctx: HiveContext, mode: str) -> Dict[str, Any]:
         return {"error": "Config not initialized"}
 
     # Validate mode
-    mode_lower = mode.lower()
+    mode_lower = str(mode).strip().lower()
+    mode_lower = LEGACY_GOVERNANCE_ALIASES.get(mode_lower, mode_lower)
     if mode_lower not in VALID_GOVERNANCE_MODES:
         return {
             "error": f"Invalid mode: {mode}",

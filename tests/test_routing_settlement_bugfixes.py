@@ -15,6 +15,7 @@ Covers:
 
 import json
 import time
+import datetime
 import pytest
 from unittest.mock import MagicMock, patch
 from dataclasses import dataclass
@@ -409,3 +410,45 @@ class TestReadOnlyPaths:
         result = pool.calculate_distribution()
 
         assert result == {}
+
+
+# =============================================================================
+# BUG 10: Weekly period parsing and legacy period aliases
+# =============================================================================
+
+class TestPoolPeriodCompatibility:
+    """Bug 10: YYYY-WW periods must map to ISO week (not month)."""
+
+    def test_get_pool_revenue_uses_iso_week_for_yyyy_dash_ww(self, database):
+        """2026-08 should mean ISO week 8, not August 2026."""
+        ts = int(datetime.datetime(2026, 2, 16, 12, 0, tzinfo=datetime.timezone.utc).timestamp())
+        with patch("modules.database.time.time", return_value=ts):
+            database.record_pool_revenue(
+                member_id=PEER_A,
+                amount_sats=123,
+                payment_hash="wk8hash",
+            )
+
+        rev = database.get_pool_revenue(period="2026-08")
+        assert rev["total_sats"] == 123
+        assert rev["transaction_count"] == 1
+
+    def test_legacy_w_period_rows_are_visible_via_canonical_period(self, database):
+        """Rows written as YYYY-WWW must be returned for YYYY-WW lookups."""
+        database.record_pool_contribution(
+            member_id=PEER_A,
+            period="2026-W08",
+            total_capacity_sats=1_000_000,
+            weighted_capacity_sats=900_000,
+            uptime_pct=0.9,
+            betweenness_centrality=0.01,
+            unique_peers=2,
+            bridge_score=0.1,
+            routing_success_rate=0.95,
+            avg_response_time_ms=50.0,
+            pool_share=0.5,
+        )
+
+        rows = database.get_pool_contributions("2026-08")
+        assert len(rows) == 1
+        assert rows[0]["member_id"] == PEER_A
