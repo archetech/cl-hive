@@ -1182,6 +1182,15 @@ class SettlementManager:
         total_fees = plan["total_fees_sats"]
         member_count = len(contributions)
 
+        # Skip zero-fee periods: they add noise to participation metrics and
+        # create "successful" settlements with no economic transfer.
+        if total_fees <= 0:
+            self.plugin.log(
+                f"Skipping settlement proposal for {period}: total_fees_sats=0",
+                level='debug'
+            )
+            return None
+
         # Generate proposal ID
         proposal_id = secrets.token_hex(16)
         timestamp = int(time.time())

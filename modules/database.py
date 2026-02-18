@@ -5548,6 +5548,7 @@ class HiveDatabase:
             True if recorded, False if duplicate
         """
         conn = self._get_connection()
+        normalized_period = self._normalize_pool_period(period)
         try:
             conn.execute("""
                 INSERT OR REPLACE INTO pool_contributions
@@ -5555,7 +5556,7 @@ class HiveDatabase:
                  uptime_pct, betweenness_centrality, unique_peers, bridge_score,
                  routing_success_rate, avg_response_time_ms, pool_share, recorded_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (member_id, period, total_capacity_sats, weighted_capacity_sats,
+            """, (member_id, normalized_period, total_capacity_sats, weighted_capacity_sats,
                   uptime_pct, betweenness_centrality, unique_peers, bridge_score,
                   routing_success_rate, avg_response_time_ms, pool_share,
                   int(time.time())))
@@ -5575,11 +5576,16 @@ class HiveDatabase:
             List of contribution dicts sorted by pool_share descending
         """
         conn = self._get_connection()
-        rows = conn.execute("""
+        aliases = self._period_aliases(period)
+        placeholders = ",".join("?" * len(aliases))
+        rows = conn.execute(
+            f"""
             SELECT * FROM pool_contributions
-            WHERE period = ?
+            WHERE period IN ({placeholders})
             ORDER BY pool_share DESC
-        """, (period,)).fetchall()
+            """,
+            tuple(aliases),
+        ).fetchall()
         return [dict(row) for row in rows]
 
     def get_member_contribution_history(
@@ -5628,13 +5634,14 @@ class HiveDatabase:
             True if recorded
         """
         conn = self._get_connection()
+        normalized_period = self._normalize_pool_period(period)
         try:
             conn.execute("""
                 INSERT OR REPLACE INTO pool_distributions
                 (period, member_id, contribution_share, revenue_share_sats,
                  total_pool_revenue_sats, settled_at)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (period, member_id, contribution_share, revenue_share_sats,
+            """, (normalized_period, member_id, contribution_share, revenue_share_sats,
                   total_pool_revenue_sats, int(time.time())))
             return True
         except sqlite3.Error as e:
@@ -5652,11 +5659,16 @@ class HiveDatabase:
             List of distribution dicts
         """
         conn = self._get_connection()
-        rows = conn.execute("""
+        aliases = self._period_aliases(period)
+        placeholders = ",".join("?" * len(aliases))
+        rows = conn.execute(
+            f"""
             SELECT * FROM pool_distributions
-            WHERE period = ?
+            WHERE period IN ({placeholders})
             ORDER BY revenue_share_sats DESC
-        """, (period,)).fetchall()
+            """,
+            tuple(aliases),
+        ).fetchall()
         return [dict(row) for row in rows]
 
     def get_member_distribution_history(
@@ -5683,13 +5695,49 @@ class HiveDatabase:
         """, (member_id, limit)).fetchall()
         return [dict(row) for row in rows]
 
+    def _normalize_pool_period(self, period: str) -> str:
+        """
+        Normalize pool period to canonical weekly format YYYY-WW.
+
+        Accepts legacy weekly format YYYY-WWW and converts to YYYY-WW.
+        Non-weekly period strings are returned unchanged.
+        """
+        if not isinstance(period, str):
+            return str(period)
+        text = period.strip()
+        parts = text.split("-")
+        if len(parts) == 2 and len(parts[0]) == 4:
+            year_part, week_part = parts
+            if week_part.startswith("W"):
+                week_part = week_part[1:]
+            if week_part.isdigit():
+                week_i = int(week_part)
+                if 1 <= week_i <= 53:
+                    return f"{year_part}-{week_i:02d}"
+        return text
+
+    def _period_aliases(self, period: str) -> List[str]:
+        """
+        Return equivalent period spellings for weekly pool lookups.
+
+        Canonical format is YYYY-WW. Legacy format YYYY-WWW is still accepted.
+        """
+        normalized = self._normalize_pool_period(period)
+        parts = normalized.split("-")
+        if len(parts) == 2 and len(parts[0]) == 4 and parts[1].isdigit():
+            legacy = f"{parts[0]}-W{parts[1]}"
+            if legacy == normalized:
+                return [normalized]
+            return [normalized, legacy]
+        return [normalized]
+
     def _period_to_timestamps(self, period: str) -> tuple:
         """
         Convert period string to start/end timestamps.
 
         Supports formats:
-        - "2025-W03" (ISO week)
-        - "2025-01" (month)
+        - "2025-03" (ISO week, canonical)
+        - "2025-W03" (ISO week, legacy)
         - "2025-01-15" (day)
 
         Returns:
@@ -5697,30 +5745,23 @@ class HiveDatabase:
         """
         import datetime
 
-        if "-W" in period:
-            # ISO week format: 2025-W03
-            year, week = period.split("-W")
+        normalized = self._normalize_pool_period(period)
+        if len(normalized) == 10:
+            # Day format: 2025-01-15
+            start = datetime.datetime.strptime(normalized, "%Y-%m-%d").replace(
+                tzinfo=datetime.timezone.utc
+            )
+            end = start + datetime.timedelta(days=1)
+        elif len(normalized) == 7:
+            # ISO week format: 2025-03
+            year, week = normalized.split("-")
             # Monday of that week (use ISO week format: %G=ISO year, %V=ISO week, %u=ISO weekday)
             start = datetime.datetime.strptime(f"{year}-W{week}-1", "%G-W%V-%u").replace(
                 tzinfo=datetime.timezone.utc
             )
             end = start + datetime.timedelta(days=7)
-        elif len(period) == 7:
-            # Month format: 2025-01
-            start = datetime.datetime.strptime(f"{period}-01", "%Y-%m-%d").replace(
-                tzinfo=datetime.timezone.utc
-            )
-            # First of next month
-            if start.month == 12:
-                end = start.replace(year=start.year + 1, month=1)
-            else:
-                end = start.replace(month=start.month + 1)
         else:
-            # Day format: 2025-01-15
-            start = datetime.datetime.strptime(period, "%Y-%m-%d").replace(
-                tzinfo=datetime.timezone.utc
-            )
-            end = start + datetime.timedelta(days=1)
+            raise ValueError(f"Unsupported period format: {period}")
 
         return (int(start.timestamp()), int(end.timestamp()))
 
@@ -6717,6 +6758,12 @@ class HiveDatabase:
         """
         conn = self._get_connection()
         now = int(time.time())
+        exists = conn.execute(
+            "SELECT 1 FROM settlement_proposals WHERE proposal_id = ?",
+            (proposal_id,),
+        ).fetchone()
+        if not exists:
+            return False
 
         try:
             conn.execute("""
@@ -6777,6 +6824,12 @@ class HiveDatabase:
         """
         conn = self._get_connection()
         now = int(time.time())
+        exists = conn.execute(
+            "SELECT 1 FROM settlement_proposals WHERE proposal_id = ?",
+            (proposal_id,),
+        ).fetchone()
+        if not exists:
+            return False
 
         try:
             conn.execute("""

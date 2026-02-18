@@ -87,6 +87,10 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
 # - advisor: Primary mode - AI (via MCP server) reviews pending_actions
 # - failsafe: Emergency mode - auto-execute critical safety actions when AI unavailable
 VALID_GOVERNANCE_MODES = {'advisor', 'failsafe'}
+LEGACY_GOVERNANCE_ALIASES: Dict[str, str] = {
+    # Backward compatibility for older deployments/configs.
+    'autonomous': 'failsafe',
+}
 
 
 @dataclass
@@ -161,7 +165,8 @@ class HiveConfig:
 
     def _normalize(self):
         """Normalize field values (case, whitespace, etc.)."""
-        self.governance_mode = str(self.governance_mode).strip().lower()
+        mode = str(self.governance_mode).strip().lower()
+        self.governance_mode = LEGACY_GOVERNANCE_ALIASES.get(mode, mode)
 
     def snapshot(self) -> 'HiveConfigSnapshot':
         """
