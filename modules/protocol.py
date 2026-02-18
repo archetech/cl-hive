@@ -166,6 +166,15 @@ class HiveMessageType(IntEnum):
     MGMT_CREDENTIAL_PRESENT = 32887  # Share a management credential with hive
     MGMT_CREDENTIAL_REVOKE = 32889   # Announce management credential revocation
 
+    # Phase 4: Extended Settlements
+    SETTLEMENT_RECEIPT = 32891       # Signed receipt for any settlement type
+    BOND_POSTING = 32893             # Announce bond deposit
+    BOND_SLASH = 32895               # Announce bond forfeiture
+    NETTING_PROPOSAL = 32897         # Bilateral/multilateral netting proposal
+    NETTING_ACK = 32899              # Acknowledge netting computation
+    VIOLATION_REPORT = 32901         # Report policy violation with evidence
+    ARBITRATION_VOTE = 32903         # Cast arbitration panel vote
+
 
 # =============================================================================
 # PHASE D: RELIABLE DELIVERY CONSTANTS
@@ -193,6 +202,14 @@ RELIABLE_MESSAGE_TYPES = frozenset({
     HiveMessageType.DID_CREDENTIAL_REVOKE,
     HiveMessageType.MGMT_CREDENTIAL_PRESENT,
     HiveMessageType.MGMT_CREDENTIAL_REVOKE,
+    # Phase 4: Extended Settlements
+    HiveMessageType.SETTLEMENT_RECEIPT,
+    HiveMessageType.BOND_POSTING,
+    HiveMessageType.BOND_SLASH,
+    HiveMessageType.NETTING_PROPOSAL,
+    HiveMessageType.NETTING_ACK,
+    HiveMessageType.VIOLATION_REPORT,
+    HiveMessageType.ARBITRATION_VOTE,
 })
 
 # Implicit ack mapping: response type -> request type it satisfies
@@ -203,6 +220,7 @@ IMPLICIT_ACK_MAP = {
     HiveMessageType.SPLICE_INIT_RESPONSE: HiveMessageType.SPLICE_INIT_REQUEST,
     HiveMessageType.BAN_VOTE: HiveMessageType.BAN_PROPOSAL,
     HiveMessageType.VOUCH: HiveMessageType.PROMOTION_REQUEST,
+    HiveMessageType.NETTING_ACK: HiveMessageType.NETTING_PROPOSAL,
 }
 
 # Field in the response payload that matches the request for implicit acks
@@ -212,6 +230,7 @@ IMPLICIT_ACK_MATCH_FIELD = {
     HiveMessageType.SPLICE_INIT_RESPONSE: "session_id",
     HiveMessageType.BAN_VOTE: "proposal_id",
     HiveMessageType.VOUCH: "request_id",
+    HiveMessageType.NETTING_ACK: "window_id",
 }
 
 # MSG_ACK valid status values
@@ -3054,8 +3073,18 @@ def validate_fee_report(payload: Dict[str, Any]) -> bool:
     if payload["period_end"] < payload["period_start"]:
         return False
 
-    # Timestamp freshness validation
+    # P3-L-5: period_start/period_end reasonableness bounds
     now = int(time.time())
+    if payload["period_start"] <= 1700000000:  # Must be after Nov 2023
+        return False
+    if payload["period_start"] > now + 86400:  # Not more than 1 day in future
+        return False
+    if payload["period_end"] <= payload["period_start"]:
+        return False
+    if payload["period_end"] > payload["period_start"] + 365 * 86400:  # Max 1 year span
+        return False
+
+    # Timestamp freshness validation
     if payload["period_end"] > now + 3600:  # More than 1 hour in future
         return False
     if payload["period_start"] < now - 90 * 86400:  # More than 90 days old
@@ -6088,9 +6117,11 @@ def validate_did_credential_present(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
-    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+    if not isinstance(timestamp, (int, float)) or timestamp <= 0:
         return False
 
     credential = payload.get("credential")
@@ -6140,9 +6171,12 @@ def validate_did_credential_present(payload: dict) -> bool:
         return False
 
     # Enforce evidence size limit if present
+    # P3-L-7: Type-check each evidence item
     evidence = credential.get("evidence")
     if evidence is not None:
         if not isinstance(evidence, list):
+            return False
+        if not all(isinstance(e, (str, dict)) for e in evidence):
             return False
         try:
             evidence_json = _json.dumps(evidence, separators=(',', ':'))
@@ -6157,9 +6191,41 @@ def validate_did_credential_present(payload: dict) -> bool:
         return False
     if period_end <= period_start:
         return False
+    # P3-L-5: period_start/period_end reasonableness bounds
+    if period_start <= 1700000000:
+        return False
+    now_ts = int(time.time())
+    if period_start > now_ts + 86400:
+        return False
+    if period_end > period_start + 365 * 86400:
+        return False
+
+    # R4-1: Validate issued_at at protocol layer (optional field)
+    issued_at = credential.get("issued_at")
+    if issued_at is not None:
+        if not isinstance(issued_at, int):
+            return False
+        if issued_at <= 1700000000:
+            return False
+        if issued_at > now_ts + 86400:
+            return False
+
+    # R4-1: Validate expires_at if present
+    expires_at = credential.get("expires_at")
+    if expires_at is not None:
+        if not isinstance(expires_at, int):
+            return False
+        # expires_at must be after issued_at (if issued_at present) or period_start
+        reference_time = issued_at if issued_at is not None else period_start
+        if expires_at <= reference_time:
+            return False
 
     signature = credential.get("signature")
     if not isinstance(signature, str) or not signature:
+        return False
+    if len(signature) < 10:
+        return False
+    if len(signature) > 200:
         return False
 
     return True
@@ -6167,16 +6233,23 @@ def validate_did_credential_present(payload: dict) -> bool:
 
 def get_did_credential_present_signing_payload(payload: dict) -> str:
     """Get deterministic signing payload from a credential present message."""
+    import hashlib
     import json
     credential = payload.get("credential", {})
     signing_data = {
+        "credential_id": credential.get("credential_id", ""),
         "issuer_id": credential.get("issuer_id", ""),
         "subject_id": credential.get("subject_id", ""),
         "domain": credential.get("domain", ""),
         "period_start": credential.get("period_start", 0),
         "period_end": credential.get("period_end", 0),
         "metrics": credential.get("metrics", {}),
-        "outcome": credential.get("outcome", "neutral"),
+        "outcome": credential.get("outcome"),
+        "issued_at": credential.get("issued_at"),
+        "expires_at": credential.get("expires_at"),
+        "evidence_hash": hashlib.sha256(
+            json.dumps(credential.get("evidence", []), sort_keys=True, separators=(',', ':')).encode()
+        ).hexdigest(),
     }
     return json.dumps(signing_data, sort_keys=True, separators=(',', ':'))
 
@@ -6223,9 +6296,11 @@ def validate_did_credential_revoke(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
-    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+    if not isinstance(timestamp, (int, float)) or timestamp <= 0:
         return False
 
     credential_id = payload.get("credential_id")
@@ -6248,6 +6323,8 @@ def validate_did_credential_revoke(payload: dict) -> bool:
     if not isinstance(signature, str) or not signature:
         return False
     if len(signature) < 10:
+        return False
+    if len(signature) > 200:
         return False
 
     return True
@@ -6314,9 +6391,11 @@ def validate_mgmt_credential_present(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
-    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+    if not isinstance(timestamp, (int, float)) or timestamp <= 0:
         return False
 
     credential = payload.get("credential")
@@ -6370,8 +6449,16 @@ def validate_mgmt_credential_present(payload: dict) -> bool:
     try:
         if isinstance(constraints, dict):
             constraints_json = _json.dumps(constraints, separators=(',', ':'))
+            # P2R4-I-2: Enforce key-count limit on dict constraints
+            if len(constraints) > 50:
+                return False
         else:
+            # P3-L-8: Verify string constraints are valid JSON
+            parsed_constraints = _json.loads(constraints)
             constraints_json = constraints
+            # P2R4-I-2: Enforce key-count limit on string constraints after parsing
+            if isinstance(parsed_constraints, dict) and len(parsed_constraints) > 50:
+                return False
         if len(constraints_json) > MAX_MGMT_CONSTRAINTS_LEN:
             return False
     except (TypeError, ValueError):
@@ -6383,9 +6470,22 @@ def validate_mgmt_credential_present(payload: dict) -> bool:
         return False
     if valid_until <= valid_from:
         return False
+    # P3-L-6: valid_from lower-bound
+    if valid_from <= 1700000000:
+        return False
+    # NEW-4: upper bounds on valid_from and max span
+    now_ts = int(time.time())
+    if valid_from > now_ts + 86400:  # Not more than 1 day in future
+        return False
+    if valid_until > valid_from + 730 * 86400:  # Max 2 year span
+        return False
 
     signature = credential.get("signature")
     if not isinstance(signature, str) or not signature:
+        return False
+    if len(signature) < 10:
+        return False
+    if len(signature) > 200:
         return False
 
     return True
@@ -6451,9 +6551,11 @@ def validate_mgmt_credential_revoke(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
-    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+    if not isinstance(timestamp, (int, float)) or timestamp <= 0:
         return False
 
     credential_id = payload.get("credential_id")
@@ -6477,6 +6579,8 @@ def validate_mgmt_credential_revoke(payload: dict) -> bool:
         return False
     if len(signature) < 10:
         return False
+    if len(signature) > 200:
+        return False
 
     return True
 
@@ -6488,4 +6592,717 @@ def get_mgmt_credential_revoke_signing_payload(credential_id: str, reason: str) 
         "credential_id": credential_id,
         "action": "mgmt_revoke",
         "reason": reason,
+    }, sort_keys=True, separators=(',', ':'))
+
+
+# =============================================================================
+# PHASE 4: EXTENDED SETTLEMENT MESSAGES
+# =============================================================================
+
+# Size limits for Phase 4 messages
+MAX_RECEIPT_DATA_LEN = 8192
+MAX_BOND_TOKEN_LEN = 16384
+MAX_NETTING_OBLIGATIONS_LEN = 65000
+MAX_EVIDENCE_LEN = 16384
+MAX_VOTE_REASON_LEN = 1000
+
+VALID_SETTLEMENT_TYPES = frozenset([
+    "routing_revenue", "rebalancing_cost", "channel_lease",
+    "cooperative_splice", "shared_channel", "pheromone_market",
+    "intelligence", "penalty", "advisor_fee",
+])
+
+VALID_BOND_TIERS = frozenset([
+    "observer", "basic", "full", "liquidity", "founding",
+])
+
+VALID_DISPUTE_OUTCOMES = frozenset(["upheld", "rejected", "partial"])
+VALID_ARBITRATION_VOTES = frozenset(["upheld", "rejected", "partial", "abstain"])
+
+
+# ---- SETTLEMENT_RECEIPT (32891) ----
+
+def create_settlement_receipt(
+    sender_id: str,
+    receipt_id: str,
+    settlement_type: str,
+    from_peer: str,
+    to_peer: str,
+    amount_sats: int,
+    window_id: str,
+    receipt_data: dict,
+    signature: str,
+    event_id: str = "",
+    timestamp: int = 0,
+) -> bytes:
+    """Create a SETTLEMENT_RECEIPT message."""
+    if not timestamp:
+        import time
+        timestamp = int(time.time())
+    if not event_id:
+        import uuid
+        event_id = str(uuid.uuid4())
+
+    return serialize(HiveMessageType.SETTLEMENT_RECEIPT, {
+        "sender_id": sender_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "receipt_id": receipt_id,
+        "settlement_type": settlement_type,
+        "from_peer": from_peer,
+        "to_peer": to_peer,
+        "amount_sats": amount_sats,
+        "window_id": window_id,
+        "receipt_data": receipt_data,
+        "signature": signature,
+    })
+
+
+def validate_settlement_receipt(payload: dict) -> bool:
+    """Validate SETTLEMENT_RECEIPT payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not _valid_pubkey(sender_id):
+        return False
+
+    event_id = payload.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return False
+    if len(event_id) > 128:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    receipt_id = payload.get("receipt_id")
+    if not isinstance(receipt_id, str) or not receipt_id or len(receipt_id) > 64:
+        return False
+
+    settlement_type = payload.get("settlement_type")
+    if settlement_type not in VALID_SETTLEMENT_TYPES:
+        return False
+
+    from_peer = payload.get("from_peer")
+    if not isinstance(from_peer, str) or not _valid_pubkey(from_peer):
+        return False
+
+    to_peer = payload.get("to_peer")
+    if not isinstance(to_peer, str) or not _valid_pubkey(to_peer):
+        return False
+
+    amount_sats = payload.get("amount_sats")
+    if not isinstance(amount_sats, int) or amount_sats <= 0:
+        return False
+
+    MAX_SETTLEMENT_AMOUNT_SATS = 100_000_000_000  # 1000 BTC - reasonable maximum
+    if amount_sats > MAX_SETTLEMENT_AMOUNT_SATS:
+        return False
+
+    window_id = payload.get("window_id")
+    if not isinstance(window_id, str) or not window_id or len(window_id) > 64:
+        return False
+
+    receipt_data = payload.get("receipt_data")
+    if not isinstance(receipt_data, dict):
+        return False
+    import json as _json
+    try:
+        rd_json = _json.dumps(receipt_data, separators=(',', ':'))
+        if len(rd_json) > MAX_RECEIPT_DATA_LEN:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
+        return False
+
+    return True
+
+
+def get_settlement_receipt_signing_payload(
+    receipt_id: str, settlement_type: str, from_peer: str,
+    to_peer: str, amount_sats: int, window_id: str,
+    receipt_data: Optional[dict] = None,
+) -> str:
+    """Get deterministic signing payload for a settlement receipt."""
+    import json
+    return json.dumps({
+        "action": "settlement_receipt",
+        "amount_sats": amount_sats,
+        "from_peer": from_peer,
+        "receipt_id": receipt_id,
+        "receipt_data": receipt_data or {},
+        "settlement_type": settlement_type,
+        "to_peer": to_peer,
+        "window_id": window_id,
+    }, sort_keys=True, separators=(',', ':'))
+
+
+# ---- BOND_POSTING (32893) ----
+
+def create_bond_posting(
+    sender_id: str,
+    bond_id: str,
+    amount_sats: int,
+    tier: str,
+    timelock: int,
+    token_hash: str,
+    signature: str,
+    event_id: str = "",
+    timestamp: int = 0,
+) -> bytes:
+    """Create a BOND_POSTING message."""
+    if not timestamp:
+        import time
+        timestamp = int(time.time())
+    if not event_id:
+        import uuid
+        event_id = str(uuid.uuid4())
+
+    return serialize(HiveMessageType.BOND_POSTING, {
+        "sender_id": sender_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "bond_id": bond_id,
+        "amount_sats": amount_sats,
+        "tier": tier,
+        "timelock": timelock,
+        "token_hash": token_hash,
+        "signature": signature,
+    })
+
+
+def validate_bond_posting(payload: dict) -> bool:
+    """Validate BOND_POSTING payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not _valid_pubkey(sender_id):
+        return False
+
+    event_id = payload.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return False
+    if len(event_id) > 128:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    bond_id = payload.get("bond_id")
+    if not isinstance(bond_id, str) or not bond_id or len(bond_id) > 64:
+        return False
+
+    amount_sats = payload.get("amount_sats")
+    if not isinstance(amount_sats, int) or amount_sats <= 0:
+        return False
+
+    tier = payload.get("tier")
+    if tier not in VALID_BOND_TIERS:
+        return False
+
+    # P4-L-4: A bond must have a positive timelock
+    timelock = payload.get("timelock")
+    if not isinstance(timelock, int) or timelock <= 0:
+        return False
+
+    token_hash = payload.get("token_hash")
+    if not isinstance(token_hash, str) or not token_hash or len(token_hash) > 128:
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
+        return False
+
+    return True
+
+
+def get_bond_posting_signing_payload(
+    bond_id: str, amount_sats: int, tier: str, timelock: int,
+    token_hash: str = "",
+) -> str:
+    """Get deterministic signing payload for a bond posting."""
+    import json
+    return json.dumps({
+        "action": "bond_posting",
+        "amount_sats": amount_sats,
+        "bond_id": bond_id,
+        "tier": tier,
+        "timelock": timelock,
+        "token_hash": token_hash,
+    }, sort_keys=True, separators=(',', ':'))
+
+
+# ---- BOND_SLASH (32895) ----
+
+def create_bond_slash(
+    sender_id: str,
+    bond_id: str,
+    slash_amount: int,
+    reason: str,
+    dispute_id: str,
+    signature: str,
+    event_id: str = "",
+    timestamp: int = 0,
+) -> bytes:
+    """Create a BOND_SLASH message."""
+    if not timestamp:
+        import time
+        timestamp = int(time.time())
+    if not event_id:
+        import uuid
+        event_id = str(uuid.uuid4())
+
+    return serialize(HiveMessageType.BOND_SLASH, {
+        "sender_id": sender_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "bond_id": bond_id,
+        "slash_amount": slash_amount,
+        "reason": reason,
+        "dispute_id": dispute_id,
+        "signature": signature,
+    })
+
+
+def validate_bond_slash(payload: dict) -> bool:
+    """Validate BOND_SLASH payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not _valid_pubkey(sender_id):
+        return False
+
+    event_id = payload.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return False
+    if len(event_id) > 128:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    bond_id = payload.get("bond_id")
+    if not isinstance(bond_id, str) or not bond_id or len(bond_id) > 64:
+        return False
+
+    slash_amount = payload.get("slash_amount")
+    if not isinstance(slash_amount, int) or slash_amount <= 0:
+        return False
+
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason or len(reason) > MAX_VOTE_REASON_LEN:
+        return False
+
+    dispute_id = payload.get("dispute_id")
+    if not isinstance(dispute_id, str) or not dispute_id or len(dispute_id) > 64:
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
+        return False
+
+    return True
+
+
+def get_bond_slash_signing_payload(
+    bond_id: str, slash_amount: int, dispute_id: str,
+    reason: str = "",
+) -> str:
+    """Get deterministic signing payload for a bond slash."""
+    import json
+    return json.dumps({
+        "action": "bond_slash",
+        "bond_id": bond_id,
+        "dispute_id": dispute_id,
+        "reason": reason,
+        "slash_amount": slash_amount,
+    }, sort_keys=True, separators=(',', ':'))
+
+
+# ---- NETTING_PROPOSAL (32897) ----
+
+def create_netting_proposal(
+    sender_id: str,
+    window_id: str,
+    netting_type: str,
+    obligations_hash: str,
+    net_payments: list,
+    signature: str,
+    event_id: str = "",
+    timestamp: int = 0,
+) -> bytes:
+    """Create a NETTING_PROPOSAL message."""
+    if not timestamp:
+        import time
+        timestamp = int(time.time())
+    if not event_id:
+        import uuid
+        event_id = str(uuid.uuid4())
+
+    return serialize(HiveMessageType.NETTING_PROPOSAL, {
+        "sender_id": sender_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "window_id": window_id,
+        "netting_type": netting_type,
+        "obligations_hash": obligations_hash,
+        "net_payments": net_payments,
+        "signature": signature,
+    })
+
+
+def validate_netting_proposal(payload: dict) -> bool:
+    """Validate NETTING_PROPOSAL payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not _valid_pubkey(sender_id):
+        return False
+
+    event_id = payload.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return False
+    if len(event_id) > 128:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    window_id = payload.get("window_id")
+    if not isinstance(window_id, str) or not window_id or len(window_id) > 64:
+        return False
+
+    netting_type = payload.get("netting_type")
+    if netting_type not in ("bilateral", "multilateral"):
+        return False
+
+    obligations_hash = payload.get("obligations_hash")
+    if not isinstance(obligations_hash, str) or not obligations_hash or len(obligations_hash) > 128:
+        return False
+
+    net_payments = payload.get("net_payments")
+    if not isinstance(net_payments, list):
+        return False
+    import json as _json
+    try:
+        np_json = _json.dumps(net_payments, separators=(',', ':'))
+        if len(np_json) > MAX_NETTING_OBLIGATIONS_LEN:
+            return False
+    except (TypeError, ValueError):
+        return False
+    for p in net_payments:
+        if not isinstance(p, dict):
+            return False
+        if "from_peer" not in p or "to_peer" not in p or "amount_sats" not in p:
+            return False
+        if not isinstance(p.get("from_peer"), str) or len(p.get("from_peer", "")) != 66:
+            return False
+        if not isinstance(p.get("to_peer"), str) or len(p.get("to_peer", "")) != 66:
+            return False
+        if not isinstance(p.get("amount_sats"), int) or p["amount_sats"] <= 0:
+            return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
+        return False
+
+    return True
+
+
+def get_netting_proposal_signing_payload(
+    window_id: str, netting_type: str, obligations_hash: str,
+    net_payments: Optional[list] = None,
+) -> str:
+    """Get deterministic signing payload for a netting proposal."""
+    import json
+    return json.dumps({
+        "action": "netting_proposal",
+        "netting_type": netting_type,
+        "net_payments": net_payments or [],
+        "obligations_hash": obligations_hash,
+        "window_id": window_id,
+    }, sort_keys=True, separators=(',', ':'))
+
+
+# ---- NETTING_ACK (32899) ----
+
+def create_netting_ack(
+    sender_id: str,
+    window_id: str,
+    obligations_hash: str,
+    accepted: bool,
+    signature: str,
+    event_id: str = "",
+    timestamp: int = 0,
+) -> bytes:
+    """Create a NETTING_ACK message."""
+    if not timestamp:
+        import time
+        timestamp = int(time.time())
+    if not event_id:
+        import uuid
+        event_id = str(uuid.uuid4())
+
+    return serialize(HiveMessageType.NETTING_ACK, {
+        "sender_id": sender_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "window_id": window_id,
+        "obligations_hash": obligations_hash,
+        "accepted": accepted,
+        "signature": signature,
+    })
+
+
+def validate_netting_ack(payload: dict) -> bool:
+    """Validate NETTING_ACK payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not _valid_pubkey(sender_id):
+        return False
+
+    event_id = payload.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return False
+    if len(event_id) > 128:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    window_id = payload.get("window_id")
+    if not isinstance(window_id, str) or not window_id or len(window_id) > 64:
+        return False
+
+    obligations_hash = payload.get("obligations_hash")
+    if not isinstance(obligations_hash, str) or not obligations_hash or len(obligations_hash) > 128:
+        return False
+
+    accepted = payload.get("accepted")
+    if not isinstance(accepted, bool):
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
+        return False
+
+    return True
+
+
+def get_netting_ack_signing_payload(
+    window_id: str, obligations_hash: str, accepted: bool,
+) -> str:
+    """Get deterministic signing payload for a netting acknowledgment."""
+    import json
+    return json.dumps({
+        "accepted": accepted,
+        "action": "netting_ack",
+        "obligations_hash": obligations_hash,
+        "window_id": window_id,
+    }, sort_keys=True, separators=(',', ':'))
+
+
+# ---- VIOLATION_REPORT (32901) ----
+
+def create_violation_report(
+    sender_id: str,
+    violation_id: str,
+    violator_id: str,
+    violation_type: str,
+    evidence: dict,
+    signature: str,
+    event_id: str = "",
+    timestamp: int = 0,
+    block_hash: str = "",
+) -> bytes:
+    """Create a VIOLATION_REPORT message.
+
+    R5-FIX-6: Includes block_hash so all nodes that receive the same
+    violation report deterministically select the same arbitration panel.
+    """
+    if not timestamp:
+        import time
+        timestamp = int(time.time())
+    if not event_id:
+        import uuid
+        event_id = str(uuid.uuid4())
+
+    payload = {
+        "sender_id": sender_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "violation_id": violation_id,
+        "violator_id": violator_id,
+        "violation_type": violation_type,
+        "evidence": evidence,
+        "signature": signature,
+    }
+    if block_hash:
+        payload["block_hash"] = block_hash
+
+    return serialize(HiveMessageType.VIOLATION_REPORT, payload)
+
+
+def validate_violation_report(payload: dict) -> bool:
+    """Validate VIOLATION_REPORT payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not _valid_pubkey(sender_id):
+        return False
+
+    event_id = payload.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return False
+    if len(event_id) > 128:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    violation_id = payload.get("violation_id")
+    if not isinstance(violation_id, str) or not violation_id or len(violation_id) > 64:
+        return False
+
+    violator_id = payload.get("violator_id")
+    if not isinstance(violator_id, str) or not _valid_pubkey(violator_id):
+        return False
+
+    violation_type = payload.get("violation_type")
+    if not isinstance(violation_type, str) or not violation_type or len(violation_type) > 64:
+        return False
+
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, dict):
+        return False
+    import json as _json
+    try:
+        ev_json = _json.dumps(evidence, separators=(',', ':'))
+        if len(ev_json) > MAX_EVIDENCE_LEN:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
+        return False
+
+    # R5-FIX-6: Optional block_hash for deterministic panel selection
+    block_hash = payload.get("block_hash")
+    if block_hash is not None:
+        if not isinstance(block_hash, str) or len(block_hash) > 128:
+            return False
+
+    return True
+
+
+def get_violation_report_signing_payload(
+    violation_id: str, violator_id: str, violation_type: str,
+    evidence: Optional[dict] = None,
+) -> str:
+    """Get deterministic signing payload for a violation report."""
+    import json
+    return json.dumps({
+        "action": "violation_report",
+        "evidence": evidence or {},
+        "violation_id": violation_id,
+        "violation_type": violation_type,
+        "violator_id": violator_id,
+    }, sort_keys=True, separators=(',', ':'))
+
+
+# ---- ARBITRATION_VOTE (32903) ----
+
+def create_arbitration_vote(
+    sender_id: str,
+    dispute_id: str,
+    vote: str,
+    reason: str,
+    signature: str,
+    event_id: str = "",
+    timestamp: int = 0,
+) -> bytes:
+    """Create an ARBITRATION_VOTE message."""
+    if not timestamp:
+        import time
+        timestamp = int(time.time())
+    if not event_id:
+        import uuid
+        event_id = str(uuid.uuid4())
+
+    return serialize(HiveMessageType.ARBITRATION_VOTE, {
+        "sender_id": sender_id,
+        "event_id": event_id,
+        "timestamp": timestamp,
+        "dispute_id": dispute_id,
+        "vote": vote,
+        "reason": reason,
+        "signature": signature,
+    })
+
+
+def validate_arbitration_vote(payload: dict) -> bool:
+    """Validate ARBITRATION_VOTE payload schema."""
+    if not isinstance(payload, dict):
+        return False
+
+    sender_id = payload.get("sender_id")
+    if not isinstance(sender_id, str) or not _valid_pubkey(sender_id):
+        return False
+
+    event_id = payload.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        return False
+    if len(event_id) > 128:
+        return False
+
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+        return False
+
+    dispute_id = payload.get("dispute_id")
+    if not isinstance(dispute_id, str) or not dispute_id or len(dispute_id) > 64:
+        return False
+
+    vote = payload.get("vote")
+    if vote not in VALID_ARBITRATION_VOTES:
+        return False
+
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or len(reason) > MAX_VOTE_REASON_LEN:
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
+        return False
+
+    return True
+
+
+def get_arbitration_vote_signing_payload(
+    dispute_id: str, vote: str, reason: str = "",
+) -> str:
+    """Get deterministic signing payload for an arbitration vote."""
+    import json
+    return json.dumps({
+        "action": "arbitration_vote",
+        "dispute_id": dispute_id,
+        "reason": reason,
+        "vote": vote,
     }, sort_keys=True, separators=(',', ':'))

@@ -19,7 +19,9 @@ Security:
 - All management actions produce signed receipts
 """
 
+import hashlib
 import json
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -32,6 +34,8 @@ MAX_MANAGEMENT_CREDENTIALS = 1_000
 MAX_MANAGEMENT_RECEIPTS = 100_000
 MAX_ALLOWED_SCHEMAS_LEN = 4096
 MAX_CONSTRAINTS_LEN = 4096
+MAX_MGMT_CREDENTIAL_PRESENTS_PER_PEER_PER_HOUR = 20
+MAX_MGMT_CREDENTIAL_REVOKES_PER_PEER_PER_HOUR = 10
 
 VALID_TIERS = frozenset(["monitor", "standard", "advanced", "admin"])
 
@@ -67,6 +71,12 @@ class DangerScore:
     time_sensitivity: int    # 1=no compounding, 10=permanent damage
     blast_radius: int        # 1=single metric, 10=entire fleet
     recovery_difficulty: int  # 1=trivial, 10=unrecoverable
+
+    def __post_init__(self):
+        for field_name in ['reversibility', 'financial_exposure', 'time_sensitivity', 'blast_radius', 'recovery_difficulty']:
+            val = getattr(self, field_name)
+            if not isinstance(val, int) or val < 1 or val > 10:
+                raise ValueError(f"DangerScore.{field_name} must be int in [1, 10], got {val}")
 
     @property
     def total(self) -> int:
@@ -137,6 +147,7 @@ class ManagementCredential:
     node_id: str            # managed node pubkey
     tier: str               # monitor/standard/advanced/admin
     allowed_schemas: tuple  # e.g. ("hive:fee-policy/*", "hive:monitor/*")
+    # NOTE: constraints are advisory metadata, not enforced at authorization time
     constraints: str        # JSON string of constraints (frozen-compatible)
     valid_from: int         # epoch
     valid_until: int        # epoch
@@ -591,6 +602,13 @@ def get_credential_signing_payload(credential: Dict[str, Any]) -> str:
     return json.dumps(signing_data, sort_keys=True, separators=(',', ':'))
 
 
+def _is_valid_pubkey(pk: str) -> bool:
+    """Validate that a string looks like a compressed secp256k1 public key."""
+    return (isinstance(pk, str) and len(pk) == 66
+            and pk[:2] in ('02', '03')
+            and all(c in '0123456789abcdef' for c in pk))
+
+
 def _schema_matches(pattern: str, schema_id: str) -> bool:
     """Check if a schema pattern matches a schema_id. Supports wildcard '*'."""
     if pattern == "*":
@@ -617,12 +635,40 @@ class ManagementSchemaRegistry:
         self.plugin = plugin
         self.rpc = rpc
         self.our_pubkey = our_pubkey
+        self._rate_limiters: Dict[tuple, List[int]] = {}
+        self._rate_lock = threading.Lock()
 
     def _log(self, msg: str, level: str = "info"):
         try:
             self.plugin.log(f"cl-hive: management_schemas: {msg}", level=level)
         except Exception:
             pass
+
+    def _check_rate_limit(self, peer_id: str, message_type: str, max_per_hour: int) -> bool:
+        """Per-peer sliding-window rate limit."""
+        now = int(time.time())
+        cutoff = now - 3600
+        key = (peer_id, message_type)
+
+        with self._rate_lock:
+            timestamps = self._rate_limiters.get(key, [])
+            timestamps = [ts for ts in timestamps if ts > cutoff]
+            if len(timestamps) >= max_per_hour:
+                self._rate_limiters[key] = timestamps
+                return False
+
+            timestamps.append(now)
+            self._rate_limiters[key] = timestamps
+
+            if len(self._rate_limiters) > 1000:
+                stale_keys = [
+                    k for k, vals in self._rate_limiters.items()
+                    if not vals or vals[-1] <= cutoff
+                ]
+                for k in stale_keys:
+                    self._rate_limiters.pop(k, None)
+
+        return True
 
     # --- Schema Queries ---
 
@@ -679,6 +725,21 @@ class ManagementSchemaRegistry:
                     if not isinstance(value, param_type):
                         return False, f"parameter '{param_name}' must be {param_type.__name__}, got {type(value).__name__}"
 
+        # Reject unexpected parameters
+        if params:
+            defined_params = set(sa.parameters.keys()) if sa.parameters else set()
+            extra = set(params.keys()) - defined_params
+            if extra:
+                return False, f"unexpected parameters: {sorted(extra)}"
+
+        # For dangerous actions (danger >= 5), require all defined parameters
+        if sa.danger and sa.danger.total >= 5 and sa.parameters:
+            if not params:
+                return False, f"high-danger action '{action}' requires parameters: {list(sa.parameters.keys())}"
+            missing = [p for p in sa.parameters if p not in params]
+            if missing:
+                return False, f"high-danger action '{action}' missing required parameters: {missing}"
+
         return True, "valid"
 
     # --- Credential Authorization ---
@@ -711,6 +772,10 @@ class ManagementSchemaRegistry:
 
         if credential.valid_from > now:
             return False, "credential not yet valid"
+
+        # Verify credential is bound to this node
+        if credential.node_id and credential.node_id != self.our_pubkey:
+            return False, f"credential bound to node {credential.node_id[:16]}..., not this node"
 
         # Check tier
         required_tier = self.get_required_tier(schema_id, action)
@@ -773,6 +838,14 @@ class ManagementSchemaRegistry:
             self._log("cannot issue: no RPC or pubkey", "warn")
             return None
 
+        if not _is_valid_pubkey(agent_id):
+            self._log(f"invalid agent_id pubkey: {agent_id!r}", "warn")
+            return None
+
+        if not _is_valid_pubkey(node_id):
+            self._log(f"invalid node_id pubkey: {node_id!r}", "warn")
+            return None
+
         if tier not in VALID_TIERS:
             self._log(f"invalid tier: {tier}", "warn")
             return None
@@ -781,8 +854,28 @@ class ManagementSchemaRegistry:
             self._log("allowed_schemas cannot be empty", "warn")
             return None
 
+        if not all(isinstance(s, str) for s in allowed_schemas):
+            self._log("issue_credential: allowed_schemas entries must be strings", "warn")
+            return None
+
+        for schema_pattern in allowed_schemas:
+            if schema_pattern == "*":
+                continue
+            if schema_pattern.endswith("/*"):
+                prefix = schema_pattern[:-2]
+                if not any(sid.startswith(prefix + "/") for sid in SCHEMA_REGISTRY):
+                    self._log(f"allowed_schemas pattern '{schema_pattern}' matches no known schemas", "warn")
+                    return None
+            elif schema_pattern not in SCHEMA_REGISTRY:
+                self._log(f"allowed_schemas entry '{schema_pattern}' is not a known schema", "warn")
+                return None
+
         if not isinstance(valid_days, int) or valid_days <= 0:
             self._log(f"invalid valid_days: {valid_days}", "warn")
+            return None
+
+        if valid_days > 730:  # 2 years max
+            self._log(f"valid_days {valid_days} exceeds max 730", "warn")
             return None
 
         if not agent_id or agent_id == self.our_pubkey:
@@ -797,6 +890,10 @@ class ManagementSchemaRegistry:
             return None
         if len(constraints_json) > MAX_CONSTRAINTS_LEN:
             self._log(f"constraints too large ({len(constraints_json)} > {MAX_CONSTRAINTS_LEN})", "warn")
+            return None
+        # P2R4-I-2: Enforce key-count limit on constraints
+        if isinstance(constraints, dict) and len(constraints) > 50:
+            self._log(f"constraints key count {len(constraints)} exceeds max 50", "warn")
             return None
 
         # Check row cap
@@ -913,6 +1010,22 @@ class ManagementSchemaRegistry:
 
         Returns receipt_id on success, None on failure.
         """
+        cred = self.db.get_management_credential(credential_id)
+        if not cred:
+            self._log(f"receipt references non-existent credential: {credential_id[:16]}...", "warn")
+            return None
+        if cred.get('revoked_at'):
+            self._log(f"receipt references revoked credential: {credential_id[:16]}...", "warn")
+            return None
+        # P2R4-L-1: Check credential expiry before recording receipt
+        if cred.get('valid_until', 0) < int(time.time()):
+            self._log(f"receipt references expired credential: {credential_id[:16]}...", "warn")
+            return None
+
+        if not self.rpc:
+            self._log("cannot record receipt: no RPC for signing", "warn")
+            return None
+
         danger = self.get_danger_score(schema_id, action)
         if not danger:
             return None
@@ -920,9 +1033,11 @@ class ManagementSchemaRegistry:
         receipt_id = str(uuid.uuid4())
         now = int(time.time())
 
-        # Sign the receipt
+        # Sign the receipt (include hashes of params/result/state)
         signature = ""
         if self.rpc:
+            params_hash = hashlib.sha256(json.dumps(params, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            result_hash = hashlib.sha256(json.dumps(result or {}, sort_keys=True, separators=(',', ':')).encode()).hexdigest() if result else ""
             receipt_payload = json.dumps({
                 "receipt_id": receipt_id,
                 "credential_id": credential_id,
@@ -930,12 +1045,21 @@ class ManagementSchemaRegistry:
                 "action": action,
                 "danger_score": danger.total,
                 "executed_at": now,
+                "params_hash": params_hash,
+                "result_hash": result_hash,
+                "state_hash_before": state_hash_before or "",
+                "state_hash_after": state_hash_after or "",
             }, sort_keys=True, separators=(',', ':'))
             try:
                 sig_result = self.rpc.signmessage(receipt_payload)
                 signature = sig_result.get("zbase", "") if isinstance(sig_result, dict) else str(sig_result)
             except Exception as e:
                 self._log(f"receipt signing failed: {e}", "warn")
+                return None  # Don't store unsigned receipts
+
+            if not isinstance(signature, str) or not signature:
+                self._log("receipt signing returned empty or malformed signature", "error")
+                return None
 
         stored = self.db.store_management_receipt(
             receipt_id=receipt_id,
@@ -969,10 +1093,22 @@ class ManagementSchemaRegistry:
             self._log("invalid mgmt_credential_present: missing credential dict", "warn")
             return False
 
+        if not self._check_rate_limit(
+            peer_id,
+            "mgmt_credential_present",
+            MAX_MGMT_CREDENTIAL_PRESENTS_PER_PEER_PER_HOUR,
+        ):
+            self._log(f"rate limit exceeded for mgmt credential presents from {peer_id[:16]}...", "warn")
+            return False
+
         # Extract fields
         credential_id = credential.get("credential_id")
         if not credential_id or not isinstance(credential_id, str):
             self._log("mgmt_credential_present: missing credential_id", "warn")
+            return False
+
+        if len(credential_id) > 64:
+            self._log("mgmt_credential_present: credential_id too long", "warn")
             return False
 
         issuer_id = credential.get("issuer_id", "")
@@ -985,6 +1121,19 @@ class ManagementSchemaRegistry:
         valid_until = credential.get("valid_until", 0)
         signature = credential.get("signature", "")
 
+        # Validate pubkey fields
+        if not _is_valid_pubkey(issuer_id):
+            self._log(f"mgmt_credential_present: invalid issuer_id pubkey: {issuer_id!r}", "warn")
+            return False
+
+        if not _is_valid_pubkey(agent_id):
+            self._log(f"mgmt_credential_present: invalid agent_id pubkey: {agent_id!r}", "warn")
+            return False
+
+        if not _is_valid_pubkey(node_id):
+            self._log(f"mgmt_credential_present: invalid node_id pubkey: {node_id!r}", "warn")
+            return False
+
         # Basic field validation
         if tier not in VALID_TIERS:
             self._log(f"mgmt_credential_present: invalid tier {tier!r}", "warn")
@@ -994,12 +1143,44 @@ class ManagementSchemaRegistry:
             self._log("mgmt_credential_present: bad allowed_schemas", "warn")
             return False
 
+        if len(allowed_schemas) > 100:
+            self._log("mgmt_credential_present: allowed_schemas exceeds 100 items", "warn")
+            return False
+
+        if not all(isinstance(s, str) for s in allowed_schemas):
+            self._log("mgmt_credential_present: allowed_schemas contains non-string entries", "warn")
+            return False
+
+        # P2R4-I-2: Enforce key-count limit on constraints (dict or string form)
+        if isinstance(constraints, dict) and len(constraints) > 50:
+            self._log("mgmt_credential_present: constraints exceeds 50 keys", "warn")
+            return False
+        if isinstance(constraints, str):
+            try:
+                parsed_constraints = json.loads(constraints)
+                if isinstance(parsed_constraints, dict) and len(parsed_constraints) > 50:
+                    self._log("mgmt_credential_present: constraints (string) exceeds 50 keys", "warn")
+                    return False
+            except (json.JSONDecodeError, TypeError):
+                self._log("mgmt_credential_present: constraints string is not valid JSON", "warn")
+                return False
+
         if not isinstance(valid_from, int) or not isinstance(valid_until, int):
             self._log("mgmt_credential_present: bad validity period", "warn")
             return False
 
         if valid_until <= valid_from:
             self._log("mgmt_credential_present: valid_until <= valid_from", "warn")
+            return False
+
+        MAX_CREDENTIAL_VALIDITY_SECONDS = 730 * 86400  # 2 years
+        if (valid_until - valid_from) > MAX_CREDENTIAL_VALIDITY_SECONDS:
+            self._log("mgmt_credential_present: validity period too long", "warn")
+            return False
+
+        now = int(time.time())
+        if valid_until < now:
+            self._log(f"rejecting expired management credential from {peer_id[:16]}...", "info")
             return False
 
         # Self-issuance of management credential: issuer == agent is not
@@ -1037,7 +1218,7 @@ class ManagementSchemaRegistry:
         signing_payload = json.dumps(signing_data, sort_keys=True, separators=(',', ':'))
 
         try:
-            result = self.rpc.checkmessage(signing_payload, signature)
+            result = self.rpc.checkmessage(signing_payload, signature, issuer_id)
             if not isinstance(result, dict):
                 self._log("mgmt_credential_present: unexpected checkmessage response type", "warn")
                 return False
@@ -1100,8 +1281,20 @@ class ManagementSchemaRegistry:
         issuer_id = payload.get("issuer_id", "")
         signature = payload.get("signature", "")
 
+        if not self._check_rate_limit(
+            peer_id,
+            "mgmt_credential_revoke",
+            MAX_MGMT_CREDENTIAL_REVOKES_PER_PEER_PER_HOUR,
+        ):
+            self._log(f"rate limit exceeded for mgmt credential revokes from {peer_id[:16]}...", "warn")
+            return False
+
         if not credential_id or not isinstance(credential_id, str):
             self._log("invalid mgmt_credential_revoke: missing credential_id", "warn")
+            return False
+
+        if len(credential_id) > 64:
+            self._log("invalid mgmt_credential_revoke: credential_id too long", "warn")
             return False
 
         if not reason or len(reason) > 500:
@@ -1138,7 +1331,7 @@ class ManagementSchemaRegistry:
         }, sort_keys=True, separators=(',', ':'))
 
         try:
-            result = self.rpc.checkmessage(revoke_payload, signature)
+            result = self.rpc.checkmessage(revoke_payload, signature, issuer_id)
             if not isinstance(result, dict):
                 self._log("mgmt revoke: unexpected checkmessage response type", "warn")
                 return False

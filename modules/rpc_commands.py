@@ -47,6 +47,11 @@ class HiveContext:
     anticipatory_manager: Any = None  # AnticipatoryLiquidityManager (Phase 7.1 - Anticipatory Liquidity)
     did_credential_mgr: Any = None  # DIDCredentialManager (Phase 16 - DID Credentials)
     management_schema_registry: Any = None  # ManagementSchemaRegistry (Phase 2 - Management Schemas)
+    cashu_escrow_mgr: Any = None  # CashuEscrowManager (Phase 4A - Cashu Escrow)
+    nostr_transport: Any = None  # NostrTransport (Phase 5A - Nostr transport)
+    marketplace_mgr: Any = None  # MarketplaceManager (Phase 5B - Advisor marketplace)
+    liquidity_mgr: Any = None  # LiquidityMarketplaceManager (Phase 5C - Liquidity marketplace)
+    policy_engine: Any = None  # PolicyEngine (Phase 6A - client policy)
     our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
@@ -4797,6 +4802,8 @@ def schema_validate(ctx: HiveContext, schema_id: str, action: str,
             params = json.loads(params_json)
         except (json.JSONDecodeError, TypeError):
             return {"error": "invalid params_json"}
+        if not isinstance(params, dict):
+            return {"error": "params_json must decode to an object"}
 
     is_valid, reason = ctx.management_schema_registry.validate_command(
         schema_id, action, params
@@ -4824,6 +4831,10 @@ def mgmt_credential_issue(ctx: HiveContext, agent_id: str, tier: str,
     if not ctx.management_schema_registry:
         return {"error": "management schema registry not initialized"}
 
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
     try:
         allowed_schemas = json.loads(allowed_schemas_json)
     except (json.JSONDecodeError, TypeError):
@@ -4838,6 +4849,8 @@ def mgmt_credential_issue(ctx: HiveContext, agent_id: str, tier: str,
             constraints = json.loads(constraints_json)
         except (json.JSONDecodeError, TypeError):
             return {"error": "invalid constraints_json"}
+        if not isinstance(constraints, dict):
+            return {"error": "constraints_json must decode to a JSON object"}
 
     node_id = ctx.our_pubkey or ""
     cred = ctx.management_schema_registry.issue_credential(
@@ -4884,5 +4897,675 @@ def mgmt_credential_revoke(ctx: HiveContext, credential_id: str) -> Dict[str, An
     if not ctx.management_schema_registry:
         return {"error": "management schema registry not initialized"}
 
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
     success = ctx.management_schema_registry.revoke_credential(credential_id)
     return {"revoked": success, "credential_id": credential_id}
+
+
+# =============================================================================
+# PHASE 4A: CASHU ESCROW COMMANDS
+# =============================================================================
+
+def escrow_create(ctx: HiveContext, agent_id: str, schema_id: str = "",
+                  action: str = "", danger_score: int = 1,
+                  amount_sats: int = 0, mint_url: str = "",
+                  ticket_type: str = "single") -> Dict[str, Any]:
+    """Create a new Cashu escrow ticket."""
+    if not ctx.cashu_escrow_mgr:
+        return {"error": "cashu escrow manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not agent_id:
+        return {"error": "agent_id is required"}
+
+    # Generate a task_id (include randomness to prevent collisions)
+    import hashlib as _hashlib
+    import os as _os
+    task_id = _hashlib.sha256(
+        f"{agent_id}:{schema_id}:{action}:{int(time.time())}:{_os.urandom(8).hex()}".encode()
+    ).hexdigest()[:32]
+
+    ticket = ctx.cashu_escrow_mgr.create_ticket(
+        agent_id=agent_id,
+        task_id=task_id,
+        danger_score=danger_score,
+        amount_sats=amount_sats,
+        mint_url=mint_url,
+        ticket_type=ticket_type,
+        schema_id=schema_id or None,
+        action=action or None,
+    )
+
+    if not ticket:
+        return {"error": "failed to create escrow ticket"}
+
+    return {"ticket": ticket, "task_id": task_id}
+
+
+def escrow_list(ctx: HiveContext, agent_id: Optional[str] = None,
+                status: Optional[str] = None) -> Dict[str, Any]:
+    """List escrow tickets with optional filters."""
+    if not ctx.cashu_escrow_mgr:
+        return {"error": "cashu escrow manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    VALID_TICKET_STATUSES = {'active', 'redeemed', 'refunded', 'expired', 'pending'}
+    if status and status not in VALID_TICKET_STATUSES:
+        return {"error": f"invalid status filter: {status}"}
+
+    tickets = ctx.cashu_escrow_mgr.db.list_escrow_tickets(
+        agent_id=agent_id, status=status
+    )
+    return {"tickets": tickets, "count": len(tickets)}
+
+
+def escrow_redeem(ctx: HiveContext, ticket_id: str,
+                  preimage: str) -> Dict[str, Any]:
+    """Redeem an escrow ticket with HTLC preimage."""
+    if not ctx.cashu_escrow_mgr:
+        return {"error": "cashu escrow manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ticket_id or not preimage:
+        return {"error": "ticket_id and preimage are required"}
+
+    result = ctx.cashu_escrow_mgr.redeem_ticket(ticket_id, preimage)
+    return result if result else {"error": "redemption failed"}
+
+
+def escrow_refund(ctx: HiveContext, ticket_id: str) -> Dict[str, Any]:
+    """Refund an escrow ticket after timelock expiry."""
+    if not ctx.cashu_escrow_mgr:
+        return {"error": "cashu escrow manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ticket_id:
+        return {"error": "ticket_id is required"}
+
+    result = ctx.cashu_escrow_mgr.refund_ticket(ticket_id)
+    return result if result else {"error": "refund failed"}
+
+
+def escrow_get_receipt(ctx: HiveContext, ticket_id: str) -> Dict[str, Any]:
+    """Get escrow receipts for a ticket."""
+    if not ctx.cashu_escrow_mgr:
+        return {"error": "cashu escrow manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ticket_id:
+        return {"error": "ticket_id is required"}
+
+    receipts = ctx.cashu_escrow_mgr.db.get_escrow_receipts(ticket_id)
+    ticket = ctx.cashu_escrow_mgr.db.get_escrow_ticket(ticket_id)
+    return {
+        "ticket": ticket,
+        "receipts": receipts,
+        "count": len(receipts),
+    }
+
+
+def escrow_complete(ctx: HiveContext, ticket_id: str, schema_id: str = "",
+                    action: str = "", params_json: str = "{}",
+                    result_json: str = "{}", success: bool = True,
+                    reveal_preimage: bool = True) -> Dict[str, Any]:
+    """
+    Record a task completion receipt and optionally reveal escrow preimage.
+
+    This provides the operator-side completion step:
+    1) record signed escrow receipt
+    2) reveal HTLC preimage (if requested)
+    """
+    if not ctx.cashu_escrow_mgr:
+        return {"error": "cashu escrow manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ticket_id:
+        return {"error": "ticket_id is required"}
+
+    ticket = ctx.cashu_escrow_mgr.db.get_escrow_ticket(ticket_id)
+    if not ticket:
+        return {"error": "ticket not found"}
+
+    try:
+        params = json.loads(params_json) if params_json else {}
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "invalid params_json"}
+    if not isinstance(params, dict):
+        return {"error": "params_json must decode to an object"}
+
+    result = None
+    if result_json:
+        try:
+            parsed = json.loads(result_json)
+        except (json.JSONDecodeError, TypeError):
+            return {"error": "invalid result_json"}
+        if parsed is not None and not isinstance(parsed, dict):
+            return {"error": "result_json must decode to an object or null"}
+        result = parsed
+
+    receipt = ctx.cashu_escrow_mgr.create_receipt(
+        ticket_id=ticket_id,
+        schema_id=schema_id or ticket.get("schema_id") or "",
+        action=action or ticket.get("action") or "",
+        params=params,
+        result=result,
+        success=bool(success),
+    )
+    if not receipt:
+        return {"error": "failed to create escrow receipt"}
+
+    response: Dict[str, Any] = {"receipt": receipt}
+    if reveal_preimage:
+        secret = ctx.cashu_escrow_mgr.db.get_escrow_secret_by_ticket(ticket_id)
+        if not secret:
+            response["preimage"] = None
+            response["error"] = "secret not found for ticket"
+            return response
+
+        task_id = secret.get("task_id", "")
+        preimage = ctx.cashu_escrow_mgr.reveal_secret(
+            task_id=task_id,
+            caller_id=ctx.our_pubkey,
+            require_receipt=True,
+        )
+        response["task_id"] = task_id
+        response["preimage"] = preimage
+        if preimage is None:
+            response["error"] = "preimage reveal failed"
+
+    return response
+
+
+# =============================================================================
+# PHASE 4B: EXTENDED SETTLEMENT COMMANDS
+# =============================================================================
+
+def bond_post(ctx: HiveContext, amount_sats: int = 0,
+              tier: str = "") -> Dict[str, Any]:
+    """Post a settlement bond."""
+    from .settlement import BondManager
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    bond_mgr = BondManager(ctx.database, ctx.safe_plugin)
+    result = bond_mgr.post_bond(ctx.our_pubkey, amount_sats)
+    return result if result else {"error": "failed to post bond"}
+
+
+def bond_status(ctx: HiveContext, peer_id: Optional[str] = None) -> Dict[str, Any]:
+    """Get bond status for a peer."""
+    from .settlement import BondManager
+
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    target = peer_id or ctx.our_pubkey
+    bond_mgr = BondManager(ctx.database, ctx.safe_plugin)
+    result = bond_mgr.get_bond_status(target)
+    if not result:
+        return {"error": "no active bond found", "peer_id": target}
+    return result
+
+
+def settlement_obligations_list(ctx: HiveContext,
+                                 window_id: Optional[str] = None,
+                                 peer_id: Optional[str] = None) -> Dict[str, Any]:
+    """List settlement obligations."""
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    if window_id:
+        obligations = ctx.database.get_obligations_for_window(window_id)
+    elif peer_id:
+        obligations = ctx.database.get_obligations_between_peers(
+            peer_id, ctx.our_pubkey
+        )
+    else:
+        obligations = ctx.database.get_obligations_for_window("", limit=100)
+
+    return {"obligations": obligations, "count": len(obligations)}
+
+
+def settlement_net(ctx: HiveContext, window_id: str = "",
+                   peer_id: Optional[str] = None) -> Dict[str, Any]:
+    """Compute netting for a settlement window."""
+    from .settlement import NettingEngine
+
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not window_id:
+        return {"error": "window_id is required"}
+
+    obligations = ctx.database.get_obligations_for_window(window_id)
+
+    if peer_id:
+        result = NettingEngine.bilateral_net(obligations, ctx.our_pubkey, peer_id, window_id)
+        return {"netting_type": "bilateral", "result": result}
+    else:
+        payments = NettingEngine.multilateral_net(obligations, window_id)
+        obligations_hash = NettingEngine.compute_obligations_hash(obligations)
+        return {
+            "netting_type": "multilateral",
+            "payments": payments,
+            "payment_count": len(payments),
+            "obligations_hash": obligations_hash,
+        }
+
+
+def dispute_file(ctx: HiveContext, obligation_id: str = "",
+                 evidence_json: str = "{}") -> Dict[str, Any]:
+    """File a settlement dispute."""
+    from .settlement import DisputeResolver
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    if not obligation_id:
+        return {"error": "obligation_id is required"}
+
+    try:
+        evidence = json.loads(evidence_json)
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "invalid evidence_json"}
+
+    resolver = DisputeResolver(ctx.database, ctx.safe_plugin)
+    result = resolver.file_dispute(obligation_id, ctx.our_pubkey, evidence)
+    return result if result else {"error": "failed to file dispute"}
+
+
+def dispute_vote(ctx: HiveContext, dispute_id: str = "",
+                 vote: str = "", reason: str = "") -> Dict[str, Any]:
+    """Cast an arbitration panel vote."""
+    from .settlement import DisputeResolver
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    if not dispute_id or not vote:
+        return {"error": "dispute_id and vote are required"}
+
+    from .protocol import VALID_ARBITRATION_VOTES
+    if vote not in VALID_ARBITRATION_VOTES:
+        return {"error": f"vote must be one of: {', '.join(VALID_ARBITRATION_VOTES)}"}
+
+    signature = ""
+    try:
+        from .protocol import get_arbitration_vote_signing_payload
+        signing_payload = get_arbitration_vote_signing_payload(dispute_id, vote, reason)
+        sig_result = ctx.safe_plugin.rpc.signmessage(signing_payload)
+        if isinstance(sig_result, dict):
+            signature = sig_result.get("zbase", "")
+    except Exception:
+        signature = ""
+
+    resolver = DisputeResolver(ctx.database, ctx.safe_plugin)
+    result = resolver.record_vote(dispute_id, ctx.our_pubkey, vote, reason, signature)
+    return result if result else {"error": "failed to record vote"}
+
+
+def dispute_status(ctx: HiveContext, dispute_id: str = "") -> Dict[str, Any]:
+    """Get dispute status."""
+    if not ctx.database:
+        return {"error": "database not initialized"}
+
+    if not dispute_id:
+        return {"error": "dispute_id is required"}
+
+    dispute = ctx.database.get_dispute(dispute_id)
+    if not dispute:
+        return {"error": "dispute not found"}
+
+    # Parse JSON fields
+    for jf in ("evidence_json", "panel_members_json", "votes_json"):
+        if jf in dispute and dispute[jf]:
+            try:
+                dispute[jf.replace("_json", "")] = json.loads(dispute[jf])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    return dispute
+
+
+def credit_tier_info(ctx: HiveContext,
+                     peer_id: Optional[str] = None) -> Dict[str, Any]:
+    """Get credit tier information for a peer."""
+    from .settlement import get_credit_tier_info
+
+    target = peer_id or ctx.our_pubkey
+    return get_credit_tier_info(target, ctx.did_credential_mgr)
+
+
+# =============================================================================
+# PHASE 5B: ADVISOR MARKETPLACE COMMANDS
+# =============================================================================
+
+def marketplace_discover(ctx: HiveContext, criteria_json: str = "{}") -> Dict[str, Any]:
+    """Discover advisor profiles from the marketplace cache."""
+    if not ctx.marketplace_mgr:
+        return {"error": "marketplace manager not initialized"}
+
+    try:
+        criteria = json.loads(criteria_json) if criteria_json else {}
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "invalid criteria_json"}
+    if not isinstance(criteria, dict):
+        return {"error": "criteria_json must decode to an object"}
+
+    advisors = ctx.marketplace_mgr.discover_advisors(criteria)
+    return {"advisors": advisors, "count": len(advisors)}
+
+
+def marketplace_profile(ctx: HiveContext, profile_json: str = "") -> Dict[str, Any]:
+    """View cached advisors or publish our advisor profile."""
+    if not ctx.marketplace_mgr:
+        return {"error": "marketplace manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not profile_json:
+        advisors = ctx.marketplace_mgr.discover_advisors({})
+        return {"advisors": advisors, "count": len(advisors)}
+
+    try:
+        profile = json.loads(profile_json)
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "invalid profile_json"}
+    if not isinstance(profile, dict):
+        return {"error": "profile_json must decode to an object"}
+
+    return ctx.marketplace_mgr.publish_profile(profile)
+
+
+def marketplace_propose(ctx: HiveContext, advisor_did: str, node_id: str,
+                        scope_json: str = "{}", tier: str = "standard",
+                        pricing_json: str = "{}") -> Dict[str, Any]:
+    """Propose a contract to an advisor."""
+    if not ctx.marketplace_mgr:
+        return {"error": "marketplace manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not advisor_did or not node_id:
+        return {"error": "advisor_did and node_id are required"}
+
+    try:
+        scope = json.loads(scope_json) if scope_json else {}
+        pricing = json.loads(pricing_json) if pricing_json else {}
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "invalid scope_json or pricing_json"}
+    if not isinstance(scope, dict) or not isinstance(pricing, dict):
+        return {"error": "scope_json and pricing_json must decode to objects"}
+
+    return ctx.marketplace_mgr.propose_contract(
+        advisor_did, node_id, scope, tier, pricing, operator_id=ctx.our_pubkey
+    )
+
+
+def marketplace_accept(ctx: HiveContext, contract_id: str) -> Dict[str, Any]:
+    """Accept a proposed advisor contract."""
+    if not ctx.marketplace_mgr:
+        return {"error": "marketplace manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not contract_id:
+        return {"error": "contract_id is required"}
+
+    return ctx.marketplace_mgr.accept_contract(contract_id)
+
+
+def marketplace_trial(ctx: HiveContext, contract_id: str,
+                      action: str = "start",
+                      duration_days: int = 14,
+                      flat_fee_sats: int = 0,
+                      evaluation_json: str = "{}") -> Dict[str, Any]:
+    """Start or evaluate an advisor trial."""
+    if not ctx.marketplace_mgr:
+        return {"error": "marketplace manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not contract_id:
+        return {"error": "contract_id is required"}
+
+    if action == "start":
+        return ctx.marketplace_mgr.start_trial(contract_id, duration_days, flat_fee_sats)
+    if action == "evaluate":
+        try:
+            evaluation = json.loads(evaluation_json) if evaluation_json else {}
+        except (json.JSONDecodeError, TypeError):
+            return {"error": "invalid evaluation_json"}
+        if not isinstance(evaluation, dict):
+            return {"error": "evaluation_json must decode to an object"}
+        return ctx.marketplace_mgr.evaluate_trial(contract_id, evaluation)
+    return {"error": "action must be 'start' or 'evaluate'"}
+
+
+def marketplace_terminate(ctx: HiveContext, contract_id: str,
+                          reason: str = "") -> Dict[str, Any]:
+    """Terminate an advisor contract."""
+    if not ctx.marketplace_mgr:
+        return {"error": "marketplace manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not contract_id:
+        return {"error": "contract_id is required"}
+
+    return ctx.marketplace_mgr.terminate_contract(contract_id, reason)
+
+
+def marketplace_status(ctx: HiveContext) -> Dict[str, Any]:
+    """Get high-level marketplace status."""
+    if not ctx.marketplace_mgr or not ctx.database:
+        return {"error": "marketplace manager not initialized"}
+
+    conn = ctx.database._get_connection()
+    contracts = conn.execute(
+        "SELECT status, COUNT(*) as cnt FROM marketplace_contracts GROUP BY status"
+    ).fetchall()
+    trials = conn.execute(
+        "SELECT COUNT(*) as cnt FROM marketplace_trials WHERE outcome IS NULL"
+    ).fetchone()
+    return {
+        "contract_counts": {row["status"]: int(row["cnt"]) for row in contracts},
+        "active_trials": int(trials["cnt"]) if trials else 0,
+    }
+
+
+# =============================================================================
+# PHASE 5C: LIQUIDITY MARKETPLACE COMMANDS
+# =============================================================================
+
+def liquidity_discover(ctx: HiveContext, service_type: Optional[int] = None,
+                       min_capacity: int = 0,
+                       max_rate: Optional[int] = None) -> Dict[str, Any]:
+    """Discover liquidity offers."""
+    if not ctx.liquidity_mgr:
+        return {"error": "liquidity manager not initialized"}
+
+    offers = ctx.liquidity_mgr.discover_offers(service_type, min_capacity, max_rate)
+    return {"offers": offers, "count": len(offers)}
+
+
+def liquidity_offer(ctx: HiveContext, provider_id: str, service_type: int,
+                    capacity_sats: int, duration_hours: int = 24,
+                    pricing_model: str = "sat-hours",
+                    rate_json: str = "{}",
+                    min_reputation: int = 0,
+                    expires_at: Optional[int] = None) -> Dict[str, Any]:
+    """Publish a liquidity offer."""
+    if not ctx.liquidity_mgr:
+        return {"error": "liquidity manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    try:
+        rate = json.loads(rate_json) if rate_json else {}
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "invalid rate_json"}
+    if not isinstance(rate, dict):
+        return {"error": "rate_json must decode to an object"}
+
+    return ctx.liquidity_mgr.publish_offer(
+        provider_id=provider_id,
+        service_type=service_type,
+        capacity_sats=capacity_sats,
+        duration_hours=duration_hours,
+        pricing_model=pricing_model,
+        rate=rate,
+        min_reputation=min_reputation,
+        expires_at=expires_at,
+    )
+
+
+def liquidity_request(ctx: HiveContext, requester_id: str, service_type: int,
+                      capacity_sats: int, details_json: str = "{}") -> Dict[str, Any]:
+    """Publish a liquidity request (RFP) on Nostr."""
+    if not ctx.nostr_transport:
+        return {"error": "nostr transport not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    try:
+        details = json.loads(details_json) if details_json else {}
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "invalid details_json"}
+    if not isinstance(details, dict):
+        return {"error": "details_json must decode to an object"}
+
+    event = ctx.nostr_transport.publish({
+        "kind": 38902,
+        "content": json.dumps({
+            "requester_id": requester_id,
+            "service_type": int(service_type),
+            "capacity_sats": int(capacity_sats),
+            "details": details,
+        }, sort_keys=True, separators=(",", ":")),
+        "tags": [["t", "hive-liquidity-rfp"]],
+    })
+    return {"ok": True, "nostr_event_id": event.get("id")}
+
+
+def liquidity_lease(ctx: HiveContext, offer_id: str, client_id: str,
+                    heartbeat_interval: int = 3600) -> Dict[str, Any]:
+    """Accept a liquidity offer and create a lease."""
+    if not ctx.liquidity_mgr:
+        return {"error": "liquidity manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not offer_id or not client_id:
+        return {"error": "offer_id and client_id are required"}
+
+    return ctx.liquidity_mgr.accept_offer(offer_id, client_id, heartbeat_interval)
+
+
+def liquidity_heartbeat(ctx: HiveContext, lease_id: str, action: str = "send",
+                        heartbeat_id: str = "", channel_id: str = "",
+                        remote_balance_sats: int = 0,
+                        capacity_sats: Optional[int] = None) -> Dict[str, Any]:
+    """Send or verify a liquidity lease heartbeat."""
+    if not ctx.liquidity_mgr:
+        return {"error": "liquidity manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not lease_id:
+        return {"error": "lease_id is required"}
+
+    if action == "send":
+        if not channel_id:
+            return {"error": "channel_id is required when action=send"}
+        return ctx.liquidity_mgr.send_heartbeat(
+            lease_id=lease_id,
+            channel_id=channel_id,
+            remote_balance_sats=remote_balance_sats,
+            capacity_sats=capacity_sats,
+        )
+    if action == "verify":
+        if not heartbeat_id:
+            return {"error": "heartbeat_id is required when action=verify"}
+        return ctx.liquidity_mgr.verify_heartbeat(lease_id, heartbeat_id)
+    return {"error": "action must be 'send' or 'verify'"}
+
+
+def liquidity_lease_status(ctx: HiveContext, lease_id: str) -> Dict[str, Any]:
+    """Get lease details and heartbeat history."""
+    if not ctx.liquidity_mgr:
+        return {"error": "liquidity manager not initialized"}
+    if not lease_id:
+        return {"error": "lease_id is required"}
+    return ctx.liquidity_mgr.get_lease_status(lease_id)
+
+
+def liquidity_terminate(ctx: HiveContext, lease_id: str,
+                        reason: str = "") -> Dict[str, Any]:
+    """Terminate a liquidity lease."""
+    if not ctx.liquidity_mgr:
+        return {"error": "liquidity manager not initialized"}
+
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not lease_id:
+        return {"error": "lease_id is required"}
+    return ctx.liquidity_mgr.terminate_lease(lease_id, reason)

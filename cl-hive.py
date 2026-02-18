@@ -32,6 +32,7 @@ License: MIT
 """
 
 import json
+import inspect
 import multiprocessing
 import os
 import queue
@@ -112,6 +113,10 @@ from modules.idempotency import check_and_record, generate_event_id
 from modules.outbox import OutboxManager
 from modules.did_credentials import DIDCredentialManager
 from modules.management_schemas import ManagementSchemaRegistry
+from modules.cashu_escrow import CashuEscrowManager
+from modules.nostr_transport import NostrTransport
+from modules.marketplace import MarketplaceManager
+from modules.liquidity_marketplace import LiquidityMarketplaceManager
 from modules import network_metrics
 from modules.rpc_commands import (
     HiveContext,
@@ -215,6 +220,38 @@ from modules.rpc_commands import (
     mgmt_credential_issue as rpc_mgmt_credential_issue,
     mgmt_credential_list as rpc_mgmt_credential_list,
     mgmt_credential_revoke as rpc_mgmt_credential_revoke,
+    # Phase 4A: Cashu Escrow
+    escrow_create as rpc_escrow_create,
+    escrow_list as rpc_escrow_list,
+    escrow_redeem as rpc_escrow_redeem,
+    escrow_refund as rpc_escrow_refund,
+    escrow_get_receipt as rpc_escrow_get_receipt,
+    escrow_complete as rpc_escrow_complete,
+    # Phase 4B: Extended Settlements
+    bond_post as rpc_bond_post,
+    bond_status as rpc_bond_status,
+    settlement_obligations_list as rpc_settlement_obligations_list,
+    settlement_net as rpc_settlement_net,
+    dispute_file as rpc_dispute_file,
+    dispute_vote as rpc_dispute_vote,
+    dispute_status as rpc_dispute_status,
+    credit_tier_info as rpc_credit_tier_info,
+    # Phase 5B: Advisor marketplace
+    marketplace_discover as rpc_marketplace_discover,
+    marketplace_profile as rpc_marketplace_profile,
+    marketplace_propose as rpc_marketplace_propose,
+    marketplace_accept as rpc_marketplace_accept,
+    marketplace_trial as rpc_marketplace_trial,
+    marketplace_terminate as rpc_marketplace_terminate,
+    marketplace_status as rpc_marketplace_status,
+    # Phase 5C: Liquidity marketplace
+    liquidity_discover as rpc_liquidity_discover,
+    liquidity_offer as rpc_liquidity_offer,
+    liquidity_request as rpc_liquidity_request,
+    liquidity_lease as rpc_liquidity_lease,
+    liquidity_heartbeat as rpc_liquidity_heartbeat,
+    liquidity_lease_status as rpc_liquidity_lease_status,
+    liquidity_terminate as rpc_liquidity_terminate,
 )
 
 # Initialize the plugin
@@ -585,6 +622,11 @@ relay_mgr: Optional[RelayManager] = None
 outbox_mgr: Optional[OutboxManager] = None
 did_credential_mgr: Optional[DIDCredentialManager] = None
 management_schema_registry: Optional[ManagementSchemaRegistry] = None
+cashu_escrow_mgr: Optional[CashuEscrowManager] = None
+nostr_transport: Optional[NostrTransport] = None
+marketplace_mgr: Optional[MarketplaceManager] = None
+liquidity_mgr: Optional[LiquidityMarketplaceManager] = None
+policy_engine: Optional[Any] = None
 our_pubkey: Optional[str] = None
 
 # Startup timestamp for lightweight health endpoint (Phase 4)
@@ -805,6 +847,23 @@ class RateLimiter:
 # Global rate limiter for PEER_AVAILABLE messages
 peer_available_limiter: Optional[RateLimiter] = None
 
+# Phase 4B per-peer sliding-window limits (count, window_seconds)
+PHASE4B_RATE_LIMITS = {
+    "SETTLEMENT_RECEIPT": (30, 3600),
+    "BOND_POSTING": (5, 3600),
+    "BOND_SLASH": (5, 3600),
+    "NETTING_PROPOSAL": (10, 3600),
+    "NETTING_ACK": (10, 3600),
+    "VIOLATION_REPORT": (5, 3600),
+    "ARBITRATION_VOTE": (5, 3600),
+}
+_phase4b_rate_windows: Dict[tuple, List[int]] = {}
+_phase4b_rate_lock = threading.Lock()
+
+# Track latest verified netting proposals by settlement window.
+_phase4b_netting_proposals: Dict[str, Dict[str, Any]] = {}
+_phase4b_netting_lock = threading.Lock()
+
 
 def _parse_bool(value: Any, default: bool = False) -> bool:
     """Parse a boolean-ish option value safely."""
@@ -909,6 +968,11 @@ def _get_hive_context() -> HiveContext:
         anticipatory_manager=_anticipatory_liquidity_mgr,
         did_credential_mgr=did_credential_mgr,
         management_schema_registry=management_schema_registry,
+        cashu_escrow_mgr=cashu_escrow_mgr,
+        nostr_transport=nostr_transport,
+        marketplace_mgr=marketplace_mgr,
+        liquidity_mgr=liquidity_mgr,
+        policy_engine=policy_engine,
         our_id=_our_pubkey or "",
         log=_log,
     )
@@ -1127,6 +1191,20 @@ plugin.add_option(
     name='hive-vpn-bind',
     default='',
     description='VPN bind address for hive traffic (ip:port)',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-cashu-mints',
+    default='',
+    description='Comma-separated Cashu mint URLs for escrow tickets',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-nostr-relays',
+    default='',
+    description='Comma-separated Nostr relay URLs for Phase 5 transport',
     dynamic=True
 )
 
@@ -1881,6 +1959,98 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     did_maintenance_thread.start()
     plugin.log("cl-hive: DID maintenance thread started")
 
+    # Phase 4A: Cashu Escrow Manager
+    global cashu_escrow_mgr
+    mint_urls_str = plugin.get_option('hive-cashu-mints')
+    acceptable_mints = [u.strip() for u in mint_urls_str.split(',') if u.strip()] if mint_urls_str else []
+    cashu_escrow_mgr = CashuEscrowManager(
+        database=database,
+        plugin=plugin,
+        rpc=plugin.rpc,
+        our_pubkey=our_pubkey,
+        acceptable_mints=acceptable_mints,
+    )
+    plugin.log("cl-hive: Cashu escrow manager initialized")
+
+    # Phase 4B: Wire extended settlement types into settlement manager
+    if settlement_mgr and cashu_escrow_mgr:
+        settlement_mgr.register_extended_types(cashu_escrow_mgr, did_credential_mgr)
+        plugin.log("cl-hive: Extended settlement types registered")
+
+    # Start escrow maintenance background thread
+    escrow_maintenance_thread = threading.Thread(
+        target=escrow_maintenance_loop,
+        name="cl-hive-escrow-maintenance",
+        daemon=True
+    )
+    escrow_maintenance_thread.start()
+    plugin.log("cl-hive: Escrow maintenance thread started")
+
+    # Phase 5A: Nostr transport foundation (thread + bounded queues)
+    global nostr_transport
+    try:
+        relays_opt = plugin.get_option('hive-nostr-relays')
+        relays = [r.strip() for r in relays_opt.split(',') if r.strip()] if relays_opt else None
+        nostr_transport = NostrTransport(
+            plugin=plugin,
+            database=database,
+            relays=relays,
+        )
+        nostr_transport.start()
+        plugin.log("cl-hive: Nostr transport initialized")
+    except Exception as e:
+        nostr_transport = None
+        plugin.log(f"cl-hive: Nostr transport disabled (init error): {e}", level='warn')
+
+    # Phase 5B: Advisor marketplace manager
+    global marketplace_mgr
+    try:
+        marketplace_mgr = MarketplaceManager(
+            database=database,
+            plugin=plugin,
+            nostr_transport=nostr_transport,
+            did_credential_mgr=did_credential_mgr,
+            management_schema_registry=management_schema_registry,
+            cashu_escrow_mgr=cashu_escrow_mgr,
+        )
+        plugin.log("cl-hive: Marketplace manager initialized")
+    except Exception as e:
+        marketplace_mgr = None
+        plugin.log(f"cl-hive: Marketplace manager disabled (init error): {e}", level='warn')
+
+    # Phase 5C: Liquidity marketplace manager
+    global liquidity_mgr
+    try:
+        liquidity_mgr = LiquidityMarketplaceManager(
+            database=database,
+            plugin=plugin,
+            nostr_transport=nostr_transport,
+            cashu_escrow_mgr=cashu_escrow_mgr,
+            settlement_mgr=settlement_mgr,
+            did_credential_mgr=did_credential_mgr,
+        )
+        plugin.log("cl-hive: Liquidity marketplace manager initialized")
+    except Exception as e:
+        liquidity_mgr = None
+        plugin.log(f"cl-hive: Liquidity manager disabled (init error): {e}", level='warn')
+
+    # Start Phase 5 maintenance background threads
+    marketplace_maintenance_thread = threading.Thread(
+        target=marketplace_maintenance_loop,
+        name="cl-hive-marketplace-maintenance",
+        daemon=True,
+    )
+    marketplace_maintenance_thread.start()
+    plugin.log("cl-hive: Marketplace maintenance thread started")
+
+    liquidity_maintenance_thread = threading.Thread(
+        target=liquidity_maintenance_loop,
+        name="cl-hive-liquidity-maintenance",
+        daemon=True,
+    )
+    liquidity_maintenance_thread.start()
+    plugin.log("cl-hive: Liquidity maintenance thread started")
+
     # Link anticipatory manager to fee coordination for time-based fees (Phase 7.4)
     if fee_coordination_mgr:
         fee_coordination_mgr.set_anticipatory_manager(anticipatory_liquidity_mgr)
@@ -1933,6 +2103,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 _rpc_pool.stop()
         except Exception:
             pass  # Best-effort on shutdown
+        try:
+            if nostr_transport:
+                nostr_transport.stop()
+        except Exception:
+            pass  # Best-effort on shutdown
+        try:
+            if cashu_escrow_mgr:
+                cashu_escrow_mgr.shutdown()
+        except Exception:
+            pass  # Best-effort on shutdown
         shutdown_event.set()
     
     try:
@@ -1945,6 +2125,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Background threads that access plugin.rpc will get bounded execution.
     plugin.rpc = RpcPoolProxy(_rpc_pool, timeout=30)
     plugin.log("cl-hive: RPC pool proxy installed")
+
+    # C4 audit fix: Re-assign thread-safe RPC proxy to managers that cached
+    # the raw plugin.rpc reference during init (before proxy was installed).
+    if did_credential_mgr:
+        did_credential_mgr.rpc = plugin.rpc
+    if management_schema_registry:
+        management_schema_registry.rpc = plugin.rpc
+    if cashu_escrow_mgr:
+        cashu_escrow_mgr.rpc = plugin.rpc
 
     plugin.log("cl-hive: Initialization complete. Swarm Intelligence ready.")
 
@@ -2227,6 +2416,21 @@ def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Pl
             handle_mgmt_credential_present(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.MGMT_CREDENTIAL_REVOKE:
             handle_mgmt_credential_revoke(peer_id, msg_payload, plugin)
+        # Phase 4: Extended Settlements
+        elif msg_type == HiveMessageType.SETTLEMENT_RECEIPT:
+            handle_settlement_receipt(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.BOND_POSTING:
+            handle_bond_posting(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.BOND_SLASH:
+            handle_bond_slash(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.NETTING_PROPOSAL:
+            handle_netting_proposal(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.NETTING_ACK:
+            handle_netting_ack(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.VIOLATION_REPORT:
+            handle_violation_report(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.ARBITRATION_VOTE:
+            handle_arbitration_vote(peer_id, msg_payload, plugin)
         else:
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
 
@@ -2555,7 +2759,7 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Store Hive membership info for ourselves
     if database and our_pubkey:
         now = int(time.time())
-        # Add ourselves as a member with the tier assigned by the admin
+        # Add ourselves as a member with the configured tier
         database.add_member(our_pubkey, tier=tier or 'neophyte', joined_at=now)
         # Store hive_id in metadata
         database.update_member(our_pubkey, metadata=json.dumps({"hive_id": hive_id}))
@@ -4017,28 +4221,70 @@ def handle_did_credential_present(peer_id: str, payload: Dict, plugin) -> Dict:
         plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT invalid payload from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Identity binding: sender_id must match peer_id
+    # P3-H-1 fix: For relayed messages, use origin for identity binding
     sender_id = payload.get("sender_id", "")
-    if sender_id != peer_id:
-        plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT identity mismatch from {peer_id[:16]}...", level='warn')
+    if _is_relayed_message(payload):
+        # NEW-1 fix: Verify relay peer is a known member
+        if database and not database.get_member(peer_id):
+            return {"result": "continue"}
+        # Ban check on relay peer
+        if database and database.is_banned(peer_id):
+            return {"result": "continue"}
+        # R5-M-5 fix: Rate limit on relay peer to prevent quota exhaustion attacks
+        if not _check_relay_credential_rate(peer_id):
+            plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT relay rate-limited for {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+        origin = _get_message_origin(payload)
+        effective_sender = origin if origin else peer_id
+        if sender_id != effective_sender:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT identity mismatch (relayed) from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    else:
+        if sender_id != peer_id:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT identity mismatch from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+
+    # Ban check against the actual sender
+    actual_sender = sender_id
+    if database and database.is_banned(actual_sender):
+        plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT from banned peer {actual_sender[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # R5-M-4 fix: Membership check BEFORE proto_events to avoid consuming dedup rows for non-members
+    if database:
+        member = database.get_member(actual_sender)
+        if not member:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT from non-member {actual_sender[:16]}...", level='debug')
+            return {"result": "continue"}
+
+    # Timestamp freshness
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "DID_CREDENTIAL_PRESENT"):
+        return {"result": "continue"}
+
+    # P3-M-4 fix: In-memory relay dedup for credential messages
+    if not _credential_relay_dedup(payload, "DID_CREDENTIAL_PRESENT"):
         return {"result": "continue"}
 
     # Dedup via proto_events
+    _eid = None
     if database:
-        is_new, _eid = check_and_record(database, "DID_CREDENTIAL_PRESENT", payload, peer_id)
+        is_new, _eid = check_and_record(database, "DID_CREDENTIAL_PRESENT", payload, actual_sender)
         if not is_new:
+            # P3-M-3 fix: Still relay even if already processed
+            _relay_message(HiveMessageType.DID_CREDENTIAL_PRESENT, payload, peer_id)
+            # R5-L-6 fix: Emit ack on dedup branch so sender outbox entries are cleared
+            _emit_ack(peer_id, payload.get("event_id") or _eid)
             return {"result": "continue"}  # Already processed
-
-    # Membership check
-    if database:
-        member = database.get_member(peer_id)
-        if not member:
-            plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT from non-member {peer_id[:16]}...", level='debug')
-            return {"result": "continue"}
 
     # Process credential
     if did_credential_mgr:
-        did_credential_mgr.handle_credential_present(peer_id, payload)
+        did_credential_mgr.handle_credential_present(actual_sender, payload)
+
+    # P3-H-2 fix: Emit ack after successful processing
+    _emit_ack(peer_id, payload.get("event_id") or _eid)
+
+    # P3-M-3 fix: Relay to other members
+    _relay_message(HiveMessageType.DID_CREDENTIAL_PRESENT, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -4051,28 +4297,70 @@ def handle_did_credential_revoke(peer_id: str, payload: Dict, plugin) -> Dict:
         plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE invalid payload from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Identity binding
+    # P3-H-1 fix: For relayed messages, use origin for identity binding
     sender_id = payload.get("sender_id", "")
-    if sender_id != peer_id:
-        plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE identity mismatch from {peer_id[:16]}...", level='warn')
+    if _is_relayed_message(payload):
+        # NEW-1 fix: Verify relay peer is a known member
+        if database and not database.get_member(peer_id):
+            return {"result": "continue"}
+        # Ban check on relay peer
+        if database and database.is_banned(peer_id):
+            return {"result": "continue"}
+        # R5-M-5 fix: Rate limit on relay peer to prevent quota exhaustion attacks
+        if not _check_relay_credential_rate(peer_id):
+            plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE relay rate-limited for {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+        origin = _get_message_origin(payload)
+        effective_sender = origin if origin else peer_id
+        if sender_id != effective_sender:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE identity mismatch (relayed) from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    else:
+        if sender_id != peer_id:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE identity mismatch from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+
+    # Ban check against the actual sender
+    actual_sender = sender_id
+    if database and database.is_banned(actual_sender):
+        plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE from banned peer {actual_sender[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # R5-M-4 fix: Membership check BEFORE proto_events to avoid consuming dedup rows for non-members
+    if database:
+        member = database.get_member(actual_sender)
+        if not member:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE from non-member {actual_sender[:16]}...", level='debug')
+            return {"result": "continue"}
+
+    # Timestamp freshness
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "DID_CREDENTIAL_REVOKE"):
+        return {"result": "continue"}
+
+    # P3-M-4 fix: In-memory relay dedup for credential messages
+    if not _credential_relay_dedup(payload, "DID_CREDENTIAL_REVOKE"):
         return {"result": "continue"}
 
     # Dedup
+    _eid = None
     if database:
-        is_new, _eid = check_and_record(database, "DID_CREDENTIAL_REVOKE", payload, peer_id)
+        is_new, _eid = check_and_record(database, "DID_CREDENTIAL_REVOKE", payload, actual_sender)
         if not is_new:
-            return {"result": "continue"}
-
-    # Membership check
-    if database:
-        member = database.get_member(peer_id)
-        if not member:
-            plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE from non-member {peer_id[:16]}...", level='debug')
+            # P3-M-3 fix: Still relay even if already processed
+            _relay_message(HiveMessageType.DID_CREDENTIAL_REVOKE, payload, peer_id)
+            # R5-L-6 fix: Emit ack on dedup branch so sender outbox entries are cleared
+            _emit_ack(peer_id, payload.get("event_id") or _eid)
             return {"result": "continue"}
 
     # Process revocation
     if did_credential_mgr:
-        did_credential_mgr.handle_credential_revoke(peer_id, payload)
+        did_credential_mgr.handle_credential_revoke(actual_sender, payload)
+
+    # P3-H-2 fix: Emit ack after successful processing
+    _emit_ack(peer_id, payload.get("event_id") or _eid)
+
+    # P3-M-3 fix: Relay to other members
+    _relay_message(HiveMessageType.DID_CREDENTIAL_REVOKE, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -4085,28 +4373,70 @@ def handle_mgmt_credential_present(peer_id: str, payload: Dict, plugin) -> Dict:
         plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT invalid payload from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Identity binding: sender_id must match peer_id
+    # P3-H-1 fix: For relayed messages, use origin for identity binding
     sender_id = payload.get("sender_id", "")
-    if sender_id != peer_id:
-        plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT identity mismatch from {peer_id[:16]}...", level='warn')
+    if _is_relayed_message(payload):
+        # NEW-1 fix: Verify relay peer is a known member
+        if database and not database.get_member(peer_id):
+            return {"result": "continue"}
+        # Ban check on relay peer
+        if database and database.is_banned(peer_id):
+            return {"result": "continue"}
+        # R5-M-5 fix: Rate limit on relay peer to prevent quota exhaustion attacks
+        if not _check_relay_credential_rate(peer_id):
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT relay rate-limited for {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+        origin = _get_message_origin(payload)
+        effective_sender = origin if origin else peer_id
+        if sender_id != effective_sender:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT identity mismatch (relayed) from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    else:
+        if sender_id != peer_id:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT identity mismatch from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+
+    # Ban check against the actual sender
+    actual_sender = sender_id
+    if database and database.is_banned(actual_sender):
+        plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT from banned peer {actual_sender[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # R5-M-4 fix: Membership check BEFORE proto_events to avoid consuming dedup rows for non-members
+    if database:
+        member = database.get_member(actual_sender)
+        if not member:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT from non-member {actual_sender[:16]}...", level='debug')
+            return {"result": "continue"}
+
+    # Timestamp freshness
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "MGMT_CREDENTIAL_PRESENT"):
+        return {"result": "continue"}
+
+    # P3-M-4 fix: In-memory relay dedup for credential messages
+    if not _credential_relay_dedup(payload, "MGMT_CREDENTIAL_PRESENT"):
         return {"result": "continue"}
 
     # Dedup via proto_events
+    _eid = None
     if database:
-        is_new, _eid = check_and_record(database, "MGMT_CREDENTIAL_PRESENT", payload, peer_id)
+        is_new, _eid = check_and_record(database, "MGMT_CREDENTIAL_PRESENT", payload, actual_sender)
         if not is_new:
-            return {"result": "continue"}
-
-    # Membership check
-    if database:
-        member = database.get_member(peer_id)
-        if not member:
-            plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT from non-member {peer_id[:16]}...", level='debug')
+            # P3-M-3 fix: Still relay even if already processed
+            _relay_message(HiveMessageType.MGMT_CREDENTIAL_PRESENT, payload, peer_id)
+            # R5-L-6 fix: Emit ack on dedup branch so sender outbox entries are cleared
+            _emit_ack(peer_id, payload.get("event_id") or _eid)
             return {"result": "continue"}
 
     # Process credential
     if management_schema_registry:
-        management_schema_registry.handle_mgmt_credential_present(peer_id, payload)
+        management_schema_registry.handle_mgmt_credential_present(actual_sender, payload)
+
+    # P3-H-2 fix: Emit ack after successful processing
+    _emit_ack(peer_id, payload.get("event_id") or _eid)
+
+    # P3-M-3 fix: Relay to other members
+    _relay_message(HiveMessageType.MGMT_CREDENTIAL_PRESENT, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -4119,28 +4449,70 @@ def handle_mgmt_credential_revoke(peer_id: str, payload: Dict, plugin) -> Dict:
         plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE invalid payload from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Identity binding
+    # P3-H-1 fix: For relayed messages, use origin for identity binding
     sender_id = payload.get("sender_id", "")
-    if sender_id != peer_id:
-        plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE identity mismatch from {peer_id[:16]}...", level='warn')
+    if _is_relayed_message(payload):
+        # NEW-1 fix: Verify relay peer is a known member
+        if database and not database.get_member(peer_id):
+            return {"result": "continue"}
+        # Ban check on relay peer
+        if database and database.is_banned(peer_id):
+            return {"result": "continue"}
+        # R5-M-5 fix: Rate limit on relay peer to prevent quota exhaustion attacks
+        if not _check_relay_credential_rate(peer_id):
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE relay rate-limited for {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+        origin = _get_message_origin(payload)
+        effective_sender = origin if origin else peer_id
+        if sender_id != effective_sender:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE identity mismatch (relayed) from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    else:
+        if sender_id != peer_id:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE identity mismatch from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+
+    # Ban check against the actual sender
+    actual_sender = sender_id
+    if database and database.is_banned(actual_sender):
+        plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE from banned peer {actual_sender[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # R5-M-4 fix: Membership check BEFORE proto_events to avoid consuming dedup rows for non-members
+    if database:
+        member = database.get_member(actual_sender)
+        if not member:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE from non-member {actual_sender[:16]}...", level='debug')
+            return {"result": "continue"}
+
+    # Timestamp freshness
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "MGMT_CREDENTIAL_REVOKE"):
+        return {"result": "continue"}
+
+    # P3-M-4 fix: In-memory relay dedup for credential messages
+    if not _credential_relay_dedup(payload, "MGMT_CREDENTIAL_REVOKE"):
         return {"result": "continue"}
 
     # Dedup
+    _eid = None
     if database:
-        is_new, _eid = check_and_record(database, "MGMT_CREDENTIAL_REVOKE", payload, peer_id)
+        is_new, _eid = check_and_record(database, "MGMT_CREDENTIAL_REVOKE", payload, actual_sender)
         if not is_new:
-            return {"result": "continue"}
-
-    # Membership check
-    if database:
-        member = database.get_member(peer_id)
-        if not member:
-            plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE from non-member {peer_id[:16]}...", level='debug')
+            # P3-M-3 fix: Still relay even if already processed
+            _relay_message(HiveMessageType.MGMT_CREDENTIAL_REVOKE, payload, peer_id)
+            # R5-L-6 fix: Emit ack on dedup branch so sender outbox entries are cleared
+            _emit_ack(peer_id, payload.get("event_id") or _eid)
             return {"result": "continue"}
 
     # Process revocation
     if management_schema_registry:
-        management_schema_registry.handle_mgmt_credential_revoke(peer_id, payload)
+        management_schema_registry.handle_mgmt_credential_revoke(actual_sender, payload)
+
+    # P3-H-2 fix: Emit ack after successful processing
+    _emit_ack(peer_id, payload.get("event_id") or _eid)
+
+    # P3-M-3 fix: Relay to other members
+    _relay_message(HiveMessageType.MGMT_CREDENTIAL_REVOKE, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -4184,6 +4556,633 @@ def did_maintenance_loop():
             plugin.log(f"cl-hive: did_maintenance_loop error: {e}", level='warn')
 
         shutdown_event.wait(1800)  # 30 min cycle
+
+
+# =============================================================================
+# PHASE 4: EXTENDED SETTLEMENT MESSAGE HANDLERS
+# =============================================================================
+
+def _verify_phase4b_signature(peer_id: str, payload: Dict, msg_type: str,
+                               get_signing_payload_fn, plugin: Plugin) -> bool:
+    """Verify signature for Phase 4B messages. Returns True if valid."""
+    signature = payload.get("signature", "")
+    if not signature:
+        plugin.log(f"cl-hive: {msg_type} missing signature from {peer_id[:16]}...", level='warn')
+        return False
+    try:
+        signing_payload = _phase4b_build_signing_payload(get_signing_payload_fn, payload)
+        verify_result = plugin.rpc.call("checkmessage", {
+            "message": signing_payload,
+            "zbase": signature,
+            "pubkey": peer_id
+        })
+        if not verify_result.get("verified"):
+            plugin.log(f"cl-hive: {msg_type} invalid signature from {peer_id[:16]}...", level='warn')
+            return False
+    except Exception as e:
+        plugin.log(f"cl-hive: {msg_type} signature check failed: {e}", level='warn')
+        return False
+    return True
+
+
+def _phase4b_build_signing_payload(get_signing_payload_fn, payload: Dict[str, Any]) -> str:
+    """Build signing payload from incoming message payload using function signature."""
+    try:
+        sig = inspect.signature(get_signing_payload_fn)
+    except (TypeError, ValueError):
+        return get_signing_payload_fn(payload)
+
+    kwargs = {}
+    for name, param in sig.parameters.items():
+        if param.kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            continue
+        if name in payload:
+            kwargs[name] = payload[name]
+        elif param.default is inspect._empty:
+            raise KeyError(f"missing signing payload field: {name}")
+    return get_signing_payload_fn(**kwargs)
+
+
+def _phase4b_check_rate_limit(peer_id: str, msg_type: str, plugin: Plugin) -> bool:
+    """Sliding-window rate limiting for Phase 4B message handlers."""
+    limit_cfg = PHASE4B_RATE_LIMITS.get(msg_type)
+    if not limit_cfg:
+        return True
+
+    max_count, window_seconds = limit_cfg
+    now = int(time.time())
+    cutoff = now - window_seconds
+    key = (peer_id, msg_type)
+
+    with _phase4b_rate_lock:
+        timestamps = _phase4b_rate_windows.get(key, [])
+        timestamps = [ts for ts in timestamps if ts > cutoff]
+        if len(timestamps) >= max_count:
+            plugin.log(
+                f"cl-hive: {msg_type} from {peer_id[:16]}... rate-limited "
+                f"({len(timestamps)}/{max_count} in {window_seconds}s)",
+                level='warn'
+            )
+            _phase4b_rate_windows[key] = timestamps
+            return False
+
+        timestamps.append(now)
+        _phase4b_rate_windows[key] = timestamps
+
+        if len(_phase4b_rate_windows) > 2000:
+            stale_keys = [
+                k for k, vals in _phase4b_rate_windows.items()
+                if not vals or vals[-1] <= cutoff
+            ]
+            for k in stale_keys:
+                _phase4b_rate_windows.pop(k, None)
+
+    return True
+
+
+def _phase4b_record_if_new(peer_id: str, payload: Dict, msg_type: str) -> bool:
+    """Record event idempotently. Returns True if new."""
+    if not database:
+        return True
+    is_new, _eid = check_and_record(database, msg_type, payload, peer_id)
+    return is_new
+
+
+def _phase4b_common_checks(peer_id: str, payload: Dict, msg_type: str,
+                            plugin: Plugin) -> bool:
+    """Common checks for all Phase 4B handlers. Returns True if message should be processed."""
+    # Identity binding
+    sender_id = payload.get("sender_id", "")
+    if sender_id != peer_id:
+        plugin.log(f"cl-hive: {msg_type} sender mismatch from {peer_id[:16]}...", level='warn')
+        return False
+
+    # Ban check
+    if database and database.is_banned(peer_id):
+        plugin.log(f"cl-hive: {msg_type} from banned peer {peer_id[:16]}...", level='warn')
+        return False
+
+    # Membership check
+    if database:
+        member = database.get_member(peer_id)
+        if not member:
+            plugin.log(f"cl-hive: {msg_type} from non-member {peer_id[:16]}...", level='debug')
+            return False
+
+    # Timestamp freshness
+    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, msg_type):
+        return False
+
+    # Rate limit
+    if not _phase4b_check_rate_limit(peer_id, msg_type, plugin):
+        return False
+
+    return True
+
+
+def handle_settlement_receipt(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle SETTLEMENT_RECEIPT message."""
+    from modules.protocol import validate_settlement_receipt, get_settlement_receipt_signing_payload
+    from modules.settlement import SettlementTypeRegistry
+    if not validate_settlement_receipt(payload):
+        plugin.log(f"cl-hive: invalid SETTLEMENT_RECEIPT from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if not _phase4b_common_checks(peer_id, payload, "SETTLEMENT_RECEIPT", plugin):
+        return {"result": "continue"}
+
+    if not _verify_phase4b_signature(peer_id, payload, "SETTLEMENT_RECEIPT",
+                                      get_settlement_receipt_signing_payload, plugin):
+        return {"result": "continue"}
+
+    if not _phase4b_record_if_new(peer_id, payload, "SETTLEMENT_RECEIPT"):
+        return {"result": "continue"}
+
+    # P4R4-M-1: Validate from_peer matches actual sender to prevent forged obligations
+    claimed_from = payload.get("from_peer", "")
+    if claimed_from and claimed_from != peer_id:
+        plugin.log(
+            f"cl-hive: SETTLEMENT_RECEIPT from_peer mismatch: "
+            f"claimed={claimed_from[:16]}... actual={peer_id[:16]}...",
+            level='warn',
+        )
+        return {"result": "continue"}
+
+    if not hasattr(settlement_mgr, '_type_registry') or settlement_mgr._type_registry is None:
+        settlement_mgr._type_registry = SettlementTypeRegistry(
+            cashu_escrow_mgr=cashu_escrow_mgr,
+            did_credential_mgr=did_credential_mgr,
+        )
+    registry = settlement_mgr._type_registry
+    valid_receipt, reason = registry.verify_receipt(
+        payload.get("settlement_type", ""),
+        payload.get("receipt_data", {}) or {},
+    )
+    if not valid_receipt:
+        plugin.log(
+            f"cl-hive: SETTLEMENT_RECEIPT rejected ({reason}) from {peer_id[:16]}...",
+            level='warn',
+        )
+        return {"result": "continue"}
+
+    if database:
+        database.store_obligation(
+            obligation_id=payload.get("receipt_id", ""),
+            settlement_type=payload.get("settlement_type", ""),
+            from_peer=payload.get("from_peer", ""),
+            to_peer=payload.get("to_peer", ""),
+            amount_sats=int(payload.get("amount_sats", 0) or 0),
+            window_id=payload.get("window_id", ""),
+            receipt_id=payload.get("receipt_id", ""),
+            created_at=int(time.time()),
+        )
+
+    plugin.log(f"cl-hive: SETTLEMENT_RECEIPT from {peer_id[:16]}... "
+               f"type={payload.get('settlement_type')} amount={payload.get('amount_sats')}")
+    return {"result": "continue"}
+
+
+def handle_bond_posting(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle BOND_POSTING message."""
+    from modules.protocol import validate_bond_posting, get_bond_posting_signing_payload
+    if not validate_bond_posting(payload):
+        plugin.log(f"cl-hive: invalid BOND_POSTING from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if not _phase4b_common_checks(peer_id, payload, "BOND_POSTING", plugin):
+        return {"result": "continue"}
+
+    if not _verify_phase4b_signature(peer_id, payload, "BOND_POSTING",
+                                      get_bond_posting_signing_payload, plugin):
+        return {"result": "continue"}
+
+    if not _phase4b_record_if_new(peer_id, payload, "BOND_POSTING"):
+        return {"result": "continue"}
+
+    if database:
+        database.store_bond(
+            bond_id=payload.get("bond_id", ""),
+            peer_id=peer_id,
+            amount_sats=int(payload.get("amount_sats", 0) or 0),
+            token_json=None,
+            posted_at=int(payload.get("timestamp", int(time.time()))),
+            timelock=int(payload.get("timelock", 0) or 0),
+            tier=payload.get("tier", ""),
+        )
+
+    plugin.log(f"cl-hive: BOND_POSTING from {peer_id[:16]}... "
+               f"tier={payload.get('tier')} amount={payload.get('amount_sats')}")
+    return {"result": "continue"}
+
+
+def handle_bond_slash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle BOND_SLASH message."""
+    from modules.protocol import (
+        validate_bond_slash,
+        get_bond_slash_signing_payload,
+        get_arbitration_vote_signing_payload,
+    )
+    from modules.settlement import BondManager
+    if not validate_bond_slash(payload):
+        plugin.log(f"cl-hive: invalid BOND_SLASH from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if not _phase4b_common_checks(peer_id, payload, "BOND_SLASH", plugin):
+        return {"result": "continue"}
+
+    if not _verify_phase4b_signature(peer_id, payload, "BOND_SLASH",
+                                      get_bond_slash_signing_payload, plugin):
+        return {"result": "continue"}
+
+    if not _phase4b_record_if_new(peer_id, payload, "BOND_SLASH"):
+        return {"result": "continue"}
+
+    if not database:
+        return {"result": "continue"}
+
+    dispute_id = payload.get("dispute_id", "")
+    dispute = database.get_dispute(dispute_id) if dispute_id else None
+    # R5-H-2 fix: Only allow outcome "upheld" (not "slashed") to prevent repeated slashing.
+    # Note: proto_events via _phase4b_record_if_new already deduplicates on (bond_id, dispute_id)
+    # so the same pair cannot be processed twice. This outcome check is a defense-in-depth guard
+    # against different event_id paths or manual DB tampering.
+    if not dispute or dispute.get("outcome") not in ("upheld",) or not dispute.get("resolved_at"):
+        plugin.log(
+            f"cl-hive: BOND_SLASH rejected for unresolved/non-upheld dispute {dispute_id[:16]}...",
+            level='warn',
+        )
+        return {"result": "continue"}
+
+    bond_id = payload.get("bond_id", "")
+    bond = database.get_bond(bond_id) if bond_id else None
+    if not bond or bond.get("status") != "active":
+        plugin.log(f"cl-hive: BOND_SLASH rejected, inactive bond {bond_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # R5-H-1 fix: Verify bond belongs to the dispute respondent
+    if bond.get("peer_id") != dispute.get("respondent_peer"):
+        plugin.log(
+            f"cl-hive: BOND_SLASH rejected, bond owner {bond.get('peer_id', '')[:16]}... "
+            f"!= dispute respondent {dispute.get('respondent_peer', '')[:16]}...",
+            level='warn',
+        )
+        return {"result": "continue"}
+
+    panel_members = []
+    votes = {}
+    try:
+        if dispute.get("panel_members_json"):
+            panel_members = json.loads(dispute["panel_members_json"])
+    except (TypeError, ValueError):
+        panel_members = []
+    try:
+        if dispute.get("votes_json"):
+            votes = json.loads(dispute["votes_json"])
+    except (TypeError, ValueError):
+        votes = {}
+
+    sender_member = database.get_member(peer_id)
+    sender_tier = (sender_member or {}).get("tier", "")
+    if peer_id not in panel_members and sender_tier not in ("admin", "founding"):
+        plugin.log(f"cl-hive: BOND_SLASH sender {peer_id[:16]}... not authorized", level='warn')
+        return {"result": "continue"}
+
+    remaining = int(bond.get("amount_sats", 0) or 0) - int(bond.get("slashed_amount", 0) or 0)
+    slash_amount = int(payload.get("slash_amount", 0) or 0)
+    if slash_amount <= 0 or slash_amount > remaining:
+        plugin.log(
+            f"cl-hive: BOND_SLASH rejected invalid amount {slash_amount} (remaining={remaining})",
+            level='warn',
+        )
+        return {"result": "continue"}
+
+    quorum = (len(panel_members) // 2) + 1 if panel_members else 0
+    upheld_votes = 0
+    for voter_id in panel_members:
+        vote_info = votes.get(voter_id)
+        if not isinstance(vote_info, dict):
+            continue
+        if vote_info.get("vote") != "upheld":
+            continue
+        vote_sig = vote_info.get("signature", "")
+        if not isinstance(vote_sig, str) or not vote_sig:
+            plugin.log(f"cl-hive: BOND_SLASH missing vote signature for {voter_id[:16]}...", level='warn')
+            return {"result": "continue"}
+        vote_payload = get_arbitration_vote_signing_payload(
+            dispute_id=dispute_id,
+            vote=vote_info.get("vote", "upheld"),
+            reason=vote_info.get("reason", ""),
+        )
+        try:
+            verify = plugin.rpc.call("checkmessage", {
+                "message": vote_payload,
+                "zbase": vote_sig,
+                "pubkey": voter_id,
+            })
+        except Exception as e:
+            plugin.log(f"cl-hive: BOND_SLASH vote signature check error: {e}", level='warn')
+            return {"result": "continue"}
+        if not verify.get("verified"):
+            plugin.log(f"cl-hive: BOND_SLASH invalid vote signature for {voter_id[:16]}...", level='warn')
+            return {"result": "continue"}
+        upheld_votes += 1
+
+    if quorum <= 0 or upheld_votes < quorum:
+        plugin.log(
+            f"cl-hive: BOND_SLASH quorum not met for {dispute_id[:16]}... ({upheld_votes}/{quorum})",
+            level='warn',
+        )
+        return {"result": "continue"}
+
+    bond_mgr = BondManager(database, plugin)
+    slash_result = bond_mgr.slash_bond(bond_id, slash_amount)
+    if not slash_result:
+        plugin.log(f"cl-hive: BOND_SLASH apply failed for bond {bond_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # R5-H-2 fix: Mark dispute as "slashed" so it cannot be reused for another slash.
+    # Note: update_dispute_outcome uses a CAS guard (resolved_at IS NULL OR resolved_at = 0)
+    # which would reject this update since the dispute is already resolved. We pass resolved_at=0
+    # to bypass the CAS guard (non-resolving update path) since we're only changing outcome.
+    database.update_dispute_outcome(
+        dispute_id=dispute_id,
+        outcome="slashed",
+        slash_amount=int(dispute.get("slash_amount", 0) or 0) + int(slash_result["slashed_amount"]),
+        panel_members_json=dispute.get("panel_members_json"),
+        votes_json=dispute.get("votes_json"),
+        resolved_at=0,
+    )
+
+    plugin.log(f"cl-hive: BOND_SLASH from {peer_id[:16]}... "
+               f"bond={payload.get('bond_id', '')[:16]} amount={payload.get('slash_amount')}")
+    return {"result": "continue"}
+
+
+def handle_netting_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle NETTING_PROPOSAL message."""
+    from modules.protocol import validate_netting_proposal, get_netting_proposal_signing_payload
+    from modules.settlement import NettingEngine
+    if not validate_netting_proposal(payload):
+        plugin.log(f"cl-hive: invalid NETTING_PROPOSAL from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if not _phase4b_common_checks(peer_id, payload, "NETTING_PROPOSAL", plugin):
+        return {"result": "continue"}
+
+    if not _verify_phase4b_signature(peer_id, payload, "NETTING_PROPOSAL",
+                                      get_netting_proposal_signing_payload, plugin):
+        return {"result": "continue"}
+
+    if not _phase4b_record_if_new(peer_id, payload, "NETTING_PROPOSAL"):
+        return {"result": "continue"}
+
+    if database:
+        window_id = payload.get("window_id", "")
+        obligations = database.get_obligations_for_window(window_id, status='pending', limit=10_000)
+        computed_hash = NettingEngine.compute_obligations_hash(obligations)
+        incoming_hash = payload.get("obligations_hash", "")
+        if computed_hash != incoming_hash:
+            plugin.log(
+                f"cl-hive: NETTING_PROPOSAL hash mismatch for window {window_id[:16]}...",
+                level='warn',
+            )
+            return {"result": "continue"}
+
+        with _phase4b_netting_lock:
+            _phase4b_netting_proposals[window_id] = {
+                "proposer": peer_id,
+                "obligations_hash": incoming_hash,
+                "received_at": int(time.time()),
+            }
+            # L-9 audit fix: Prune stale netting proposals to prevent unbounded growth
+            if len(_phase4b_netting_proposals) > 500:
+                cutoff = int(time.time()) - 86400  # 24 hours
+                stale_keys = [k for k, v in _phase4b_netting_proposals.items()
+                              if v.get("received_at", 0) < cutoff]
+                for k in stale_keys:
+                    _phase4b_netting_proposals.pop(k, None)
+
+    plugin.log(f"cl-hive: NETTING_PROPOSAL from {peer_id[:16]}... "
+               f"window={payload.get('window_id', '')[:16]} type={payload.get('netting_type')}")
+    return {"result": "continue"}
+
+
+def handle_netting_ack(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle NETTING_ACK message."""
+    from modules.protocol import validate_netting_ack, get_netting_ack_signing_payload
+    if not validate_netting_ack(payload):
+        plugin.log(f"cl-hive: invalid NETTING_ACK from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if not _phase4b_common_checks(peer_id, payload, "NETTING_ACK", plugin):
+        return {"result": "continue"}
+
+    if not _verify_phase4b_signature(peer_id, payload, "NETTING_ACK",
+                                      get_netting_ack_signing_payload, plugin):
+        return {"result": "continue"}
+
+    if not _phase4b_record_if_new(peer_id, payload, "NETTING_ACK"):
+        return {"result": "continue"}
+
+    if database:
+        window_id = payload.get("window_id", "")
+        obligations_hash = payload.get("obligations_hash", "")
+        accepted = bool(payload.get("accepted", False))
+
+        # R5-M-11 fix: Hold netting lock through hash verification AND DB update
+        # to prevent TOCTOU race where proposal is modified between check and update.
+        with _phase4b_netting_lock:
+            proposal = _phase4b_netting_proposals.get(window_id)
+
+            if proposal and proposal.get("obligations_hash") == obligations_hash and accepted:
+                # M-6 audit fix: Verify ack sender is NOT the proposer (counterparty check)
+                if proposal.get("proposer") == peer_id:
+                    plugin.log(f"cl-hive: NETTING_ACK from proposer {peer_id[:16]}..., ignoring", level='warn')
+                else:
+                    # Verify peer is party to at least one obligation in this window
+                    obligations = database.get_obligations_for_window(window_id, status='pending', limit=10_000)
+                    peer_is_party = any(
+                        o.get("from_peer") == peer_id or o.get("to_peer") == peer_id
+                        for o in obligations
+                    )
+                    if peer_is_party:
+                        proposer_id = proposal.get("proposer", "")
+                        database.update_bilateral_obligation_status(window_id, peer_id, proposer_id, "netted")
+                    else:
+                        plugin.log(f"cl-hive: NETTING_ACK from non-party {peer_id[:16]}..., ignoring", level='warn')
+
+    plugin.log(f"cl-hive: NETTING_ACK from {peer_id[:16]}... "
+               f"window={payload.get('window_id', '')[:16]} accepted={payload.get('accepted')}")
+    return {"result": "continue"}
+
+
+def handle_violation_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle VIOLATION_REPORT message."""
+    from modules.protocol import validate_violation_report, get_violation_report_signing_payload
+    from modules.settlement import DisputeResolver
+    if not validate_violation_report(payload):
+        plugin.log(f"cl-hive: invalid VIOLATION_REPORT from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if not _phase4b_common_checks(peer_id, payload, "VIOLATION_REPORT", plugin):
+        return {"result": "continue"}
+
+    if not _verify_phase4b_signature(peer_id, payload, "VIOLATION_REPORT",
+                                      get_violation_report_signing_payload, plugin):
+        return {"result": "continue"}
+
+    if not _phase4b_record_if_new(peer_id, payload, "VIOLATION_REPORT"):
+        return {"result": "continue"}
+
+    # P4-M-4 fix: Use violator_id from payload for proper violation tracking
+    violator_id = payload.get("violator_id", "")
+    violation_type = payload.get("violation_type", "")
+
+    if database:
+        evidence = payload.get("evidence", {}) or {}
+        # Inject violator_id into evidence so dispute resolver can reference it
+        if violator_id:
+            evidence["violator_id"] = violator_id
+        if violation_type:
+            evidence["violation_type"] = violation_type
+        obligation_id = evidence.get("obligation_id")
+        if isinstance(obligation_id, str) and obligation_id:
+            resolver = DisputeResolver(database, plugin, rpc=plugin.rpc)
+            resolver.file_dispute(obligation_id, peer_id, evidence)
+
+    plugin.log(f"cl-hive: VIOLATION_REPORT from {peer_id[:16]}... "
+               f"violator={violator_id[:16] if violator_id else 'unknown'} type={violation_type}")
+    return {"result": "continue"}
+
+
+def handle_arbitration_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Handle ARBITRATION_VOTE message."""
+    from modules.protocol import validate_arbitration_vote, get_arbitration_vote_signing_payload
+    from modules.settlement import DisputeResolver
+    if not validate_arbitration_vote(payload):
+        plugin.log(f"cl-hive: invalid ARBITRATION_VOTE from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if not _phase4b_common_checks(peer_id, payload, "ARBITRATION_VOTE", plugin):
+        return {"result": "continue"}
+
+    if not _verify_phase4b_signature(peer_id, payload, "ARBITRATION_VOTE",
+                                      get_arbitration_vote_signing_payload, plugin):
+        return {"result": "continue"}
+
+    if not _phase4b_record_if_new(peer_id, payload, "ARBITRATION_VOTE"):
+        return {"result": "continue"}
+
+    if database:
+        dispute_id = payload.get("dispute_id", "")
+        vote = payload.get("vote", "")
+        reason = payload.get("reason", "")
+        signature = payload.get("signature", "")
+        resolver = DisputeResolver(database, plugin, rpc=plugin.rpc)
+        vote_result = resolver.record_vote(
+            dispute_id=dispute_id,
+            voter_id=peer_id,
+            vote=vote,
+            reason=reason,
+            signature=signature,
+        )
+        if isinstance(vote_result, dict) and vote_result.get("error"):
+            plugin.log(
+                f"cl-hive: ARBITRATION_VOTE rejected for {dispute_id[:16]}...: {vote_result['error']}",
+                level='warn',
+            )
+            return {"result": "continue"}
+
+        # P4R4-M-2: record_vote() already checks quorum atomically while
+        # holding _dispute_lock.  A redundant external check_quorum() call
+        # was removed here to avoid using stale data and double-resolution.
+        if isinstance(vote_result, dict) and vote_result.get("quorum_result"):
+            qr = vote_result["quorum_result"]
+            plugin.log(
+                f"cl-hive: dispute {dispute_id[:16]}... resolved via quorum: "
+                f"outcome={qr.get('outcome')}",
+            )
+
+    plugin.log(f"cl-hive: ARBITRATION_VOTE from {peer_id[:16]}... "
+               f"dispute={payload.get('dispute_id', '')[:16]} vote={payload.get('vote')}")
+    return {"result": "continue"}
+
+
+# =============================================================================
+# PHASE 4: ESCROW MAINTENANCE LOOP
+# =============================================================================
+
+def escrow_maintenance_loop():
+    """
+    Background thread for escrow maintenance.
+
+    15-minute cycle: expire tickets, retry mint ops, prune secrets.
+    """
+    shutdown_event.wait(30)
+
+    while not shutdown_event.is_set():
+        try:
+            if not cashu_escrow_mgr or not database:
+                shutdown_event.wait(60)
+                continue
+
+            # 1. Cleanup expired tickets
+            cashu_escrow_mgr.cleanup_expired_tickets()
+
+            # 2. Retry pending mint operations
+            cashu_escrow_mgr.retry_pending_operations()
+
+            # 3. Prune old revealed secrets
+            cashu_escrow_mgr.prune_old_secrets()
+
+        except Exception as e:
+            plugin.log(f"cl-hive: escrow_maintenance_loop error: {e}", level='warn')
+
+        shutdown_event.wait(900)  # 15 min cycle
+
+
+def marketplace_maintenance_loop():
+    """Background maintenance for advisor marketplace state."""
+    shutdown_event.wait(30)
+
+    while not shutdown_event.is_set():
+        try:
+            if not marketplace_mgr or not database:
+                shutdown_event.wait(60)
+                continue
+
+            marketplace_mgr.cleanup_stale_profiles()
+            marketplace_mgr.evaluate_expired_trials()
+            marketplace_mgr.check_contract_renewals()
+            marketplace_mgr.republish_profile()
+        except Exception as e:
+            plugin.log(f"cl-hive: marketplace_maintenance_loop error: {e}", level='warn')
+
+        shutdown_event.wait(3600)  # 1h cycle
+
+
+def liquidity_maintenance_loop():
+    """Background maintenance for liquidity leases/offers."""
+    shutdown_event.wait(30)
+
+    while not shutdown_event.is_set():
+        try:
+            if not liquidity_mgr or not database:
+                shutdown_event.wait(60)
+                continue
+
+            liquidity_mgr.check_heartbeat_deadlines()
+            liquidity_mgr.terminate_dead_leases()
+            liquidity_mgr.expire_stale_offers()
+            liquidity_mgr.republish_offers()
+        except Exception as e:
+            plugin.log(f"cl-hive: liquidity_maintenance_loop error: {e}", level='warn')
+
+        shutdown_event.wait(600)  # 10 min cycle
 
 
 def outbox_retry_loop():
@@ -4273,6 +5272,81 @@ def _broadcast_promotion_vote(target_peer_id: str, voter_peer_id: str) -> bool:
     return sent > 0
 
 
+# R5-M-5 fix: Per-relay-peer rate limiter for credential messages
+# Prevents a single relay node from flooding rate limits for multiple spoofed origins.
+# Maps relay_peer_id -> list of timestamps
+_relay_credential_rate: Dict[str, list] = {}
+_relay_credential_rate_lock = threading.Lock()
+_RELAY_CREDENTIAL_RATE_MAX = 50   # max 50 relayed credential messages per hour per relay peer
+_RELAY_CREDENTIAL_RATE_WINDOW = 3600  # 1 hour window
+_RELAY_CREDENTIAL_RATE_DICT_MAX = 500  # max tracked relay peers
+
+
+def _check_relay_credential_rate(relay_peer_id: str) -> bool:
+    """Check per-relay-peer rate limit for credential messages.
+    Returns True if within limit, False if rate-limited."""
+    now = int(time.time())
+    cutoff = now - _RELAY_CREDENTIAL_RATE_WINDOW
+    with _relay_credential_rate_lock:
+        timestamps = _relay_credential_rate.get(relay_peer_id, [])
+        timestamps = [ts for ts in timestamps if ts > cutoff]
+        if len(timestamps) >= _RELAY_CREDENTIAL_RATE_MAX:
+            _relay_credential_rate[relay_peer_id] = timestamps
+            return False
+        timestamps.append(now)
+        _relay_credential_rate[relay_peer_id] = timestamps
+        # Evict stale entries if dict grows too large
+        if len(_relay_credential_rate) > _RELAY_CREDENTIAL_RATE_DICT_MAX:
+            stale = [k for k, v in _relay_credential_rate.items()
+                     if not v or v[-1] <= cutoff]
+            for k in stale:
+                _relay_credential_rate.pop(k, None)
+    return True
+
+
+# P3-M-4 fix: In-memory dedup cache for credential relay messages
+# Bounded dict: maps message_hash -> timestamp, evicts oldest when full
+_credential_relay_seen: Dict[str, float] = {}
+_credential_relay_lock = threading.Lock()  # NEW-3 fix: thread safety for dedup dict
+_CREDENTIAL_RELAY_DEDUP_MAX = 1000
+_CREDENTIAL_RELAY_DEDUP_TTL = 600  # 10 minutes
+
+
+def _credential_relay_dedup(payload: Dict[str, Any], msg_type: str) -> bool:
+    """
+    Check if a credential message has already been seen for relay dedup.
+    Returns True if message is new (should process), False if duplicate.
+    """
+    import hashlib
+    # Build a dedup key from stable payload fields
+    event_id = payload.get("event_id", "") or payload.get("_event_id", "")
+    sender_id = payload.get("sender_id", "")
+    ts = str(payload.get("timestamp", ""))
+    dedup_input = f"{msg_type}:{sender_id}:{event_id}:{ts}"
+    msg_hash = hashlib.sha256(dedup_input.encode()).hexdigest()[:32]
+
+    now = time.time()
+
+    with _credential_relay_lock:
+        # Evict expired entries if cache is full
+        if len(_credential_relay_seen) >= _CREDENTIAL_RELAY_DEDUP_MAX:
+            expired = [k for k, v in _credential_relay_seen.items()
+                       if now - v > _CREDENTIAL_RELAY_DEDUP_TTL]
+            for k in expired:
+                del _credential_relay_seen[k]
+            # If still full after eviction, remove oldest entries
+            if len(_credential_relay_seen) >= _CREDENTIAL_RELAY_DEDUP_MAX:
+                oldest = sorted(_credential_relay_seen.items(), key=lambda x: x[1])
+                for k, _ in oldest[:len(oldest) // 2]:
+                    del _credential_relay_seen[k]
+
+        if msg_hash in _credential_relay_seen:
+            return False  # Already seen
+
+        _credential_relay_seen[msg_hash] = now
+        return True
+
+
 def _is_relayed_message(payload: Dict[str, Any]) -> bool:
     """Check if message was relayed (not direct from origin)."""
     relay_data = payload.get("_relay", {})
@@ -4300,9 +5374,13 @@ def _validate_relay_sender(peer_id: str, sender_id: str, payload: Dict[str, Any]
         return False
 
     if _is_relayed_message(payload):
-        # Relayed message: verify peer_id is a known member (they're relaying)
+        # Relayed message: verify peer_id is a known member or neophyte (they're relaying)
+        # M-15 audit fix: Allow neophyte relay to avoid message delivery failures
         relay_peer = database.get_member(peer_id)
-        if not relay_peer or relay_peer.get("tier") != MembershipTier.MEMBER.value:
+        if not relay_peer or relay_peer.get("tier") not in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value):
+            return False
+        # P5R3-L-1 fix: Reject relayed messages from banned relay peers
+        if database.is_banned(peer_id):
             return False
         # Verify origin matches claimed sender_id
         origin = _get_message_origin(payload)
@@ -4311,6 +5389,9 @@ def _validate_relay_sender(peer_id: str, sender_id: str, payload: Dict[str, Any]
         # Verify original sender is also a member
         original_sender = database.get_member(sender_id)
         if not original_sender:
+            return False
+        # P5-H-1 fix: Reject relayed messages from banned senders
+        if database.is_banned(sender_id):
             return False
         return True
     else:
@@ -4337,20 +5418,13 @@ def _relay_message(
     if not relay_mgr:
         return 0
 
-    # Check if should relay (TTL > 0, not in path already)
-    if not relay_mgr.should_relay(payload):
-        return 0
-
-    # Prepare for relay (decrement TTL, add us to path)
-    relay_payload = relay_mgr.prepare_for_relay(payload, sender_peer_id)
-    if not relay_payload:
-        return 0
-
-    # Encode and relay
+    # Let relay_mgr.relay() handle should_relay + prepare_for_relay internally.
+    # Do NOT call them here — double-preparation adds our_pubkey to relay_path
+    # before relay() checks it, causing relay() to always return 0.
     def encode_message(p: Dict[str, Any]) -> bytes:
         return serialize(msg_type, p)
 
-    return relay_mgr.relay(relay_payload, sender_peer_id, encode_message)
+    return relay_mgr.relay(payload, sender_peer_id, encode_message)
 
 
 def _prepare_broadcast_payload(payload: Dict[str, Any], ttl: int = 3) -> Dict[str, Any]:
@@ -4423,7 +5497,6 @@ def _sync_member_policies(plugin: Plugin) -> None:
     the plugin was restarted or policies were reset.
 
     Policy assignment:
-    - Admin: HIVE strategy (0 PPM fees)
     - Member: HIVE strategy (0 PPM fees)
     - Neophyte: dynamic strategy (normal fee behavior)
     """
@@ -4442,8 +5515,9 @@ def _sync_member_policies(plugin: Plugin) -> None:
             continue
 
         # Determine if this peer should have HIVE strategy
-        # Both admin and member tiers get HIVE strategy
-        is_hive_member = tier in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value)
+        # P5-M-1 fix: Only full member tier gets HIVE strategy (0-fee)
+        # Neophytes should NOT get hive fees — they use dynamic strategy
+        is_hive_member = tier in (MembershipTier.MEMBER.value,)
 
         try:
             # Use bypass_rate_limit=True for startup sync
@@ -4551,6 +5625,15 @@ def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     if relay_count > 0:
         plugin.log(f"cl-hive: PROMOTION_REQUEST relayed to {relay_count} members", level='debug')
 
+    # C-1 audit fix: Reject promotion requests from/for banned peers
+    if database.is_banned(target_pubkey):
+        plugin.log(f"cl-hive: PROMOTION_REQUEST from banned peer {target_pubkey[:16]}..., ignoring", level='warn')
+        return {"result": "continue"}
+
+    # H-4 audit fix: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_GOSSIP_AGE_SECONDS, "PROMOTION_REQUEST"):
+        return {"result": "continue"}
+
     target_member = database.get_member(target_pubkey)
     if not target_member or target_member.get("tier") != MembershipTier.NEOPHYTE.value:
         return {"result": "continue"}
@@ -4636,8 +5719,22 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if relay_count > 0:
         plugin.log(f"cl-hive: VOUCH relayed to {relay_count} members", level='debug')
 
+    # H-7 audit fix: Prevent self-vouching
+    if voucher_pubkey == payload["target_pubkey"]:
+        plugin.log(f"cl-hive: VOUCH self-vouch attempt for {voucher_pubkey[:16]}..., ignoring", level='warn')
+        return {"result": "continue"}
+
+    # H-4 audit fix: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_GOSSIP_AGE_SECONDS, "VOUCH"):
+        return {"result": "continue"}
+
     voucher = database.get_member(voucher_pubkey)
     if not voucher or voucher.get("tier") not in (MembershipTier.MEMBER.value,):
+        return {"result": "continue"}
+
+    # P5-M-2 fix: Check ban status BEFORE storing vouch or doing expensive operations
+    if database.is_banned(payload["voucher_pubkey"]):
+        plugin.log(f"cl-hive: VOUCH from banned voucher {voucher_pubkey[:16]}..., ignoring", level='warn')
         return {"result": "continue"}
 
     target_member = database.get_member(payload["target_pubkey"])
@@ -4658,9 +5755,6 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     if not result.get("verified") or result.get("pubkey") != payload["voucher_pubkey"]:
-        return {"result": "continue"}
-
-    if database.is_banned(payload["voucher_pubkey"]):
         return {"result": "continue"}
 
     local_tier = membership_mgr.get_tier(our_pubkey) if our_pubkey else None
@@ -4695,14 +5789,16 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if outbox_mgr:
         outbox_mgr.process_implicit_ack(peer_id, HiveMessageType.VOUCH, payload)
 
-    # Only members and admins can trigger auto-promotion
+    # Only full members can trigger auto-promotion
     if local_tier not in (MembershipTier.MEMBER.value,):
         return {"result": "continue"}
 
     active_members = membership_mgr.get_active_members()
     quorum = membership_mgr.calculate_quorum(len(active_members))
     vouches = database.get_promotion_vouches(payload["target_pubkey"], payload["request_id"])
-    if len(vouches) < quorum:
+    # R5-L-10 fix: Filter out vouches from banned members before quorum check
+    valid_vouches = [v for v in vouches if not database.is_banned(v.get("voucher_peer_id", ""))]
+    if len(valid_vouches) < quorum:
         return {"result": "continue"}
 
     if not config.auto_promote_enabled:
@@ -4718,7 +5814,7 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
                 "timestamp": v["timestamp"],
                 "voucher_pubkey": v["voucher_peer_id"],
                 "sig": v["sig"]
-            } for v in vouches[:MAX_VOUCHES_IN_PROMOTION]
+            } for v in valid_vouches[:MAX_VOUCHES_IN_PROMOTION]
         ]
     }
     _reliable_broadcast(HiveMessageType.PROMOTION, promotion_payload)
@@ -4753,6 +5849,9 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         relay_member = database.get_member(peer_id)
         if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
             return {"result": "continue"}
+        # Ban check on relay peer
+        if database.is_banned(peer_id):
+            return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
         sender_tier = sender.get("tier") if sender else None
@@ -4761,6 +5860,11 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     target_pubkey = payload["target_pubkey"]
     request_id = payload["request_id"]
+
+    # P5-H-2 fix: Reject promotion of banned peers
+    if database.is_banned(target_pubkey):
+        plugin.log(f"cl-hive: PROMOTION target {target_pubkey[:16]}... is banned, ignoring", level='warn')
+        return {"result": "continue"}
 
     target_member = database.get_member(target_pubkey)
     if not target_member:
@@ -4969,7 +6073,16 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if event_id:
         payload["_event_id"] = event_id
 
-    # Verify proposer is a member or admin
+    # C-2 audit fix: Reject ban proposals from banned peers
+    if database.is_banned(proposer_peer_id):
+        plugin.log(f"cl-hive: BAN_PROPOSAL from banned member {proposer_peer_id[:16]}..., ignoring", level='warn')
+        return {"result": "continue"}
+
+    # H-4 audit fix: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_GOSSIP_AGE_SECONDS, "BAN_PROPOSAL"):
+        return {"result": "continue"}
+
+    # Verify proposer is a full member
     proposer = database.get_member(proposer_peer_id)
     if not proposer or proposer.get("tier") not in (MembershipTier.MEMBER.value,):
         plugin.log(f"cl-hive: BAN_PROPOSAL from non-member", level='warn')
@@ -5001,10 +6114,28 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if existing:
         return {"result": "continue"}
 
-    # Store proposal
+    # H-5 audit fix: Enforce BAN_COOLDOWN_SECONDS for same target
+    recent_proposal = database.get_ban_proposal_for_target(target_peer_id)
+    if recent_proposal:
+        recent_ts = recent_proposal.get("proposed_at", 0)
+        if int(time.time()) - recent_ts < BAN_COOLDOWN_SECONDS:
+            plugin.log(f"cl-hive: BAN_PROPOSAL cooldown active for {target_peer_id[:16]}...", level='info')
+            return {"result": "continue"}
+
+    # L-19 audit fix: Reject already-expired proposals
     expires_at = timestamp + BAN_PROPOSAL_TTL_SECONDS
+    if expires_at < int(time.time()):
+        plugin.log(f"cl-hive: BAN_PROPOSAL already expired, ignoring", level='debug')
+        return {"result": "continue"}
+
+    # Store proposal
+    # R5-H-3 fix: Extract proposal_type from payload so settlement_gaming uses reversed voting
+    proposal_type = payload.get("proposal_type", "standard")
+    if proposal_type not in ("standard", "settlement_gaming"):
+        proposal_type = "standard"  # Sanitize unexpected values
     database.create_ban_proposal(proposal_id, target_peer_id, proposer_peer_id,
-                                 reason, timestamp, expires_at)
+                                 reason, timestamp, expires_at,
+                                 proposal_type=proposal_type)
     plugin.log(f"cl-hive: Ban proposal {proposal_id[:16]}... for {target_peer_id[:16]}... by {proposer_peer_id[:16]}...")
 
     # Phase D: Acknowledge receipt
@@ -5054,7 +6185,11 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if event_id:
         payload["_event_id"] = event_id
 
-    # Verify voter is a member or admin and not banned
+    # H-4 audit fix: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_GOSSIP_AGE_SECONDS, "BAN_VOTE"):
+        return {"result": "continue"}
+
+    # Verify voter is a full member and not banned
     voter = database.get_member(voter_peer_id)
     if not voter or voter.get("tier") not in (MembershipTier.MEMBER.value,):
         return {"result": "continue"}
@@ -5065,6 +6200,16 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Get the proposal
     proposal = database.get_ban_proposal(proposal_id)
     if not proposal or proposal.get("status") != "pending":
+        return {"result": "continue"}
+
+    # R5-M-7 fix: Reject votes on expired proposals
+    if proposal.get("expires_at") and proposal["expires_at"] < int(time.time()):
+        plugin.log(f"cl-hive: BAN_VOTE on expired proposal {proposal_id[:16]}...", level='info')
+        return {"result": "continue"}
+
+    # H-6 audit fix: Ban target cannot vote on their own ban
+    if voter_peer_id == proposal.get("target_peer_id"):
+        plugin.log(f"cl-hive: BAN_VOTE target voting on own ban, ignoring", level='warn')
         return {"result": "continue"}
 
     # Verify signature
@@ -5111,12 +6256,15 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
     # Get all votes
     votes = database.get_ban_votes(proposal_id)
 
-    # Get eligible voters (members and admins, excluding target)
+    # Get eligible voters (members, excluding target, banned, and inactive)
     all_members = database.get_all_members()
+    activity_cutoff = int(time.time()) - 7 * 86400  # 7 days
     eligible_voters = [
         m for m in all_members
         if m.get("tier") in (MembershipTier.MEMBER.value,)
         and m["peer_id"] != target_peer_id
+        and not database.is_banned(m["peer_id"])
+        and (m.get("last_seen") or 0) >= activity_cutoff
     ]
     eligible_count = len(eligible_voters)
 
@@ -5142,18 +6290,35 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
         # REVERSED VOTING: Non-participation = approve (yes to ban)
         # Members must actively vote "reject" (no) to defend the accused
         # Ban executes if less than 51% vote "reject"
+        # P5-C-1 fix: Only count non-voters as approvals AFTER voting window expires
         reject_threshold = int(eligible_count * BAN_QUORUM_THRESHOLD) + 1
-        # Non-voters are implicit approvals
-        implicit_approvals = eligible_count - reject_count - approve_count
-        total_approvals = approve_count + implicit_approvals
+        proposal_timestamp = proposal.get("proposed_at", proposal.get("timestamp", 0))
+        voting_window_expired = time.time() - proposal_timestamp >= BAN_PROPOSAL_TTL_SECONDS
 
-        if reject_count < reject_threshold:
-            # Not enough members defended the accused - ban executes
-            should_execute = True
-            plugin.log(
-                f"cl-hive: Settlement gaming ban - {reject_count} reject votes "
-                f"(needed {reject_threshold} to prevent), {implicit_approvals} non-voters counted as approve"
-            )
+        if voting_window_expired:
+            # Window expired: non-voters are implicit approvals
+            implicit_approvals = eligible_count - reject_count - approve_count
+            total_approvals = approve_count + implicit_approvals
+
+            if reject_count < reject_threshold:
+                # Not enough members defended the accused - ban executes
+                should_execute = True
+                plugin.log(
+                    f"cl-hive: Settlement gaming ban - {reject_count} reject votes "
+                    f"(needed {reject_threshold} to prevent), {implicit_approvals} non-voters counted as approve"
+                )
+        else:
+            # Window still open: can only execute if enough explicit reject votes
+            # make it impossible to block (i.e., even if all remaining voters reject,
+            # they can't reach threshold). Otherwise, wait for window to expire.
+            remaining_voters = eligible_count - reject_count - approve_count
+            if reject_count + remaining_voters < reject_threshold:
+                # Mathematically impossible to reach reject threshold - execute early
+                should_execute = True
+                plugin.log(
+                    f"cl-hive: Settlement gaming ban (early) - {reject_count} reject votes, "
+                    f"{remaining_voters} remaining, threshold={reject_threshold} unreachable"
+                )
     else:
         # STANDARD VOTING: Need 51% explicit approve votes
         quorum_needed = int(eligible_count * BAN_QUORUM_THRESHOLD) + 1
@@ -9339,6 +10504,34 @@ def membership_maintenance_loop():
                 if reconnected > 0 and plugin:
                     plugin.log(f"Auto-connected to {reconnected} hive member(s)", level='info')
 
+                # Sweep expired settlement_gaming ban proposals that may need quorum check.
+                # These use reversed voting (non-participation = approve) so bans only
+                # execute after the voting window expires, but nothing re-checks quorum
+                # post-window unless we sweep here. Run this BEFORE generic expiry.
+                try:
+                    pending_proposals = database.get_pending_ban_proposals()
+                    now_ts = int(time.time())
+                    for prop in pending_proposals:
+                        if prop.get("proposal_type") != "settlement_gaming":
+                            continue
+                        expires_at = prop.get("expires_at", 0)
+                        if expires_at > 0 and expires_at < now_ts:
+                            _check_ban_quorum(prop["proposal_id"], prop, plugin)
+                except Exception as sweep_err:
+                    if plugin:
+                        plugin.log(f"cl-hive: Settlement gaming ban sweep error: {sweep_err}", level='warn')
+
+                # R5-M-7 fix: Expire all still-pending ban proposals past expires_at.
+                # This runs after settlement_gaming sweep so those proposals can still
+                # execute via reversed voting at the expiry boundary.
+                try:
+                    expired_count = database.cleanup_expired_ban_proposals(now=int(time.time()))
+                    if expired_count > 0 and plugin:
+                        plugin.log(f"cl-hive: Expired {expired_count} ban proposal(s)", level='info')
+                except Exception as expire_err:
+                    if plugin:
+                        plugin.log(f"cl-hive: Ban proposal expiry sweep error: {expire_err}", level='warn')
+
         except Exception as e:
             if plugin:
                 plugin.log(f"Membership maintenance error: {e}", level='warn')
@@ -10177,13 +11370,15 @@ def _propose_settlement_gaming_ban(target_peer_id: str, reason: str):
     database.add_ban_vote(proposal_id, our_pubkey, "approve", timestamp, vote_sig)
 
     # Broadcast proposal
+    # R5-H-3 fix: Include proposal_type so receivers can apply reversed voting logic
     proposal_payload = {
         "proposal_id": proposal_id,
         "target_peer_id": target_peer_id,
         "proposer_peer_id": our_pubkey,
         "reason": reason[:500],
         "timestamp": timestamp,
-        "signature": sig
+        "signature": sig,
+        "proposal_type": "settlement_gaming",
     }
     _reliable_broadcast(HiveMessageType.BAN_PROPOSAL, proposal_payload,
                         msg_id=proposal_id)
@@ -14844,18 +16039,21 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     except Exception as e:
         return {"error": f"Failed to sign ban: {e}"}
 
-    # Add ban to database
-    expires_at = now + (365 * 86400)  # 1 year default
+    # R5-M-8 fix: add_ban accepts expires_days (int), not expires_at (timestamp)
+    expires_days = 365  # 1 year default
     success = database.add_ban(
         peer_id=peer_id,
         reason=reason,
         reporter=our_pubkey,
         signature=sig,
-        expires_at=expires_at
+        expires_days=expires_days
     )
 
     if not success:
         return {"error": "Failed to add ban", "peer_id": peer_id}
+
+    # R5-M-9 fix: Remove member from roster after successful ban
+    database.remove_member(peer_id)
 
     plugin.log(f"cl-hive: Banned peer {peer_id[:16]}... reason: {reason}")
 
@@ -14864,7 +16062,7 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
         "peer_id": peer_id,
         "reason": reason,
         "reporter": our_pubkey,
-        "expires_at": expires_at,
+        "expires_days": expires_days,
     }
 
 
@@ -18627,6 +19825,330 @@ def hive_mgmt_credential_revoke(plugin: Plugin, credential_id: str):
     """
     ctx = _get_hive_context()
     return rpc_mgmt_credential_revoke(ctx, credential_id)
+
+
+# =============================================================================
+# PHASE 4A: CASHU ESCROW RPC METHODS
+# =============================================================================
+
+@plugin.method("hive-escrow-create")
+def hive_escrow_create(plugin: Plugin, agent_id: str, schema_id: str = "",
+                       action: str = "", danger_score: int = 1,
+                       amount_sats: int = 0, mint_url: str = "",
+                       ticket_type: str = "single"):
+    """
+    Create a Cashu escrow ticket for agent task payment.
+
+    Example:
+        lightning-cli hive-escrow-create agent_id=03abc... danger_score=5 amount_sats=100 mint_url=https://mint.example.com
+    """
+    ctx = _get_hive_context()
+    return rpc_escrow_create(ctx, agent_id, schema_id, action,
+                             danger_score, amount_sats, mint_url, ticket_type)
+
+
+@plugin.method("hive-escrow-list")
+def hive_escrow_list(plugin: Plugin, agent_id: str = None,
+                     status: str = None):
+    """
+    List escrow tickets with optional filters.
+
+    Example:
+        lightning-cli hive-escrow-list
+        lightning-cli hive-escrow-list status=active
+    """
+    ctx = _get_hive_context()
+    return rpc_escrow_list(ctx, agent_id, status)
+
+
+@plugin.method("hive-escrow-redeem")
+def hive_escrow_redeem(plugin: Plugin, ticket_id: str, preimage: str):
+    """
+    Redeem an escrow ticket with HTLC preimage.
+
+    Example:
+        lightning-cli hive-escrow-redeem ticket_id=abc123 preimage=deadbeef...
+    """
+    ctx = _get_hive_context()
+    return rpc_escrow_redeem(ctx, ticket_id, preimage)
+
+
+@plugin.method("hive-escrow-refund")
+def hive_escrow_refund(plugin: Plugin, ticket_id: str):
+    """
+    Refund an escrow ticket after timelock expiry.
+
+    Example:
+        lightning-cli hive-escrow-refund ticket_id=abc123
+    """
+    ctx = _get_hive_context()
+    return rpc_escrow_refund(ctx, ticket_id)
+
+
+@plugin.method("hive-escrow-receipt")
+def hive_escrow_receipt(plugin: Plugin, ticket_id: str):
+    """
+    Get escrow receipts for a ticket.
+
+    Example:
+        lightning-cli hive-escrow-receipt ticket_id=abc123
+    """
+    ctx = _get_hive_context()
+    return rpc_escrow_get_receipt(ctx, ticket_id)
+
+
+@plugin.method("hive-escrow-complete")
+def hive_escrow_complete(plugin: Plugin, ticket_id: str, schema_id: str = "",
+                         action: str = "", params_json: str = "{}",
+                         result_json: str = "{}", success: bool = True,
+                         reveal_preimage: bool = True):
+    """
+    Complete an escrow task: create receipt and optionally reveal preimage.
+
+    Example:
+        lightning-cli hive-escrow-complete ticket_id=abc123 success=true
+    """
+    ctx = _get_hive_context()
+    return rpc_escrow_complete(
+        ctx, ticket_id, schema_id, action, params_json,
+        result_json, success, reveal_preimage
+    )
+
+
+# =============================================================================
+# PHASE 4B: EXTENDED SETTLEMENT RPC METHODS
+# =============================================================================
+
+@plugin.method("hive-bond-post")
+def hive_bond_post(plugin: Plugin, amount_sats: int = 0,
+                   tier: str = ""):
+    """
+    Post a settlement bond.
+
+    Example:
+        lightning-cli hive-bond-post amount_sats=50000
+    """
+    ctx = _get_hive_context()
+    return rpc_bond_post(ctx, amount_sats, tier)
+
+
+@plugin.method("hive-bond-status")
+def hive_bond_status(plugin: Plugin, peer_id: str = None):
+    """
+    Get bond status for a peer.
+
+    Example:
+        lightning-cli hive-bond-status
+        lightning-cli hive-bond-status peer_id=03abc...
+    """
+    ctx = _get_hive_context()
+    return rpc_bond_status(ctx, peer_id)
+
+
+@plugin.method("hive-settlement-list")
+def hive_settlement_list(plugin: Plugin, window_id: str = None,
+                         peer_id: str = None):
+    """
+    List settlement obligations.
+
+    Example:
+        lightning-cli hive-settlement-list window_id=2024-W01
+    """
+    ctx = _get_hive_context()
+    return rpc_settlement_obligations_list(ctx, window_id, peer_id)
+
+
+@plugin.method("hive-settlement-net")
+def hive_settlement_net(plugin: Plugin, window_id: str = "",
+                        peer_id: str = None):
+    """
+    Compute netting for a settlement window.
+
+    Example:
+        lightning-cli hive-settlement-net window_id=2024-W01
+        lightning-cli hive-settlement-net window_id=2024-W01 peer_id=03abc...
+    """
+    ctx = _get_hive_context()
+    return rpc_settlement_net(ctx, window_id, peer_id)
+
+
+@plugin.method("hive-dispute-file")
+def hive_dispute_file(plugin: Plugin, obligation_id: str = "",
+                      evidence_json: str = "{}"):
+    """
+    File a settlement dispute.
+
+    Example:
+        lightning-cli hive-dispute-file obligation_id=abc123 evidence_json='{"reason":"underpayment"}'
+    """
+    ctx = _get_hive_context()
+    return rpc_dispute_file(ctx, obligation_id, evidence_json)
+
+
+@plugin.method("hive-dispute-vote")
+def hive_dispute_vote(plugin: Plugin, dispute_id: str = "",
+                      vote: str = "", reason: str = ""):
+    """
+    Cast an arbitration panel vote.
+
+    Example:
+        lightning-cli hive-dispute-vote dispute_id=abc123 vote=upheld reason="clear evidence"
+    """
+    ctx = _get_hive_context()
+    return rpc_dispute_vote(ctx, dispute_id, vote, reason)
+
+
+@plugin.method("hive-dispute-status")
+def hive_dispute_status(plugin: Plugin, dispute_id: str = ""):
+    """
+    Get dispute status.
+
+    Example:
+        lightning-cli hive-dispute-status dispute_id=abc123
+    """
+    ctx = _get_hive_context()
+    return rpc_dispute_status(ctx, dispute_id)
+
+
+@plugin.method("hive-credit-tier")
+def hive_credit_tier(plugin: Plugin, peer_id: str = None):
+    """
+    Get credit tier information for a peer.
+
+    Example:
+        lightning-cli hive-credit-tier
+        lightning-cli hive-credit-tier peer_id=03abc...
+    """
+    ctx = _get_hive_context()
+    return rpc_credit_tier_info(ctx, peer_id)
+
+
+# =============================================================================
+# PHASE 5B: ADVISOR MARKETPLACE RPC METHODS
+# =============================================================================
+
+@plugin.method("hive-marketplace-discover")
+def hive_marketplace_discover(plugin: Plugin, criteria_json: str = "{}"):
+    """Discover advisor profiles from marketplace cache."""
+    ctx = _get_hive_context()
+    return rpc_marketplace_discover(ctx, criteria_json)
+
+
+@plugin.method("hive-marketplace-profile")
+def hive_marketplace_profile(plugin: Plugin, profile_json: str = ""):
+    """View cached advisor profiles or publish local advisor profile."""
+    ctx = _get_hive_context()
+    return rpc_marketplace_profile(ctx, profile_json)
+
+
+@plugin.method("hive-marketplace-propose")
+def hive_marketplace_propose(plugin: Plugin, advisor_did: str, node_id: str,
+                             scope_json: str = "{}", tier: str = "standard",
+                             pricing_json: str = "{}"):
+    """Propose a contract to an advisor."""
+    ctx = _get_hive_context()
+    return rpc_marketplace_propose(ctx, advisor_did, node_id, scope_json, tier, pricing_json)
+
+
+@plugin.method("hive-marketplace-accept")
+def hive_marketplace_accept(plugin: Plugin, contract_id: str):
+    """Accept an advisor contract proposal."""
+    ctx = _get_hive_context()
+    return rpc_marketplace_accept(ctx, contract_id)
+
+
+@plugin.method("hive-marketplace-trial")
+def hive_marketplace_trial(plugin: Plugin, contract_id: str, action: str = "start",
+                           duration_days: int = 14, flat_fee_sats: int = 0,
+                           evaluation_json: str = "{}"):
+    """Start or evaluate a trial for an advisor contract."""
+    ctx = _get_hive_context()
+    return rpc_marketplace_trial(
+        ctx, contract_id, action, duration_days, flat_fee_sats, evaluation_json
+    )
+
+
+@plugin.method("hive-marketplace-terminate")
+def hive_marketplace_terminate(plugin: Plugin, contract_id: str, reason: str = ""):
+    """Terminate an advisor contract."""
+    ctx = _get_hive_context()
+    return rpc_marketplace_terminate(ctx, contract_id, reason)
+
+
+@plugin.method("hive-marketplace-status")
+def hive_marketplace_status(plugin: Plugin):
+    """Get advisor marketplace status."""
+    ctx = _get_hive_context()
+    return rpc_marketplace_status(ctx)
+
+
+# =============================================================================
+# PHASE 5C: LIQUIDITY MARKETPLACE RPC METHODS
+# =============================================================================
+
+@plugin.method("hive-liquidity-discover")
+def hive_liquidity_discover(plugin: Plugin, service_type: int = None,
+                            min_capacity: int = 0, max_rate: int = None):
+    """Discover liquidity offers."""
+    ctx = _get_hive_context()
+    return rpc_liquidity_discover(ctx, service_type, min_capacity, max_rate)
+
+
+@plugin.method("hive-liquidity-offer")
+def hive_liquidity_offer(plugin: Plugin, provider_id: str, service_type: int,
+                         capacity_sats: int, duration_hours: int = 24,
+                         pricing_model: str = "sat-hours",
+                         rate_json: str = "{}",
+                         min_reputation: int = 0,
+                         expires_at: int = None):
+    """Publish a liquidity offer."""
+    ctx = _get_hive_context()
+    return rpc_liquidity_offer(
+        ctx, provider_id, service_type, capacity_sats, duration_hours,
+        pricing_model, rate_json, min_reputation, expires_at
+    )
+
+
+@plugin.method("hive-liquidity-request")
+def hive_liquidity_request(plugin: Plugin, requester_id: str, service_type: int,
+                           capacity_sats: int, details_json: str = "{}"):
+    """Publish a liquidity request (RFP)."""
+    ctx = _get_hive_context()
+    return rpc_liquidity_request(ctx, requester_id, service_type, capacity_sats, details_json)
+
+
+@plugin.method("hive-liquidity-lease")
+def hive_liquidity_lease(plugin: Plugin, offer_id: str, client_id: str,
+                         heartbeat_interval: int = 3600):
+    """Accept a liquidity offer and create a lease."""
+    ctx = _get_hive_context()
+    return rpc_liquidity_lease(ctx, offer_id, client_id, heartbeat_interval)
+
+
+@plugin.method("hive-liquidity-heartbeat")
+def hive_liquidity_heartbeat(plugin: Plugin, lease_id: str, action: str = "send",
+                             heartbeat_id: str = "", channel_id: str = "",
+                             remote_balance_sats: int = 0,
+                             capacity_sats: int = None):
+    """Send or verify a lease heartbeat."""
+    ctx = _get_hive_context()
+    return rpc_liquidity_heartbeat(
+        ctx, lease_id, action, heartbeat_id, channel_id, remote_balance_sats, capacity_sats
+    )
+
+
+@plugin.method("hive-liquidity-lease-status")
+def hive_liquidity_lease_status(plugin: Plugin, lease_id: str):
+    """Get liquidity lease status."""
+    ctx = _get_hive_context()
+    return rpc_liquidity_lease_status(ctx, lease_id)
+
+
+@plugin.method("hive-liquidity-terminate")
+def hive_liquidity_terminate(plugin: Plugin, lease_id: str, reason: str = ""):
+    """Terminate a liquidity lease."""
+    ctx = _get_hive_context()
+    return rpc_liquidity_terminate(ctx, lease_id, reason)
 
 
 # =============================================================================

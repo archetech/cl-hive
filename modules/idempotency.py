@@ -55,6 +55,14 @@ EVENT_ID_FIELDS: Dict[str, list] = {
     "MGMT_CREDENTIAL_PRESENT": ["event_id"],
     # REVOKE: use domain-specific fields for content-based dedup
     "MGMT_CREDENTIAL_REVOKE": ["credential_id", "issuer_id"],
+    # Phase 4: Extended Settlements
+    "SETTLEMENT_RECEIPT": ["receipt_id"],
+    "BOND_POSTING": ["bond_id"],
+    "BOND_SLASH": ["bond_id", "dispute_id"],
+    "NETTING_PROPOSAL": ["window_id", "sender_id"],
+    "NETTING_ACK": ["window_id", "sender_id"],
+    "VIOLATION_REPORT": ["violation_id"],
+    "ARBITRATION_VOTE": ["dispute_id", "sender_id"],
 }
 
 

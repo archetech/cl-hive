@@ -14,6 +14,7 @@ from . import network_metrics
 
 ACTIVE_MEMBER_WINDOW_SECONDS = 24 * 3600
 BAN_QUORUM_THRESHOLD = 0.51  # 51% quorum for ban proposals
+BAN_COOLDOWN_SECONDS = 7 * 24 * 3600  # 7-day cooldown before re-proposing ban
 CONTRIBUTION_RATIO_NO_DATA = 999999999
 
 
@@ -423,12 +424,90 @@ class MembershipManager:
         threshold = math.ceil(active_members * 0.51)  # Simple majority
         return max(2, threshold)
 
+    def check_ban_cooldown(self, target_peer_id: str,
+                           cooldown_seconds: int = 0) -> bool:
+        """
+        Check if a ban proposal for target_peer_id is within cooldown.
+
+        P5-L-3: Uses current time (time.time()) as the reference point,
+        not the incoming proposal's timestamp. The cooldown checks if
+        enough wall-clock time has passed since the last ban proposal
+        against the same target.
+
+        Args:
+            target_peer_id: The peer being proposed for ban
+            cooldown_seconds: Cooldown period (default: BAN_COOLDOWN_SECONDS)
+
+        Returns:
+            True if cooldown is active (ban should be rejected),
+            False if cooldown has expired (ban is allowed)
+        """
+        if cooldown_seconds <= 0:
+            cooldown_seconds = BAN_COOLDOWN_SECONDS
+
+        recent_proposal = self.db.get_ban_proposal_for_target(target_peer_id)
+        if not recent_proposal:
+            return False  # No prior proposal, no cooldown
+
+        recent_ts = recent_proposal.get("proposed_at", 0)
+        now = int(time.time())
+        if now - recent_ts < cooldown_seconds:
+            self._log(
+                f"Ban cooldown active for {target_peer_id[:16]}... "
+                f"({now - recent_ts}s < {cooldown_seconds}s)",
+                level='info'
+            )
+            return True  # Cooldown active
+        return False  # Cooldown expired
+
     def build_vouch_message(self, target_pubkey: str, request_id: str, timestamp: int) -> str:
         """
         DEPRECATED: Vouch-based promotion is no longer used.
         Kept for backward compatibility with existing message handlers.
         """
         return f"hive:vouch:{target_pubkey}:{request_id}:{timestamp}"
+
+    @staticmethod
+    def _check_timestamp_freshness(payload: dict, max_age: int,
+                                    label: str = "message",
+                                    plugin=None,
+                                    max_clock_skew: int = 120) -> bool:
+        """
+        Check if a message timestamp is fresh enough to process.
+
+        P5-L-2: This is a self-contained version that receives plugin as a
+        parameter instead of relying on a global variable.
+
+        Args:
+            payload: Message payload containing 'timestamp' field
+            max_age: Maximum allowed age in seconds
+            label: Message type label for logging
+            plugin: Optional plugin instance for logging
+            max_clock_skew: Maximum allowed clock skew in seconds
+
+        Returns:
+            True if timestamp is acceptable, False if stale/invalid
+        """
+        ts = payload.get("timestamp")
+        if not isinstance(ts, (int, float)) or ts <= 0:
+            return False
+        now = int(time.time())
+        age = now - int(ts)
+        if age > max_age:
+            if plugin:
+                plugin.log(
+                    f"[Membership] {label} rejected: timestamp too old ({age}s > {max_age}s)",
+                    level='debug'
+                )
+            return False
+        if age < -max_clock_skew:
+            if plugin:
+                plugin.log(
+                    f"[Membership] {label} rejected: timestamp {-age}s in the future",
+                    level='debug'
+                )
+            return False
+        return True
 
     # =========================================================================
     # MANUAL PROMOTION (majority vote bypass of probation period)
@@ -457,6 +536,9 @@ class MembershipManager:
                 "error": "only_members_can_propose",
                 "message": "Only members can propose promotions"
             }
+
+        if self.db.is_banned(proposer_peer_id):
+            return {"success": False, "error": "proposer_banned", "message": "Banned members cannot propose promotions"}
 
         # Verify target is a neophyte
         target_tier = self.get_tier(target_peer_id)
@@ -523,6 +605,9 @@ class MembershipManager:
                 "error": "only_members_can_vote",
                 "message": "Only members can vote on promotions"
             }
+
+        if self.db.is_banned(voter_peer_id):
+            return {"success": False, "error": "voter_banned", "message": "Banned members cannot vote"}
 
         # Check proposal exists
         proposal = self.db.get_admin_promotion(target_peer_id)

@@ -119,6 +119,9 @@ class PeerReputationManager:
         # Rate limiting for snapshots
         self._snapshot_rate: Dict[str, List[float]] = defaultdict(list)
 
+    # P5-L-1: Maximum entries in _snapshot_rate dict to prevent unbounded growth
+    MAX_SNAPSHOT_RATE_ENTRIES = 5000
+
     def _check_rate_limit(
         self,
         sender: str,
@@ -141,6 +144,15 @@ class PeerReputationManager:
                 stale = [k for k, v in rate_tracker.items() if not v]
                 for k in stale:
                     del rate_tracker[k]
+
+            # P5-L-1: Bound the rate tracker dict size
+            if len(rate_tracker) >= self.MAX_SNAPSHOT_RATE_ENTRIES:
+                # Evict the oldest entry (sender with earliest last timestamp)
+                oldest_key = min(
+                    rate_tracker,
+                    key=lambda k: (rate_tracker[k][-1] if rate_tracker[k] else 0)
+                )
+                del rate_tracker[oldest_key]
 
             return len(rate_tracker[sender]) < max_count
 
@@ -410,7 +422,12 @@ class PeerReputationManager:
 
         timestamps = [r.get("timestamp", 0) for r in filtered]
 
+        MAX_AGGREGATED_PEERS = 5000
         with self._lock:
+            if peer_id not in self._aggregated and len(self._aggregated) >= MAX_AGGREGATED_PEERS:
+                # Evict oldest entry
+                oldest_key = min(self._aggregated, key=lambda k: self._aggregated[k].last_update)
+                del self._aggregated[oldest_key]
             self._aggregated[peer_id] = AggregatedReputation(
                 peer_id=peer_id,
                 avg_uptime=avg_uptime,

@@ -175,6 +175,7 @@ def _make_manager(our_pubkey=ALICE_PUBKEY, with_rpc=True):
     if rpc:
         rpc.signmessage.return_value = {"zbase": "fakesig_zbase32encoded"}
         rpc.checkmessage.return_value = {"verified": True, "pubkey": ALICE_PUBKEY}
+        rpc.call.return_value = {"verified": True, "pubkey": ALICE_PUBKEY}
     return DIDCredentialManager(database=db, plugin=plugin, rpc=rpc, our_pubkey=our_pubkey), db
 
 
@@ -625,7 +626,7 @@ class TestCredentialVerification:
 
     def test_verify_signature_failure(self):
         mgr, _ = _make_manager()
-        mgr.rpc.checkmessage.return_value = {"verified": False}
+        mgr.rpc.call.return_value = {"verified": False}
         cred = self._make_valid_credential()
         is_valid, reason = mgr.verify_credential(cred)
         assert is_valid is False
@@ -650,7 +651,7 @@ class TestCredentialVerification:
 
     def test_verify_pubkey_mismatch(self):
         mgr, _ = _make_manager()
-        mgr.rpc.checkmessage.return_value = {"verified": True, "pubkey": CHARLIE_PUBKEY}
+        mgr.rpc.call.return_value = {"verified": True, "pubkey": CHARLIE_PUBKEY}
         cred = self._make_valid_credential()
         is_valid, reason = mgr.verify_credential(cred)
         assert is_valid is False
@@ -893,13 +894,14 @@ class TestHandleCredentialPresent:
                 "metrics": _valid_node_metrics(),
                 "outcome": "neutral",
                 "signature": "valid_sig",
+                "issued_at": now,
             },
         }
 
     def test_handle_valid_credential(self):
         mgr, db = _make_manager()
         # Make checkmessage return the issuer's pubkey (BOB_PUBKEY)
-        mgr.rpc.checkmessage.return_value = {"verified": True, "pubkey": BOB_PUBKEY}
+        mgr.rpc.call.return_value = {"verified": True, "pubkey": BOB_PUBKEY}
         payload = self._make_credential_payload()
         result = mgr.handle_credential_present(BOB_PUBKEY, payload)
         assert result is True
@@ -907,7 +909,7 @@ class TestHandleCredentialPresent:
 
     def test_handle_duplicate_idempotent(self):
         mgr, db = _make_manager()
-        mgr.rpc.checkmessage.return_value = {"verified": True, "pubkey": BOB_PUBKEY}
+        mgr.rpc.call.return_value = {"verified": True, "pubkey": BOB_PUBKEY}
         payload = self._make_credential_payload()
         mgr.handle_credential_present(BOB_PUBKEY, payload)
         result = mgr.handle_credential_present(BOB_PUBKEY, payload)
@@ -928,7 +930,7 @@ class TestHandleCredentialPresent:
     def test_handle_missing_credential_id(self):
         """credential_id must be present — reject if missing (M2 fix)."""
         mgr, db = _make_manager()
-        mgr.rpc.checkmessage.return_value = {"verified": True, "pubkey": BOB_PUBKEY}
+        mgr.rpc.call.return_value = {"verified": True, "pubkey": BOB_PUBKEY}
         payload = self._make_credential_payload()
         # Remove credential_id from the credential dict
         del payload["credential"]["credential_id"]
@@ -962,7 +964,7 @@ class TestHandleCredentialRevoke:
             "domain": "hive:node",
             "revoked_at": None,
         }
-        mgr.rpc.checkmessage.return_value = {"verified": True, "pubkey": BOB_PUBKEY}
+        mgr.rpc.call.return_value = {"verified": True, "pubkey": BOB_PUBKEY}
 
         payload = {
             "credential_id": cred_id,
@@ -1135,7 +1137,7 @@ class TestProtocolMessages:
                 "period_end": now,
                 "metrics": _valid_node_metrics(),
                 "outcome": "neutral",
-                "signature": "sig123",
+                "signature": "sig1234567890",
             },
         }
         assert validate_did_credential_present(payload) is True

@@ -34,6 +34,7 @@ from modules.management_schemas import (
     TIER_PRICING_MULTIPLIERS,
     get_credential_signing_payload,
     _schema_matches,
+    _is_valid_pubkey,
 )
 
 
@@ -423,12 +424,13 @@ class TestCommandValidation:
         assert not ok
         assert "must be str" in reason
 
-    def test_extra_params_allowed(self):
-        """Extra parameters not in the schema are ignored."""
+    def test_extra_params_rejected(self):
+        """Extra parameters not in the schema are rejected."""
         reg, _ = _make_registry()
         ok, reason = reg.validate_command("hive:fee-policy/v1", "set_single",
                                            {"channel_id": "abc", "extra": True})
-        assert ok
+        assert not ok
+        assert "unexpected parameters" in reason
 
     def test_missing_params_allowed(self):
         """Missing parameters are allowed (optional by design)."""
@@ -864,23 +866,51 @@ class TestReceiptRecording:
         assert receipt_id is None
 
     def test_record_receipt_no_rpc(self):
-        """Receipt recording works without RPC (signature will be empty)."""
+        """Receipt recording refuses to store unsigned receipts when RPC is None."""
         db = MockDatabase()
         plugin = MagicMock()
         reg = ManagementSchemaRegistry(db, plugin, rpc=None, our_pubkey=ALICE_PUBKEY)
-        # Need to use a valid schema/action
+        # Pre-populate a credential so the existence check passes
+        db.credentials["cred-123"] = {
+            "credential_id": "cred-123",
+            "issuer_id": ALICE_PUBKEY,
+            "agent_id": BOB_PUBKEY,
+            "node_id": ALICE_PUBKEY,
+            "tier": "monitor",
+            "allowed_schemas_json": '["*"]',
+            "constraints_json": "{}",
+            "valid_from": int(time.time()),
+            "valid_until": int(time.time()) + 86400,
+            "signature": "fakesig",
+            "revoked_at": None,
+            "created_at": int(time.time()),
+        }
+        # Without RPC, receipt recording should return None (refuse unsigned)
         receipt_id = reg.record_receipt(
             credential_id="cred-123",
             schema_id="hive:monitor/v1",
             action="get_info",
             params={"format": "json"},
         )
-        assert receipt_id is not None
-        receipt = db.receipts[receipt_id]
-        assert receipt["executor_signature"] == ""
+        assert receipt_id is None
 
     def test_receipt_with_state_hashes(self):
         reg, db = _make_registry()
+        # Pre-populate a credential so the existence check passes
+        db.credentials["cred-123"] = {
+            "credential_id": "cred-123",
+            "issuer_id": ALICE_PUBKEY,
+            "agent_id": BOB_PUBKEY,
+            "node_id": ALICE_PUBKEY,
+            "tier": "standard",
+            "allowed_schemas_json": '["*"]',
+            "constraints_json": "{}",
+            "valid_from": int(time.time()),
+            "valid_until": int(time.time()) + 86400,
+            "signature": "fakesig",
+            "revoked_at": None,
+            "created_at": int(time.time()),
+        }
         receipt_id = reg.record_receipt(
             credential_id="cred-123",
             schema_id="hive:fee-policy/v1",
@@ -1025,6 +1055,9 @@ class TestRPCHandlers:
         ctx = MagicMock(spec=HiveContext)
         ctx.management_schema_registry = reg
         ctx.our_pubkey = ALICE_PUBKEY
+        # Provide database mock so check_permission succeeds
+        ctx.database = MagicMock()
+        ctx.database.get_member.return_value = {"peer_id": ALICE_PUBKEY, "tier": "member"}
         return ctx, reg, db
 
     def test_schema_list_handler(self):
@@ -1086,3 +1119,304 @@ class TestRPCHandlers:
         assert "error" in result
         result = schema_validate(ctx, "x", "y")
         assert "error" in result
+
+    def test_schema_validate_params_json_not_dict(self):
+        """params_json that decodes to non-dict should be rejected (P2-M-2)."""
+        from modules.rpc_commands import schema_validate
+        ctx, _, _ = self._make_context()
+        # JSON list instead of object
+        result = schema_validate(ctx, "hive:fee-policy/v1", "set_single",
+                                  params_json='["not", "a", "dict"]')
+        assert "error" in result
+        assert "object" in result["error"]
+
+    def test_schema_validate_params_json_string(self):
+        """params_json that decodes to a string should be rejected (P2-M-2)."""
+        from modules.rpc_commands import schema_validate
+        ctx, _, _ = self._make_context()
+        result = schema_validate(ctx, "hive:fee-policy/v1", "set_single",
+                                  params_json='"just a string"')
+        assert "error" in result
+        assert "object" in result["error"]
+
+
+# =============================================================================
+# Gossip Protocol Handler Tests (P2-L-4)
+# =============================================================================
+
+class TestGossipHandlers:
+    """Test the gossip/protocol handlers in management_schemas.py."""
+
+    def _make_valid_credential_payload(self, issuer_id=ALICE_PUBKEY,
+                                        agent_id=BOB_PUBKEY,
+                                        node_id=ALICE_PUBKEY):
+        """Build a valid MGMT_CREDENTIAL_PRESENT payload."""
+        now = int(time.time())
+        return {
+            "credential": {
+                "credential_id": str(uuid.uuid4()),
+                "issuer_id": issuer_id,
+                "agent_id": agent_id,
+                "node_id": node_id,
+                "tier": "standard",
+                "allowed_schemas": ["hive:fee-policy/*"],
+                "constraints": {"max_fee_ppm": 1000},
+                "valid_from": now - 3600,
+                "valid_until": now + 86400,
+                "signature": "valid_signature_zbase32",
+            }
+        }
+
+    def _make_registry_with_checkmessage(self, our_pubkey=CHARLIE_PUBKEY):
+        """Create a registry with RPC that passes checkmessage verification."""
+        db = MockDatabase()
+        plugin = MagicMock()
+        rpc = MagicMock()
+        rpc.signmessage.return_value = {"zbase": "fakesig123"}
+        registry = ManagementSchemaRegistry(
+            database=db,
+            plugin=plugin,
+            rpc=rpc,
+            our_pubkey=our_pubkey,
+        )
+        return registry, db, rpc
+
+    def test_valid_credential_gossip_accepted(self):
+        """A properly formed and signed credential should be accepted."""
+        reg, db, rpc = self._make_registry_with_checkmessage()
+        payload = self._make_valid_credential_payload()
+        issuer_id = payload["credential"]["issuer_id"]
+
+        # Mock checkmessage to return verified
+        rpc.checkmessage.return_value = {"verified": True, "pubkey": issuer_id}
+
+        result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
+        assert result is True
+        assert len(db.credentials) == 1
+
+    def test_reject_invalid_agent_id_pubkey(self):
+        """Credentials with invalid agent_id pubkey should be rejected (P2-M-3)."""
+        reg, db, rpc = self._make_registry_with_checkmessage()
+        payload = self._make_valid_credential_payload(agent_id="not_a_valid_pubkey")
+
+        result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
+        assert result is False
+        assert len(db.credentials) == 0
+
+    def test_reject_invalid_node_id_pubkey(self):
+        """Credentials with invalid node_id pubkey should be rejected (P2-M-3)."""
+        reg, db, rpc = self._make_registry_with_checkmessage()
+        payload = self._make_valid_credential_payload(node_id="04" + "aa" * 32)
+
+        result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
+        assert result is False
+        assert len(db.credentials) == 0
+
+    def test_reject_invalid_issuer_id_pubkey(self):
+        """Credentials with invalid issuer_id pubkey should be rejected (P2-M-3)."""
+        reg, db, rpc = self._make_registry_with_checkmessage()
+        payload = self._make_valid_credential_payload(issuer_id="short")
+
+        result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
+        assert result is False
+        assert len(db.credentials) == 0
+
+    def test_reject_oversized_allowed_schemas(self):
+        """allowed_schemas with >100 entries should be rejected (P2-L-1)."""
+        reg, db, rpc = self._make_registry_with_checkmessage()
+        payload = self._make_valid_credential_payload()
+        payload["credential"]["allowed_schemas"] = [f"hive:schema-{i}/v1" for i in range(101)]
+
+        result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
+        assert result is False
+        assert len(db.credentials) == 0
+
+    def test_reject_oversized_constraints(self):
+        """constraints with >50 keys should be rejected (P2-L-1)."""
+        reg, db, rpc = self._make_registry_with_checkmessage()
+        payload = self._make_valid_credential_payload()
+        payload["credential"]["constraints"] = {f"key_{i}": i for i in range(51)}
+
+        result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
+        assert result is False
+        assert len(db.credentials) == 0
+
+    def test_reject_non_string_allowed_schemas_entries(self):
+        """allowed_schemas containing non-string entries should be rejected (P2-L-2)."""
+        reg, db, rpc = self._make_registry_with_checkmessage()
+        payload = self._make_valid_credential_payload()
+        payload["credential"]["allowed_schemas"] = ["hive:fee-policy/*", 42, True]
+
+        result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
+        assert result is False
+        assert len(db.credentials) == 0
+
+    def test_reject_long_credential_id(self):
+        """credential_id longer than 128 chars should be rejected (P2-L-3)."""
+        reg, db, rpc = self._make_registry_with_checkmessage()
+        payload = self._make_valid_credential_payload()
+        payload["credential"]["credential_id"] = "x" * 129
+
+        result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
+        assert result is False
+        assert len(db.credentials) == 0
+
+    def test_reject_long_credential_id_in_revoke(self):
+        """credential_id longer than 128 chars should be rejected in revoke (P2-L-3)."""
+        reg, db, rpc = self._make_registry_with_checkmessage()
+        payload = {
+            "credential_id": "x" * 129,
+            "reason": "test revocation",
+            "issuer_id": ALICE_PUBKEY,
+            "signature": "fakesig",
+        }
+        result = reg.handle_mgmt_credential_revoke(BOB_PUBKEY, payload)
+        assert result is False
+
+    def test_exactly_100_allowed_schemas_accepted(self):
+        """Exactly 100 allowed_schemas should be accepted."""
+        reg, db, rpc = self._make_registry_with_checkmessage()
+        payload = self._make_valid_credential_payload()
+        payload["credential"]["allowed_schemas"] = [f"hive:schema-{i}/v1" for i in range(100)]
+        issuer_id = payload["credential"]["issuer_id"]
+        rpc.checkmessage.return_value = {"verified": True, "pubkey": issuer_id}
+
+        result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
+        assert result is True
+
+    def test_exactly_50_constraints_accepted(self):
+        """Exactly 50 constraint keys should be accepted."""
+        reg, db, rpc = self._make_registry_with_checkmessage()
+        payload = self._make_valid_credential_payload()
+        payload["credential"]["constraints"] = {f"key_{i}": i for i in range(50)}
+        issuer_id = payload["credential"]["issuer_id"]
+        rpc.checkmessage.return_value = {"verified": True, "pubkey": issuer_id}
+
+        result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
+        assert result is True
+
+
+# =============================================================================
+# Valid Days > 730 Rejection Test (P2-L-5)
+# =============================================================================
+
+class TestValidDaysLimit:
+    """Test that credentials with valid_days > 730 are rejected."""
+
+    def test_issue_rejects_valid_days_over_730(self):
+        """valid_days > 730 (2 years) should be rejected (P2-L-5)."""
+        reg, db = _make_registry()
+        cred = reg.issue_credential(
+            agent_id=BOB_PUBKEY,
+            node_id=ALICE_PUBKEY,
+            tier="standard",
+            allowed_schemas=["*"],
+            constraints={},
+            valid_days=731,
+        )
+        assert cred is None
+        assert len(db.credentials) == 0
+
+    def test_issue_accepts_valid_days_exactly_730(self):
+        """valid_days == 730 should be accepted."""
+        reg, db = _make_registry()
+        cred = reg.issue_credential(
+            agent_id=BOB_PUBKEY,
+            node_id=ALICE_PUBKEY,
+            tier="standard",
+            allowed_schemas=["*"],
+            constraints={},
+            valid_days=730,
+        )
+        assert cred is not None
+        assert cred.valid_until - cred.valid_from == 730 * 86400
+
+    def test_issue_rejects_valid_days_very_large(self):
+        """Extremely large valid_days should be rejected."""
+        reg, db = _make_registry()
+        cred = reg.issue_credential(
+            agent_id=BOB_PUBKEY,
+            node_id=ALICE_PUBKEY,
+            tier="standard",
+            allowed_schemas=["*"],
+            constraints={},
+            valid_days=10000,
+        )
+        assert cred is None
+
+
+# =============================================================================
+# Receipt Signing Malformed Response Test (P2-M-1)
+# =============================================================================
+
+class TestReceiptSigningMalformed:
+    """Test that malformed HSM responses don't produce empty-signature receipts."""
+
+    def test_receipt_rejects_empty_signature_from_malformed_response(self):
+        """If signmessage returns malformed response with no 'zbase', reject (P2-M-1)."""
+        reg, db = _make_registry()
+        # Issue a credential first
+        cred = reg.issue_credential(
+            agent_id=BOB_PUBKEY,
+            node_id=ALICE_PUBKEY,
+            tier="standard",
+            allowed_schemas=["*"],
+            constraints={},
+        )
+        assert cred is not None
+
+        # Now make signmessage return a malformed response (no 'zbase' key)
+        reg.rpc.signmessage.return_value = {"unexpected_key": "value"}
+
+        receipt_id = reg.record_receipt(
+            credential_id=cred.credential_id,
+            schema_id="hive:fee-policy/v1",
+            action="set_single",
+            params={"channel_id": "abc", "fee_ppm": 50},
+        )
+        assert receipt_id is None
+        assert len(db.receipts) == 0
+
+    def test_receipt_rejects_none_signature(self):
+        """If signmessage returns dict with zbase=None, reject."""
+        reg, db = _make_registry()
+        cred = reg.issue_credential(
+            agent_id=BOB_PUBKEY,
+            node_id=ALICE_PUBKEY,
+            tier="standard",
+            allowed_schemas=["*"],
+            constraints={},
+        )
+        assert cred is not None
+
+        reg.rpc.signmessage.return_value = {"zbase": None}
+
+        receipt_id = reg.record_receipt(
+            credential_id=cred.credential_id,
+            schema_id="hive:fee-policy/v1",
+            action="set_single",
+            params={"channel_id": "abc", "fee_ppm": 50},
+        )
+        assert receipt_id is None
+
+    def test_receipt_accepts_valid_signature(self):
+        """Normal signmessage response with valid zbase should succeed."""
+        reg, db = _make_registry()
+        cred = reg.issue_credential(
+            agent_id=BOB_PUBKEY,
+            node_id=ALICE_PUBKEY,
+            tier="standard",
+            allowed_schemas=["*"],
+            constraints={},
+        )
+        assert cred is not None
+
+        # signmessage still returns valid signature from _make_registry setup
+        receipt_id = reg.record_receipt(
+            credential_id=cred.credential_id,
+            schema_id="hive:fee-policy/v1",
+            action="set_single",
+            params={"channel_id": "abc", "fee_ppm": 50},
+        )
+        assert receipt_id is not None
+        assert len(db.receipts) == 1
