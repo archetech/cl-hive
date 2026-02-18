@@ -114,6 +114,7 @@ from modules.outbox import OutboxManager
 from modules.did_credentials import DIDCredentialManager
 from modules.management_schemas import ManagementSchemaRegistry
 from modules.cashu_escrow import CashuEscrowManager
+from modules.boltz_client import BoltzClient, BoltzConfig
 from modules.nostr_transport import NostrTransport
 from modules.marketplace import MarketplaceManager
 from modules.liquidity_marketplace import LiquidityMarketplaceManager
@@ -171,6 +172,9 @@ from modules.rpc_commands import (
     circular_flow_status as rpc_circular_flow_status,
     cost_reduction_status as rpc_cost_reduction_status,
     execute_hive_circular_rebalance as rpc_execute_hive_circular_rebalance,
+    boltz_status as rpc_boltz_status,
+    boltz_swap_in as rpc_boltz_swap_in,
+    boltz_swap_out as rpc_boltz_swap_out,
     # Phase 15 - MCF Optimization
     mcf_status as rpc_mcf_status,
     mcf_solve as rpc_mcf_solve,
@@ -594,6 +598,7 @@ state_manager: Optional[StateManager] = None
 gossip_mgr: Optional[GossipManager] = None
 intent_mgr: Optional[IntentManager] = None
 bridge: Optional[Bridge] = None
+boltz_client: Optional[BoltzClient] = None
 membership_mgr: Optional[MembershipManager] = None
 contribution_mgr: Optional[ContributionManager] = None
 planner: Optional[Planner] = None
@@ -928,6 +933,7 @@ def _get_hive_context() -> HiveContext:
     _vpn_transport = vpn_transport if vpn_transport is not None else None
     _planner = planner if planner is not None else None
     _bridge = bridge if bridge is not None else None
+    _boltz_client = boltz_client if boltz_client is not None else None
     _intent_mgr = intent_mgr if intent_mgr is not None else None
     _membership_mgr = membership_mgr if membership_mgr is not None else None
     _coop_expansion = coop_expansion if coop_expansion is not None else None
@@ -954,6 +960,7 @@ def _get_hive_context() -> HiveContext:
         planner=_planner,
         quality_scorer=quality_scorer_mgr if quality_scorer_mgr is not None else None,
         bridge=_bridge,
+        boltz_client=_boltz_client,
         intent_mgr=_intent_mgr,
         membership_mgr=_membership_mgr,
         coop_expansion_mgr=_coop_expansion,
@@ -1202,6 +1209,76 @@ plugin.add_option(
 )
 
 plugin.add_option(
+    name='hive-boltz-enabled',
+    default='true',
+    description='Enable boltzcli integration for swap-in/swap-out commands',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-boltz-binary',
+    default='boltzcli',
+    description='Path or binary name for boltzcli executable',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-boltz-timeout-seconds',
+    default='60',
+    description='Timeout in seconds for boltzcli commands',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-boltz-host',
+    default='',
+    description='Optional boltzd gRPC host override for boltzcli',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-boltz-port',
+    default='0',
+    description='Optional boltzd gRPC port override for boltzcli',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-boltz-datadir',
+    default='',
+    description='Optional boltzcli datadir override',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-boltz-tlscert',
+    default='',
+    description='Optional boltzd TLS cert path for boltzcli',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-boltz-macaroon',
+    default='',
+    description='Optional boltzd macaroon path for boltzcli auth',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-boltz-tenant',
+    default='',
+    description='Optional Boltz tenant ID/name for boltzcli requests',
+    dynamic=True
+)
+
+plugin.add_option(
+    name='hive-boltz-no-macaroons',
+    default='false',
+    description='Disable macaroon auth for boltzcli requests',
+    dynamic=True
+)
+
+plugin.add_option(
     name='hive-nostr-relays',
     default='',
     description='Comma-separated Nostr relay URLs for Phase 5 transport',
@@ -1365,7 +1442,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     Note: pyln-client is inherently thread-safe (opens new socket per RPC call),
     so no RPC locking is needed. The global 'plugin' object is used directly.
     """
-    global database, config, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge, vpn_transport, relay_mgr
+    global database, config, handshake_mgr, state_manager, gossip_mgr, intent_mgr
+    global our_pubkey, bridge, boltz_client, vpn_transport, relay_mgr
 
     plugin.log("cl-hive: Initializing Swarm Intelligence layer...")
     
@@ -1522,6 +1600,37 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             "Hive policy integration will be unavailable. Recommended: v1.4.0+",
             level='warn'
         )
+
+    # Initialize Boltz client wrapper for swap-in/swap-out operations.
+    boltz_enabled = _parse_bool(options.get('hive-boltz-enabled', 'true'))
+    if boltz_enabled:
+        try:
+            boltz_cfg = BoltzConfig(
+                binary=options.get('hive-boltz-binary', 'boltzcli'),
+                timeout_seconds=max(5, int(options.get('hive-boltz-timeout-seconds', '60'))),
+                host=options.get('hive-boltz-host', ''),
+                port=max(0, int(options.get('hive-boltz-port', '0'))),
+                datadir=options.get('hive-boltz-datadir', ''),
+                tlscert=options.get('hive-boltz-tlscert', ''),
+                macaroon=options.get('hive-boltz-macaroon', ''),
+                tenant=options.get('hive-boltz-tenant', ''),
+                no_macaroons=_parse_bool(options.get('hive-boltz-no-macaroons', 'false')),
+            )
+            boltz_client = BoltzClient(plugin=plugin, config=boltz_cfg)
+            boltz_state = boltz_client.status()
+            if boltz_state.get("available"):
+                plugin.log("cl-hive: Boltz client initialized and reachable")
+            else:
+                plugin.log(
+                    f"cl-hive: Boltz client initialized but unavailable: {boltz_state.get('error', 'connectivity check failed')}",
+                    level='warn'
+                )
+        except Exception as e:
+            boltz_client = None
+            plugin.log(f"cl-hive: Failed to initialize Boltz client: {e}", level='warn')
+    else:
+        boltz_client = None
+        plugin.log("cl-hive: Boltz integration disabled by config")
 
     # Initialize contribution and membership managers (Phase 5)
     global contribution_mgr, membership_mgr
@@ -18357,6 +18466,74 @@ def hive_execute_circular_rebalance(
         amount_sats=amount_sats,
         via_members=via_members,
         dry_run=dry_run
+    )
+
+
+@plugin.method("hive-boltz-status")
+def hive_boltz_status(plugin: Plugin):
+    """Get Boltz client status and connectivity."""
+    return rpc_boltz_status(_get_hive_context())
+
+
+@plugin.method("hive-boltz-swap-in")
+def hive_boltz_swap_in(
+    plugin: Plugin,
+    amount_sats: int,
+    currency: str = "btc",
+    invoice: str = "",
+    from_wallet: str = "",
+    refund_address: str = "",
+    external_pay: bool = False,
+    dry_run: bool = True,
+):
+    """
+    Create a Boltz chain->lightning submarine swap.
+
+    Set dry_run=false to create the actual swap.
+    """
+    return rpc_boltz_swap_in(
+        _get_hive_context(),
+        amount_sats=amount_sats,
+        currency=currency,
+        invoice=invoice,
+        from_wallet=from_wallet,
+        refund_address=refund_address,
+        external_pay=external_pay,
+        dry_run=dry_run,
+    )
+
+
+@plugin.method("hive-boltz-swap-out")
+def hive_boltz_swap_out(
+    plugin: Plugin,
+    amount_sats: int,
+    currency: str = "btc",
+    address: str = "",
+    to_wallet: str = "",
+    external_pay: bool = False,
+    no_zero_conf: bool = False,
+    description: str = "",
+    routing_fee_limit_ppm: int = 0,
+    chan_ids: list = None,
+    dry_run: bool = True,
+):
+    """
+    Create a Boltz lightning->chain reverse swap.
+
+    Set dry_run=false to create the actual swap.
+    """
+    return rpc_boltz_swap_out(
+        _get_hive_context(),
+        amount_sats=amount_sats,
+        currency=currency,
+        address=address,
+        to_wallet=to_wallet,
+        external_pay=external_pay,
+        no_zero_conf=no_zero_conf,
+        description=description,
+        routing_fee_limit_ppm=routing_fee_limit_ppm,
+        chan_ids=chan_ids,
+        dry_run=dry_run,
     )
 
 

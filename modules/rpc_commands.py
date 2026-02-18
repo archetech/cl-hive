@@ -33,6 +33,7 @@ class HiveContext:
     planner: Any = None  # Planner
     quality_scorer: Any = None  # PeerQualityScorer
     bridge: Any = None  # Bridge
+    boltz_client: Any = None  # BoltzClient (submarine swaps)
     intent_mgr: Any = None  # IntentManager
     membership_mgr: Any = None  # MembershipManager
     coop_expansion_mgr: Any = None  # CooperativeExpansionManager
@@ -3033,6 +3034,131 @@ def execute_hive_circular_rebalance(
 
     except Exception as e:
         return {"error": f"Failed to execute hive circular rebalance: {e}"}
+
+
+def boltz_status(ctx: HiveContext) -> Dict[str, Any]:
+    """Get boltz client availability and connectivity status."""
+    if not ctx.boltz_client:
+        return {"enabled": False, "available": False, "error": "boltz client not initialized"}
+    return ctx.boltz_client.status()
+
+
+def boltz_swap_in(
+    ctx: HiveContext,
+    amount_sats: int,
+    currency: str = "btc",
+    invoice: str = "",
+    from_wallet: str = "",
+    refund_address: str = "",
+    external_pay: bool = False,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Create a Boltz chain->lightning submarine swap.
+
+    If dry_run=True, return a quote instead of creating a swap.
+    """
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ctx.boltz_client:
+        return {"error": "boltz client not initialized"}
+    if not isinstance(amount_sats, int) or amount_sats <= 0:
+        return {"error": "amount_sats must be a positive integer"}
+
+    if dry_run:
+        quote = ctx.boltz_client.quote_submarine(amount_sats=amount_sats, currency=currency)
+        if not quote.get("ok"):
+            return {"error": quote.get("error", "failed to quote swap"), "details": quote}
+        return {
+            "status": "quote",
+            "swap_type": "submarine",
+            "amount_sats": amount_sats,
+            "currency": currency.lower(),
+            "quote": quote.get("result", {}),
+        }
+
+    result = ctx.boltz_client.create_swap_in(
+        amount_sats=amount_sats,
+        currency=currency,
+        invoice=invoice,
+        from_wallet=from_wallet,
+        refund_address=refund_address,
+        external_pay=external_pay,
+    )
+    if not result.get("ok"):
+        return {"error": result.get("error", "failed to create swap"), "details": result}
+
+    return {
+        "status": "created",
+        "swap_type": "submarine",
+        "amount_sats": amount_sats,
+        "currency": currency.lower(),
+        "swap": result.get("result", {}),
+    }
+
+
+def boltz_swap_out(
+    ctx: HiveContext,
+    amount_sats: int,
+    currency: str = "btc",
+    address: str = "",
+    to_wallet: str = "",
+    external_pay: bool = False,
+    no_zero_conf: bool = False,
+    description: str = "",
+    routing_fee_limit_ppm: int = 0,
+    chan_ids: Optional[List[str]] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Create a Boltz lightning->chain reverse swap.
+
+    If dry_run=True, return a quote instead of creating a swap.
+    """
+    perm_error = check_permission(ctx, 'member')
+    if perm_error:
+        return perm_error
+
+    if not ctx.boltz_client:
+        return {"error": "boltz client not initialized"}
+    if not isinstance(amount_sats, int) or amount_sats <= 0:
+        return {"error": "amount_sats must be a positive integer"}
+
+    if dry_run:
+        quote = ctx.boltz_client.quote_reverse(amount_sats=amount_sats, currency=currency)
+        if not quote.get("ok"):
+            return {"error": quote.get("error", "failed to quote reverse swap"), "details": quote}
+        return {
+            "status": "quote",
+            "swap_type": "reverse",
+            "amount_sats": amount_sats,
+            "currency": currency.lower(),
+            "quote": quote.get("result", {}),
+        }
+
+    result = ctx.boltz_client.create_swap_out(
+        amount_sats=amount_sats,
+        currency=currency,
+        address=address,
+        to_wallet=to_wallet,
+        external_pay=external_pay,
+        no_zero_conf=no_zero_conf,
+        description=description,
+        routing_fee_limit_ppm=routing_fee_limit_ppm,
+        chan_ids=chan_ids or [],
+    )
+    if not result.get("ok"):
+        return {"error": result.get("error", "failed to create reverse swap"), "details": result}
+
+    return {
+        "status": "created",
+        "swap_type": "reverse",
+        "amount_sats": amount_sats,
+        "currency": currency.lower(),
+        "swap": result.get("result", {}),
+    }
 
 
 # =============================================================================

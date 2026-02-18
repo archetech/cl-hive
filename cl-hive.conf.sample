@@ -86,3 +86,25 @@ hive-planner-enable-expansions=true
 
 # Path to SQLite database for Hive state
 #hive-db-path=~/.lightning/cl_hive.db
+
+# ============================================================================
+# BOLTZ SWAPS (OPTIONAL)
+# ============================================================================
+
+# Enable boltzcli integration for swap-in/swap-out RPC methods
+#hive-boltz-enabled=true
+
+# boltzcli binary path/name
+#hive-boltz-binary=boltzcli
+
+# boltz command timeout
+#hive-boltz-timeout-seconds=60
+
+# Optional boltzd connection overrides (leave blank to use defaults)
+#hive-boltz-host=
+#hive-boltz-port=0
+#hive-boltz-datadir=
+#hive-boltz-tlscert=
+#hive-boltz-macaroon=
+#hive-boltz-tenant=
+#hive-boltz-no-macaroons=false
