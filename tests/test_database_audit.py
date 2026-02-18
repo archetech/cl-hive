@@ -13,6 +13,7 @@ Tests cover:
 import pytest
 import time
 import threading
+import sqlite3
 from unittest.mock import MagicMock
 
 import sys
@@ -238,7 +239,6 @@ class TestSyncUptimeFromPresence:
             "INSERT INTO hive_members (peer_id, tier, joined_at) VALUES (?, ?, ?)",
             ("peer_b", "member", now - 86400)
         )
-
         # Online since window start
         window = 1000
         conn.execute(
@@ -269,6 +269,97 @@ class TestSyncUptimeFromPresence:
 
         updated = database.sync_uptime_from_presence()
         assert updated == 0
+
+
+class TestSettlementBondSchemaMigration:
+    """Automatic migration tests for legacy settlement_bonds UNIQUE(peer_id)."""
+
+    def test_migrate_legacy_settlement_bonds_unique_peer_constraint(self, mock_plugin, tmp_path):
+        db_path = str(tmp_path / "legacy_bonds.db")
+
+        # Simulate legacy schema from older deployments.
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE settlement_bonds (
+                bond_id TEXT PRIMARY KEY,
+                peer_id TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                token_json TEXT,
+                posted_at INTEGER NOT NULL,
+                timelock INTEGER NOT NULL,
+                tier TEXT NOT NULL DEFAULT 'observer',
+                slashed_amount INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                UNIQUE(peer_id)
+            )
+        """)
+        conn.execute(
+            "INSERT INTO settlement_bonds (bond_id, peer_id, amount_sats, posted_at, timelock, tier, slashed_amount, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("bond_old", "02" + "aa" * 32, 100000, 1700000100, 1700100100, "observer", 0, "active")
+        )
+        conn.commit()
+        conn.close()
+
+        db = HiveDatabase(db_path, mock_plugin)
+        db.initialize()
+
+        live = db._get_connection()
+        table_sql = live.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='settlement_bonds'"
+        ).fetchone()["sql"]
+        assert "UNIQUE(peer_id)" not in table_sql.replace(" ", "")
+
+        # Existing rows must survive migration.
+        row = live.execute(
+            "SELECT peer_id FROM settlement_bonds WHERE bond_id = ?",
+            ("bond_old",)
+        ).fetchone()
+        assert row is not None
+        assert row["peer_id"] == "02" + "aa" * 32
+
+        # New schema allows same peer_id in multiple rows.
+        live.execute(
+            "INSERT INTO settlement_bonds (bond_id, peer_id, amount_sats, posted_at, timelock, tier, slashed_amount, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("bond_new", "02" + "aa" * 32, 200000, 1700000200, 1700100200, "member", 0, "refunded")
+        )
+        count = live.execute(
+            "SELECT COUNT(*) as cnt FROM settlement_bonds WHERE peer_id = ?",
+            ("02" + "aa" * 32,)
+        ).fetchone()["cnt"]
+        assert count == 2
+
+    def test_migration_is_idempotent_across_restarts(self, mock_plugin, tmp_path):
+        db_path = str(tmp_path / "legacy_bonds_idempotent.db")
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE settlement_bonds (
+                bond_id TEXT PRIMARY KEY,
+                peer_id TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                token_json TEXT,
+                posted_at INTEGER NOT NULL,
+                timelock INTEGER NOT NULL,
+                tier TEXT NOT NULL DEFAULT 'observer',
+                slashed_amount INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                UNIQUE(peer_id)
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        db = HiveDatabase(db_path, mock_plugin)
+        db.initialize()
+        db.initialize()  # Simulate second restart after upgrade
+
+        live = db._get_connection()
+        table_sql = live.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='settlement_bonds'"
+        ).fetchone()["sql"]
+        assert "UNIQUE(peer_id)" not in table_sql.replace(" ", "")
 
 
 class TestPruneSettlementData:

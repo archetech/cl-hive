@@ -128,6 +128,84 @@ class HiveDatabase:
                 pass  # Don't mask the original exception
             raise
 
+    def _table_create_sql(self, conn: sqlite3.Connection, table_name: str) -> str:
+        """Return CREATE TABLE SQL for table_name (empty string if missing)."""
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        if not row:
+            return ""
+        return str(row["sql"] or "")
+
+    def _migrate_settlement_bonds_legacy_unique_peer_id(self, conn: sqlite3.Connection) -> bool:
+        """
+        Migrate legacy settlement_bonds schema that enforced UNIQUE(peer_id).
+
+        Older deployments created settlement_bonds with a table-level UNIQUE(peer_id)
+        constraint. That prevents re-bonding after slash/refund. New schema removes
+        that DB-level uniqueness and enforces active-bond uniqueness in application
+        logic (get_bond_for_peer(status='active')).
+
+        Returns:
+            True if migration was applied, False if not needed.
+        """
+        table_sql = self._table_create_sql(conn, "settlement_bonds")
+        if not table_sql:
+            return False
+
+        normalized = "".join(table_sql.lower().split())
+        if "unique(peer_id)" not in normalized:
+            return False
+
+        self.plugin.log(
+            "HiveDatabase: migrating legacy settlement_bonds schema (remove UNIQUE(peer_id))",
+            level='info',
+        )
+
+        # Use explicit transaction for atomic table rebuild.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DROP TABLE IF EXISTS settlement_bonds_migrating")
+            conn.execute("""
+                CREATE TABLE settlement_bonds_migrating (
+                    bond_id TEXT PRIMARY KEY,
+                    peer_id TEXT NOT NULL,
+                    amount_sats INTEGER NOT NULL,
+                    token_json TEXT,
+                    posted_at INTEGER NOT NULL,
+                    timelock INTEGER NOT NULL,
+                    tier TEXT NOT NULL DEFAULT 'observer',
+                    slashed_amount INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active'
+                )
+            """)
+            conn.execute("""
+                INSERT INTO settlement_bonds_migrating (
+                    bond_id, peer_id, amount_sats, token_json, posted_at,
+                    timelock, tier, slashed_amount, status
+                )
+                SELECT
+                    bond_id, peer_id, amount_sats, token_json, posted_at,
+                    timelock, tier, slashed_amount, status
+                FROM settlement_bonds
+            """)
+            conn.execute("DROP TABLE settlement_bonds")
+            conn.execute("ALTER TABLE settlement_bonds_migrating RENAME TO settlement_bonds")
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+        self.plugin.log(
+            "HiveDatabase: settlement_bonds migration complete",
+            level='info',
+        )
+        return True
+
     def initialize(self):
         """Create database tables if they don't exist."""
         conn = self._get_connection()
@@ -1627,6 +1705,12 @@ class HiveDatabase:
                 slashed_amount INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'active'
             )
+        """)
+        # Automatic upgrade path: remove legacy UNIQUE(peer_id) constraint.
+        self._migrate_settlement_bonds_legacy_unique_peer_id(conn)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_settlement_bonds_peer_status
+            ON settlement_bonds(peer_id, status)
         """)
 
         # Phase 4B: Settlement obligations
