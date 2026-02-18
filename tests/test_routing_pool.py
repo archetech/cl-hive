@@ -488,3 +488,46 @@ class TestIntegration:
 
         assert len(results) == 2
         assert sum(r.revenue_share_sats for r in results) == 10000
+
+
+class TestSnapshotDiagnostics:
+    """Tests for snapshot capacity/uptime diagnostics."""
+
+    def test_snapshot_normalizes_percentage_uptime(self):
+        """uptime_pct stored as 0-100 should be normalized to 0-1."""
+        db = MockDatabase()
+        plugin = MockPlugin()
+        state_mgr = MockStateManager()
+        pool = RoutingPool(database=db, plugin=plugin, state_manager=state_mgr)
+
+        member_a = "02" + "a" * 64
+        db.members = {
+            member_a: {"peer_id": member_a, "tier": "member", "uptime_pct": 95.0},
+        }
+        state_mgr.set_peer_state(member_a, capacity=1_000_000)
+
+        contributions = pool.snapshot_contributions("2026-08")
+        assert len(contributions) == 1
+        assert contributions[0].total_capacity_sats == 1_000_000
+        assert contributions[0].weighted_capacity_sats == 950_000
+
+    def test_snapshot_log_includes_total_and_weighted_capacity(self):
+        """Snapshot log should report both raw and weighted capacity totals."""
+        db = MockDatabase()
+        plugin = MockPlugin()
+        state_mgr = MockStateManager()
+        pool = RoutingPool(database=db, plugin=plugin, state_manager=state_mgr)
+
+        member_a = "02" + "a" * 64
+        db.members = {
+            member_a: {"peer_id": member_a, "tier": "member", "uptime_pct": 0.5},
+        }
+        state_mgr.set_peer_state(member_a, capacity=2_000_000)
+
+        pool.snapshot_contributions("2026-08")
+
+        messages = [entry["msg"] for entry in plugin.logs]
+        snapshot_logs = [m for m in messages if "Snapshot complete for 2026-08" in m]
+        assert snapshot_logs, "expected snapshot completion log"
+        assert "total capacity 2,000,000 sats" in snapshot_logs[-1]
+        assert "(weighted 1,000,000 sats)" in snapshot_logs[-1]
