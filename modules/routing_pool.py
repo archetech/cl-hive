@@ -311,6 +311,7 @@ class RoutingPool:
             period = self._current_period()
 
         contributions = []
+        total_capacity = 0
         total_weighted_capacity = 0
 
         # Get all members
@@ -325,7 +326,7 @@ class RoutingPool:
 
             # Get capacity and uptime
             capacity = self._get_member_capacity(member_id)
-            uptime = member.get('uptime_pct', 1.0)
+            uptime = self._normalize_uptime_pct(member.get('uptime_pct', 1.0))
 
             # Get position metrics (from state_manager if available)
             centrality, unique_peers, bridge_score = self._get_position_metrics(member_id)
@@ -346,6 +347,7 @@ class RoutingPool:
             )
 
             contributions.append(contrib)
+            total_capacity += contrib.total_capacity_sats
             total_weighted_capacity += contrib.weighted_capacity_sats
 
         # Second pass: calculate pool shares
@@ -392,8 +394,23 @@ class RoutingPool:
 
         self._log(
             f"Snapshot complete for {period}: {len(contributions)} members, "
-            f"total capacity {total_weighted_capacity:,} sats"
+            f"total capacity {total_capacity:,} sats "
+            f"(weighted {total_weighted_capacity:,} sats)"
         )
+
+        if contributions and total_capacity == 0:
+            self._log(
+                "All members reported 0 capacity. "
+                "State data may be missing/stale (wait for gossip heartbeat).",
+                level='warn'
+            )
+
+        if total_capacity > 0 and total_weighted_capacity == 0:
+            self._log(
+                "All weighted capacity is 0 despite non-zero total capacity. "
+                "Check member uptime data (uptime_pct may be 0 or stale).",
+                level='warn'
+            )
 
         return contributions
 
@@ -646,6 +663,23 @@ class RoutingPool:
             if state:
                 return getattr(state, 'capacity_sats', 0) or 0
         return 0
+
+    @staticmethod
+    def _normalize_uptime_pct(uptime_raw: Any) -> float:
+        """
+        Normalize uptime values to a 0.0-1.0 fraction.
+
+        Accepts either fractional values (0-1) or percentage values (0-100).
+        """
+        try:
+            uptime = float(uptime_raw)
+        except (TypeError, ValueError):
+            return 1.0
+
+        if uptime > 1.0:
+            uptime = uptime / 100.0
+
+        return max(0.0, min(1.0, uptime))
 
     def _get_position_metrics(self, member_id: str) -> Tuple[float, int, float]:
         """
