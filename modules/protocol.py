@@ -3073,8 +3073,18 @@ def validate_fee_report(payload: Dict[str, Any]) -> bool:
     if payload["period_end"] < payload["period_start"]:
         return False
 
-    # Timestamp freshness validation
+    # P3-L-5: period_start/period_end reasonableness bounds
     now = int(time.time())
+    if payload["period_start"] <= 1700000000:  # Must be after Nov 2023
+        return False
+    if payload["period_start"] > now + 86400:  # Not more than 1 day in future
+        return False
+    if payload["period_end"] <= payload["period_start"]:
+        return False
+    if payload["period_end"] > payload["period_start"] + 365 * 86400:  # Max 1 year span
+        return False
+
+    # Timestamp freshness validation
     if payload["period_end"] > now + 3600:  # More than 1 hour in future
         return False
     if payload["period_start"] < now - 90 * 86400:  # More than 90 days old
@@ -6111,7 +6121,7 @@ def validate_did_credential_present(payload: dict) -> bool:
         return False
 
     timestamp = payload.get("timestamp")
-    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+    if not isinstance(timestamp, (int, float)) or timestamp <= 0:
         return False
 
     credential = payload.get("credential")
@@ -6161,9 +6171,12 @@ def validate_did_credential_present(payload: dict) -> bool:
         return False
 
     # Enforce evidence size limit if present
+    # P3-L-7: Type-check each evidence item
     evidence = credential.get("evidence")
     if evidence is not None:
         if not isinstance(evidence, list):
+            return False
+        if not all(isinstance(e, (str, dict)) for e in evidence):
             return False
         try:
             evidence_json = _json.dumps(evidence, separators=(',', ':'))
@@ -6178,6 +6191,34 @@ def validate_did_credential_present(payload: dict) -> bool:
         return False
     if period_end <= period_start:
         return False
+    # P3-L-5: period_start/period_end reasonableness bounds
+    if period_start <= 1700000000:
+        return False
+    now_ts = int(time.time())
+    if period_start > now_ts + 86400:
+        return False
+    if period_end > period_start + 365 * 86400:
+        return False
+
+    # R4-1: Validate issued_at at protocol layer (optional field)
+    issued_at = credential.get("issued_at")
+    if issued_at is not None:
+        if not isinstance(issued_at, int):
+            return False
+        if issued_at <= 1700000000:
+            return False
+        if issued_at > now_ts + 86400:
+            return False
+
+    # R4-1: Validate expires_at if present
+    expires_at = credential.get("expires_at")
+    if expires_at is not None:
+        if not isinstance(expires_at, int):
+            return False
+        # expires_at must be after issued_at (if issued_at present) or period_start
+        reference_time = issued_at if issued_at is not None else period_start
+        if expires_at <= reference_time:
+            return False
 
     signature = credential.get("signature")
     if not isinstance(signature, str) or not signature:
@@ -6192,6 +6233,7 @@ def validate_did_credential_present(payload: dict) -> bool:
 
 def get_did_credential_present_signing_payload(payload: dict) -> str:
     """Get deterministic signing payload from a credential present message."""
+    import hashlib
     import json
     credential = payload.get("credential", {})
     signing_data = {
@@ -6203,6 +6245,11 @@ def get_did_credential_present_signing_payload(payload: dict) -> str:
         "period_end": credential.get("period_end", 0),
         "metrics": credential.get("metrics", {}),
         "outcome": credential.get("outcome"),
+        "issued_at": credential.get("issued_at"),
+        "expires_at": credential.get("expires_at"),
+        "evidence_hash": hashlib.sha256(
+            json.dumps(credential.get("evidence", []), sort_keys=True, separators=(',', ':')).encode()
+        ).hexdigest(),
     }
     return json.dumps(signing_data, sort_keys=True, separators=(',', ':'))
 
@@ -6249,9 +6296,11 @@ def validate_did_credential_revoke(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
-    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+    if not isinstance(timestamp, (int, float)) or timestamp <= 0:
         return False
 
     credential_id = payload.get("credential_id")
@@ -6346,7 +6395,7 @@ def validate_mgmt_credential_present(payload: dict) -> bool:
         return False
 
     timestamp = payload.get("timestamp")
-    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+    if not isinstance(timestamp, (int, float)) or timestamp <= 0:
         return False
 
     credential = payload.get("credential")
@@ -6400,8 +6449,16 @@ def validate_mgmt_credential_present(payload: dict) -> bool:
     try:
         if isinstance(constraints, dict):
             constraints_json = _json.dumps(constraints, separators=(',', ':'))
+            # P2R4-I-2: Enforce key-count limit on dict constraints
+            if len(constraints) > 50:
+                return False
         else:
+            # P3-L-8: Verify string constraints are valid JSON
+            parsed_constraints = _json.loads(constraints)
             constraints_json = constraints
+            # P2R4-I-2: Enforce key-count limit on string constraints after parsing
+            if isinstance(parsed_constraints, dict) and len(parsed_constraints) > 50:
+                return False
         if len(constraints_json) > MAX_MGMT_CONSTRAINTS_LEN:
             return False
     except (TypeError, ValueError):
@@ -6412,6 +6469,15 @@ def validate_mgmt_credential_present(payload: dict) -> bool:
     if not isinstance(valid_from, int) or not isinstance(valid_until, int):
         return False
     if valid_until <= valid_from:
+        return False
+    # P3-L-6: valid_from lower-bound
+    if valid_from <= 1700000000:
+        return False
+    # NEW-4: upper bounds on valid_from and max span
+    now_ts = int(time.time())
+    if valid_from > now_ts + 86400:  # Not more than 1 day in future
+        return False
+    if valid_until > valid_from + 730 * 86400:  # Max 2 year span
         return False
 
     signature = credential.get("signature")
@@ -6485,9 +6551,11 @@ def validate_mgmt_credential_revoke(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
-    if not isinstance(timestamp, (int, float)) or timestamp < 0:
+    if not isinstance(timestamp, (int, float)) or timestamp <= 0:
         return False
 
     credential_id = payload.get("credential_id")
@@ -6602,6 +6670,8 @@ def validate_settlement_receipt(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
     if not isinstance(timestamp, (int, float)) or timestamp < 0:
@@ -6627,6 +6697,10 @@ def validate_settlement_receipt(payload: dict) -> bool:
     if not isinstance(amount_sats, int) or amount_sats <= 0:
         return False
 
+    MAX_SETTLEMENT_AMOUNT_SATS = 100_000_000_000  # 1000 BTC - reasonable maximum
+    if amount_sats > MAX_SETTLEMENT_AMOUNT_SATS:
+        return False
+
     window_id = payload.get("window_id")
     if not isinstance(window_id, str) or not window_id or len(window_id) > 64:
         return False
@@ -6643,7 +6717,7 @@ def validate_settlement_receipt(payload: dict) -> bool:
         return False
 
     signature = payload.get("signature")
-    if not isinstance(signature, str) or not signature or len(signature) < 10:
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
         return False
 
     return True
@@ -6714,6 +6788,8 @@ def validate_bond_posting(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
     if not isinstance(timestamp, (int, float)) or timestamp < 0:
@@ -6731,8 +6807,9 @@ def validate_bond_posting(payload: dict) -> bool:
     if tier not in VALID_BOND_TIERS:
         return False
 
+    # P4-L-4: A bond must have a positive timelock
     timelock = payload.get("timelock")
-    if not isinstance(timelock, int) or timelock < 0:
+    if not isinstance(timelock, int) or timelock <= 0:
         return False
 
     token_hash = payload.get("token_hash")
@@ -6740,7 +6817,7 @@ def validate_bond_posting(payload: dict) -> bool:
         return False
 
     signature = payload.get("signature")
-    if not isinstance(signature, str) or not signature or len(signature) < 10:
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
         return False
 
     return True
@@ -6806,6 +6883,8 @@ def validate_bond_slash(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
     if not isinstance(timestamp, (int, float)) or timestamp < 0:
@@ -6828,7 +6907,7 @@ def validate_bond_slash(payload: dict) -> bool:
         return False
 
     signature = payload.get("signature")
-    if not isinstance(signature, str) or not signature or len(signature) < 10:
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
         return False
 
     return True
@@ -6893,6 +6972,8 @@ def validate_netting_proposal(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
     if not isinstance(timestamp, (int, float)) or timestamp < 0:
@@ -6925,9 +7006,15 @@ def validate_netting_proposal(payload: dict) -> bool:
             return False
         if "from_peer" not in p or "to_peer" not in p or "amount_sats" not in p:
             return False
+        if not isinstance(p.get("from_peer"), str) or len(p.get("from_peer", "")) != 66:
+            return False
+        if not isinstance(p.get("to_peer"), str) or len(p.get("to_peer", "")) != 66:
+            return False
+        if not isinstance(p.get("amount_sats"), int) or p["amount_sats"] <= 0:
+            return False
 
     signature = payload.get("signature")
-    if not isinstance(signature, str) or not signature or len(signature) < 10:
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
         return False
 
     return True
@@ -6990,6 +7077,8 @@ def validate_netting_ack(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
     if not isinstance(timestamp, (int, float)) or timestamp < 0:
@@ -7008,7 +7097,7 @@ def validate_netting_ack(payload: dict) -> bool:
         return False
 
     signature = payload.get("signature")
-    if not isinstance(signature, str) or not signature or len(signature) < 10:
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
         return False
 
     return True
@@ -7038,8 +7127,13 @@ def create_violation_report(
     signature: str,
     event_id: str = "",
     timestamp: int = 0,
+    block_hash: str = "",
 ) -> bytes:
-    """Create a VIOLATION_REPORT message."""
+    """Create a VIOLATION_REPORT message.
+
+    R5-FIX-6: Includes block_hash so all nodes that receive the same
+    violation report deterministically select the same arbitration panel.
+    """
     if not timestamp:
         import time
         timestamp = int(time.time())
@@ -7047,7 +7141,7 @@ def create_violation_report(
         import uuid
         event_id = str(uuid.uuid4())
 
-    return serialize(HiveMessageType.VIOLATION_REPORT, {
+    payload = {
         "sender_id": sender_id,
         "event_id": event_id,
         "timestamp": timestamp,
@@ -7056,7 +7150,11 @@ def create_violation_report(
         "violation_type": violation_type,
         "evidence": evidence,
         "signature": signature,
-    })
+    }
+    if block_hash:
+        payload["block_hash"] = block_hash
+
+    return serialize(HiveMessageType.VIOLATION_REPORT, payload)
 
 
 def validate_violation_report(payload: dict) -> bool:
@@ -7070,6 +7168,8 @@ def validate_violation_report(payload: dict) -> bool:
 
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
+        return False
+    if len(event_id) > 128:
         return False
 
     timestamp = payload.get("timestamp")
@@ -7100,8 +7200,14 @@ def validate_violation_report(payload: dict) -> bool:
         return False
 
     signature = payload.get("signature")
-    if not isinstance(signature, str) or not signature or len(signature) < 10:
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
         return False
+
+    # R5-FIX-6: Optional block_hash for deterministic panel selection
+    block_hash = payload.get("block_hash")
+    if block_hash is not None:
+        if not isinstance(block_hash, str) or len(block_hash) > 128:
+            return False
 
     return True
 
@@ -7163,6 +7269,8 @@ def validate_arbitration_vote(payload: dict) -> bool:
     event_id = payload.get("event_id")
     if not isinstance(event_id, str) or not event_id:
         return False
+    if len(event_id) > 128:
+        return False
 
     timestamp = payload.get("timestamp")
     if not isinstance(timestamp, (int, float)) or timestamp < 0:
@@ -7181,7 +7289,7 @@ def validate_arbitration_vote(payload: dict) -> bool:
         return False
 
     signature = payload.get("signature")
-    if not isinstance(signature, str) or not signature or len(signature) < 10:
+    if not isinstance(signature, str) or not signature or len(signature) < 10 or len(signature) > 200:
         return False
 
     return True

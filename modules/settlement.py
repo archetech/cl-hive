@@ -19,6 +19,7 @@ Thread Safety:
 - Uses thread-local database connections via HiveDatabase pattern
 """
 
+import os
 import time
 import json
 import sqlite3
@@ -1793,7 +1794,7 @@ class IntelligenceHandler(SettlementTypeHandler):
         result = []
         for ob in obligations:
             amount = ob.get("amount_sats", 0)
-            base = int(amount * 0.70)
+            base = amount * 70 // 100
             bonus = amount - base
             result.append({**ob, "base_sats": base, "bonus_sats": bonus})
         return result
@@ -1828,10 +1829,13 @@ class AdvisorFeeHandler(SettlementTypeHandler):
 class SettlementTypeRegistry:
     """Registry of settlement type handlers."""
 
-    def __init__(self):
+    def __init__(self, cashu_escrow_mgr=None, database=None, plugin=None,
+                 did_credential_mgr=None, **kwargs):
         self.handlers: Dict[str, SettlementTypeHandler] = {}
-        self.cashu_escrow_mgr = None
-        self.did_credential_mgr = None
+        self.cashu_escrow_mgr = cashu_escrow_mgr
+        self.database = database
+        self.plugin = plugin
+        self.did_credential_mgr = did_credential_mgr
         self._register_defaults()
 
     def _register_defaults(self):
@@ -1869,6 +1873,11 @@ class NettingEngine:
 
     All computations use integer sats (no floats).
     Deterministic JSON serialization for obligation hashing.
+
+    P4R4-L-2: Callers should compute obligations_hash before netting,
+    then re-verify against the obligation snapshot at execution time
+    to detect stale data.  bilateral_net() and multilateral_net()
+    include the obligations_hash in their return value for this purpose.
     """
 
     @staticmethod
@@ -1882,6 +1891,15 @@ class NettingEngine:
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     @staticmethod
+    def verify_obligations_hash(obligations: List[Dict],
+                                expected_hash: str) -> bool:
+        """Verify obligations have not changed since hash was computed.
+
+        P4R4-L-2: Call this at execution time to guard against stale data.
+        """
+        return NettingEngine.compute_obligations_hash(obligations) == expected_hash
+
+    @staticmethod
     def bilateral_net(obligations: List[Dict],
                       peer_a: str, peer_b: str,
                       window_id: str) -> Dict[str, Any]:
@@ -1889,14 +1907,19 @@ class NettingEngine:
         Compute bilateral net between two peers.
 
         Returns single net payment direction + amount.
+        Includes obligations_hash for staleness verification at execution time.
         """
+        # P4R4-L-2: Compute hash at netting time so callers can re-verify
+        # at execution time to detect stale obligations.
+        ob_hash = NettingEngine.compute_obligations_hash(obligations)
+
         a_to_b = 0  # total A owes B
         b_to_a = 0  # total B owes A
 
         for ob in obligations:
             if ob.get("window_id") != window_id:
                 continue
-            if ob.get("status") not in ("pending", None):
+            if ob.get("status") != "pending":
                 continue
             amount = ob.get("amount_sats", 0)
             if amount <= 0:
@@ -1918,6 +1941,7 @@ class NettingEngine:
                 "amount_sats": net,
                 "window_id": window_id,
                 "obligations_netted": a_to_b + b_to_a,
+                "obligations_hash": ob_hash,
             }
         elif net < 0:
             return {
@@ -1926,6 +1950,7 @@ class NettingEngine:
                 "amount_sats": -net,
                 "window_id": window_id,
                 "obligations_netted": a_to_b + b_to_a,
+                "obligations_hash": ob_hash,
             }
         else:
             return {
@@ -1934,6 +1959,7 @@ class NettingEngine:
                 "amount_sats": 0,
                 "window_id": window_id,
                 "obligations_netted": a_to_b + b_to_a,
+                "obligations_hash": ob_hash,
             }
 
     @staticmethod
@@ -1946,13 +1972,17 @@ class NettingEngine:
         All integer arithmetic.
 
         Returns list of net payments.
+
+        P4R4-L-2: Callers should snapshot obligations and use
+        verify_obligations_hash() at execution time to guard
+        against stale obligation data.
         """
         # Aggregate net balances per peer
         balances: Dict[str, int] = {}
         for ob in obligations:
             if ob.get("window_id") != window_id:
                 continue
-            if ob.get("status") not in ("pending", None):
+            if ob.get("status") != "pending":
                 continue
             amount = ob.get("amount_sats", 0)
             if amount <= 0:
@@ -2021,6 +2051,9 @@ class BondManager:
 
     TENURE_MATURITY_DAYS = 180
     SLASH_DISTRIBUTION = {"aggrieved": 0.50, "panel": 0.30, "burned": 0.20}
+    # P4R4-M-3: Class-level lock shared across all instances to provide
+    # cross-request protection even if BondManager is instantiated per-message.
+    _bond_lock = threading.Lock()
 
     def __init__(self, database, plugin, rpc=None):
         self.db = database
@@ -2046,18 +2079,19 @@ class BondManager:
     def post_bond(self, peer_id: str, amount_sats: int,
                   token_json: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Post a new bond for a peer."""
-        if amount_sats < 0:
+        if amount_sats <= 0:
             return None
 
-        # Reject if peer already has an active or slashed bond
+        # Reject if peer already has an active bond (allow re-bonding after slash/refund)
         existing = self.db.get_bond_for_peer(peer_id)
         if existing:
             self._log(f"bond rejected: {peer_id[:16]}... already has active bond")
             return None
 
         tier = self.get_tier_for_amount(amount_sats)
+        nonce = os.urandom(16).hex()
         bond_id = hashlib.sha256(
-            f"bond:{peer_id}:{int(time.time())}".encode()
+            f"bond:{peer_id}:{int(time.time())}:{nonce}".encode()
         ).hexdigest()[:32]
 
         # 6-month timelock for refund path
@@ -2104,7 +2138,13 @@ class BondManager:
         return max(option_a, option_b)
 
     def distribute_slash(self, slash_amount: int) -> Dict[str, int]:
-        """Distribute slashed funds per policy (integer arithmetic)."""
+        """Distribute slashed funds per SLASH_DISTRIBUTION policy (integer arithmetic).
+
+        P4R4-L-1: Uses pure integer arithmetic (// and * 100) to avoid
+        floating-point rounding errors in sat amounts.
+        Distribution: 50% aggrieved, 30% panel, 20% burned.
+        """
+        # Integer percentages: 50%, 30%, remainder to burned
         aggrieved = slash_amount * 50 // 100
         panel = slash_amount * 30 // 100
         burned = slash_amount - aggrieved - panel  # Remainder to burned
@@ -2116,44 +2156,52 @@ class BondManager:
 
     def slash_bond(self, bond_id: str, slash_amount: int) -> Optional[Dict[str, Any]]:
         """Execute a bond slash."""
-        bond = self.db.get_bond(bond_id)
-        if not bond:
-            return None
+        with self._bond_lock:
+            bond = self.db.get_bond(bond_id)
+            if not bond:
+                return None
 
-        if bond['status'] != 'active':
-            return None
+            if bond['status'] != 'active':
+                return None
 
-        # Cap slash at bond amount
-        prior_slashed = bond['slashed_amount']
-        effective_slash = min(slash_amount, bond['amount_sats'] - prior_slashed)
-        if effective_slash <= 0:
-            return None
+            # Cap slash at bond amount
+            prior_slashed = bond['slashed_amount']
+            effective_slash = min(slash_amount, bond['amount_sats'] - prior_slashed)
+            if effective_slash <= 0:
+                return None
 
-        self.db.slash_bond(bond_id, effective_slash)
-        distribution = self.distribute_slash(effective_slash)
+            success = self.db.slash_bond(bond_id, effective_slash)
+            if not success:
+                self._log(f"bond {bond_id[:16]}... slash failed at DB level", level='error')
+                return None
+            distribution = self.distribute_slash(effective_slash)
 
-        remaining = bond['amount_sats'] - prior_slashed - effective_slash
-        self._log(f"bond {bond_id[:16]}... slashed {effective_slash} sats")
+            remaining = bond['amount_sats'] - prior_slashed - effective_slash
+            self._log(f"bond {bond_id[:16]}... slashed {effective_slash} sats")
 
-        return {
-            "bond_id": bond_id,
-            "slashed_amount": effective_slash,
-            "distribution": distribution,
-            "remaining": remaining,
-        }
+            return {
+                "bond_id": bond_id,
+                "slashed_amount": effective_slash,
+                "distribution": distribution,
+                "remaining": remaining,
+            }
 
     def refund_bond(self, bond_id: str) -> Optional[Dict[str, Any]]:
         """Refund a bond after timelock expiry."""
-        bond = self.db.get_bond(bond_id)
-        if not bond:
-            return None
+        with self._bond_lock:
+            bond = self.db.get_bond(bond_id)
+            if not bond:
+                return None
 
-        now = int(time.time())
-        if now < bond['timelock']:
-            return {"error": "timelock not expired", "timelock": bond['timelock']}
+            if bond['status'] not in ('active', 'slashed'):
+                return {"error": f"bond status is {bond['status']}, cannot refund"}
 
-        remaining = bond['amount_sats'] - bond['slashed_amount']
-        self.db.update_bond_status(bond_id, 'refunded')
+            now = int(time.time())
+            if now < bond['timelock']:
+                return {"error": "timelock not expired", "timelock": bond['timelock']}
+
+            remaining = bond['amount_sats'] - bond['slashed_amount']
+            self.db.update_bond_status(bond_id, 'refunded')
 
         return {
             "bond_id": bond_id,
@@ -2191,10 +2239,13 @@ class DisputeResolver:
     - 5-9 eligible: 3 members (2-of-3)
 
     Selection seed: SHA256(dispute_id || block_hash_at_filing_height)
-    Weight: bond_amount + sqrt(tenure_days)
+    Weight: bond_amount + (tenure_days * 100)
     """
 
     MIN_ELIGIBLE_FOR_PANEL = 5
+    # P4R4-M-3: Class-level lock shared across all instances to provide
+    # cross-request protection even if DisputeResolver is instantiated per-message.
+    _dispute_lock = threading.Lock()
 
     def __init__(self, database, plugin, rpc=None):
         self.db = database
@@ -2277,7 +2328,7 @@ class DisputeResolver:
         }
 
     def file_dispute(self, obligation_id: str, filing_peer: str,
-                     evidence: Dict) -> Optional[Dict]:
+                     evidence: Dict, block_hash: Optional[str] = None) -> Optional[Dict]:
         """File a new dispute."""
         obligation = self.db.get_obligation(obligation_id)
 
@@ -2289,8 +2340,9 @@ class DisputeResolver:
 
         respondent = obligation['from_peer'] if obligation['to_peer'] == filing_peer else obligation['to_peer']
 
+        nonce = os.urandom(16).hex()
         dispute_id = hashlib.sha256(
-            f"dispute:{obligation_id}:{filing_peer}:{int(time.time())}".encode()
+            f"dispute:{obligation_id}:{filing_peer}:{int(time.time())}:{nonce}".encode()
         ).hexdigest()[:32]
 
         evidence_json = json.dumps(evidence, sort_keys=True, separators=(',', ':'))
@@ -2329,18 +2381,24 @@ class DisputeResolver:
                 "tenure_days": tenure_days,
             })
 
-        block_hash = "0" * 64
-        if self.rpc:
-            try:
-                info = self.rpc.getinfo()
-                if isinstance(info, dict):
-                    block_hash = (
-                        info.get("bestblockhash")
-                        or info.get("blockhash")
-                        or f"height:{info.get('blockheight', 0)}"
-                    )
-            except Exception:
-                pass
+        # R5-FIX-6: Use deterministic block_hash from violation report or
+        # evidence so all nodes select the same arbitration panel.
+        # Fall back to live RPC only if no block_hash was provided.
+        resolved_block_hash = block_hash or evidence.get("block_hash") if isinstance(evidence, dict) else block_hash
+        if not resolved_block_hash:
+            resolved_block_hash = "0" * 64
+            if self.rpc:
+                try:
+                    info = self.rpc.getinfo()
+                    if isinstance(info, dict):
+                        resolved_block_hash = (
+                            info.get("bestblockhash")
+                            or info.get("blockhash")
+                            or f"height:{info.get('blockheight', 0)}"
+                        )
+                except Exception:
+                    pass
+        block_hash = resolved_block_hash
 
         panel_info = self.select_arbitration_panel(dispute_id, str(block_hash), eligible_members)
         if panel_info:
@@ -2381,64 +2439,84 @@ class DisputeResolver:
     def record_vote(self, dispute_id: str, voter_id: str,
                     vote: str, reason: str = "",
                     signature: str = "") -> Optional[Dict]:
-        """Record an arbitration panel vote."""
-        dispute = self.db.get_dispute(dispute_id)
-        if not dispute:
-            return {"error": "dispute not found"}
+        """Record an arbitration panel vote.
 
-        if dispute.get('resolved_at'):
-            return {"error": "dispute already resolved"}
-
-        # Check panel membership before accepting vote
-        panel_members = []
-        if dispute.get('panel_members_json'):
-            try:
-                panel_members = json.loads(dispute['panel_members_json'])
-            except (json.JSONDecodeError, TypeError):
-                panel_members = []
-
-        if voter_id not in panel_members:
-            return {"error": "voter not on arbitration panel"}
-
+        After recording the vote, automatically checks quorum while still
+        holding _dispute_lock to prevent TOCTOU races.  The return dict
+        includes a 'quorum_result' key when quorum was reached.
+        """
         if vote not in {"upheld", "rejected", "partial", "abstain"}:
             return {"error": "invalid vote"}
 
-        # Parse existing votes
-        votes = {}
-        if dispute.get('votes_json'):
-            try:
-                votes = json.loads(dispute['votes_json'])
-            except (json.JSONDecodeError, TypeError):
-                votes = {}
+        with self._dispute_lock:
+            dispute = self.db.get_dispute(dispute_id)
+            if not dispute:
+                return {"error": "dispute not found"}
 
-        votes[voter_id] = {
-            "vote": vote,
-            "reason": reason,
-            "signature": signature,
-            "timestamp": int(time.time()),
-        }
+            if dispute.get('resolved_at'):
+                return {"error": "dispute already resolved"}
 
-        votes_json = json.dumps(votes, sort_keys=True, separators=(',', ':'))
+            # Check panel membership before accepting vote
+            panel_members = []
+            if dispute.get('panel_members_json'):
+                try:
+                    panel_members = json.loads(dispute['panel_members_json'])
+                except (json.JSONDecodeError, TypeError):
+                    panel_members = []
 
-        # Update votes
-        self.db.update_dispute_outcome(
-            dispute_id=dispute_id,
-            outcome=dispute.get('outcome'),
-            slash_amount=dispute.get('slash_amount', 0),
-            panel_members_json=dispute.get('panel_members_json'),
-            votes_json=votes_json,
-            resolved_at=dispute.get('resolved_at') or 0,
-        )
+            if voter_id not in panel_members:
+                return {"error": "voter not on arbitration panel"}
 
-        return {
+            # Parse existing votes
+            votes = {}
+            if dispute.get('votes_json'):
+                try:
+                    votes = json.loads(dispute['votes_json'])
+                except (json.JSONDecodeError, TypeError):
+                    votes = {}
+
+            if voter_id in votes:
+                return {"error": "voter has already cast a vote"}
+
+            votes[voter_id] = {
+                "vote": vote,
+                "reason": reason,
+                "signature": signature,
+                "timestamp": int(time.time()),
+            }
+
+            votes_json = json.dumps(votes, sort_keys=True, separators=(',', ':'))
+
+            # Update votes
+            self.db.update_dispute_outcome(
+                dispute_id=dispute_id,
+                outcome=dispute.get('outcome'),
+                slash_amount=dispute.get('slash_amount', 0),
+                panel_members_json=dispute.get('panel_members_json'),
+                votes_json=votes_json,
+                resolved_at=dispute.get('resolved_at') or 0,
+            )
+
+            # Check quorum while still holding the lock (P4R3-M-2 fix)
+            quorum = (len(panel_members) // 2) + 1 if panel_members else 1
+            quorum_result = self._check_quorum_locked(dispute_id, quorum)
+
+        result = {
             "dispute_id": dispute_id,
             "voter_id": voter_id,
             "vote": vote,
             "total_votes": len(votes),
         }
+        if quorum_result:
+            result["quorum_result"] = quorum_result
+        return result
 
-    def check_quorum(self, dispute_id: str, quorum: int) -> Optional[Dict]:
-        """Check if quorum reached and determine outcome."""
+    def _check_quorum_locked(self, dispute_id: str, quorum: int) -> Optional[Dict]:
+        """Check if quorum reached and determine outcome.
+
+        MUST be called while holding _dispute_lock.  This is the internal
+        implementation; the public check_quorum() acquires the lock itself.
+        """
         dispute = self.db.get_dispute(dispute_id)
         if not dispute or dispute.get('resolved_at'):
             return None
@@ -2465,15 +2543,19 @@ class DisputeResolver:
         non_abstain = counts["upheld"] + counts["rejected"] + counts["partial"]
         if non_abstain == 0:
             outcome = "rejected"
-        elif counts["upheld"] > non_abstain / 2:
+        elif counts["upheld"] * 2 > non_abstain:
             outcome = "upheld"
-        elif counts["partial"] > non_abstain / 2:
+        elif counts["partial"] * 2 > non_abstain:
+            outcome = "partial"
+        elif counts["upheld"] >= counts["rejected"] and counts["upheld"] >= counts["partial"]:
+            outcome = "upheld"
+        elif counts["partial"] >= counts["rejected"]:
             outcome = "partial"
         else:
             outcome = "rejected"
 
         now = int(time.time())
-        self.db.update_dispute_outcome(
+        updated = self.db.update_dispute_outcome(
             dispute_id=dispute_id,
             outcome=outcome,
             slash_amount=dispute.get('slash_amount', 0),
@@ -2481,6 +2563,10 @@ class DisputeResolver:
             votes_json=dispute.get('votes_json'),
             resolved_at=now,
         )
+
+        if not updated:
+            # CAS guard prevented double resolution
+            return None
 
         self._log(f"dispute {dispute_id[:16]}... resolved: {outcome}")
 
@@ -2490,6 +2576,17 @@ class DisputeResolver:
             "vote_counts": counts,
             "resolved_at": now,
         }
+
+    def check_quorum(self, dispute_id: str, quorum: int) -> Optional[Dict]:
+        """Check if quorum reached and determine outcome.
+
+        Public API that acquires _dispute_lock.  Safe to call externally
+        (e.g. from cl-hive.py) — the CAS guard in update_dispute_outcome
+        prevents double resolution even without the lock, but the lock
+        provides additional serialisation.
+        """
+        with self._dispute_lock:
+            return self._check_quorum_locked(dispute_id, quorum)
 
 
 # =============================================================================

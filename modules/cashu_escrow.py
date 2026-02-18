@@ -17,6 +17,7 @@ Key patterns:
 """
 
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -237,20 +238,29 @@ class CashuEscrowManager:
         except Exception as e:
             self._log(f"secret key derivation failed (non-fatal): {e}", level='warn')
 
-    def _encrypt_secret(self, secret_hex: str) -> str:
-        """XOR-encrypt a hex secret with the derived key. Returns hex."""
+    def _encrypt_secret(self, secret_hex: str, task_id: str = "") -> str:
+        """XOR-encrypt a hex secret with an HMAC-derived key. Returns hex.
+
+        P4-L-1: Uses HMAC-SHA256 key derivation instead of raw XOR with
+        signmessage output, providing better semantic security.
+
+        R5-FIX-3: Derives a unique key per secret using task_id to avoid
+        static keystream reuse across different secrets.
+        """
         if not self._secret_key:
             self._log("secret key unavailable — storing secret as plaintext", level='warn')
             return secret_hex  # No key available, store plaintext
         secret_bytes = bytes.fromhex(secret_hex)
-        key = self._secret_key
-        encrypted = bytes(s ^ key[i % len(key)] for i, s in enumerate(secret_bytes))
+        # Derive a unique encryption key per task using HMAC with task_id
+        key_material = b"escrow_secret_key:" + task_id.encode('utf-8') if task_id else b"escrow_secret_key"
+        derived_key = hmac.new(self._secret_key, key_material, hashlib.sha256).digest()
+        encrypted = bytes(s ^ derived_key[i % len(derived_key)] for i, s in enumerate(secret_bytes))
         return encrypted.hex()
 
-    def _decrypt_secret(self, encrypted_hex: str) -> str:
+    def _decrypt_secret(self, encrypted_hex: str, task_id: str = "") -> str:
         """XOR-decrypt a hex secret with the derived key. Returns hex."""
         # XOR is symmetric
-        return self._encrypt_secret(encrypted_hex)
+        return self._encrypt_secret(encrypted_hex, task_id=task_id)
 
     def _get_breaker(self, mint_url: str) -> MintCircuitBreaker:
         """Get or create circuit breaker for a mint URL."""
@@ -337,7 +347,7 @@ class CashuEscrowManager:
         hash_hex = hashlib.sha256(secret_bytes).hexdigest()
 
         # Encrypt and store
-        encrypted = self._encrypt_secret(secret_hex)
+        encrypted = self._encrypt_secret(secret_hex, task_id=task_id)
         success = self.db.store_escrow_secret(
             task_id=task_id,
             ticket_id=ticket_id,
@@ -389,7 +399,7 @@ class CashuEscrowManager:
                           f"for ticket {ticket_id[:16]}...", level='warn')
                 return None
 
-        secret_hex = self._decrypt_secret(record['secret_hex'])
+        secret_hex = self._decrypt_secret(record['secret_hex'], task_id=task_id)
 
         # Mark as revealed
         self.db.reveal_escrow_secret(task_id, int(time.time()))
@@ -413,12 +423,11 @@ class CashuEscrowManager:
 
         for min_d, max_d, base_min, base_max, window in DANGER_PRICING_TABLE:
             if min_d <= danger_score <= max_d:
-                # Linear interpolation within the band
+                # Integer arithmetic interpolation within the band
                 if max_d > min_d:
-                    t = (danger_score - min_d) / (max_d - min_d)
+                    base_sats = base_min + (danger_score - min_d) * (base_max - base_min) // (max_d - min_d)
                 else:
-                    t = 0.5
-                base_sats = int(base_min + t * (base_max - base_min))
+                    base_sats = (base_min + base_max) // 2
                 adjusted = max(0, int(base_sats * modifier))
                 return {
                     "base_sats": base_sats,
@@ -585,7 +594,7 @@ class CashuEscrowManager:
             if field not in token:
                 return False, f"missing field: {field}"
 
-        if not isinstance(token["amount"], int) or token["amount"] < 0:
+        if not isinstance(token["amount"], int) or token["amount"] <= 0:
             return False, "invalid amount"
 
         if token["ticket_type"] not in VALID_TICKET_TYPES:
@@ -739,12 +748,8 @@ class CashuEscrowManager:
             if now < ticket['timelock']:
                 return {"error": "timelock not yet expired", "timelock": ticket['timelock']}
 
-            # Update status under lock
-            self.db.update_escrow_ticket_status(ticket_id, 'refunded', now)
-
-            # Re-read to confirm the transition took effect
-            updated = self.db.get_escrow_ticket(ticket_id)
-            if not updated or updated['status'] != 'refunded':
+            # Update status under lock with CAS guard to prevent race conditions
+            if not self.db.update_escrow_ticket_status(ticket_id, 'refunded', now, expected_status=ticket['status']):
                 return {"error": "ticket status transition failed (race condition)"}
 
         # Attempt mint refund (optional) — outside the lock
@@ -853,7 +858,12 @@ class CashuEscrowManager:
     # =========================================================================
 
     def cleanup_expired_tickets(self) -> int:
-        """Mark expired active tickets. Returns count of newly expired."""
+        """Mark expired active tickets. Returns count of newly expired.
+
+        P4-M-2: Uses CAS guard (expected_status='active') so that if
+        redeem_ticket already changed a ticket's status, the cleanup
+        UPDATE is a no-op and does not clobber the redemption.
+        """
         if not self.db:
             return 0
 
@@ -862,8 +872,16 @@ class CashuEscrowManager:
         expired_count = 0
         for t in tickets:
             if t['timelock'] < now:
-                self.db.update_escrow_ticket_status(t['ticket_id'], 'expired', now)
-                expired_count += 1
+                # CAS guard: only expire if still 'active'
+                try:
+                    changed = self.db.update_escrow_ticket_status(
+                        t['ticket_id'], 'expired', now, expected_status='active')
+                except TypeError:
+                    # Fallback for DB implementations without expected_status
+                    changed = self.db.update_escrow_ticket_status(
+                        t['ticket_id'], 'expired', now)
+                if changed:
+                    expired_count += 1
 
         if expired_count > 0:
             self._log(f"expired {expired_count} tickets")
@@ -893,11 +911,16 @@ class CashuEscrowManager:
         return retried
 
     def prune_old_secrets(self) -> int:
-        """Delete revealed secrets older than SECRET_RETENTION_DAYS. Returns count."""
+        """Delete revealed secrets older than SECRET_RETENTION_DAYS. Returns count.
+
+        P4-L-5: Pruning cutoff is always relative to time.time() with an
+        explicit retention period, never based on a hardcoded absolute timestamp.
+        """
         if not self.db:
             return 0
 
-        cutoff = int(time.time()) - (self.SECRET_RETENTION_DAYS * 86400)
+        retention_seconds = max(86400, self.SECRET_RETENTION_DAYS * 86400)  # At least 1 day
+        cutoff = int(time.time()) - retention_seconds
         return self.db.prune_escrow_secrets(cutoff)
 
     def get_mint_status(self, mint_url: str) -> Dict[str, Any]:

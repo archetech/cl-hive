@@ -126,30 +126,6 @@ class ContributionManager:
         with self._map_lock:
             return self._channel_map.get(channel_id)
 
-    def _allow_daily_global(self) -> bool:
-        """
-        P5-02: Check global daily limit across all peers (thread-safe).
-
-        Returns False if daily cap exceeded (resets after 24h).
-        """
-        with self._lock:
-            now = int(time.time())
-            if now - self._daily_window_start >= 86400:
-                self._daily_window_start = now
-                self._daily_count = 0
-            if self._daily_count >= MAX_CONTRIB_EVENTS_PER_DAY_TOTAL:
-                return False
-            self._daily_count += 1
-
-        if self.db:
-            try:
-                self.db.save_contribution_daily_stats(
-                    self._daily_window_start, self._daily_count
-                )
-            except Exception:
-                pass
-        return True
-
     def _allow_record(self, peer_id: str) -> bool:
         """Check per-peer rate limit and global daily limit (thread-safe)."""
         with self._lock:
@@ -250,7 +226,7 @@ class ContributionManager:
 
         if ratio >= LEECH_WARN_RATIO:
             self.db.clear_leech_flag(peer_id)
-            return {"is_leech": ratio < LEECH_WARN_RATIO, "ratio": ratio}
+            return {"is_leech": False, "ratio": ratio}
 
         now = int(time.time())
         flag = self.db.get_leech_flag(peer_id)

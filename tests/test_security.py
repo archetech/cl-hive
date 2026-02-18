@@ -208,26 +208,27 @@ class TestContributionDailyCap:
 
     def test_daily_global_limit_enforced(self, contribution_manager):
         """Daily global limit should reject events after cap reached."""
-        # Exhaust the daily cap
-        for i in range(MAX_CONTRIB_EVENTS_PER_DAY_TOTAL):
-            assert contribution_manager._allow_daily_global() is True
+        # Exhaust the daily cap via _allow_record (which checks the global daily limit)
+        peer_id = "02" + "b" * 64
+        contribution_manager._daily_count = MAX_CONTRIB_EVENTS_PER_DAY_TOTAL
 
         # Next should be rejected
-        assert contribution_manager._allow_daily_global() is False
+        assert contribution_manager._allow_record(peer_id) is False
 
     def test_daily_limit_resets_after_24h(self, contribution_manager):
         """Daily limit should reset after 24 hours."""
-        # Exhaust the cap
-        for _ in range(MAX_CONTRIB_EVENTS_PER_DAY_TOTAL):
-            contribution_manager._allow_daily_global()
+        peer_id = "02" + "c" * 64
 
-        assert contribution_manager._allow_daily_global() is False
+        # Exhaust the cap
+        contribution_manager._daily_count = MAX_CONTRIB_EVENTS_PER_DAY_TOTAL
+
+        assert contribution_manager._allow_record(peer_id) is False
 
         # Simulate 24h passing
         contribution_manager._daily_window_start = int(time.time()) - 86401
 
-        # Should allow again
-        assert contribution_manager._allow_daily_global() is True
+        # Should allow again (daily counter resets inside _allow_record)
+        assert contribution_manager._allow_record(peer_id) is True
 
     def test_allow_record_checks_daily_limit(self, contribution_manager):
         """_allow_record should check daily global limit before per-peer limit."""
@@ -422,6 +423,23 @@ class TestSecurityIntegration:
         # Phase 3: RPC Pool replaces global RPC_LOCK
         assert 'class RpcPool' in main_content
         assert 'P3-02' in main_content
+
+
+class TestBanMaintenanceOrder:
+    """Regression tests for ban maintenance sequencing."""
+
+    def test_settlement_gaming_sweep_runs_before_generic_expiry(self):
+        """Settlement-gaming expiry sweep must run before cleanup_expired_ban_proposals."""
+        with open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'cl-hive.py'
+        )) as f:
+            content = f.read()
+
+        sweep_idx = content.find("Settlement gaming ban sweep error")
+        expiry_idx = content.find("cleanup_expired_ban_proposals")
+        assert sweep_idx != -1 and expiry_idx != -1
+        assert sweep_idx < expiry_idx
 
 
 if __name__ == "__main__":

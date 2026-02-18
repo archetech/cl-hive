@@ -519,6 +519,10 @@ class PeerQualityScorer:
         Returns:
             List of PeerQualityResult, sorted by overall_score descending
         """
+        MAX_BATCH_SIZE = 500
+        if len(peer_ids) > MAX_BATCH_SIZE:
+            peer_ids = peer_ids[:MAX_BATCH_SIZE]
+
         results = []
         for peer_id in peer_ids:
             result = self.calculate_score(peer_id, days=days)

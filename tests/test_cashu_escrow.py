@@ -75,8 +75,10 @@ class MockDatabase:
             result.append(t)
         return result[:limit]
 
-    def update_escrow_ticket_status(self, ticket_id, status, timestamp):
+    def update_escrow_ticket_status(self, ticket_id, status, timestamp, expected_status=None):
         if ticket_id in self.tickets:
+            if expected_status is not None and self.tickets[ticket_id]["status"] != expected_status:
+                return False
             self.tickets[ticket_id]["status"] = status
             if status == "redeemed":
                 self.tickets[ticket_id]["redeemed_at"] = timestamp
@@ -253,8 +255,9 @@ class TestCashuEscrowManager:
     def test_secret_encryption_roundtrip(self):
         mgr = make_manager()
         original = os.urandom(32).hex()
-        encrypted = mgr._encrypt_secret(original)
-        decrypted = mgr._decrypt_secret(encrypted)
+        task_id = "test_task_1"
+        encrypted = mgr._encrypt_secret(original, task_id=task_id)
+        decrypted = mgr._decrypt_secret(encrypted, task_id=task_id)
         assert decrypted == original
         assert encrypted != original  # Should be different
 

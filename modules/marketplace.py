@@ -106,8 +106,20 @@ class MarketplaceManager:
             "nostr_event_id": event.get("id") if event else None,
         }
 
+    def _resolve_advisor_nostr_pubkey(self, advisor_did: str) -> Optional[str]:
+        """Resolve advisor DID to cached Nostr pubkey when available."""
+        conn = self.db._get_connection()
+        row = conn.execute(
+            "SELECT nostr_pubkey FROM marketplace_profiles WHERE advisor_did = ?",
+            (advisor_did,),
+        ).fetchone()
+        if row and row["nostr_pubkey"]:
+            return str(row["nostr_pubkey"])
+        return None
+
     def propose_contract(self, advisor_did: str, node_id: str, scope: Dict[str, Any],
-                         tier: str, pricing: Dict[str, Any]) -> Dict[str, Any]:
+                         tier: str, pricing: Dict[str, Any],
+                         operator_id: Optional[str] = None) -> Dict[str, Any]:
         """Create a proposed contract and send a DM proposal."""
         now = int(time.time())
         if self.db.count_rows("marketplace_contracts") >= self.db.MAX_MARKETPLACE_CONTRACT_ROWS:
@@ -121,7 +133,7 @@ class MarketplaceManager:
             (
                 contract_id,
                 advisor_did,
-                node_id,
+                operator_id or node_id,
                 node_id,
                 tier or "standard",
                 json.dumps(scope or {}, sort_keys=True, separators=(",", ":")),
@@ -132,20 +144,28 @@ class MarketplaceManager:
 
         dm_event_id = None
         if self.nostr_transport:
-            dm_payload = {
-                "type": "contract_proposal",
-                "contract_id": contract_id,
-                "advisor_did": advisor_did,
-                "node_id": node_id,
-                "tier": tier,
-                "scope": scope or {},
-                "pricing": pricing or {},
-            }
-            dm_event = self.nostr_transport.send_dm(
-                recipient_pubkey=advisor_did,
-                plaintext=json.dumps(dm_payload, sort_keys=True, separators=(",", ":")),
-            )
-            dm_event_id = dm_event.get("id")
+            recipient = self._resolve_advisor_nostr_pubkey(advisor_did) or advisor_did
+            # Only send DM when recipient resolves to a valid 32-byte hex pubkey.
+            if len(recipient) == 64 and all(c in "0123456789abcdefABCDEF" for c in recipient):
+                dm_payload = {
+                    "type": "contract_proposal",
+                    "contract_id": contract_id,
+                    "advisor_did": advisor_did,
+                    "node_id": node_id,
+                    "tier": tier,
+                    "scope": scope or {},
+                    "pricing": pricing or {},
+                }
+                dm_event = self.nostr_transport.send_dm(
+                    recipient_pubkey=recipient,
+                    plaintext=json.dumps(dm_payload, sort_keys=True, separators=(",", ":")),
+                )
+                dm_event_id = dm_event.get("id")
+            else:
+                self._log(
+                    f"contract {contract_id[:8]}: no valid nostr_pubkey for advisor_did {advisor_did[:16]}...",
+                    level="warn",
+                )
         return {"ok": True, "contract_id": contract_id, "dm_event_id": dm_event_id}
 
     def accept_contract(self, contract_id: str) -> Dict[str, Any]:
@@ -210,8 +230,11 @@ class MarketplaceManager:
 
         cooldown_cutoff = int(time.time()) - (self.TRIAL_COOLDOWN_DAYS * 86400)
         prev = conn.execute(
-            "SELECT 1 FROM marketplace_trials WHERE node_id = ? AND scope = ? AND start_at > ? LIMIT 1",
-            (node_id, scope, cooldown_cutoff),
+            "SELECT mt.advisor_did FROM marketplace_trials mt "
+            "JOIN marketplace_contracts mc ON mc.contract_id = mt.contract_id "
+            "WHERE mt.node_id = ? AND mt.scope = ? AND mt.start_at > ? "
+            "AND mt.advisor_did != ? LIMIT 1",
+            (node_id, scope, cooldown_cutoff, contract["advisor_did"]),
         ).fetchone()
         if prev:
             return {"error": "trial cooldown active"}
@@ -297,11 +320,26 @@ class MarketplaceManager:
         """Auto-fail un-evaluated expired trials."""
         conn = self.db._get_connection()
         now = int(time.time())
-        cursor = conn.execute(
+        trial_rows = conn.execute(
+            "SELECT trial_id, contract_id FROM marketplace_trials "
+            "WHERE end_at < ? AND outcome IS NULL",
+            (now,),
+        ).fetchall()
+        if not trial_rows:
+            return 0
+
+        conn.execute(
             "UPDATE marketplace_trials SET outcome = 'fail' WHERE end_at < ? AND outcome IS NULL",
             (now,),
         )
-        return int(cursor.rowcount or 0)
+        contract_ids = {row["contract_id"] for row in trial_rows}
+        for contract_id in contract_ids:
+            conn.execute(
+                "UPDATE marketplace_contracts SET status = 'terminated' "
+                "WHERE contract_id = ? AND status = 'trial'",
+                (contract_id,),
+            )
+        return len(trial_rows)
 
     def check_contract_renewals(self) -> List[Dict[str, Any]]:
         """List active contracts approaching expiration."""

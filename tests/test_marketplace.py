@@ -79,6 +79,24 @@ def test_contract_proposal_and_accept(manager):
     assert accepted["contract_id"] == contract_id
 
 
+def test_propose_contract_uses_operator_id(manager, database):
+    result = manager.propose_contract(
+        advisor_did="did:cid:advisor-op",
+        node_id="02" + "ab" * 32,
+        scope={"scope": "monitor"},
+        tier="standard",
+        pricing={},
+        operator_id="03" + "cd" * 32,
+    )
+    assert result["ok"] is True
+    conn = database._get_connection()
+    row = conn.execute(
+        "SELECT operator_id FROM marketplace_contracts WHERE contract_id = ?",
+        (result["contract_id"],),
+    ).fetchone()
+    assert row["operator_id"] == "03" + "cd" * 32
+
+
 def test_trial_start_and_evaluate_pass(manager, database):
     proposal = manager.propose_contract(
         advisor_did="did:cid:advisor2",
@@ -135,6 +153,31 @@ def test_trial_cooldown_enforced(manager):
     assert "cooldown" in second["error"]
 
 
+def test_trial_cooldown_allows_same_advisor(manager):
+    node_id = "02" + "dd" * 32
+    p1 = manager.propose_contract(
+        advisor_did="did:cid:advisor-same",
+        node_id=node_id,
+        scope={"scope": "rebalance"},
+        tier="standard",
+        pricing={},
+    )
+    manager.accept_contract(p1["contract_id"])
+    first = manager.start_trial(p1["contract_id"], duration_days=1)
+    assert first["ok"] is True
+
+    p2 = manager.propose_contract(
+        advisor_did="did:cid:advisor-same",
+        node_id=node_id,
+        scope={"scope": "rebalance"},
+        tier="standard",
+        pricing={},
+    )
+    manager.accept_contract(p2["contract_id"])
+    second = manager.start_trial(p2["contract_id"], duration_days=1)
+    assert second["ok"] is True
+
+
 def test_cleanup_stale_profiles(manager, database):
     now = int(time.time())
     conn = database._get_connection()
@@ -155,3 +198,31 @@ def test_cleanup_stale_profiles(manager, database):
     )
     deleted = manager.cleanup_stale_profiles()
     assert deleted == 1
+
+
+def test_evaluate_expired_trials_updates_contract_status(manager, database):
+    proposal = manager.propose_contract(
+        advisor_did="did:cid:advisor-exp",
+        node_id="02" + "ef" * 32,
+        scope={"scope": "monitor"},
+        tier="standard",
+        pricing={},
+    )
+    contract_id = proposal["contract_id"]
+    manager.accept_contract(contract_id)
+    trial = manager.start_trial(contract_id, duration_days=1)
+    assert trial["ok"] is True
+
+    conn = database._get_connection()
+    conn.execute(
+        "UPDATE marketplace_trials SET end_at = ? WHERE trial_id = ?",
+        (int(time.time()) - 10, trial["trial_id"]),
+    )
+    updated = manager.evaluate_expired_trials()
+    assert updated == 1
+
+    row = conn.execute(
+        "SELECT status FROM marketplace_contracts WHERE contract_id = ?",
+        (contract_id,),
+    ).fetchone()
+    assert row["status"] == "terminated"

@@ -241,14 +241,18 @@ class LiquidityMarketplaceManager:
         conn = self.db._get_connection()
         now = int(time.time())
         rows = conn.execute(
-            "SELECT lease_id, heartbeat_interval, last_heartbeat, start_at FROM liquidity_leases WHERE status = 'active'"
+            "SELECT lease_id, heartbeat_interval, last_heartbeat, start_at, missed_heartbeats "
+            "FROM liquidity_leases WHERE status = 'active'"
         ).fetchall()
         updates = 0
         for row in rows:
             lease = dict(row)
             interval = int(lease.get("heartbeat_interval") or 3600)
             last = int(lease.get("last_heartbeat") or lease.get("start_at") or 0)
-            if last and now - last > interval:
+            missed = int(lease.get("missed_heartbeats") or 0)
+            # Increment at most once per missed interval window.
+            next_deadline = last + (interval * (missed + 1))
+            if last and now > next_deadline:
                 conn.execute(
                     "UPDATE liquidity_leases SET missed_heartbeats = missed_heartbeats + 1 WHERE lease_id = ?",
                     (lease["lease_id"],),

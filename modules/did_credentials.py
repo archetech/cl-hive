@@ -18,6 +18,7 @@ Security:
 - Row caps on storage to prevent unbounded growth
 """
 
+import hashlib
 import heapq
 import json
 import math
@@ -227,16 +228,23 @@ def get_credential_signing_payload(credential: Dict[str, Any]) -> str:
     Build deterministic JSON string for credential signing.
 
     Uses sorted keys and minimal separators for reproducibility.
+    Aligned with get_did_credential_present_signing_payload() in protocol.py
+    to prevent signing payload divergence (R4-2).
     """
     signing_data = {
         "credential_id": credential.get("credential_id", ""),
-        "issuer_id": credential["issuer_id"],
-        "subject_id": credential["subject_id"],
-        "domain": credential["domain"],
-        "period_start": credential["period_start"],
-        "period_end": credential["period_end"],
-        "metrics": credential["metrics"],
-        "outcome": credential["outcome"],
+        "issuer_id": credential.get("issuer_id", ""),
+        "subject_id": credential.get("subject_id", ""),
+        "domain": credential.get("domain", ""),
+        "period_start": credential.get("period_start", 0),
+        "period_end": credential.get("period_end", 0),
+        "metrics": credential.get("metrics", {}),
+        "outcome": credential.get("outcome"),
+        "issued_at": credential.get("issued_at"),
+        "expires_at": credential.get("expires_at"),
+        "evidence_hash": hashlib.sha256(
+            json.dumps(credential.get("evidence", []), sort_keys=True, separators=(',', ':')).encode()
+        ).hexdigest(),
     }
     return json.dumps(signing_data, sort_keys=True, separators=(',', ':'))
 
@@ -262,14 +270,41 @@ def validate_metrics_for_profile(domain: str, metrics: Dict[str, Any]) -> Option
         if key not in all_known:
             return f"unknown metric: {key}"
 
+    # Type check ALL metrics (not just those with ranges)
+    for key, value in metrics.items():
+        if isinstance(value, bool):
+            return f"metric {key} must be numeric, got bool"
+        if not isinstance(value, (int, float)):
+            return f"metric {key} must be numeric, got {type(value).__name__}"
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return f"metric {key} must be finite"
+
     # Check metric value ranges
     for key, value in metrics.items():
         if key in profile.metric_ranges:
             lo, hi = profile.metric_ranges[key]
-            if not isinstance(value, (int, float)):
-                return f"metric {key} must be numeric, got {type(value).__name__}"
-            if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-                return f"metric {key} must be finite"
+            if value < lo or value > hi:
+                return f"metric {key} value {value} out of range [{lo}, {hi}]"
+
+    # R4-3: Default upper-bound range checks for optional metrics without explicit ranges
+    DEFAULT_OPTIONAL_BOUNDS: Dict[str, tuple] = {
+        # hive:advisor optional
+        "sla_violations": (0, 100000),
+        "response_time_ms": (0, 600000),
+        # hive:node optional
+        "capacity_sats": (0, 21_000_000_00000000),  # 21M BTC in sats
+        "forward_count": (0, 100_000_000),
+        "force_close_count": (0, 100000),
+        # hive:client optional
+        "dispute_count": (0, 100000),
+        "contract_duration_days": (0, 36500),  # ~100 years
+        # agent:general optional
+        "cost_efficiency": (0.0, 1000.0),
+        "error_rate": (0.0, 1.0),
+    }
+    for key, value in metrics.items():
+        if key not in profile.metric_ranges and key in DEFAULT_OPTIONAL_BOUNDS:
+            lo, hi = DEFAULT_OPTIONAL_BOUNDS[key]
             if value < lo or value > hi:
                 return f"metric {key} value {value} out of range [{lo}, {hi}]"
 
@@ -437,6 +472,9 @@ class DIDCredentialManager:
             "period_end": period_end,
             "metrics": metrics,
             "outcome": outcome,
+            "issued_at": now,
+            "expires_at": expires_at,
+            "evidence": evidence,
         }
         signing_payload = get_credential_signing_payload(cred_dict)
 
@@ -477,7 +515,7 @@ class DIDCredentialManager:
             period_end=credential.period_end,
             metrics_json=json.dumps(credential.metrics, sort_keys=True),
             outcome=credential.outcome,
-            evidence_json=json.dumps(credential.evidence) if credential.evidence else None,
+            evidence_json=json.dumps(credential.evidence, sort_keys=True, separators=(',', ':')) if credential.evidence else None,
             signature=credential.signature,
             issued_at=credential.issued_at,
             expires_at=credential.expires_at,
@@ -558,8 +596,12 @@ class DIDCredentialManager:
         # Expiry check
         now = int(time.time())
         expires_at = credential.get("expires_at")
-        if expires_at is not None and isinstance(expires_at, int) and expires_at < now:
-            return False, "credential expired"
+        if expires_at is not None:
+            if not isinstance(expires_at, int):
+                self._log("credential has non-int expires_at", "warn")
+                return False, "invalid expires_at type"
+            if expires_at < now:
+                return False, "credential expired"
 
         # Revocation check
         revoked_at = credential.get("revoked_at")
@@ -572,7 +614,11 @@ class DIDCredentialManager:
 
         signing_payload = get_credential_signing_payload(credential)
         try:
-            result = self.rpc.checkmessage(signing_payload, signature)
+            result = self.rpc.call("checkmessage", {
+                "message": signing_payload,
+                "zbase": signature,
+                "pubkey": issuer_id,
+            })
             if isinstance(result, dict):
                 verified = result.get("verified", False)
                 pubkey = result.get("pubkey", "")
@@ -845,12 +891,12 @@ class DIDCredentialManager:
             return False
 
         # Size checks
-        metrics_json = json.dumps(credential.get("metrics", {}))
+        metrics_json = json.dumps(credential.get("metrics", {}), sort_keys=True, separators=(',', ':'))
         if len(metrics_json) > MAX_METRICS_JSON_LEN:
             self._log("credential metrics too large", "warn")
             return False
 
-        evidence_json = json.dumps(credential.get("evidence", []))
+        evidence_json = json.dumps(credential.get("evidence", []), sort_keys=True, separators=(',', ':'))
         if len(evidence_json) > MAX_EVIDENCE_JSON_LEN:
             self._log("credential evidence too large", "warn")
             return False
@@ -889,6 +935,11 @@ class DIDCredentialManager:
             self._log(f"rejecting credential without valid issued_at from {peer_id[:16]}...", "info")
             return False
         now = int(time.time())
+        # Lower bound: reject credentials older than 5 years (or before ~Nov 2023)
+        min_issued_at = max(1700000000, now - 365 * 86400 * 5)
+        if issued_at < min_issued_at:
+            self._log(f"credential_present: issued_at {issued_at} too old (min {min_issued_at})", "warn")
+            return False
         period_start = credential.get("period_start", 0)
         if issued_at < period_start:
             self._log("credential_present: issued_at before period_start", "warn")
@@ -954,6 +1005,10 @@ class DIDCredentialManager:
             self._log("invalid credential_revoke: missing credential_id", "warn")
             return False
 
+        if not isinstance(issuer_id, str) or not _is_valid_pubkey(issuer_id):
+            self._log("invalid credential_revoke: invalid issuer_id pubkey", "warn")
+            return False
+
         if not reason or len(reason) > MAX_REASON_LEN:
             self._log("invalid credential_revoke: bad reason", "warn")
             return False
@@ -987,7 +1042,11 @@ class DIDCredentialManager:
             "reason": reason,
         }, sort_keys=True, separators=(',', ':'))
         try:
-            result = self.rpc.checkmessage(revoke_payload, signature)
+            result = self.rpc.call("checkmessage", {
+                "message": revoke_payload,
+                "zbase": signature,
+                "pubkey": issuer_id,
+            })
             if not isinstance(result, dict):
                 self._log("revoke: unexpected checkmessage response type", "warn")
                 return False
@@ -1252,16 +1311,17 @@ class DIDCredentialManager:
         else:
             metrics["htlc_success_rate"] = 0.5
 
-        # Average fee PPM from fee policy
+        # Average fee PPM from fee policy (clamped to valid range)
         fee_policy = getattr(peer_state, 'fee_policy', {})
         if isinstance(fee_policy, dict):
-            metrics["avg_fee_ppm"] = fee_policy.get("fee_ppm", 0)
+            avg_fee_ppm = fee_policy.get("fee_ppm", 0)
         else:
-            metrics["avg_fee_ppm"] = 0
+            avg_fee_ppm = 0
+        metrics["avg_fee_ppm"] = max(0, min(avg_fee_ppm, 50000))
 
         # Optional metrics
-        metrics["capacity_sats"] = getattr(peer_state, 'capacity_sats', 0)
-        metrics["forward_count"] = forward_count
+        metrics["capacity_sats"] = getattr(peer_state, 'capacity_sats', 0) or 0
+        metrics["forward_count"] = forward_count or 0
 
         return metrics
 

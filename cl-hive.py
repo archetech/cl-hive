@@ -2759,7 +2759,7 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Store Hive membership info for ourselves
     if database and our_pubkey:
         now = int(time.time())
-        # Add ourselves as a member with the tier assigned by the admin
+        # Add ourselves as a member with the configured tier
         database.add_member(our_pubkey, tier=tier or 'neophyte', joined_at=now)
         # Store hive_id in metadata
         database.update_member(our_pubkey, metadata=json.dumps({"hive_id": hive_id}))
@@ -4221,37 +4221,70 @@ def handle_did_credential_present(peer_id: str, payload: Dict, plugin) -> Dict:
         plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT invalid payload from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Identity binding: sender_id must match peer_id
+    # P3-H-1 fix: For relayed messages, use origin for identity binding
     sender_id = payload.get("sender_id", "")
-    if sender_id != peer_id:
-        plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT identity mismatch from {peer_id[:16]}...", level='warn')
+    if _is_relayed_message(payload):
+        # NEW-1 fix: Verify relay peer is a known member
+        if database and not database.get_member(peer_id):
+            return {"result": "continue"}
+        # Ban check on relay peer
+        if database and database.is_banned(peer_id):
+            return {"result": "continue"}
+        # R5-M-5 fix: Rate limit on relay peer to prevent quota exhaustion attacks
+        if not _check_relay_credential_rate(peer_id):
+            plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT relay rate-limited for {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+        origin = _get_message_origin(payload)
+        effective_sender = origin if origin else peer_id
+        if sender_id != effective_sender:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT identity mismatch (relayed) from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    else:
+        if sender_id != peer_id:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT identity mismatch from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+
+    # Ban check against the actual sender
+    actual_sender = sender_id
+    if database and database.is_banned(actual_sender):
+        plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT from banned peer {actual_sender[:16]}...", level='warn')
         return {"result": "continue"}
 
-    # Ban check
-    if database and database.is_banned(peer_id):
-        plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT from banned peer {peer_id[:16]}...", level='warn')
-        return {"result": "continue"}
+    # R5-M-4 fix: Membership check BEFORE proto_events to avoid consuming dedup rows for non-members
+    if database:
+        member = database.get_member(actual_sender)
+        if not member:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT from non-member {actual_sender[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Timestamp freshness
     if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "DID_CREDENTIAL_PRESENT"):
         return {"result": "continue"}
 
-    # Dedup via proto_events
-    if database:
-        is_new, _eid = check_and_record(database, "DID_CREDENTIAL_PRESENT", payload, peer_id)
-        if not is_new:
-            return {"result": "continue"}  # Already processed
+    # P3-M-4 fix: In-memory relay dedup for credential messages
+    if not _credential_relay_dedup(payload, "DID_CREDENTIAL_PRESENT"):
+        return {"result": "continue"}
 
-    # Membership check
+    # Dedup via proto_events
+    _eid = None
     if database:
-        member = database.get_member(peer_id)
-        if not member:
-            plugin.log(f"cl-hive: DID_CREDENTIAL_PRESENT from non-member {peer_id[:16]}...", level='debug')
-            return {"result": "continue"}
+        is_new, _eid = check_and_record(database, "DID_CREDENTIAL_PRESENT", payload, actual_sender)
+        if not is_new:
+            # P3-M-3 fix: Still relay even if already processed
+            _relay_message(HiveMessageType.DID_CREDENTIAL_PRESENT, payload, peer_id)
+            # R5-L-6 fix: Emit ack on dedup branch so sender outbox entries are cleared
+            _emit_ack(peer_id, payload.get("event_id") or _eid)
+            return {"result": "continue"}  # Already processed
 
     # Process credential
     if did_credential_mgr:
-        did_credential_mgr.handle_credential_present(peer_id, payload)
+        did_credential_mgr.handle_credential_present(actual_sender, payload)
+
+    # P3-H-2 fix: Emit ack after successful processing
+    _emit_ack(peer_id, payload.get("event_id") or _eid)
+
+    # P3-M-3 fix: Relay to other members
+    _relay_message(HiveMessageType.DID_CREDENTIAL_PRESENT, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -4264,37 +4297,70 @@ def handle_did_credential_revoke(peer_id: str, payload: Dict, plugin) -> Dict:
         plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE invalid payload from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Identity binding
+    # P3-H-1 fix: For relayed messages, use origin for identity binding
     sender_id = payload.get("sender_id", "")
-    if sender_id != peer_id:
-        plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE identity mismatch from {peer_id[:16]}...", level='warn')
+    if _is_relayed_message(payload):
+        # NEW-1 fix: Verify relay peer is a known member
+        if database and not database.get_member(peer_id):
+            return {"result": "continue"}
+        # Ban check on relay peer
+        if database and database.is_banned(peer_id):
+            return {"result": "continue"}
+        # R5-M-5 fix: Rate limit on relay peer to prevent quota exhaustion attacks
+        if not _check_relay_credential_rate(peer_id):
+            plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE relay rate-limited for {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+        origin = _get_message_origin(payload)
+        effective_sender = origin if origin else peer_id
+        if sender_id != effective_sender:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE identity mismatch (relayed) from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    else:
+        if sender_id != peer_id:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE identity mismatch from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+
+    # Ban check against the actual sender
+    actual_sender = sender_id
+    if database and database.is_banned(actual_sender):
+        plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE from banned peer {actual_sender[:16]}...", level='warn')
         return {"result": "continue"}
 
-    # Ban check
-    if database and database.is_banned(peer_id):
-        plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE from banned peer {peer_id[:16]}...", level='warn')
-        return {"result": "continue"}
+    # R5-M-4 fix: Membership check BEFORE proto_events to avoid consuming dedup rows for non-members
+    if database:
+        member = database.get_member(actual_sender)
+        if not member:
+            plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE from non-member {actual_sender[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Timestamp freshness
     if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "DID_CREDENTIAL_REVOKE"):
         return {"result": "continue"}
 
-    # Dedup
-    if database:
-        is_new, _eid = check_and_record(database, "DID_CREDENTIAL_REVOKE", payload, peer_id)
-        if not is_new:
-            return {"result": "continue"}
+    # P3-M-4 fix: In-memory relay dedup for credential messages
+    if not _credential_relay_dedup(payload, "DID_CREDENTIAL_REVOKE"):
+        return {"result": "continue"}
 
-    # Membership check
+    # Dedup
+    _eid = None
     if database:
-        member = database.get_member(peer_id)
-        if not member:
-            plugin.log(f"cl-hive: DID_CREDENTIAL_REVOKE from non-member {peer_id[:16]}...", level='debug')
+        is_new, _eid = check_and_record(database, "DID_CREDENTIAL_REVOKE", payload, actual_sender)
+        if not is_new:
+            # P3-M-3 fix: Still relay even if already processed
+            _relay_message(HiveMessageType.DID_CREDENTIAL_REVOKE, payload, peer_id)
+            # R5-L-6 fix: Emit ack on dedup branch so sender outbox entries are cleared
+            _emit_ack(peer_id, payload.get("event_id") or _eid)
             return {"result": "continue"}
 
     # Process revocation
     if did_credential_mgr:
-        did_credential_mgr.handle_credential_revoke(peer_id, payload)
+        did_credential_mgr.handle_credential_revoke(actual_sender, payload)
+
+    # P3-H-2 fix: Emit ack after successful processing
+    _emit_ack(peer_id, payload.get("event_id") or _eid)
+
+    # P3-M-3 fix: Relay to other members
+    _relay_message(HiveMessageType.DID_CREDENTIAL_REVOKE, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -4307,37 +4373,70 @@ def handle_mgmt_credential_present(peer_id: str, payload: Dict, plugin) -> Dict:
         plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT invalid payload from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Identity binding: sender_id must match peer_id
+    # P3-H-1 fix: For relayed messages, use origin for identity binding
     sender_id = payload.get("sender_id", "")
-    if sender_id != peer_id:
-        plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT identity mismatch from {peer_id[:16]}...", level='warn')
+    if _is_relayed_message(payload):
+        # NEW-1 fix: Verify relay peer is a known member
+        if database and not database.get_member(peer_id):
+            return {"result": "continue"}
+        # Ban check on relay peer
+        if database and database.is_banned(peer_id):
+            return {"result": "continue"}
+        # R5-M-5 fix: Rate limit on relay peer to prevent quota exhaustion attacks
+        if not _check_relay_credential_rate(peer_id):
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT relay rate-limited for {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+        origin = _get_message_origin(payload)
+        effective_sender = origin if origin else peer_id
+        if sender_id != effective_sender:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT identity mismatch (relayed) from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    else:
+        if sender_id != peer_id:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT identity mismatch from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+
+    # Ban check against the actual sender
+    actual_sender = sender_id
+    if database and database.is_banned(actual_sender):
+        plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT from banned peer {actual_sender[:16]}...", level='warn')
         return {"result": "continue"}
 
-    # Ban check
-    if database and database.is_banned(peer_id):
-        plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT from banned peer {peer_id[:16]}...", level='warn')
-        return {"result": "continue"}
+    # R5-M-4 fix: Membership check BEFORE proto_events to avoid consuming dedup rows for non-members
+    if database:
+        member = database.get_member(actual_sender)
+        if not member:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT from non-member {actual_sender[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Timestamp freshness
     if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "MGMT_CREDENTIAL_PRESENT"):
         return {"result": "continue"}
 
-    # Dedup via proto_events
-    if database:
-        is_new, _eid = check_and_record(database, "MGMT_CREDENTIAL_PRESENT", payload, peer_id)
-        if not is_new:
-            return {"result": "continue"}
+    # P3-M-4 fix: In-memory relay dedup for credential messages
+    if not _credential_relay_dedup(payload, "MGMT_CREDENTIAL_PRESENT"):
+        return {"result": "continue"}
 
-    # Membership check
+    # Dedup via proto_events
+    _eid = None
     if database:
-        member = database.get_member(peer_id)
-        if not member:
-            plugin.log(f"cl-hive: MGMT_CREDENTIAL_PRESENT from non-member {peer_id[:16]}...", level='debug')
+        is_new, _eid = check_and_record(database, "MGMT_CREDENTIAL_PRESENT", payload, actual_sender)
+        if not is_new:
+            # P3-M-3 fix: Still relay even if already processed
+            _relay_message(HiveMessageType.MGMT_CREDENTIAL_PRESENT, payload, peer_id)
+            # R5-L-6 fix: Emit ack on dedup branch so sender outbox entries are cleared
+            _emit_ack(peer_id, payload.get("event_id") or _eid)
             return {"result": "continue"}
 
     # Process credential
     if management_schema_registry:
-        management_schema_registry.handle_mgmt_credential_present(peer_id, payload)
+        management_schema_registry.handle_mgmt_credential_present(actual_sender, payload)
+
+    # P3-H-2 fix: Emit ack after successful processing
+    _emit_ack(peer_id, payload.get("event_id") or _eid)
+
+    # P3-M-3 fix: Relay to other members
+    _relay_message(HiveMessageType.MGMT_CREDENTIAL_PRESENT, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -4350,37 +4449,70 @@ def handle_mgmt_credential_revoke(peer_id: str, payload: Dict, plugin) -> Dict:
         plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE invalid payload from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # Identity binding
+    # P3-H-1 fix: For relayed messages, use origin for identity binding
     sender_id = payload.get("sender_id", "")
-    if sender_id != peer_id:
-        plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE identity mismatch from {peer_id[:16]}...", level='warn')
+    if _is_relayed_message(payload):
+        # NEW-1 fix: Verify relay peer is a known member
+        if database and not database.get_member(peer_id):
+            return {"result": "continue"}
+        # Ban check on relay peer
+        if database and database.is_banned(peer_id):
+            return {"result": "continue"}
+        # R5-M-5 fix: Rate limit on relay peer to prevent quota exhaustion attacks
+        if not _check_relay_credential_rate(peer_id):
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE relay rate-limited for {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+        origin = _get_message_origin(payload)
+        effective_sender = origin if origin else peer_id
+        if sender_id != effective_sender:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE identity mismatch (relayed) from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    else:
+        if sender_id != peer_id:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE identity mismatch from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+
+    # Ban check against the actual sender
+    actual_sender = sender_id
+    if database and database.is_banned(actual_sender):
+        plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE from banned peer {actual_sender[:16]}...", level='warn')
         return {"result": "continue"}
 
-    # Ban check
-    if database and database.is_banned(peer_id):
-        plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE from banned peer {peer_id[:16]}...", level='warn')
-        return {"result": "continue"}
+    # R5-M-4 fix: Membership check BEFORE proto_events to avoid consuming dedup rows for non-members
+    if database:
+        member = database.get_member(actual_sender)
+        if not member:
+            plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE from non-member {actual_sender[:16]}...", level='debug')
+            return {"result": "continue"}
 
     # Timestamp freshness
     if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "MGMT_CREDENTIAL_REVOKE"):
         return {"result": "continue"}
 
-    # Dedup
-    if database:
-        is_new, _eid = check_and_record(database, "MGMT_CREDENTIAL_REVOKE", payload, peer_id)
-        if not is_new:
-            return {"result": "continue"}
+    # P3-M-4 fix: In-memory relay dedup for credential messages
+    if not _credential_relay_dedup(payload, "MGMT_CREDENTIAL_REVOKE"):
+        return {"result": "continue"}
 
-    # Membership check
+    # Dedup
+    _eid = None
     if database:
-        member = database.get_member(peer_id)
-        if not member:
-            plugin.log(f"cl-hive: MGMT_CREDENTIAL_REVOKE from non-member {peer_id[:16]}...", level='debug')
+        is_new, _eid = check_and_record(database, "MGMT_CREDENTIAL_REVOKE", payload, actual_sender)
+        if not is_new:
+            # P3-M-3 fix: Still relay even if already processed
+            _relay_message(HiveMessageType.MGMT_CREDENTIAL_REVOKE, payload, peer_id)
+            # R5-L-6 fix: Emit ack on dedup branch so sender outbox entries are cleared
+            _emit_ack(peer_id, payload.get("event_id") or _eid)
             return {"result": "continue"}
 
     # Process revocation
     if management_schema_registry:
-        management_schema_registry.handle_mgmt_credential_revoke(peer_id, payload)
+        management_schema_registry.handle_mgmt_credential_revoke(actual_sender, payload)
+
+    # P3-H-2 fix: Emit ack after successful processing
+    _emit_ack(peer_id, payload.get("event_id") or _eid)
+
+    # P3-M-3 fix: Relay to other members
+    _relay_message(HiveMessageType.MGMT_CREDENTIAL_REVOKE, payload, peer_id)
 
     return {"result": "continue"}
 
@@ -4570,10 +4702,22 @@ def handle_settlement_receipt(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     if not _phase4b_record_if_new(peer_id, payload, "SETTLEMENT_RECEIPT"):
         return {"result": "continue"}
 
-    registry = SettlementTypeRegistry(
-        cashu_escrow_mgr=cashu_escrow_mgr,
-        did_credential_mgr=did_credential_mgr,
-    )
+    # P4R4-M-1: Validate from_peer matches actual sender to prevent forged obligations
+    claimed_from = payload.get("from_peer", "")
+    if claimed_from and claimed_from != peer_id:
+        plugin.log(
+            f"cl-hive: SETTLEMENT_RECEIPT from_peer mismatch: "
+            f"claimed={claimed_from[:16]}... actual={peer_id[:16]}...",
+            level='warn',
+        )
+        return {"result": "continue"}
+
+    if not hasattr(settlement_mgr, '_type_registry') or settlement_mgr._type_registry is None:
+        settlement_mgr._type_registry = SettlementTypeRegistry(
+            cashu_escrow_mgr=cashu_escrow_mgr,
+            did_credential_mgr=did_credential_mgr,
+        )
+    registry = settlement_mgr._type_registry
     valid_receipt, reason = registry.verify_receipt(
         payload.get("settlement_type", ""),
         payload.get("receipt_data", {}) or {},
@@ -4662,7 +4806,11 @@ def handle_bond_slash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     dispute_id = payload.get("dispute_id", "")
     dispute = database.get_dispute(dispute_id) if dispute_id else None
-    if not dispute or dispute.get("outcome") != "upheld" or not dispute.get("resolved_at"):
+    # R5-H-2 fix: Only allow outcome "upheld" (not "slashed") to prevent repeated slashing.
+    # Note: proto_events via _phase4b_record_if_new already deduplicates on (bond_id, dispute_id)
+    # so the same pair cannot be processed twice. This outcome check is a defense-in-depth guard
+    # against different event_id paths or manual DB tampering.
+    if not dispute or dispute.get("outcome") not in ("upheld",) or not dispute.get("resolved_at"):
         plugin.log(
             f"cl-hive: BOND_SLASH rejected for unresolved/non-upheld dispute {dispute_id[:16]}...",
             level='warn',
@@ -4673,6 +4821,15 @@ def handle_bond_slash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     bond = database.get_bond(bond_id) if bond_id else None
     if not bond or bond.get("status") != "active":
         plugin.log(f"cl-hive: BOND_SLASH rejected, inactive bond {bond_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # R5-H-1 fix: Verify bond belongs to the dispute respondent
+    if bond.get("peer_id") != dispute.get("respondent_peer"):
+        plugin.log(
+            f"cl-hive: BOND_SLASH rejected, bond owner {bond.get('peer_id', '')[:16]}... "
+            f"!= dispute respondent {dispute.get('respondent_peer', '')[:16]}...",
+            level='warn',
+        )
         return {"result": "continue"}
 
     panel_members = []
@@ -4747,13 +4904,17 @@ def handle_bond_slash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: BOND_SLASH apply failed for bond {bond_id[:16]}...", level='warn')
         return {"result": "continue"}
 
+    # R5-H-2 fix: Mark dispute as "slashed" so it cannot be reused for another slash.
+    # Note: update_dispute_outcome uses a CAS guard (resolved_at IS NULL OR resolved_at = 0)
+    # which would reject this update since the dispute is already resolved. We pass resolved_at=0
+    # to bypass the CAS guard (non-resolving update path) since we're only changing outcome.
     database.update_dispute_outcome(
         dispute_id=dispute_id,
-        outcome=dispute.get("outcome", "upheld"),
+        outcome="slashed",
         slash_amount=int(dispute.get("slash_amount", 0) or 0) + int(slash_result["slashed_amount"]),
         panel_members_json=dispute.get("panel_members_json"),
         votes_json=dispute.get("votes_json"),
-        resolved_at=int(dispute.get("resolved_at", int(time.time())) or int(time.time())),
+        resolved_at=0,
     )
 
     plugin.log(f"cl-hive: BOND_SLASH from {peer_id[:16]}... "
@@ -4797,6 +4958,13 @@ def handle_netting_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
                 "obligations_hash": incoming_hash,
                 "received_at": int(time.time()),
             }
+            # L-9 audit fix: Prune stale netting proposals to prevent unbounded growth
+            if len(_phase4b_netting_proposals) > 500:
+                cutoff = int(time.time()) - 86400  # 24 hours
+                stale_keys = [k for k, v in _phase4b_netting_proposals.items()
+                              if v.get("received_at", 0) < cutoff]
+                for k in stale_keys:
+                    _phase4b_netting_proposals.pop(k, None)
 
     plugin.log(f"cl-hive: NETTING_PROPOSAL from {peer_id[:16]}... "
                f"window={payload.get('window_id', '')[:16]} type={payload.get('netting_type')}")
@@ -4825,13 +4993,27 @@ def handle_netting_ack(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         obligations_hash = payload.get("obligations_hash", "")
         accepted = bool(payload.get("accepted", False))
 
+        # R5-M-11 fix: Hold netting lock through hash verification AND DB update
+        # to prevent TOCTOU race where proposal is modified between check and update.
         with _phase4b_netting_lock:
             proposal = _phase4b_netting_proposals.get(window_id)
 
-        if proposal and proposal.get("obligations_hash") == obligations_hash and accepted:
-            obligations = database.get_obligations_for_window(window_id, status='pending', limit=10_000)
-            for obligation in obligations:
-                database.update_obligation_status(obligation.get("obligation_id", ""), "netted")
+            if proposal and proposal.get("obligations_hash") == obligations_hash and accepted:
+                # M-6 audit fix: Verify ack sender is NOT the proposer (counterparty check)
+                if proposal.get("proposer") == peer_id:
+                    plugin.log(f"cl-hive: NETTING_ACK from proposer {peer_id[:16]}..., ignoring", level='warn')
+                else:
+                    # Verify peer is party to at least one obligation in this window
+                    obligations = database.get_obligations_for_window(window_id, status='pending', limit=10_000)
+                    peer_is_party = any(
+                        o.get("from_peer") == peer_id or o.get("to_peer") == peer_id
+                        for o in obligations
+                    )
+                    if peer_is_party:
+                        proposer_id = proposal.get("proposer", "")
+                        database.update_bilateral_obligation_status(window_id, peer_id, proposer_id, "netted")
+                    else:
+                        plugin.log(f"cl-hive: NETTING_ACK from non-party {peer_id[:16]}..., ignoring", level='warn')
 
     plugin.log(f"cl-hive: NETTING_ACK from {peer_id[:16]}... "
                f"window={payload.get('window_id', '')[:16]} accepted={payload.get('accepted')}")
@@ -4856,15 +5038,24 @@ def handle_violation_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
     if not _phase4b_record_if_new(peer_id, payload, "VIOLATION_REPORT"):
         return {"result": "continue"}
 
+    # P4-M-4 fix: Use violator_id from payload for proper violation tracking
+    violator_id = payload.get("violator_id", "")
+    violation_type = payload.get("violation_type", "")
+
     if database:
         evidence = payload.get("evidence", {}) or {}
+        # Inject violator_id into evidence so dispute resolver can reference it
+        if violator_id:
+            evidence["violator_id"] = violator_id
+        if violation_type:
+            evidence["violation_type"] = violation_type
         obligation_id = evidence.get("obligation_id")
         if isinstance(obligation_id, str) and obligation_id:
             resolver = DisputeResolver(database, plugin, rpc=plugin.rpc)
             resolver.file_dispute(obligation_id, peer_id, evidence)
 
     plugin.log(f"cl-hive: VIOLATION_REPORT from {peer_id[:16]}... "
-               f"violator={payload.get('violator_id', '')[:16]} type={payload.get('violation_type')}")
+               f"violator={violator_id[:16] if violator_id else 'unknown'} type={violation_type}")
     return {"result": "continue"}
 
 
@@ -4906,15 +5097,15 @@ def handle_arbitration_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
             )
             return {"result": "continue"}
 
-        dispute = database.get_dispute(dispute_id)
-        if dispute and dispute.get("panel_members_json"):
-            try:
-                panel_members = json.loads(dispute["panel_members_json"])
-            except (TypeError, ValueError):
-                panel_members = []
-            if panel_members:
-                quorum = (len(panel_members) // 2) + 1
-                resolver.check_quorum(dispute_id, quorum)
+        # P4R4-M-2: record_vote() already checks quorum atomically while
+        # holding _dispute_lock.  A redundant external check_quorum() call
+        # was removed here to avoid using stale data and double-resolution.
+        if isinstance(vote_result, dict) and vote_result.get("quorum_result"):
+            qr = vote_result["quorum_result"]
+            plugin.log(
+                f"cl-hive: dispute {dispute_id[:16]}... resolved via quorum: "
+                f"outcome={qr.get('outcome')}",
+            )
 
     plugin.log(f"cl-hive: ARBITRATION_VOTE from {peer_id[:16]}... "
                f"dispute={payload.get('dispute_id', '')[:16]} vote={payload.get('vote')}")
@@ -5081,6 +5272,81 @@ def _broadcast_promotion_vote(target_peer_id: str, voter_peer_id: str) -> bool:
     return sent > 0
 
 
+# R5-M-5 fix: Per-relay-peer rate limiter for credential messages
+# Prevents a single relay node from flooding rate limits for multiple spoofed origins.
+# Maps relay_peer_id -> list of timestamps
+_relay_credential_rate: Dict[str, list] = {}
+_relay_credential_rate_lock = threading.Lock()
+_RELAY_CREDENTIAL_RATE_MAX = 50   # max 50 relayed credential messages per hour per relay peer
+_RELAY_CREDENTIAL_RATE_WINDOW = 3600  # 1 hour window
+_RELAY_CREDENTIAL_RATE_DICT_MAX = 500  # max tracked relay peers
+
+
+def _check_relay_credential_rate(relay_peer_id: str) -> bool:
+    """Check per-relay-peer rate limit for credential messages.
+    Returns True if within limit, False if rate-limited."""
+    now = int(time.time())
+    cutoff = now - _RELAY_CREDENTIAL_RATE_WINDOW
+    with _relay_credential_rate_lock:
+        timestamps = _relay_credential_rate.get(relay_peer_id, [])
+        timestamps = [ts for ts in timestamps if ts > cutoff]
+        if len(timestamps) >= _RELAY_CREDENTIAL_RATE_MAX:
+            _relay_credential_rate[relay_peer_id] = timestamps
+            return False
+        timestamps.append(now)
+        _relay_credential_rate[relay_peer_id] = timestamps
+        # Evict stale entries if dict grows too large
+        if len(_relay_credential_rate) > _RELAY_CREDENTIAL_RATE_DICT_MAX:
+            stale = [k for k, v in _relay_credential_rate.items()
+                     if not v or v[-1] <= cutoff]
+            for k in stale:
+                _relay_credential_rate.pop(k, None)
+    return True
+
+
+# P3-M-4 fix: In-memory dedup cache for credential relay messages
+# Bounded dict: maps message_hash -> timestamp, evicts oldest when full
+_credential_relay_seen: Dict[str, float] = {}
+_credential_relay_lock = threading.Lock()  # NEW-3 fix: thread safety for dedup dict
+_CREDENTIAL_RELAY_DEDUP_MAX = 1000
+_CREDENTIAL_RELAY_DEDUP_TTL = 600  # 10 minutes
+
+
+def _credential_relay_dedup(payload: Dict[str, Any], msg_type: str) -> bool:
+    """
+    Check if a credential message has already been seen for relay dedup.
+    Returns True if message is new (should process), False if duplicate.
+    """
+    import hashlib
+    # Build a dedup key from stable payload fields
+    event_id = payload.get("event_id", "") or payload.get("_event_id", "")
+    sender_id = payload.get("sender_id", "")
+    ts = str(payload.get("timestamp", ""))
+    dedup_input = f"{msg_type}:{sender_id}:{event_id}:{ts}"
+    msg_hash = hashlib.sha256(dedup_input.encode()).hexdigest()[:32]
+
+    now = time.time()
+
+    with _credential_relay_lock:
+        # Evict expired entries if cache is full
+        if len(_credential_relay_seen) >= _CREDENTIAL_RELAY_DEDUP_MAX:
+            expired = [k for k, v in _credential_relay_seen.items()
+                       if now - v > _CREDENTIAL_RELAY_DEDUP_TTL]
+            for k in expired:
+                del _credential_relay_seen[k]
+            # If still full after eviction, remove oldest entries
+            if len(_credential_relay_seen) >= _CREDENTIAL_RELAY_DEDUP_MAX:
+                oldest = sorted(_credential_relay_seen.items(), key=lambda x: x[1])
+                for k, _ in oldest[:len(oldest) // 2]:
+                    del _credential_relay_seen[k]
+
+        if msg_hash in _credential_relay_seen:
+            return False  # Already seen
+
+        _credential_relay_seen[msg_hash] = now
+        return True
+
+
 def _is_relayed_message(payload: Dict[str, Any]) -> bool:
     """Check if message was relayed (not direct from origin)."""
     relay_data = payload.get("_relay", {})
@@ -5108,9 +5374,13 @@ def _validate_relay_sender(peer_id: str, sender_id: str, payload: Dict[str, Any]
         return False
 
     if _is_relayed_message(payload):
-        # Relayed message: verify peer_id is a known member (they're relaying)
+        # Relayed message: verify peer_id is a known member or neophyte (they're relaying)
+        # M-15 audit fix: Allow neophyte relay to avoid message delivery failures
         relay_peer = database.get_member(peer_id)
-        if not relay_peer or relay_peer.get("tier") != MembershipTier.MEMBER.value:
+        if not relay_peer or relay_peer.get("tier") not in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value):
+            return False
+        # P5R3-L-1 fix: Reject relayed messages from banned relay peers
+        if database.is_banned(peer_id):
             return False
         # Verify origin matches claimed sender_id
         origin = _get_message_origin(payload)
@@ -5119,6 +5389,9 @@ def _validate_relay_sender(peer_id: str, sender_id: str, payload: Dict[str, Any]
         # Verify original sender is also a member
         original_sender = database.get_member(sender_id)
         if not original_sender:
+            return False
+        # P5-H-1 fix: Reject relayed messages from banned senders
+        if database.is_banned(sender_id):
             return False
         return True
     else:
@@ -5145,20 +5418,13 @@ def _relay_message(
     if not relay_mgr:
         return 0
 
-    # Check if should relay (TTL > 0, not in path already)
-    if not relay_mgr.should_relay(payload):
-        return 0
-
-    # Prepare for relay (decrement TTL, add us to path)
-    relay_payload = relay_mgr.prepare_for_relay(payload, sender_peer_id)
-    if not relay_payload:
-        return 0
-
-    # Encode and relay
+    # Let relay_mgr.relay() handle should_relay + prepare_for_relay internally.
+    # Do NOT call them here — double-preparation adds our_pubkey to relay_path
+    # before relay() checks it, causing relay() to always return 0.
     def encode_message(p: Dict[str, Any]) -> bytes:
         return serialize(msg_type, p)
 
-    return relay_mgr.relay(relay_payload, sender_peer_id, encode_message)
+    return relay_mgr.relay(payload, sender_peer_id, encode_message)
 
 
 def _prepare_broadcast_payload(payload: Dict[str, Any], ttl: int = 3) -> Dict[str, Any]:
@@ -5231,7 +5497,6 @@ def _sync_member_policies(plugin: Plugin) -> None:
     the plugin was restarted or policies were reset.
 
     Policy assignment:
-    - Admin: HIVE strategy (0 PPM fees)
     - Member: HIVE strategy (0 PPM fees)
     - Neophyte: dynamic strategy (normal fee behavior)
     """
@@ -5250,8 +5515,9 @@ def _sync_member_policies(plugin: Plugin) -> None:
             continue
 
         # Determine if this peer should have HIVE strategy
-        # Both admin and member tiers get HIVE strategy
-        is_hive_member = tier in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value)
+        # P5-M-1 fix: Only full member tier gets HIVE strategy (0-fee)
+        # Neophytes should NOT get hive fees — they use dynamic strategy
+        is_hive_member = tier in (MembershipTier.MEMBER.value,)
 
         try:
             # Use bypass_rate_limit=True for startup sync
@@ -5359,6 +5625,15 @@ def handle_promotion_request(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     if relay_count > 0:
         plugin.log(f"cl-hive: PROMOTION_REQUEST relayed to {relay_count} members", level='debug')
 
+    # C-1 audit fix: Reject promotion requests from/for banned peers
+    if database.is_banned(target_pubkey):
+        plugin.log(f"cl-hive: PROMOTION_REQUEST from banned peer {target_pubkey[:16]}..., ignoring", level='warn')
+        return {"result": "continue"}
+
+    # H-4 audit fix: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_GOSSIP_AGE_SECONDS, "PROMOTION_REQUEST"):
+        return {"result": "continue"}
+
     target_member = database.get_member(target_pubkey)
     if not target_member or target_member.get("tier") != MembershipTier.NEOPHYTE.value:
         return {"result": "continue"}
@@ -5444,8 +5719,22 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if relay_count > 0:
         plugin.log(f"cl-hive: VOUCH relayed to {relay_count} members", level='debug')
 
+    # H-7 audit fix: Prevent self-vouching
+    if voucher_pubkey == payload["target_pubkey"]:
+        plugin.log(f"cl-hive: VOUCH self-vouch attempt for {voucher_pubkey[:16]}..., ignoring", level='warn')
+        return {"result": "continue"}
+
+    # H-4 audit fix: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_GOSSIP_AGE_SECONDS, "VOUCH"):
+        return {"result": "continue"}
+
     voucher = database.get_member(voucher_pubkey)
     if not voucher or voucher.get("tier") not in (MembershipTier.MEMBER.value,):
+        return {"result": "continue"}
+
+    # P5-M-2 fix: Check ban status BEFORE storing vouch or doing expensive operations
+    if database.is_banned(payload["voucher_pubkey"]):
+        plugin.log(f"cl-hive: VOUCH from banned voucher {voucher_pubkey[:16]}..., ignoring", level='warn')
         return {"result": "continue"}
 
     target_member = database.get_member(payload["target_pubkey"])
@@ -5466,9 +5755,6 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     if not result.get("verified") or result.get("pubkey") != payload["voucher_pubkey"]:
-        return {"result": "continue"}
-
-    if database.is_banned(payload["voucher_pubkey"]):
         return {"result": "continue"}
 
     local_tier = membership_mgr.get_tier(our_pubkey) if our_pubkey else None
@@ -5503,14 +5789,16 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if outbox_mgr:
         outbox_mgr.process_implicit_ack(peer_id, HiveMessageType.VOUCH, payload)
 
-    # Only members and admins can trigger auto-promotion
+    # Only full members can trigger auto-promotion
     if local_tier not in (MembershipTier.MEMBER.value,):
         return {"result": "continue"}
 
     active_members = membership_mgr.get_active_members()
     quorum = membership_mgr.calculate_quorum(len(active_members))
     vouches = database.get_promotion_vouches(payload["target_pubkey"], payload["request_id"])
-    if len(vouches) < quorum:
+    # R5-L-10 fix: Filter out vouches from banned members before quorum check
+    valid_vouches = [v for v in vouches if not database.is_banned(v.get("voucher_peer_id", ""))]
+    if len(valid_vouches) < quorum:
         return {"result": "continue"}
 
     if not config.auto_promote_enabled:
@@ -5526,7 +5814,7 @@ def handle_vouch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
                 "timestamp": v["timestamp"],
                 "voucher_pubkey": v["voucher_peer_id"],
                 "sig": v["sig"]
-            } for v in vouches[:MAX_VOUCHES_IN_PROMOTION]
+            } for v in valid_vouches[:MAX_VOUCHES_IN_PROMOTION]
         ]
     }
     _reliable_broadcast(HiveMessageType.PROMOTION, promotion_payload)
@@ -5561,6 +5849,9 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         relay_member = database.get_member(peer_id)
         if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
             return {"result": "continue"}
+        # Ban check on relay peer
+        if database.is_banned(peer_id):
+            return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
         sender_tier = sender.get("tier") if sender else None
@@ -5569,6 +5860,11 @@ def handle_promotion(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     target_pubkey = payload["target_pubkey"]
     request_id = payload["request_id"]
+
+    # P5-H-2 fix: Reject promotion of banned peers
+    if database.is_banned(target_pubkey):
+        plugin.log(f"cl-hive: PROMOTION target {target_pubkey[:16]}... is banned, ignoring", level='warn')
+        return {"result": "continue"}
 
     target_member = database.get_member(target_pubkey)
     if not target_member:
@@ -5777,7 +6073,16 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if event_id:
         payload["_event_id"] = event_id
 
-    # Verify proposer is a member or admin
+    # C-2 audit fix: Reject ban proposals from banned peers
+    if database.is_banned(proposer_peer_id):
+        plugin.log(f"cl-hive: BAN_PROPOSAL from banned member {proposer_peer_id[:16]}..., ignoring", level='warn')
+        return {"result": "continue"}
+
+    # H-4 audit fix: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_GOSSIP_AGE_SECONDS, "BAN_PROPOSAL"):
+        return {"result": "continue"}
+
+    # Verify proposer is a full member
     proposer = database.get_member(proposer_peer_id)
     if not proposer or proposer.get("tier") not in (MembershipTier.MEMBER.value,):
         plugin.log(f"cl-hive: BAN_PROPOSAL from non-member", level='warn')
@@ -5809,10 +6114,28 @@ def handle_ban_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if existing:
         return {"result": "continue"}
 
-    # Store proposal
+    # H-5 audit fix: Enforce BAN_COOLDOWN_SECONDS for same target
+    recent_proposal = database.get_ban_proposal_for_target(target_peer_id)
+    if recent_proposal:
+        recent_ts = recent_proposal.get("proposed_at", 0)
+        if int(time.time()) - recent_ts < BAN_COOLDOWN_SECONDS:
+            plugin.log(f"cl-hive: BAN_PROPOSAL cooldown active for {target_peer_id[:16]}...", level='info')
+            return {"result": "continue"}
+
+    # L-19 audit fix: Reject already-expired proposals
     expires_at = timestamp + BAN_PROPOSAL_TTL_SECONDS
+    if expires_at < int(time.time()):
+        plugin.log(f"cl-hive: BAN_PROPOSAL already expired, ignoring", level='debug')
+        return {"result": "continue"}
+
+    # Store proposal
+    # R5-H-3 fix: Extract proposal_type from payload so settlement_gaming uses reversed voting
+    proposal_type = payload.get("proposal_type", "standard")
+    if proposal_type not in ("standard", "settlement_gaming"):
+        proposal_type = "standard"  # Sanitize unexpected values
     database.create_ban_proposal(proposal_id, target_peer_id, proposer_peer_id,
-                                 reason, timestamp, expires_at)
+                                 reason, timestamp, expires_at,
+                                 proposal_type=proposal_type)
     plugin.log(f"cl-hive: Ban proposal {proposal_id[:16]}... for {target_peer_id[:16]}... by {proposer_peer_id[:16]}...")
 
     # Phase D: Acknowledge receipt
@@ -5862,7 +6185,11 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if event_id:
         payload["_event_id"] = event_id
 
-    # Verify voter is a member or admin and not banned
+    # H-4 audit fix: Timestamp freshness check
+    if not _check_timestamp_freshness(payload, MAX_GOSSIP_AGE_SECONDS, "BAN_VOTE"):
+        return {"result": "continue"}
+
+    # Verify voter is a full member and not banned
     voter = database.get_member(voter_peer_id)
     if not voter or voter.get("tier") not in (MembershipTier.MEMBER.value,):
         return {"result": "continue"}
@@ -5873,6 +6200,16 @@ def handle_ban_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Get the proposal
     proposal = database.get_ban_proposal(proposal_id)
     if not proposal or proposal.get("status") != "pending":
+        return {"result": "continue"}
+
+    # R5-M-7 fix: Reject votes on expired proposals
+    if proposal.get("expires_at") and proposal["expires_at"] < int(time.time()):
+        plugin.log(f"cl-hive: BAN_VOTE on expired proposal {proposal_id[:16]}...", level='info')
+        return {"result": "continue"}
+
+    # H-6 audit fix: Ban target cannot vote on their own ban
+    if voter_peer_id == proposal.get("target_peer_id"):
+        plugin.log(f"cl-hive: BAN_VOTE target voting on own ban, ignoring", level='warn')
         return {"result": "continue"}
 
     # Verify signature
@@ -5919,12 +6256,15 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
     # Get all votes
     votes = database.get_ban_votes(proposal_id)
 
-    # Get eligible voters (members and admins, excluding target)
+    # Get eligible voters (members, excluding target, banned, and inactive)
     all_members = database.get_all_members()
+    activity_cutoff = int(time.time()) - 7 * 86400  # 7 days
     eligible_voters = [
         m for m in all_members
         if m.get("tier") in (MembershipTier.MEMBER.value,)
         and m["peer_id"] != target_peer_id
+        and not database.is_banned(m["peer_id"])
+        and (m.get("last_seen") or 0) >= activity_cutoff
     ]
     eligible_count = len(eligible_voters)
 
@@ -5950,18 +6290,35 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
         # REVERSED VOTING: Non-participation = approve (yes to ban)
         # Members must actively vote "reject" (no) to defend the accused
         # Ban executes if less than 51% vote "reject"
+        # P5-C-1 fix: Only count non-voters as approvals AFTER voting window expires
         reject_threshold = int(eligible_count * BAN_QUORUM_THRESHOLD) + 1
-        # Non-voters are implicit approvals
-        implicit_approvals = eligible_count - reject_count - approve_count
-        total_approvals = approve_count + implicit_approvals
+        proposal_timestamp = proposal.get("proposed_at", proposal.get("timestamp", 0))
+        voting_window_expired = time.time() - proposal_timestamp >= BAN_PROPOSAL_TTL_SECONDS
 
-        if reject_count < reject_threshold:
-            # Not enough members defended the accused - ban executes
-            should_execute = True
-            plugin.log(
-                f"cl-hive: Settlement gaming ban - {reject_count} reject votes "
-                f"(needed {reject_threshold} to prevent), {implicit_approvals} non-voters counted as approve"
-            )
+        if voting_window_expired:
+            # Window expired: non-voters are implicit approvals
+            implicit_approvals = eligible_count - reject_count - approve_count
+            total_approvals = approve_count + implicit_approvals
+
+            if reject_count < reject_threshold:
+                # Not enough members defended the accused - ban executes
+                should_execute = True
+                plugin.log(
+                    f"cl-hive: Settlement gaming ban - {reject_count} reject votes "
+                    f"(needed {reject_threshold} to prevent), {implicit_approvals} non-voters counted as approve"
+                )
+        else:
+            # Window still open: can only execute if enough explicit reject votes
+            # make it impossible to block (i.e., even if all remaining voters reject,
+            # they can't reach threshold). Otherwise, wait for window to expire.
+            remaining_voters = eligible_count - reject_count - approve_count
+            if reject_count + remaining_voters < reject_threshold:
+                # Mathematically impossible to reach reject threshold - execute early
+                should_execute = True
+                plugin.log(
+                    f"cl-hive: Settlement gaming ban (early) - {reject_count} reject votes, "
+                    f"{remaining_voters} remaining, threshold={reject_threshold} unreachable"
+                )
     else:
         # STANDARD VOTING: Need 51% explicit approve votes
         quorum_needed = int(eligible_count * BAN_QUORUM_THRESHOLD) + 1
@@ -10147,6 +10504,34 @@ def membership_maintenance_loop():
                 if reconnected > 0 and plugin:
                     plugin.log(f"Auto-connected to {reconnected} hive member(s)", level='info')
 
+                # Sweep expired settlement_gaming ban proposals that may need quorum check.
+                # These use reversed voting (non-participation = approve) so bans only
+                # execute after the voting window expires, but nothing re-checks quorum
+                # post-window unless we sweep here. Run this BEFORE generic expiry.
+                try:
+                    pending_proposals = database.get_pending_ban_proposals()
+                    now_ts = int(time.time())
+                    for prop in pending_proposals:
+                        if prop.get("proposal_type") != "settlement_gaming":
+                            continue
+                        expires_at = prop.get("expires_at", 0)
+                        if expires_at > 0 and expires_at < now_ts:
+                            _check_ban_quorum(prop["proposal_id"], prop, plugin)
+                except Exception as sweep_err:
+                    if plugin:
+                        plugin.log(f"cl-hive: Settlement gaming ban sweep error: {sweep_err}", level='warn')
+
+                # R5-M-7 fix: Expire all still-pending ban proposals past expires_at.
+                # This runs after settlement_gaming sweep so those proposals can still
+                # execute via reversed voting at the expiry boundary.
+                try:
+                    expired_count = database.cleanup_expired_ban_proposals(now=int(time.time()))
+                    if expired_count > 0 and plugin:
+                        plugin.log(f"cl-hive: Expired {expired_count} ban proposal(s)", level='info')
+                except Exception as expire_err:
+                    if plugin:
+                        plugin.log(f"cl-hive: Ban proposal expiry sweep error: {expire_err}", level='warn')
+
         except Exception as e:
             if plugin:
                 plugin.log(f"Membership maintenance error: {e}", level='warn')
@@ -10985,13 +11370,15 @@ def _propose_settlement_gaming_ban(target_peer_id: str, reason: str):
     database.add_ban_vote(proposal_id, our_pubkey, "approve", timestamp, vote_sig)
 
     # Broadcast proposal
+    # R5-H-3 fix: Include proposal_type so receivers can apply reversed voting logic
     proposal_payload = {
         "proposal_id": proposal_id,
         "target_peer_id": target_peer_id,
         "proposer_peer_id": our_pubkey,
         "reason": reason[:500],
         "timestamp": timestamp,
-        "signature": sig
+        "signature": sig,
+        "proposal_type": "settlement_gaming",
     }
     _reliable_broadcast(HiveMessageType.BAN_PROPOSAL, proposal_payload,
                         msg_id=proposal_id)
@@ -15652,18 +16039,21 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     except Exception as e:
         return {"error": f"Failed to sign ban: {e}"}
 
-    # Add ban to database
-    expires_at = now + (365 * 86400)  # 1 year default
+    # R5-M-8 fix: add_ban accepts expires_days (int), not expires_at (timestamp)
+    expires_days = 365  # 1 year default
     success = database.add_ban(
         peer_id=peer_id,
         reason=reason,
         reporter=our_pubkey,
         signature=sig,
-        expires_at=expires_at
+        expires_days=expires_days
     )
 
     if not success:
         return {"error": "Failed to add ban", "peer_id": peer_id}
+
+    # R5-M-9 fix: Remove member from roster after successful ban
+    database.remove_member(peer_id)
 
     plugin.log(f"cl-hive: Banned peer {peer_id[:16]}... reason: {reason}")
 
@@ -15672,7 +16062,7 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
         "peer_id": peer_id,
         "reason": reason,
         "reporter": our_pubkey,
-        "expires_at": expires_at,
+        "expires_days": expires_days,
     }
 
 

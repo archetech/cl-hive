@@ -156,3 +156,31 @@ def test_terminate_dead_leases(manager, database):
     assert terminated == 1
     row = conn.execute("SELECT status FROM liquidity_leases WHERE lease_id = 'lease-dead'").fetchone()
     assert row["status"] == "terminated"
+
+
+def test_check_heartbeat_deadlines_no_overincrement(manager, database):
+    now = int(time.time())
+    conn = database._get_connection()
+    conn.execute(
+        "INSERT INTO liquidity_leases (lease_id, provider_id, client_id, service_type, capacity_sats, start_at, "
+        "end_at, heartbeat_interval, last_heartbeat, missed_heartbeats, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "lease-over",
+            "02" + "12" * 32,
+            "03" + "34" * 32,
+            1,
+            1_000_000,
+            now - 10000,
+            now + 10000,
+            1000,
+            now - 1200,  # one interval overdue
+            0,
+            "active",
+            now - 10000,
+        ),
+    )
+    first = manager.check_heartbeat_deadlines()
+    assert first == 1
+    second = manager.check_heartbeat_deadlines()
+    assert second == 0

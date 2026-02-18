@@ -191,6 +191,11 @@ class MockDatabase:
     def update_dispute_outcome(self, dispute_id, outcome, slash_amount,
                                 panel_members_json, votes_json, resolved_at):
         if dispute_id in self.disputes:
+            # CAS guard: if resolving, only allow if not already resolved
+            if resolved_at:
+                existing = self.disputes[dispute_id].get("resolved_at")
+                if existing and existing != 0:
+                    return False
             self.disputes[dispute_id]["outcome"] = outcome
             self.disputes[dispute_id]["slash_amount"] = slash_amount
             self.disputes[dispute_id]["panel_members_json"] = panel_members_json
@@ -591,10 +596,12 @@ class TestDisputeResolver:
         panel = json.dumps([CHARLIE, DAVE, GRACE])
         db.disputes["disp2"]["panel_members_json"] = panel
         resolver.record_vote("disp2", CHARLIE, "upheld", "")
-        resolver.record_vote("disp2", DAVE, "upheld", "")
-        result = resolver.check_quorum("disp2", quorum=2)
-        assert result is not None
-        assert result["outcome"] == "upheld"
+        # Second vote reaches quorum — record_vote now resolves internally
+        vote_result = resolver.record_vote("disp2", DAVE, "upheld", "")
+        assert vote_result.get("quorum_result") is not None
+        assert vote_result["quorum_result"]["outcome"] == "upheld"
+        # Subsequent check_quorum returns None (already resolved)
+        assert resolver.check_quorum("disp2", quorum=2) is None
 
     def test_quorum_rejected_outcome(self):
         resolver, db = self._make_resolver()
@@ -602,9 +609,12 @@ class TestDisputeResolver:
         panel = json.dumps([CHARLIE, DAVE, GRACE])
         db.disputes["disp3"]["panel_members_json"] = panel
         resolver.record_vote("disp3", CHARLIE, "rejected", "")
-        resolver.record_vote("disp3", DAVE, "rejected", "")
-        result = resolver.check_quorum("disp3", quorum=2)
-        assert result["outcome"] == "rejected"
+        # Second vote reaches quorum — record_vote now resolves internally
+        vote_result = resolver.record_vote("disp3", DAVE, "rejected", "")
+        assert vote_result.get("quorum_result") is not None
+        assert vote_result["quorum_result"]["outcome"] == "rejected"
+        # Subsequent check_quorum returns None (already resolved)
+        assert resolver.check_quorum("disp3", quorum=2) is None
 
     def test_quorum_not_reached(self):
         resolver, db = self._make_resolver()

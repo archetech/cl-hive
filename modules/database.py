@@ -1612,6 +1612,9 @@ class HiveDatabase:
         """)
 
         # Phase 4B: Settlement bonds
+        # No UNIQUE(peer_id): a peer may re-bond after a previous bond was
+        # slashed or refunded.  Active-bond uniqueness is enforced at the
+        # application layer (get_bond_for_peer checks status='active').
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settlement_bonds (
                 bond_id TEXT PRIMARY KEY,
@@ -1622,8 +1625,7 @@ class HiveDatabase:
                 timelock INTEGER NOT NULL,
                 tier TEXT NOT NULL DEFAULT 'observer',
                 slashed_amount INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'active',
-                UNIQUE(peer_id)
+                status TEXT NOT NULL DEFAULT 'active'
             )
         """)
 
@@ -2404,11 +2406,15 @@ class HiveDatabase:
         return dict(row) if row else None
 
     def get_ban_proposal_for_target(self, target_peer_id: str) -> Optional[Dict[str, Any]]:
-        """Get pending ban proposal for a target peer."""
+        """Get most recent pending or rejected ban proposal for a target peer.
+
+        Includes rejected proposals so that ban cooldown cannot be bypassed
+        by repeatedly proposing bans that get rejected.
+        """
         conn = self._get_connection()
         row = conn.execute("""
             SELECT * FROM ban_proposals
-            WHERE target_peer_id = ? AND status = 'pending'
+            WHERE target_peer_id = ? AND status IN ('pending', 'rejected')
             ORDER BY proposed_at DESC LIMIT 1
         """, (target_peer_id,)).fetchone()
         return dict(row) if row else None
@@ -2435,15 +2441,15 @@ class HiveDatabase:
 
     def add_ban_vote(self, proposal_id: str, voter_peer_id: str,
                     vote: str, voted_at: int, signature: str) -> bool:
-        """Add or update a vote on a ban proposal."""
+        """Add a vote on a ban proposal. Ignores duplicate votes (no flipping)."""
         conn = self._get_connection()
         try:
-            conn.execute("""
-                INSERT OR REPLACE INTO ban_votes
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO ban_votes
                 (proposal_id, voter_peer_id, vote, voted_at, signature)
                 VALUES (?, ?, ?, ?, ?)
             """, (proposal_id, voter_peer_id, vote, voted_at, signature))
-            return True
+            return cursor.rowcount > 0
         except Exception:
             return False
 
@@ -2474,6 +2480,44 @@ class HiveDatabase:
             WHERE status = 'pending' AND expires_at < ?
         """, (now,))
         return cursor.rowcount
+
+    def get_expired_ban_proposals(self, now_ts: int) -> List[Dict[str, Any]]:
+        """Return all pending ban proposals where expires_at < now_ts."""
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM ban_proposals
+            WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < ?
+            ORDER BY proposed_at ASC
+        """, (now_ts,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_expired_settlement_gaming_proposals(self, now_ts: int,
+                                                 voting_window_seconds: int = 86400
+                                                 ) -> List[Dict[str, Any]]:
+        """
+        Get settlement_gaming ban proposals whose voting window has expired.
+
+        Settlement gaming proposals use reversed voting: non-votes count as
+        approval. This method returns pending proposals where the voting
+        window (proposed_at + voting_window_seconds) has elapsed, so the
+        caller can finalize them.
+
+        Args:
+            now_ts: Current unix timestamp
+            voting_window_seconds: Duration of voting window (default 86400 = 24h)
+
+        Returns:
+            List of expired settlement_gaming proposal dicts
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT * FROM ban_proposals
+            WHERE proposal_type = 'settlement_gaming'
+              AND status = 'pending'
+              AND (proposed_at + ?) < ?
+            ORDER BY proposed_at ASC
+        """, (voting_window_seconds, now_ts)).fetchall()
+        return [dict(row) for row in rows]
 
     def prune_old_ban_data(self, older_than_days: int = 180) -> int:
         """
@@ -7932,7 +7976,7 @@ class HiveDatabase:
                     level='warn'
                 )
                 return False
-            conn.execute("""
+            cursor = conn.execute("""
                 INSERT OR IGNORE INTO escrow_tickets (
                     ticket_id, ticket_type, agent_id, operator_id,
                     mint_url, amount_sats, token_json, htlc_hash,
@@ -7943,6 +7987,12 @@ class HiveDatabase:
                   mint_url, amount_sats, token_json, htlc_hash,
                   timelock, danger_score, schema_id, action,
                   status, created_at))
+            if cursor.rowcount == 0:
+                self.plugin.log(
+                    f"HiveDatabase: store_escrow_ticket ignored duplicate ticket_id={ticket_id[:16]}",
+                    level='warn'
+                )
+                return False
             return True
         except Exception as e:
             self.plugin.log(
@@ -7978,25 +8028,34 @@ class HiveDatabase:
         return [dict(r) for r in rows]
 
     def update_escrow_ticket_status(self, ticket_id: str, status: str,
-                                     timestamp: int) -> bool:
-        """Update escrow ticket status with timestamp."""
+                                     timestamp: int,
+                                     expected_status: Optional[str] = None) -> bool:
+        """Update escrow ticket status with timestamp and optional CAS guard."""
         conn = self._get_connection()
         try:
             if status == 'redeemed':
-                conn.execute(
-                    "UPDATE escrow_tickets SET status = ?, redeemed_at = ? WHERE ticket_id = ?",
-                    (status, timestamp, ticket_id)
-                )
+                query = "UPDATE escrow_tickets SET status = ?, redeemed_at = ? WHERE ticket_id = ?"
+                params: list = [status, timestamp, ticket_id]
             elif status == 'refunded':
-                conn.execute(
-                    "UPDATE escrow_tickets SET status = ?, refunded_at = ? WHERE ticket_id = ?",
-                    (status, timestamp, ticket_id)
-                )
+                query = "UPDATE escrow_tickets SET status = ?, refunded_at = ? WHERE ticket_id = ?"
+                params = [status, timestamp, ticket_id]
             else:
-                conn.execute(
-                    "UPDATE escrow_tickets SET status = ? WHERE ticket_id = ?",
-                    (status, ticket_id)
+                query = "UPDATE escrow_tickets SET status = ? WHERE ticket_id = ?"
+                params = [status, ticket_id]
+
+            if expected_status is not None:
+                query += " AND status = ?"
+                params.append(expected_status)
+
+            cursor = conn.execute(query, params)
+            if cursor.rowcount == 0:
+                self.plugin.log(
+                    f"HiveDatabase: update_escrow_ticket_status no rows updated "
+                    f"for ticket_id={ticket_id[:16]}"
+                    f"{' (expected ' + expected_status + ')' if expected_status else ''}",
+                    level='warn'
                 )
+                return False
             return True
         except Exception as e:
             self.plugin.log(
@@ -8026,11 +8085,17 @@ class HiveDatabase:
                     level='warn'
                 )
                 return False
-            conn.execute("""
+            cursor = conn.execute("""
                 INSERT OR IGNORE INTO escrow_secrets (
                     task_id, ticket_id, secret_hex, hash_hex
                 ) VALUES (?, ?, ?, ?)
             """, (task_id, ticket_id, secret_hex, hash_hex))
+            if cursor.rowcount == 0:
+                self.plugin.log(
+                    f"HiveDatabase: store_escrow_secret ignored duplicate task_id={task_id[:16]}",
+                    level='warn'
+                )
+                return False
             return True
         except Exception as e:
             self.plugin.log(
@@ -8112,7 +8177,7 @@ class HiveDatabase:
                     level='warn'
                 )
                 return False
-            conn.execute("""
+            cursor = conn.execute("""
                 INSERT OR IGNORE INTO escrow_receipts (
                     receipt_id, ticket_id, schema_id, action,
                     params_json, result_json, success,
@@ -8123,6 +8188,12 @@ class HiveDatabase:
                   params_json, result_json, success,
                   preimage_revealed, agent_signature,
                   node_signature, created_at))
+            if cursor.rowcount == 0:
+                self.plugin.log(
+                    f"HiveDatabase: store_escrow_receipt ignored duplicate receipt_id={receipt_id[:16]}",
+                    level='warn'
+                )
+                return False
             return True
         except Exception as e:
             self.plugin.log(
@@ -8222,14 +8293,22 @@ class HiveDatabase:
             return False
 
     def slash_bond(self, bond_id: str, slash_amount: int) -> bool:
-        """Record a bond slash amount."""
+        """Record a bond slash amount with CAS guard."""
         conn = self._get_connection()
         try:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE settlement_bonds SET slashed_amount = slashed_amount + ?, "
-                "status = 'slashed' WHERE bond_id = ?",
-                (slash_amount, bond_id)
+                "status = 'slashed' WHERE bond_id = ? "
+                "AND status IN ('active', 'slashed') "
+                "AND slashed_amount + ? <= amount_sats",
+                (slash_amount, bond_id, slash_amount)
             )
+            if cursor.rowcount == 0:
+                self.plugin.log(
+                    f"HiveDatabase: slash_bond no rows updated for bond_id={bond_id[:16]}",
+                    level='warn'
+                )
+                return False
             return True
         except Exception as e:
             self.plugin.log(
@@ -8266,13 +8345,21 @@ class HiveDatabase:
                     level='warn'
                 )
                 return False
-            conn.execute("""
+            # P4R4-L-4: Check rowcount to detect silent duplicate ignores
+            cursor = conn.execute("""
                 INSERT OR IGNORE INTO settlement_obligations (
                     obligation_id, settlement_type, from_peer, to_peer,
                     amount_sats, window_id, receipt_id, status, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             """, (obligation_id, settlement_type, from_peer, to_peer,
                   amount_sats, window_id, receipt_id, created_at))
+            if cursor.rowcount == 0:
+                self.plugin.log(
+                    f"HiveDatabase: store_obligation ignored duplicate "
+                    f"obligation_id={obligation_id[:16]}",
+                    level='warn'
+                )
+                return False
             return True
         except Exception as e:
             self.plugin.log(
@@ -8335,6 +8422,31 @@ class HiveDatabase:
             )
             return False
 
+    def update_bilateral_obligation_status(self, window_id: str,
+                                              peer_a: str, peer_b: str,
+                                              new_status: str) -> int:
+        """
+        Update obligation status only for obligations between two specific
+        peers within a settlement window (bilateral netting scope).
+
+        Returns the number of rows updated.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "UPDATE settlement_obligations SET status = ? "
+                "WHERE window_id = ? AND status = 'pending' "
+                "AND ((from_peer = ? AND to_peer = ?) OR (from_peer = ? AND to_peer = ?))",
+                (new_status, window_id, peer_a, peer_b, peer_b, peer_a)
+            )
+            return cursor.rowcount
+        except Exception as e:
+            self.plugin.log(
+                f"HiveDatabase: update_bilateral_obligation_status error: {e}",
+                level='error'
+            )
+            return 0
+
     def count_obligations(self) -> int:
         """Count total obligations."""
         conn = self._get_connection()
@@ -8362,13 +8474,21 @@ class HiveDatabase:
                     level='warn'
                 )
                 return False
-            conn.execute("""
+            # P4R4-L-5: Check rowcount to detect silent duplicate ignores
+            cursor = conn.execute("""
                 INSERT OR IGNORE INTO settlement_disputes (
                     dispute_id, obligation_id, filing_peer,
                     respondent_peer, evidence_json, filed_at
                 ) VALUES (?, ?, ?, ?, ?, ?)
             """, (dispute_id, obligation_id, filing_peer,
                   respondent_peer, evidence_json, filed_at))
+            if cursor.rowcount == 0:
+                self.plugin.log(
+                    f"HiveDatabase: store_dispute ignored duplicate "
+                    f"dispute_id={dispute_id[:16]}",
+                    level='warn'
+                )
+                return False
             return True
         except Exception as e:
             self.plugin.log(
@@ -8390,17 +8510,37 @@ class HiveDatabase:
                                 panel_members_json: Optional[str],
                                 votes_json: Optional[str],
                                 resolved_at: int) -> bool:
-        """Update dispute with outcome."""
+        """Update dispute with outcome.
+
+        Uses a CAS guard when resolved_at is non-zero: only updates if the
+        dispute has not already been resolved (resolved_at IS NULL or 0).
+        Returns False if the row was already resolved (no rows updated).
+        """
         conn = self._get_connection()
         try:
-            conn.execute("""
-                UPDATE settlement_disputes
-                SET outcome = ?, slash_amount = ?,
-                    panel_members_json = ?, votes_json = ?,
-                    resolved_at = ?
-                WHERE dispute_id = ?
-            """, (outcome, slash_amount, panel_members_json,
-                  votes_json, resolved_at, dispute_id))
+            if resolved_at:
+                # CAS guard: only resolve if not already resolved
+                cursor = conn.execute("""
+                    UPDATE settlement_disputes
+                    SET outcome = ?, slash_amount = ?,
+                        panel_members_json = ?, votes_json = ?,
+                        resolved_at = ?
+                    WHERE dispute_id = ?
+                      AND (resolved_at IS NULL OR resolved_at = 0)
+                """, (outcome, slash_amount, panel_members_json,
+                      votes_json, resolved_at, dispute_id))
+                if cursor.rowcount == 0:
+                    return False
+            else:
+                # Non-resolving update (e.g. recording votes), no CAS needed
+                conn.execute("""
+                    UPDATE settlement_disputes
+                    SET outcome = ?, slash_amount = ?,
+                        panel_members_json = ?, votes_json = ?,
+                        resolved_at = ?
+                    WHERE dispute_id = ?
+                """, (outcome, slash_amount, panel_members_json,
+                      votes_json, resolved_at, dispute_id))
             return True
         except Exception as e:
             self.plugin.log(

@@ -4802,6 +4802,8 @@ def schema_validate(ctx: HiveContext, schema_id: str, action: str,
             params = json.loads(params_json)
         except (json.JSONDecodeError, TypeError):
             return {"error": "invalid params_json"}
+        if not isinstance(params, dict):
+            return {"error": "params_json must decode to an object"}
 
     is_valid, reason = ctx.management_schema_registry.validate_command(
         schema_id, action, params
@@ -4847,6 +4849,8 @@ def mgmt_credential_issue(ctx: HiveContext, agent_id: str, tier: str,
             constraints = json.loads(constraints_json)
         except (json.JSONDecodeError, TypeError):
             return {"error": "invalid constraints_json"}
+        if not isinstance(constraints, dict):
+            return {"error": "constraints_json must decode to a JSON object"}
 
     node_id = ctx.our_pubkey or ""
     cred = ctx.management_schema_registry.issue_credential(
@@ -4920,10 +4924,11 @@ def escrow_create(ctx: HiveContext, agent_id: str, schema_id: str = "",
     if not agent_id:
         return {"error": "agent_id is required"}
 
-    # Generate a task_id
+    # Generate a task_id (include randomness to prevent collisions)
     import hashlib as _hashlib
+    import os as _os
     task_id = _hashlib.sha256(
-        f"{agent_id}:{schema_id}:{action}:{int(time.time())}".encode()
+        f"{agent_id}:{schema_id}:{action}:{int(time.time())}:{_os.urandom(8).hex()}".encode()
     ).hexdigest()[:32]
 
     ticket = ctx.cashu_escrow_mgr.create_ticket(
@@ -5334,7 +5339,9 @@ def marketplace_propose(ctx: HiveContext, advisor_did: str, node_id: str,
     if not isinstance(scope, dict) or not isinstance(pricing, dict):
         return {"error": "scope_json and pricing_json must decode to objects"}
 
-    return ctx.marketplace_mgr.propose_contract(advisor_did, node_id, scope, tier, pricing)
+    return ctx.marketplace_mgr.propose_contract(
+        advisor_did, node_id, scope, tier, pricing, operator_id=ctx.our_pubkey
+    )
 
 
 def marketplace_accept(ctx: HiveContext, contract_id: str) -> Dict[str, Any]:
