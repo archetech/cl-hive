@@ -807,6 +807,13 @@ hive-comms-policy-preset=moderate
 # Marketplace publishing
 hive-comms-marketplace-publish=true   # Publish Nostr marketplace events (38380+/38900+)
 
+# Optional feature toggles (same plugin boundary; no separate marketplace plugin)
+# hive-comms-marketplace-enabled=true
+# hive-comms-liquidity-enabled=true
+# hive-comms-marketplace-subscribe=true
+# hive-comms-liquidity-subscribe=true
+# hive-comms-liquidity-publish=true
+
 # Alerts (optional)
 # hive-comms-alert-nostr-dm=npub1abc...
 
