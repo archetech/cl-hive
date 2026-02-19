@@ -1,7 +1,7 @@
 # Lightning Hive Protocol Suite — Planning Documents
 
 **Status:** Phase 1 Implemented
-**Last Updated:** 2026-02-17
+**Last Updated:** 2026-02-19
 **Author:** Hex (`did:cid:bagaaierajrr7k6izcrdfwqxpgtrobflsv5oibymfnthjazkkokaugszyh4ka`)
 
 ---
@@ -24,7 +24,8 @@ Documents are numbered by dependency order: foundational specs first, implementa
 | 10 | [Node Provisioning](./10-NODE-PROVISIONING.md) | Draft | Autonomous VPS lifecycle — provision, operate, and decommission self-sustaining Lightning nodes. Paid with Lightning. Revenue ≥ costs or graceful death. Capital allocation: 6.55M–19.46M sats. |
 | 11 | [Implementation Plan (Phase 1–3)](./11-IMPLEMENTATION-PLAN.md) | **Phase 2 Complete** | Phased implementation roadmap. Dependency order: Reputation → Fleet Mgmt → Escrow → Marketplace → Settlements → Liquidity → Client. Python-first with Archon wired in later. Phase 1 (DID Credential Foundation) and Phase 2 (Management Schemas + Danger Scoring) implemented. |
 | 12 | [Implementation Plan (Phase 4–6)](./12-IMPLEMENTATION-PLAN-PHASE4-6.md) | Draft | Later implementation phases. |
-| 13 | [Phase 6 Readiness-Gated Plan](./13-PHASE6-READINESS-GATED-PLAN.md) | Planning-only | Detailed execution and rollout plan for the 3-plugin split (`cl-hive-comms`, `cl-hive-archon`, `cl-hive`) with explicit production-readiness gates. Repos may be scaffolded in advance, but implementation remains gated. |
+| 13 | [Phase 6 Readiness-Gated Plan](./13-PHASE6-READINESS-GATED-PLAN.md) | Planning-only | Detailed execution and rollout plan for the 3-plugin split (`cl-hive-comms`, `cl-hive-archon`, `cl-hive`) with explicit production-readiness gates, plus plugin-boundary decision notes (marketplace stays in `cl-hive-comms` with feature flags). Repos may be scaffolded in advance, but implementation remains gated. |
+| 15 | [Hive System Overview](./15-HIVE-SYSTEM-OVERVIEW.md) | Living overview | High-level explanation of what the Lightning Hive suite does, plugin boundaries, core flows, and how the planning documents fit together. |
 
 ---
 
