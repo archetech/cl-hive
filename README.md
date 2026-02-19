@@ -120,10 +120,7 @@ pip install -r requirements.txt
 lightningd --plugin=/path/to/cl-hive/cl-hive.py
 ```
 
-Phase 6 planning-only references:
-- `docs/planning/13-PHASE6-READINESS-GATED-PLAN.md`
-- `docs/deployment/PHASE6-MANUAL-INSTALL-NON-DOCKER.md`
-- `docs/deployment/PHASE6-DOCKER-PLUGIN-INTEGRATION-PLAN.md`
+Phase 6 planning references: see [hive-docs](https://github.com/lightning-goats/hive-docs)
 
 ## RPC Commands
 
@@ -355,22 +352,14 @@ See:
 
 ## Documentation
 
-Canonical documentation is being migrated to a dedicated docs repository:
-- Canonical repo: `https://github.com/lightning-goats/hive-docs`
-- Migration plan: `docs/planning/16-DOCS-REPO-MIGRATION.md`
+Full docs: **https://github.com/lightning-goats/hive-docs**
 
 | Document | Description |
 |----------|-------------|
 | [Joining the Hive](docs/JOINING_THE_HIVE.md) | How to join an existing hive |
-| [Docs Portal](docs/README.md) | Documentation location and migration status |
-| [MOLTY.md](MOLTY.md) | AI agent instructions |
 | [MCP Server](docs/MCP_SERVER.md) | MCP server setup and tool reference |
-| [Cooperative Fee Coordination](docs/design/cooperative-fee-coordination.md) | Fee coordination design |
-| [VPN Transport](docs/design/VPN_HIVE_TRANSPORT.md) | VPN transport design |
-| [Liquidity Integration](docs/design/LIQUIDITY_INTEGRATION.md) | cl-revenue-ops integration |
-| [Architecture](docs/ARCHITECTURE.md) | Complete protocol specification |
+| [MOLTY.md](MOLTY.md) | AI agent instructions |
 | [Docker Deployment](docker/README.md) | Docker deployment guide |
-| [Threat Model](docs/security/THREAT_MODEL.md) | Security threat analysis |
 
 ## Testing
 

@@ -231,5 +231,5 @@ See `CLAUDE.md` for detailed development guidance.
 ## Related Documentation
 
 - [MCP_SERVER.md](docs/MCP_SERVER.md) — Full tool reference
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — Protocol specification
+- [hive-docs](https://github.com/lightning-goats/hive-docs) — Full documentation (architecture, specs, planning)
 - [CLAUDE.md](CLAUDE.md) — Development guidance

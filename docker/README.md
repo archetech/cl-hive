@@ -3,7 +3,7 @@
 Production-ready Docker image for cl-hive Lightning nodes with Tor, WireGuard, and full plugin stack.
 
 Phase 6 planning note:
-- Future split-plugin support (`cl-hive-comms`, `cl-hive-archon`) is documented in `docs/deployment/PHASE6-DOCKER-PLUGIN-INTEGRATION-PLAN.md`.
+- Future split-plugin support (`cl-hive-comms`, `cl-hive-archon`) is documented in the [hive-docs](https://github.com/lightning-goats/hive-docs) repo.
 - This is planning-only and is not enabled in current production images.
 
 ## Features
