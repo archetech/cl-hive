@@ -187,6 +187,20 @@ RUN ARCH=$(uname -m) \
     && rm /tmp/sling.tar.gz
 
 # =============================================================================
+# BOLTZ CLIENT (Submarine/Reverse Swaps)
+# =============================================================================
+ARG BOLTZ_VERSION=v2.11.0
+RUN ARCH=$(uname -m) \
+    && if [ "$ARCH" = "x86_64" ]; then ARCH_SUFFIX="linux-amd64"; fi \
+    && if [ "$ARCH" = "aarch64" ]; then ARCH_SUFFIX="linux-arm64"; fi \
+    && wget -O /tmp/boltz-client.tar.gz \
+       "https://github.com/BoltzExchange/boltz-client/releases/download/${BOLTZ_VERSION}/boltz-client-${ARCH_SUFFIX}-${BOLTZ_VERSION}.tar.gz" \
+    && tar -xzf /tmp/boltz-client.tar.gz -C /tmp \
+    && install -m 0755 /tmp/bin/${ARCH_SUFFIX}/boltzd /usr/local/bin/boltzd \
+    && install -m 0755 /tmp/bin/${ARCH_SUFFIX}/boltzcli /usr/local/bin/boltzcli \
+    && rm -rf /tmp/boltz-client.tar.gz /tmp/bin
+
+# =============================================================================
 # C-LIGHTNING-REST (for RTL integration)
 # =============================================================================
 # REST API plugin enabling Ride The Lightning web interface

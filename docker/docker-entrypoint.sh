@@ -88,6 +88,8 @@ NETWORK_MODE="${NETWORK_MODE:-tor}"
 WIREGUARD_ENABLED="${WIREGUARD_ENABLED:-false}"
 HIVE_GOVERNANCE_MODE="${HIVE_GOVERNANCE_MODE:-advisor}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
+BOLTZ_ENABLED="${BOLTZ_ENABLED:-false}"
+export BOLTZ_ENABLED
 
 # Set TOR_ENABLED based on NETWORK_MODE (for supervisord)
 if [[ "$NETWORK_MODE" == "tor" || "$NETWORK_MODE" == "hybrid" ]]; then
@@ -628,6 +630,7 @@ fi
 echo "Lightning Port: $LIGHTNING_PORT"
 echo "Network Mode:   $NETWORK_MODE"
 echo "WireGuard:      $WIREGUARD_ENABLED"
+echo "Boltz:          $BOLTZ_ENABLED"
 echo "Hive Mode:      $HIVE_GOVERNANCE_MODE"
 echo "Lightning Dir:  $LIGHTNING_DIR"
 echo "Advisor DB:     $ADVISOR_DB_PATH"
@@ -649,6 +652,42 @@ if [ "${TRUSTEDCOIN_ENABLED:-false}" = "true" ]; then
 fi
 echo "============================="
 echo ""
+
+# -----------------------------------------------------------------------------
+# Boltz Client Configuration
+# -----------------------------------------------------------------------------
+if [ "$BOLTZ_ENABLED" = "true" ]; then
+    mkdir -p /data/boltz
+    # Symlink so boltzcli works without --datadir
+    ln -sf /data/boltz /root/.boltz
+    # Generate boltz.toml if it doesn't exist (don't overwrite user config)
+    if [ ! -f /data/boltz/boltz.toml ]; then
+        # gRPC certs are in the network subdir (e.g., /data/lightning/bitcoin/bitcoin/)
+        GRPC_CERT_DIR="${LIGHTNING_DIR}/${NETWORK}"
+        cat > /data/boltz/boltz.toml << BEOF
+# Boltz Client Configuration (auto-generated)
+# Network: ${NETWORK}
+
+node = "cln"
+network = "mainnet"
+
+[Cln]
+host = "127.0.0.1"
+port = 9937
+datadir = "${GRPC_CERT_DIR}"
+rootCert = "${GRPC_CERT_DIR}/ca.pem"
+privateKey = "${GRPC_CERT_DIR}/client-key.pem"
+certChain = "${GRPC_CERT_DIR}/client.pem"
+BEOF
+        chmod 600 /data/boltz/boltz.toml
+        echo "Boltz client: generated config at /data/boltz/boltz.toml"
+    else
+        echo "Boltz client: using existing config at /data/boltz/boltz.toml"
+    fi
+    echo "Boltz client: enabled (datadir=/data/boltz)"
+else
+    echo "Boltz client: disabled"
+fi
 
 # -----------------------------------------------------------------------------
 # Pre-flight Validation

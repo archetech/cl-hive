@@ -94,6 +94,9 @@ services:
       # When enabled with bitcoin-rpc*: hybrid mode (bitcoind primary, explorers fallback)
       - TRUSTEDCOIN_ENABLED=${TRUSTEDCOIN_ENABLED:-false}
 
+      # Boltz Client (submarine/reverse swaps - disabled by default)
+      - BOLTZ_ENABLED=${BOLTZ_ENABLED:-false}
+
       # Logging
       - LOG_LEVEL=${LOG_LEVEL:-info}
 
@@ -136,6 +139,9 @@ services:
 
       # bitcoin-cli mount (only needed if host has newer version)
       # - ./bitcoin-cli:/usr/local/bin/bitcoin-cli:ro
+
+      # Boltz client data (config, DB, TLS certs, macaroons)
+      - boltz-data:/data/boltz
 
       # Backup directory for database replication and emergency.recover
       - ${BACKUP_LOCATION:-./backups}:/backups
@@ -241,6 +247,8 @@ volumes:
     labels:
       - "com.cl-hive.backup=critical"
   rtl-data:
+    driver: local
+  boltz-data:
     driver: local
 
 networks:
