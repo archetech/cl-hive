@@ -183,6 +183,31 @@ claude -p "Use hive_status to check the fleet"
 | `revenue_rebalance` | Trigger manual rebalance with EV constraints |
 | `revenue_report` | Generate summary, peer, hive, or cost reports |
 | `revenue_config` | Get/set runtime configuration |
+| `revenue_hive_status` | Show hive integration mode and bridge diagnostics |
+| `revenue_rebalance_debug` | Detailed reasons rebalances are skipped/failing |
+| `revenue_fee_debug` | Detailed reasons fee updates are skipped/failing |
+| `revenue_analyze` | Trigger flow analysis on-demand |
+| `revenue_wake_all` | Wake sleeping channels for immediate fee evaluation |
+| `revenue_capacity_report` | Strategic capital redeployment report |
+| `revenue_clboss_status` | Show clboss unmanaged/managed state |
+| `revenue_remanage` | Re-enable clboss management for a peer |
+| `revenue_ignore` | Deprecated peer ignore operation (policy-mapped) |
+| `revenue_unignore` | Deprecated peer unignore operation (policy-mapped) |
+| `revenue_list_ignored` | Deprecated list of ignored peers |
+| `revenue_cleanup_closed` | Archive and clean closed channels from tracking |
+| `revenue_clear_reservations` | Clear active rebalance budget reservations |
+| `revenue_boltz_quote` | Get Boltz quote for reverse/submarine swaps |
+| `revenue_boltz_loop_out` | Execute LN -> on-chain/LBTC swap |
+| `revenue_boltz_loop_in` | Execute on-chain/LBTC -> LN swap |
+| `revenue_boltz_status` | Get Boltz swap status by swap ID |
+| `revenue_boltz_history` | Get recent Boltz swap history and costs |
+| `revenue_boltz_budget` | Show daily Boltz swap budget usage |
+| `revenue_boltz_wallet` | Show boltzd BTC/LBTC wallet balances |
+| `revenue_boltz_refund` | Refund a failed submarine/chain swap |
+| `revenue_boltz_claim` | Manually claim reverse/chain swaps |
+| `revenue_boltz_chainswap` | Execute BTC<->LBTC chain swap |
+| `revenue_boltz_withdraw` | Withdraw from boltzd wallet to external address |
+| `revenue_boltz_deposit` | Get boltzd deposit address |
 | `revenue_debug` | Diagnostic info for fee or rebalance issues |
 | `revenue_history` | Lifetime financial history including closed channels |
 

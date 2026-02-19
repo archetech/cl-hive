@@ -1918,6 +1918,295 @@ Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
             }
         ),
         Tool(
+            name="revenue_boltz_quote",
+            description="Get a Boltz swap fee quote for reverse/submarine swaps.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Swap amount in satoshis"
+                    },
+                    "swap_type": {
+                        "type": "string",
+                        "enum": ["reverse", "submarine"],
+                        "description": "Swap type (default: reverse)"
+                    },
+                    "currency": {
+                        "type": "string",
+                        "enum": ["btc", "lbtc", "both"],
+                        "description": "Quote currency to request"
+                    }
+                },
+                "required": ["node", "amount_sats"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_loop_out",
+            description="Execute Boltz loop-out (LN -> on-chain/LBTC).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Swap amount in satoshis"
+                    },
+                    "address": {
+                        "type": "string",
+                        "description": "Destination address (optional)"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Preferred channel SCID (optional)"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Preferred peer pubkey (optional)"
+                    },
+                    "currency": {
+                        "type": "string",
+                        "enum": ["btc", "lbtc"],
+                        "description": "Settlement currency (optional)"
+                    }
+                },
+                "required": ["node", "amount_sats"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_loop_in",
+            description="Execute Boltz loop-in (on-chain/LBTC -> LN).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Swap amount in satoshis"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Preferred channel SCID (optional)"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Preferred peer pubkey (optional)"
+                    },
+                    "currency": {
+                        "type": "string",
+                        "enum": ["btc", "lbtc"],
+                        "description": "Funding currency (optional)"
+                    }
+                },
+                "required": ["node", "amount_sats"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_status",
+            description="Get Boltz swap status by swap ID.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "swap_id": {
+                        "type": "string",
+                        "description": "Boltz swap ID"
+                    }
+                },
+                "required": ["node", "swap_id"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_history",
+            description="Get recent Boltz swap history and cost summary.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum swaps to return (default: 20)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_budget",
+            description="Show Boltz daily swap budget usage.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_wallet",
+            description="Show boltzd wallet balances for BTC/LBTC.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_refund",
+            description="Refund a failed submarine/chain swap.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "swap_id": {
+                        "type": "string",
+                        "description": "Boltz swap ID to refund"
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "Refund destination: wallet or on-chain address"
+                    }
+                },
+                "required": ["node", "swap_id"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_claim",
+            description="Manually claim reverse/chain swaps that failed auto-claim.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "swap_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of Boltz swap IDs to claim"
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "Claim destination: wallet or on-chain address"
+                    }
+                },
+                "required": ["node", "swap_ids"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_chainswap",
+            description="Execute a BTC<->LBTC chain swap via Boltz.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Swap amount in satoshis"
+                    },
+                    "from_currency": {
+                        "type": "string",
+                        "enum": ["btc", "lbtc"],
+                        "description": "Source currency (default: lbtc)"
+                    },
+                    "to_currency": {
+                        "type": "string",
+                        "enum": ["btc", "lbtc"],
+                        "description": "Destination currency (default: btc)"
+                    },
+                    "to_address": {
+                        "type": "string",
+                        "description": "Optional destination address"
+                    }
+                },
+                "required": ["node", "amount_sats"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_withdraw",
+            description="Withdraw funds from boltzd wallet to an external address.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "Target BTC/Liquid address"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Amount in satoshis to send"
+                    },
+                    "currency": {
+                        "type": "string",
+                        "enum": ["btc", "lbtc"],
+                        "description": "Wallet currency to send from (default: lbtc)"
+                    },
+                    "sat_per_vbyte": {
+                        "type": "integer",
+                        "description": "Optional fee rate override"
+                    },
+                    "sweep": {
+                        "type": "boolean",
+                        "description": "If true, send entire wallet balance"
+                    }
+                },
+                "required": ["node", "destination", "amount_sats"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_deposit",
+            description="Get a deposit address for boltzd wallet.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "currency": {
+                        "type": "string",
+                        "enum": ["btc", "lbtc"],
+                        "description": "Wallet currency (default: lbtc)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
             name="askrene_constraints_summary",
             description="Summarize AskRene liquidity constraints for a given layer (default: xpay). Useful routing intelligence for why rebalances fail.",
             inputSchema={
@@ -1990,6 +2279,212 @@ Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
                     }
                 },
                 "required": ["node", "action"]
+            }
+        ),
+        Tool(
+            name="revenue_hive_status",
+            description="Get cl-revenue-ops hive integration status and active mode.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_rebalance_debug",
+            description="Get detailed diagnostics for why rebalances may be skipped or failing.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_fee_debug",
+            description="Get detailed diagnostics for fee adjustment cadence and skip reasons.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_analyze",
+            description="Trigger on-demand flow analysis (all channels or one channel).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Optional channel ID for targeted analysis"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_wake_all",
+            description="Wake all sleeping channels for immediate fee re-evaluation.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_capacity_report",
+            description="Generate strategic capital redeployment report (winner/loser channels).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_clboss_status",
+            description="Show clboss management state (unmanaged peers/channels).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_remanage",
+            description="Re-enable clboss management for a peer.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Peer pubkey"
+                    },
+                    "tag": {
+                        "type": "string",
+                        "description": "Optional tag context for remanage action"
+                    }
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="revenue_ignore",
+            description="DEPRECATED: Ignore a peer (maps to passive+disabled policy).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Peer pubkey to ignore"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Reason tag (default: manual)"
+                    }
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="revenue_unignore",
+            description="DEPRECATED: Unignore a peer (maps to policy delete).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Peer pubkey to restore to default policy"
+                    }
+                },
+                "required": ["node", "peer_id"]
+            }
+        ),
+        Tool(
+            name="revenue_list_ignored",
+            description="DEPRECATED: List peers currently ignored by policy mapping.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_cleanup_closed",
+            description="Archive and clean closed channels from active tracking tables.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_clear_reservations",
+            description="Clear all active rebalance budget reservations.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
             }
         ),
         Tool(
@@ -8586,6 +9081,171 @@ async def handle_revenue_status(args: Dict) -> Dict:
     return status
 
 
+async def handle_revenue_hive_status(args: Dict) -> Dict:
+    """Get cl-revenue-ops hive integration status."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-hive-status")
+
+
+async def handle_revenue_rebalance_debug(args: Dict) -> Dict:
+    """Get rebalance diagnostics."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-rebalance-debug")
+
+
+async def handle_revenue_fee_debug(args: Dict) -> Dict:
+    """Get fee adjustment diagnostics."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-fee-debug")
+
+
+async def handle_revenue_analyze(args: Dict) -> Dict:
+    """Run on-demand flow analysis."""
+    node_name = args.get("node")
+    channel_id = args.get("channel_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if channel_id:
+        return await node.call("revenue-analyze", {"channel_id": channel_id})
+    return await node.call("revenue-analyze")
+
+
+async def handle_revenue_wake_all(args: Dict) -> Dict:
+    """Wake all sleeping channels for immediate evaluation."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-wake-all")
+
+
+async def handle_revenue_capacity_report(args: Dict) -> Dict:
+    """Generate strategic capital redeployment report."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-capacity-report")
+
+
+async def handle_revenue_clboss_status(args: Dict) -> Dict:
+    """Get clboss management status."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-clboss-status")
+
+
+async def handle_revenue_remanage(args: Dict) -> Dict:
+    """Re-enable clboss management for a peer."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    tag = args.get("tag")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    if not peer_id:
+        return {"error": "peer_id is required"}
+
+    params = {"peer_id": peer_id}
+    if tag is not None:
+        params["tag"] = tag
+
+    return await node.call("revenue-remanage", params)
+
+
+async def handle_revenue_ignore(args: Dict) -> Dict:
+    """Ignore a peer (deprecated; mapped by plugin to policy)."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+    reason = args.get("reason")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    if not peer_id:
+        return {"error": "peer_id is required"}
+
+    params = {"peer_id": peer_id}
+    if reason is not None:
+        params["reason"] = reason
+
+    return await node.call("revenue-ignore", params)
+
+
+async def handle_revenue_unignore(args: Dict) -> Dict:
+    """Unignore a peer (deprecated; mapped by plugin to policy delete)."""
+    node_name = args.get("node")
+    peer_id = args.get("peer_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    if not peer_id:
+        return {"error": "peer_id is required"}
+
+    return await node.call("revenue-unignore", {"peer_id": peer_id})
+
+
+async def handle_revenue_list_ignored(args: Dict) -> Dict:
+    """List ignored peers (deprecated interface)."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-list-ignored")
+
+
+async def handle_revenue_cleanup_closed(args: Dict) -> Dict:
+    """Archive and clean closed channels from active tracking."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-cleanup-closed")
+
+
+async def handle_revenue_clear_reservations(args: Dict) -> Dict:
+    """Clear active rebalance budget reservations."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-clear-reservations")
+
+
 async def handle_revenue_profitability(args: Dict) -> Dict:
     """Get channel profitability analysis with market context."""
     node_name = args.get("node")
@@ -9085,6 +9745,214 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
                 logger.warning(f"Failed to mark rebalance decision failed in advisor_db: {ee}")
 
         raise
+
+
+async def handle_revenue_boltz_quote(args: Dict) -> Dict:
+    """Get Boltz swap quote."""
+    node_name = args.get("node")
+    amount_sats = args.get("amount_sats")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    if amount_sats is None:
+        return {"error": "amount_sats is required"}
+
+    params = {"amount_sats": amount_sats}
+    if args.get("swap_type") is not None:
+        params["swap_type"] = args["swap_type"]
+    if args.get("currency") is not None:
+        params["currency"] = args["currency"]
+
+    return await node.call("revenue-boltz-quote", params)
+
+
+async def handle_revenue_boltz_loop_out(args: Dict) -> Dict:
+    """Execute Boltz loop-out."""
+    node_name = args.get("node")
+    amount_sats = args.get("amount_sats")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    if amount_sats is None:
+        return {"error": "amount_sats is required"}
+
+    params = {"amount_sats": amount_sats}
+    for key in ("address", "channel_id", "peer_id", "currency"):
+        if args.get(key) is not None:
+            params[key] = args[key]
+
+    return await node.call("revenue-boltz-loop-out", params)
+
+
+async def handle_revenue_boltz_loop_in(args: Dict) -> Dict:
+    """Execute Boltz loop-in."""
+    node_name = args.get("node")
+    amount_sats = args.get("amount_sats")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    if amount_sats is None:
+        return {"error": "amount_sats is required"}
+
+    params = {"amount_sats": amount_sats}
+    for key in ("channel_id", "peer_id", "currency"):
+        if args.get(key) is not None:
+            params[key] = args[key]
+
+    return await node.call("revenue-boltz-loop-in", params)
+
+
+async def handle_revenue_boltz_status(args: Dict) -> Dict:
+    """Get Boltz swap status."""
+    node_name = args.get("node")
+    swap_id = args.get("swap_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    if not swap_id:
+        return {"error": "swap_id is required"}
+
+    return await node.call("revenue-boltz-status", {"swap_id": swap_id})
+
+
+async def handle_revenue_boltz_history(args: Dict) -> Dict:
+    """Get Boltz swap history."""
+    node_name = args.get("node")
+    limit = args.get("limit")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if limit is None:
+        return await node.call("revenue-boltz-history")
+    return await node.call("revenue-boltz-history", {"limit": limit})
+
+
+async def handle_revenue_boltz_budget(args: Dict) -> Dict:
+    """Get Boltz budget status."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-boltz-budget")
+
+
+async def handle_revenue_boltz_wallet(args: Dict) -> Dict:
+    """Get boltzd wallet balances."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-boltz-wallet")
+
+
+async def handle_revenue_boltz_refund(args: Dict) -> Dict:
+    """Refund a failed Boltz swap."""
+    node_name = args.get("node")
+    swap_id = args.get("swap_id")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    if not swap_id:
+        return {"error": "swap_id is required"}
+
+    params = {"swap_id": swap_id}
+    if args.get("destination") is not None:
+        params["destination"] = args["destination"]
+
+    return await node.call("revenue-boltz-refund", params)
+
+
+async def handle_revenue_boltz_claim(args: Dict) -> Dict:
+    """Manually claim reverse/chain swaps."""
+    node_name = args.get("node")
+    swap_ids = args.get("swap_ids")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if isinstance(swap_ids, str):
+        swap_ids = [s.strip() for s in swap_ids.split(",") if s.strip()]
+    if not isinstance(swap_ids, list) or len(swap_ids) == 0:
+        return {"error": "swap_ids is required and must be a non-empty list"}
+
+    params = {"swap_ids": swap_ids}
+    if args.get("destination") is not None:
+        params["destination"] = args["destination"]
+
+    return await node.call("revenue-boltz-claim", params)
+
+
+async def handle_revenue_boltz_chainswap(args: Dict) -> Dict:
+    """Execute a BTC/LBTC chain swap via Boltz."""
+    node_name = args.get("node")
+    amount_sats = args.get("amount_sats")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    if amount_sats is None:
+        return {"error": "amount_sats is required"}
+
+    params = {"amount_sats": amount_sats}
+    for key in ("from_currency", "to_currency", "to_address"):
+        if args.get(key) is not None:
+            params[key] = args[key]
+
+    return await node.call("revenue-boltz-chainswap", params)
+
+
+async def handle_revenue_boltz_withdraw(args: Dict) -> Dict:
+    """Withdraw funds from boltzd wallet."""
+    node_name = args.get("node")
+    destination = args.get("destination")
+    amount_sats = args.get("amount_sats")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    if not destination:
+        return {"error": "destination is required"}
+    if amount_sats is None:
+        return {"error": "amount_sats is required"}
+
+    params = {
+        "destination": destination,
+        "amount_sats": amount_sats,
+    }
+    if args.get("currency") is not None:
+        params["currency"] = args["currency"]
+    if args.get("sat_per_vbyte") is not None:
+        params["sat_per_vbyte"] = args["sat_per_vbyte"]
+    if args.get("sweep") is not None:
+        params["sweep"] = bool(args["sweep"])
+
+    return await node.call("revenue-boltz-withdraw", params)
+
+
+async def handle_revenue_boltz_deposit(args: Dict) -> Dict:
+    """Get boltzd deposit address."""
+    node_name = args.get("node")
+    currency = args.get("currency")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    if currency is None:
+        return await node.call("revenue-boltz-deposit")
+    return await node.call("revenue-boltz-deposit", {"currency": currency})
 
 
 async def handle_askrene_constraints_summary(args: Dict) -> Dict:
@@ -15501,6 +16369,19 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "hive_routing_intelligence_status": handle_routing_intelligence_status,
     # cl-revenue-ops
     "revenue_status": handle_revenue_status,
+    "revenue_hive_status": handle_revenue_hive_status,
+    "revenue_rebalance_debug": handle_revenue_rebalance_debug,
+    "revenue_fee_debug": handle_revenue_fee_debug,
+    "revenue_analyze": handle_revenue_analyze,
+    "revenue_wake_all": handle_revenue_wake_all,
+    "revenue_capacity_report": handle_revenue_capacity_report,
+    "revenue_clboss_status": handle_revenue_clboss_status,
+    "revenue_remanage": handle_revenue_remanage,
+    "revenue_ignore": handle_revenue_ignore,
+    "revenue_unignore": handle_revenue_unignore,
+    "revenue_list_ignored": handle_revenue_list_ignored,
+    "revenue_cleanup_closed": handle_revenue_cleanup_closed,
+    "revenue_clear_reservations": handle_revenue_clear_reservations,
     "revenue_profitability": handle_revenue_profitability,
     "revenue_dashboard": handle_revenue_dashboard,
     "revenue_portfolio": handle_revenue_portfolio,
@@ -15511,6 +16392,18 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_set_fee": handle_revenue_set_fee,
     "revenue_fee_anchor": handle_revenue_fee_anchor,
     "revenue_rebalance": handle_revenue_rebalance,
+    "revenue_boltz_quote": handle_revenue_boltz_quote,
+    "revenue_boltz_loop_out": handle_revenue_boltz_loop_out,
+    "revenue_boltz_loop_in": handle_revenue_boltz_loop_in,
+    "revenue_boltz_status": handle_revenue_boltz_status,
+    "revenue_boltz_history": handle_revenue_boltz_history,
+    "revenue_boltz_budget": handle_revenue_boltz_budget,
+    "revenue_boltz_wallet": handle_revenue_boltz_wallet,
+    "revenue_boltz_refund": handle_revenue_boltz_refund,
+    "revenue_boltz_claim": handle_revenue_boltz_claim,
+    "revenue_boltz_chainswap": handle_revenue_boltz_chainswap,
+    "revenue_boltz_withdraw": handle_revenue_boltz_withdraw,
+    "revenue_boltz_deposit": handle_revenue_boltz_deposit,
     "askrene_constraints_summary": handle_askrene_constraints_summary,
     "askrene_reservations": handle_askrene_reservations,
     "revenue_report": handle_revenue_report,
