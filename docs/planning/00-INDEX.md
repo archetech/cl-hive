@@ -26,6 +26,7 @@ Documents are numbered by dependency order: foundational specs first, implementa
 | 12 | [Implementation Plan (Phase 4–6)](./12-IMPLEMENTATION-PLAN-PHASE4-6.md) | Draft | Later implementation phases. |
 | 13 | [Phase 6 Readiness-Gated Plan](./13-PHASE6-READINESS-GATED-PLAN.md) | Planning-only | Detailed execution and rollout plan for the 3-plugin split (`cl-hive-comms`, `cl-hive-archon`, `cl-hive`) with explicit production-readiness gates, plus plugin-boundary decision notes (marketplace stays in `cl-hive-comms` with feature flags). Repos may be scaffolded in advance, but implementation remains gated. |
 | 14 | [Boltz Swaps Integration](./14-BOLTZ-SWAPS-INTEGRATION.md) | Implemented (Initial) | Operational plan + implementation notes for `boltzcli` swap-in/swap-out integration in `cl-hive`, including config, RPC methods, and rollout guidance. |
+| 15 | [Hive System Overview](./15-HIVE-SYSTEM-OVERVIEW.md) | Living overview | High-level explanation of what the Lightning Hive suite does, plugin boundaries, core flows, and how the planning documents fit together. |
 
 ---
 
