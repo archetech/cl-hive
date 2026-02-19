@@ -355,9 +355,14 @@ See:
 
 ## Documentation
 
+Canonical documentation is being migrated to a dedicated docs repository:
+- Planned canonical repo: `https://github.com/lightning-goats/hive-docs`
+- Migration plan: `docs/planning/16-DOCS-REPO-MIGRATION.md`
+
 | Document | Description |
 |----------|-------------|
 | [Joining the Hive](docs/JOINING_THE_HIVE.md) | How to join an existing hive |
+| [Docs Portal](docs/README.md) | Documentation location and migration status |
 | [MOLTY.md](MOLTY.md) | AI agent instructions |
 | [MCP Server](docs/MCP_SERVER.md) | MCP server setup and tool reference |
 | [Cooperative Fee Coordination](docs/design/cooperative-fee-coordination.md) | Fee coordination design |
