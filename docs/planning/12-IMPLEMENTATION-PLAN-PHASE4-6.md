@@ -872,6 +872,8 @@ The lightweight client entry point. Contains:
 | **Receipt Store** | Append-only hash-chained dual-signed SQLite log | `management_receipts` table |
 | **Marketplace Client** | Publish/subscribe to kinds 38380+/38900+ | `modules/marketplace.py`, `modules/liquidity_marketplace.py` |
 
+Boundary note: Marketplace and liquidity remain part of `cl-hive-comms` at plugin level. Optional behavior is controlled by `hive-comms-marketplace-*` / `hive-comms-liquidity-*` flags rather than introducing a fourth plugin.
+
 **Module dependencies for cl-hive-comms**:
 - `modules/management_schemas.py` (Phase 2)
 - `modules/nostr_transport.py` (Phase 5A)

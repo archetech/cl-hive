@@ -1,7 +1,7 @@
 # Phase 6 Readiness-Gated Plan
 
 **Status:** Planning-only (implementation deferred)  
-**Last Updated:** 2026-02-17  
+**Last Updated:** 2026-02-19  
 **Scope:** Phase 6 split into `cl-hive-comms`, `cl-hive-archon`, and `cl-hive` repos and plugins
 
 ---
@@ -55,6 +55,55 @@ Notes:
 - Gossip, topology, settlements, governance, fleet coordination
 - Existing hive membership/economics/state management
 - Tables: existing hive tables plus `settlement_*`, `escrow_*`
+
+### 3A. Marketplace Modularity Decision
+
+Decision: **Do not create a separate marketplace plugin at Phase 6 start.**
+
+Rationale:
+- The client architecture promise is "install `cl-hive-comms`, access everything."
+- Marketplace and liquidity marketplace share core dependencies with transport/payment/policy/receipts.
+- A fourth runtime plugin now would add startup ordering, compatibility matrix, and DB ownership complexity during the highest-risk migration period.
+
+Therefore:
+- Marketplace remains inside `cl-hive-comms` at plugin boundary level.
+- Marketplace is modularized **internally** (service/module boundaries), not as a separate plugin repo/runtime.
+
+#### Required internal boundaries in `cl-hive-comms`
+
+- `services/marketplace_service.py`: advisor marketplace flows
+- `services/liquidity_service.py`: liquidity marketplace flows
+- `services/discovery_service.py`: Nostr/Archon provider discovery abstraction
+- `services/contract_service.py`: contracts/trials/termination lifecycle
+- `storage/marketplace_store.py`: all `marketplace_*` table writes
+- `storage/liquidity_store.py`: all `liquidity_*` table writes
+
+#### Required feature flags (optional behavior, same plugin)
+
+- `hive-comms-marketplace-enabled=true|false`
+- `hive-comms-liquidity-enabled=true|false`
+- `hive-comms-marketplace-publish=true|false`
+- `hive-comms-marketplace-subscribe=true|false`
+- `hive-comms-liquidity-publish=true|false`
+- `hive-comms-liquidity-subscribe=true|false`
+
+Default policy:
+- All flags enabled in full mode.
+- Operators can disable marketplace and/or liquidity features without uninstalling `cl-hive-comms`.
+
+#### Re-evaluation criteria for a future separate plugin
+
+Revisit a dedicated `cl-hive-marketplace` plugin only if at least one condition is met for 2 consecutive releases:
+- Release cadence divergence: marketplace requires urgent patch cadence independent from comms transport.
+- Dependency divergence: marketplace requires heavyweight deps that materially increase base `cl-hive-comms` footprint.
+- Reliability isolation: marketplace defects repeatedly affect transport/policy availability despite module boundaries.
+- Operational demand: operators frequently request marketplace removal while keeping comms transport active.
+
+If triggered, run an RFC first:
+- migration/compatibility plan
+- table ownership changes
+- startup order/failure mode matrix
+- rollback and mixed-version strategy
 
 ---
 
@@ -125,4 +174,3 @@ Phase 6 implementation may begin only when:
 - All gates in Section 4 are green.
 - Maintainers explicitly mark this plan as "Execution Approved".
 - A release tag for the final Phase 5 production baseline is cut.
-
