@@ -2,11 +2,12 @@
 
 This repository is transitioning to an external canonical docs repository.
 
-## Canonical Docs (Target)
+## Canonical Docs
 
-- `https://github.com/lightning-goats/hive-docs` (planned canonical location)
+- `https://github.com/lightning-goats/hive-docs` (canonical location)
 
-Until cutover is complete, docs in this repo remain the working mirror/source.
+Migration status: seeded from `cl-hive` docs history; cutover in progress.
+Until cutover is complete, docs in this repo remain a transition mirror.
 
 ## Current Local Entry Points
 

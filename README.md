@@ -356,7 +356,7 @@ See:
 ## Documentation
 
 Canonical documentation is being migrated to a dedicated docs repository:
-- Planned canonical repo: `https://github.com/lightning-goats/hive-docs`
+- Canonical repo: `https://github.com/lightning-goats/hive-docs`
 - Migration plan: `docs/planning/16-DOCS-REPO-MIGRATION.md`
 
 | Document | Description |

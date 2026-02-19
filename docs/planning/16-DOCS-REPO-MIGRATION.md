@@ -1,6 +1,6 @@
 # Documentation Externalization Plan
 
-**Status:** Proposed / Ready to execute  
+**Status:** In Progress  
 **Last Updated:** 2026-02-19
 
 ---
@@ -14,9 +14,13 @@ Move the documentation corpus out of the `cl-hive` code repository into a dedica
 - contributors can collaborate on docs without touching runtime branches
 - versioned docs can map cleanly to code release tags
 
-Target canonical docs repo:
+Canonical docs repo:
 
 - `lightning-goats/hive-docs`
+
+Current state:
+- Repository created in `lightning-goats`
+- Initial docs history seeded from `cl-hive` (`docs/` subtree -> `hive-docs` `main`)
 
 ---
 
@@ -101,8 +105,8 @@ Recommended checks:
 
 ## 7. Execution Checklist
 
-1. Create `hive-docs` repo and protections.
-2. Run subtree export + push.
+1. [x] Create `hive-docs` repo and protections.
+2. [x] Run subtree export + push.
 3. Open PR in `hive-docs` to set docs navigation.
 4. Update `cl-hive` pointers (`README.md`, `docs/README.md`, planning index note).
 5. Announce canonical docs URL to contributors.
