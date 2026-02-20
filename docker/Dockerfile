@@ -125,6 +125,7 @@ ENV PATH="/opt/cln-plugins-venv/bin:$PATH"
 # Install Python dependencies
 RUN pip install --no-cache-dir \
     pyln-client>=24.0 \
+    PyNaCl>=1.5.0 \
     requests \
     anthropic
 
@@ -191,13 +192,13 @@ RUN ARCH=$(uname -m) \
 # =============================================================================
 ARG BOLTZ_VERSION=v2.11.0
 RUN ARCH=$(uname -m) \
-    && if [ "$ARCH" = "x86_64" ]; then ARCH_SUFFIX="linux-amd64"; fi \
-    && if [ "$ARCH" = "aarch64" ]; then ARCH_SUFFIX="linux-arm64"; fi \
+    && if [ "$ARCH" = "x86_64" ]; then DL_SUFFIX="linux-amd64"; TAR_DIR="linux_amd64"; fi \
+    && if [ "$ARCH" = "aarch64" ]; then DL_SUFFIX="linux-arm64"; TAR_DIR="linux_arm64"; fi \
     && wget -O /tmp/boltz-client.tar.gz \
-       "https://github.com/BoltzExchange/boltz-client/releases/download/${BOLTZ_VERSION}/boltz-client-${ARCH_SUFFIX}-${BOLTZ_VERSION}.tar.gz" \
+       "https://github.com/BoltzExchange/boltz-client/releases/download/${BOLTZ_VERSION}/boltz-client-${DL_SUFFIX}-${BOLTZ_VERSION}.tar.gz" \
     && tar -xzf /tmp/boltz-client.tar.gz -C /tmp \
-    && install -m 0755 /tmp/bin/${ARCH_SUFFIX}/boltzd /usr/local/bin/boltzd \
-    && install -m 0755 /tmp/bin/${ARCH_SUFFIX}/boltzcli /usr/local/bin/boltzcli \
+    && install -m 0755 /tmp/bin/${TAR_DIR}/boltzd /usr/local/bin/boltzd \
+    && install -m 0755 /tmp/bin/${TAR_DIR}/boltzcli /usr/local/bin/boltzcli \
     && rm -rf /tmp/boltz-client.tar.gz /tmp/bin
 
 # =============================================================================
@@ -229,11 +230,11 @@ RUN git clone --depth 1 --branch ${CL_REVENUE_OPS_VERSION} https://github.com/li
 #   HIVE_COMMS_ENABLED=true
 #   HIVE_ARCHON_ENABLED=true
 
-ARG CL_HIVE_COMMS_VERSION=v0.1.0
+ARG CL_HIVE_COMMS_VERSION=main
 RUN git clone --depth 1 --branch ${CL_HIVE_COMMS_VERSION} https://github.com/lightning-goats/cl-hive-comms.git /opt/cl-hive-comms \
     && chmod +x /opt/cl-hive-comms/cl-hive-comms.py
 
-ARG CL_HIVE_ARCHON_VERSION=v0.1.0
+ARG CL_HIVE_ARCHON_VERSION=main
 RUN git clone --depth 1 --branch ${CL_HIVE_ARCHON_VERSION} https://github.com/lightning-goats/cl-hive-archon.git /opt/cl-hive-archon \
     && chmod +x /opt/cl-hive-archon/cl-hive-archon.py
 
