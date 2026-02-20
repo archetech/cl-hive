@@ -615,6 +615,93 @@ _msg_executor: Optional[ThreadPoolExecutor] = None
 
 
 # =============================================================================
+# BATCHED LOG WRITER — reduces write_lock contention on plugin stdout
+# =============================================================================
+# pyln-client's plugin.log() acquires write_lock per-line (same lock as RPC
+# responses). With 16 msg threads + 9 background loops, the IO thread gets
+# starved. This writer queues log messages and flushes them in batches with
+# a single write_lock acquisition per batch.
+
+_batched_log_writer: Optional["BatchedLogWriter"] = None
+
+
+class BatchedLogWriter:
+    """Queue-based log writer that batches plugin.log() calls."""
+
+    _FLUSH_INTERVAL = 0.05   # 50ms between flushes
+    _MAX_BATCH = 200          # max messages per flush
+    _QUEUE_SIZE = 10_000      # drop on overflow (non-blocking put)
+
+    def __init__(self, plugin_obj):
+        self._plugin = plugin_obj
+        self._queue: queue.Queue = queue.Queue(maxsize=self._QUEUE_SIZE)
+        self._stop = threading.Event()
+        self._original_log = plugin_obj.log  # save original
+        self._thread = threading.Thread(
+            target=self._writer_loop,
+            name="hive_log_writer",
+            daemon=True,
+        )
+        self._thread.start()
+        # Monkey-patch plugin.log → queued version
+        plugin_obj.log = self._enqueue
+
+    def _enqueue(self, message: str, level: str = 'info') -> None:
+        """Non-blocking replacement for plugin.log()."""
+        try:
+            self._queue.put_nowait((level, message))
+        except queue.Full:
+            pass  # drop — better than blocking the caller
+
+    def _writer_loop(self) -> None:
+        """Drain queue and write batches with one write_lock acquisition."""
+        while not self._stop.is_set():
+            self._stop.wait(self._FLUSH_INTERVAL)
+            self._flush_batch()
+
+    def _flush_batch(self) -> None:
+        """Write up to _MAX_BATCH messages in one lock acquisition."""
+        batch = []
+        for _ in range(self._MAX_BATCH):
+            try:
+                batch.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        if not batch:
+            return
+
+        # Build all JSON-RPC notification bytes, write with one lock hold
+        import json as _json
+        parts = []
+        for level, message in batch:
+            for line in message.split('\n'):
+                parts.append(
+                    bytes(
+                        _json.dumps({
+                            'jsonrpc': '2.0',
+                            'method': 'log',
+                            'params': {'level': level, 'message': line},
+                        }, ensure_ascii=False) + '\n\n',
+                        encoding='utf-8',
+                    )
+                )
+        try:
+            with self._plugin.write_lock:
+                for part in parts:
+                    self._plugin.stdout.buffer.write(part)
+                self._plugin.stdout.flush()
+        except Exception:
+            pass  # stdout closed during shutdown
+
+    def stop(self) -> None:
+        """Flush remaining messages and stop the writer thread."""
+        self._stop.set()
+        self._flush_batch()        # drain what's left
+        self._thread.join(timeout=2)
+        self._plugin.log = self._original_log  # restore original
+
+
+# =============================================================================
 # GLOBAL INSTANCES (initialized in init)
 # =============================================================================
 
@@ -1580,8 +1667,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Reason: spawn-context workers take several seconds to start, but init
     # needs immediate RPC calls (getinfo, listpeerchannels, setchannel).
     # By the end of init, workers are ready for background thread use.
-    global _rpc_pool, _msg_executor
+    global _rpc_pool, _msg_executor, _batched_log_writer
     _msg_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="hive_msg")
+
+    # Install batched log writer to prevent IO thread starvation.
+    # Must be BEFORE any background loops start logging.
+    _batched_log_writer = BatchedLogWriter(plugin)
+
     _rpc_socket_path = getattr(plugin.rpc, "socket_path", None)
     if not _rpc_socket_path:
         ldir = configuration.get("lightning-dir") or configuration.get("lightning_dir")
@@ -2331,6 +2423,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         try:
             if cashu_escrow_mgr:
                 cashu_escrow_mgr.shutdown()
+        except Exception:
+            pass  # Best-effort on shutdown
+        try:
+            if _batched_log_writer:
+                _batched_log_writer.stop()
         except Exception:
             pass  # Best-effort on shutdown
         shutdown_event.set()
