@@ -18,6 +18,8 @@ set -e
 #   WIREGUARD_ENABLED    - Enable WireGuard (default: false)
 #   WIREGUARD_CONFIG     - Path to WireGuard config (default: /etc/wireguard/wg0.conf)
 #   HIVE_GOVERNANCE_MODE - advisor, autonomous, oracle (default: advisor)
+#   HIVE_COMMS_ENABLED   - Enable optional cl-hive-comms plugin (default: false)
+#   HIVE_ARCHON_ENABLED  - Enable optional cl-hive-archon plugin (default: false; requires comms)
 #   CLBOSS_ENABLED       - Enable CLBOSS (default: true, optional - hive works without it)
 #   LOG_LEVEL            - debug, info, unusual, broken (default: info)
 # =============================================================================
@@ -87,6 +89,8 @@ LIGHTNING_PORT="${LIGHTNING_PORT:-9736}"
 NETWORK_MODE="${NETWORK_MODE:-tor}"
 WIREGUARD_ENABLED="${WIREGUARD_ENABLED:-false}"
 HIVE_GOVERNANCE_MODE="${HIVE_GOVERNANCE_MODE:-advisor}"
+HIVE_COMMS_ENABLED="${HIVE_COMMS_ENABLED:-false}"
+HIVE_ARCHON_ENABLED="${HIVE_ARCHON_ENABLED:-false}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 BOLTZ_ENABLED="${BOLTZ_ENABLED:-false}"
 export BOLTZ_ENABLED
@@ -180,9 +184,6 @@ log-file=$LIGHTNING_DIR/lightningd.log
 
 # Database with real-time replication to backup directory
 wallet=sqlite3://$LIGHTNING_DIR/lightningd.sqlite3:/backups/database/lightningd.sqlite3
-
-# Plugins directory
-plugin-dir=/root/.lightning/plugins
 
 # gRPC plugin (must use different port than Lightning P2P)
 grpc-port=9937
@@ -491,6 +492,55 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# Optional Phase 6 Plugin Wiring
+# -----------------------------------------------------------------------------
+
+echo "Configuring optional Phase 6 plugins..."
+
+if [ "$HIVE_ARCHON_ENABLED" = "true" ] && [ "$HIVE_COMMS_ENABLED" != "true" ]; then
+    echo "ERROR: HIVE_ARCHON_ENABLED=true requires HIVE_COMMS_ENABLED=true"
+    exit 1
+fi
+
+if [ "$HIVE_COMMS_ENABLED" = "true" ]; then
+    if [ ! -x /opt/cl-hive-comms/cl-hive-comms.py ]; then
+        echo "ERROR: cl-hive-comms enabled but /opt/cl-hive-comms/cl-hive-comms.py not found/executable"
+        exit 1
+    fi
+    echo "cl-hive-comms: enabled"
+else
+    echo "cl-hive-comms: disabled"
+fi
+
+if [ "$HIVE_ARCHON_ENABLED" = "true" ]; then
+    if [ ! -x /opt/cl-hive-archon/cl-hive-archon.py ]; then
+        echo "ERROR: cl-hive-archon enabled but /opt/cl-hive-archon/cl-hive-archon.py not found/executable"
+        exit 1
+    fi
+    echo "cl-hive-archon: enabled"
+else
+    echo "cl-hive-archon: disabled"
+fi
+
+cat >> "$CONFIG_FILE" << EOF
+
+# =============================================================================
+# Plugin Load Order (Phase 6 optional stack)
+# =============================================================================
+EOF
+
+# Optional plugins are loaded first if enabled.
+if [ "$HIVE_COMMS_ENABLED" = "true" ]; then
+    echo "plugin=/opt/cl-hive-comms/cl-hive-comms.py" >> "$CONFIG_FILE"
+fi
+if [ "$HIVE_ARCHON_ENABLED" = "true" ]; then
+    echo "plugin=/opt/cl-hive-archon/cl-hive-archon.py" >> "$CONFIG_FILE"
+fi
+
+# Core plugin dir is loaded after optional explicit plugins.
+echo "plugin-dir=/root/.lightning/plugins" >> "$CONFIG_FILE"
+
+# -----------------------------------------------------------------------------
 # cl-hive Configuration
 # -----------------------------------------------------------------------------
 
@@ -511,7 +561,7 @@ cat >> "$CONFIG_FILE" << EOF
 # =============================================================================
 # Vitality monitors channel health and pings Amboss for online status
 
-vitality-amboss=true
+# vitality-amboss=true  # disabled: option unavailable in current lightningd/plugin build
 
 # =============================================================================
 # cl-hive Configuration
@@ -632,6 +682,8 @@ echo "Network Mode:   $NETWORK_MODE"
 echo "WireGuard:      $WIREGUARD_ENABLED"
 echo "Boltz:          $BOLTZ_ENABLED"
 echo "Hive Mode:      $HIVE_GOVERNANCE_MODE"
+echo "Hive Comms:     $HIVE_COMMS_ENABLED"
+echo "Hive Archon:    $HIVE_ARCHON_ENABLED"
 echo "Lightning Dir:  $LIGHTNING_DIR"
 echo "Advisor DB:     $ADVISOR_DB_PATH"
 if [ -n "$ANNOUNCE_ADDR" ]; then
@@ -647,6 +699,16 @@ fi
 echo "  Sling:        installed"
 echo "  cl-hive:      installed"
 echo "  cl-revenue-ops: installed"
+if [ "$HIVE_COMMS_ENABLED" = "true" ]; then
+    echo "  cl-hive-comms: enabled"
+else
+    echo "  cl-hive-comms: disabled"
+fi
+if [ "$HIVE_ARCHON_ENABLED" = "true" ]; then
+    echo "  cl-hive-archon: enabled"
+else
+    echo "  cl-hive-archon: disabled"
+fi
 if [ "${TRUSTEDCOIN_ENABLED:-false}" = "true" ]; then
     echo "  trustedcoin:  enabled (replaces bcli)"
 fi
@@ -716,6 +778,13 @@ if [ -d /opt/cl-hive/docker/scripts ]; then
 
     cp /opt/cl-hive/docker/scripts/lightningd-wrapper.sh /usr/local/bin/ 2>/dev/null || true
     chmod +x /usr/local/bin/lightningd-wrapper.sh 2>/dev/null || true
+fi
+
+# Ensure lightning user owns data directories before starting services
+if id -u lightning >/dev/null 2>&1; then
+    chown -R lightning:lightning /data /home/lightning /backups /var/lib/tor
+else
+    echo "WARNING: 'lightning' user not found in container; skipping chown to lightning:lightning"
 fi
 
 echo "Initialization complete. Starting services..."

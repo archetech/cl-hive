@@ -223,6 +223,21 @@ RUN git clone --depth 1 --branch ${CL_REVENUE_OPS_VERSION} https://github.com/li
     && chmod +x /opt/cl-revenue-ops/cl-revenue-ops.py
 
 # =============================================================================
+# OPTIONAL PHASE 6 PLUGINS (disabled by default at runtime)
+# =============================================================================
+# These repos are baked into the image so operators can enable them via:
+#   HIVE_COMMS_ENABLED=true
+#   HIVE_ARCHON_ENABLED=true
+
+ARG CL_HIVE_COMMS_VERSION=v0.1.0
+RUN git clone --depth 1 --branch ${CL_HIVE_COMMS_VERSION} https://github.com/lightning-goats/cl-hive-comms.git /opt/cl-hive-comms \
+    && chmod +x /opt/cl-hive-comms/cl-hive-comms.py
+
+ARG CL_HIVE_ARCHON_VERSION=v0.1.0
+RUN git clone --depth 1 --branch ${CL_HIVE_ARCHON_VERSION} https://github.com/lightning-goats/cl-hive-archon.git /opt/cl-hive-archon \
+    && chmod +x /opt/cl-hive-archon/cl-hive-archon.py
+
+# =============================================================================
 # CL-HIVE PLUGIN
 # =============================================================================
 # Fallback: Copy files if not mounted from host.
@@ -246,20 +261,24 @@ COPY docker/torrc /etc/tor/torrc
 # DIRECTORY STRUCTURE
 # =============================================================================
 
-RUN mkdir -p /root/.lightning/bitcoin \
-    && mkdir -p /root/.lightning/plugins \
+# Create lightning user
+RUN useradd -m -s /bin/bash lightning
+
+RUN mkdir -p /home/lightning/.lightning/bitcoin \
+    && mkdir -p /home/lightning/.lightning/plugins \
     && mkdir -p /data/lightning \
-    && mkdir -p /data/bitcoin
+    && mkdir -p /data/bitcoin \
+    && chown -R lightning:lightning /home/lightning /data
 
 # Symlink plugins to CLN plugins directory
-RUN ln -sf /opt/cl-hive/cl-hive.py /root/.lightning/plugins/cl-hive.py \
-    && ln -sf /opt/cl-hive/modules /root/.lightning/plugins/modules \
-    && ln -sf /opt/cl-revenue-ops/cl-revenue-ops.py /root/.lightning/plugins/cl-revenue-ops.py \
-    && ln -sf /opt/cl-revenue-ops/modules /root/.lightning/plugins/revenue-modules \
-    && ln -sf /usr/local/bin/clboss /root/.lightning/plugins/clboss \
-    && ln -sf /usr/local/bin/vitality /root/.lightning/plugins/vitality \
-    && ln -sf /usr/local/bin/sling /root/.lightning/plugins/sling \
-    && ln -sf /opt/c-lightning-REST/cl-rest.js /root/.lightning/plugins/cl-rest.js
+RUN ln -sf /opt/cl-hive/cl-hive.py /home/lightning/.lightning/plugins/cl-hive.py \
+    && ln -sf /opt/cl-hive/modules /home/lightning/.lightning/plugins/modules \
+    && ln -sf /opt/cl-revenue-ops/cl-revenue-ops.py /home/lightning/.lightning/plugins/cl-revenue-ops.py \
+    && ln -sf /opt/cl-revenue-ops/modules /home/lightning/.lightning/plugins/revenue-modules \
+    && ln -sf /usr/local/bin/clboss /home/lightning/.lightning/plugins/clboss \
+    && ln -sf /usr/local/bin/vitality /home/lightning/.lightning/plugins/vitality \
+    && ln -sf /usr/local/bin/sling /home/lightning/.lightning/plugins/sling \
+    && ln -sf /opt/c-lightning-REST/cl-rest.js /home/lightning/.lightning/plugins/cl-rest.js
 
 # =============================================================================
 # CONFIGURATION FILES

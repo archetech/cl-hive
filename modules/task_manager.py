@@ -536,8 +536,15 @@ class TaskManager:
         self._log(f"Executing expand_to task: {target[:16]}... for {amount_sats} sats")
 
         try:
-            # Attempt to open the channel
-            result = rpc.fundchannel(target, amount_sats, announce=True)
+            # Attempt to open the channel (dual-funded first, single-funded fallback)
+            from modules.rpc_commands import _open_channel
+            result = _open_channel(
+                rpc=rpc,
+                target=target,
+                amount_sats=amount_sats,
+                announce=True,
+                log_fn=lambda msg, lvl="info": self._log(msg, level=lvl),
+            )
 
             # Success!
             txid = result.get('txid', '')

@@ -414,6 +414,8 @@ class ProactiveAdvisor:
                 payments = settlement_result.get("payments_executed", 0)
                 total = settlement_result.get("total_distributed_sats", 0)
                 logger.info(f"    Payments: {payments}, Total distributed: {total:,} sats")
+            elif settlement_result.get("queued_for_approval"):
+                logger.info(f"  → Settlement queued for approval: {result.settlement_period}")
             elif settlement_result.get("skipped"):
                 logger.info(f"  Settlement skipped: {settlement_result.get('reason', 'already settled')}")
             else:
@@ -559,48 +561,44 @@ class ProactiveAdvisor:
                     "period": previous_period
                 }
 
-            # Step 2: Execute settlement (for real)
-            logger.info("  Step 2: Executing settlement payments...")
+            # Step 2: Queue settlement for approval (never auto-execute payments)
+            logger.info("  Step 2: Queuing settlement for approval...")
             try:
-                exec_result = await self.mcp.call(
-                    "settlement_execute",
-                    {"node": node_name, "dry_run": False}
+                await self.mcp.call(
+                    "advisor_record_decision",
+                    {
+                        "decision_type": "settlement_execute",
+                        "node": node_name,
+                        "recommendation": f"Execute settlement for period {previous_period}: {total_fees:,} sats across {len(members)} members",
+                        "reasoning": "Weekly settlement ready. Fair shares calculated. Requires human/AI approval before BOLT12 payments are sent.",
+                        "confidence": 0.95,
+                        "predicted_benefit": total_fees,
+                        "snapshot_metrics": json.dumps({
+                            "period": previous_period,
+                            "total_fees_sats": total_fees,
+                            "member_count": len(members),
+                            "members": members,
+                        }),
+                    }
                 )
 
-                if "error" in exec_result:
-                    return {
-                        "executed": False,
-                        "reason": f"Execution failed: {exec_result.get('error')}",
-                        "period": previous_period,
-                        "calculation": calc_result
-                    }
-
-                payments = exec_result.get("payments", [])
-                successful = [p for p in payments if p.get("status") == "success"]
-                failed = [p for p in payments if p.get("status") != "success"]
-                total_distributed = sum(p.get("amount_sats", 0) for p in successful)
-
-                logger.info(f"    Payments: {len(successful)} successful, {len(failed)} failed")
-                logger.info(f"    Total distributed: {total_distributed:,} sats")
-
                 return {
-                    "executed": True,
+                    "executed": False,
+                    "queued_for_approval": True,
                     "period": previous_period,
                     "current_period": current_period,
-                    "payments_executed": len(successful),
-                    "payments_failed": len(failed),
-                    "total_distributed_sats": total_distributed,
+                    "total_fees_sats": total_fees,
+                    "member_count": len(members),
                     "calculation": calc_result,
-                    "execution": exec_result
                 }
 
             except Exception as e:
-                logger.error(f"  Settlement execution failed: {e}")
+                logger.error(f"  Failed to queue settlement: {e}")
                 return {
                     "executed": False,
-                    "reason": f"Execution error: {str(e)}",
+                    "reason": f"Queue error: {str(e)}",
                     "period": previous_period,
-                    "calculation": calc_result
+                    "calculation": calc_result,
                 }
 
         except Exception as e:

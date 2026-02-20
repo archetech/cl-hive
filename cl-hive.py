@@ -114,7 +114,9 @@ from modules.outbox import OutboxManager
 from modules.did_credentials import DIDCredentialManager
 from modules.management_schemas import ManagementSchemaRegistry
 from modules.cashu_escrow import CashuEscrowManager
-from modules.nostr_transport import NostrTransport
+from modules.nostr_transport import InternalNostrTransport, ExternalCommsTransport, TransportInterface
+from modules.identity_adapter import IdentityInterface, LocalIdentity, RemoteArchonIdentity
+from modules.phase6_ingest import parse_injected_hive_packet
 from modules.marketplace import MarketplaceManager
 from modules.liquidity_marketplace import LiquidityMarketplaceManager
 from modules import network_metrics
@@ -555,13 +557,44 @@ class RpcPoolProxy:
         self._pool = pool
         self._timeout = timeout
 
+    def _maybe_sign_via_identity(self, message: Any) -> Optional[Dict[str, Any]]:
+        """
+        Route signmessage through RemoteArchonIdentity when coordinated identity is active.
+        """
+        global identity_adapter
+        if not isinstance(identity_adapter, RemoteArchonIdentity):
+            return None
+        if not isinstance(message, str):
+            return None
+        sig = identity_adapter.sign_message(message)
+        return {"zbase": sig, "signature": sig}
+
     def call(self, method: str, payload: Any = None) -> Any:
+        if method == "signmessage":
+            msg = payload.get("message") if isinstance(payload, dict) else payload
+            delegated = self._maybe_sign_via_identity(msg)
+            if delegated is not None:
+                return delegated
         return self._pool.request(method=method, payload=payload,
                                   timeout=self._timeout)
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
+
+        if name == "signmessage":
+            def _sign_proxy(*args, **kwargs):
+                message = args[0] if args else kwargs.get("message")
+                delegated = self._maybe_sign_via_identity(message)
+                if delegated is not None:
+                    return delegated
+                return self._pool.request(
+                    method=name,
+                    args=list(args) if args else None,
+                    kwargs=kwargs if kwargs else None,
+                    timeout=self._timeout,
+                )
+            return _sign_proxy
 
         def _method_proxy(*args, **kwargs):
             return self._pool.request(
@@ -623,11 +656,17 @@ outbox_mgr: Optional[OutboxManager] = None
 did_credential_mgr: Optional[DIDCredentialManager] = None
 management_schema_registry: Optional[ManagementSchemaRegistry] = None
 cashu_escrow_mgr: Optional[CashuEscrowManager] = None
-nostr_transport: Optional[NostrTransport] = None
+nostr_transport: Optional[TransportInterface] = None
+identity_adapter: Optional[IdentityInterface] = None
 marketplace_mgr: Optional[MarketplaceManager] = None
 liquidity_mgr: Optional[LiquidityMarketplaceManager] = None
 policy_engine: Optional[Any] = None
 our_pubkey: Optional[str] = None
+phase6_optional_plugins: Dict[str, Any] = {
+    "cl_hive_comms": {"installed": False, "active": False, "name": ""},
+    "cl_hive_archon": {"installed": False, "active": False, "name": ""},
+    "warnings": [],
+}
 
 # Startup timestamp for lightweight health endpoint (Phase 4)
 _start_time: float = time.time()
@@ -1283,6 +1322,59 @@ def _parse_setconfig_value(value: Any, target_type: type) -> Any:
         return str(value)
 
 
+def _detect_phase6_optional_plugins(plugin_obj: Plugin) -> Dict[str, Any]:
+    """
+    Detect optional Phase 6 sibling plugins.
+
+    This is advisory-only. cl-hive stays fully functional when siblings are
+    absent. The result is cached in the global phase6_optional_plugins map.
+    """
+    result: Dict[str, Any] = {
+        "cl_hive_comms": {"installed": False, "active": False, "name": ""},
+        "cl_hive_archon": {"installed": False, "active": False, "name": ""},
+        "warnings": [],
+    }
+
+    try:
+        try:
+            plugins_resp = plugin_obj.rpc.plugin("list")
+        except Exception:
+            plugins_resp = plugin_obj.rpc.listplugins()
+
+        for entry in plugins_resp.get("plugins", []):
+            raw_name = (
+                entry.get("name")
+                or entry.get("path")
+                or entry.get("plugin")
+                or ""
+            )
+            normalized = os.path.basename(str(raw_name)).lower()
+            is_active = bool(entry.get("active", False))
+
+            if "cl-hive-comms" in normalized:
+                result["cl_hive_comms"] = {
+                    "installed": True,
+                    "active": is_active,
+                    "name": raw_name,
+                }
+            elif "cl-hive-archon" in normalized:
+                result["cl_hive_archon"] = {
+                    "installed": True,
+                    "active": is_active,
+                    "name": raw_name,
+                }
+
+        if result["cl_hive_archon"]["active"] and not result["cl_hive_comms"]["active"]:
+            result["warnings"].append(
+                "cl-hive-archon is active while cl-hive-comms is inactive; "
+                "this is not a supported Phase 6 stack."
+            )
+    except Exception as e:
+        result["warnings"].append(f"optional plugin detection failed: {e}")
+
+    return result
+
+
 def _reload_config_from_cln(plugin_obj: Plugin) -> Dict[str, Any]:
     """
     Reload all hive config options from CLN's current values.
@@ -1347,6 +1439,89 @@ def _reload_config_from_cln(plugin_obj: Plugin) -> Dict[str, Any]:
 
 
 # =============================================================================
+# EXTERNAL TRANSPORT PUMP (Coordinated Mode)
+# =============================================================================
+
+
+def _submit_hive_message(peer_id: str, msg_type: HiveMessageType, msg_payload: Dict[str, Any], plugin_obj: Plugin) -> bool:
+    """Apply common policy checks and dispatch a validated Hive message."""
+    if not peer_id or msg_type is None or not isinstance(msg_payload, dict):
+        return False
+
+    # VPN Transport Policy Check
+    if vpn_transport and vpn_transport.is_enabled():
+        accept, reason = vpn_transport.should_accept_hive_message(
+            peer_id=peer_id,
+            message_type=msg_type.name if msg_type else "",
+        )
+        if not accept:
+            plugin_obj.log(
+                f"cl-hive: VPN policy rejected {msg_type.name} from {peer_id[:16]}...: {reason}",
+                level='info'
+            )
+            return False
+
+    # Update last_seen for any valid Hive message from a member (Issue #59)
+    if database:
+        member = database.get_member(peer_id)
+        if member:
+            database.update_member(peer_id, last_seen=int(time.time()))
+
+    # Dispatch to a background thread so ingress paths return immediately.
+    if _msg_executor is not None:
+        _msg_executor.submit(_dispatch_hive_message, peer_id, msg_type, msg_payload, plugin_obj)
+    else:
+        threading.Thread(
+            target=_dispatch_hive_message,
+            args=(peer_id, msg_type, msg_payload, plugin_obj),
+            daemon=True,
+        ).start()
+    return True
+
+
+def _handle_external_transport_dm(envelope: Dict[str, Any]) -> None:
+    """Decode injected payloads from comms and feed existing Hive dispatch path."""
+    try:
+        if not isinstance(envelope, dict):
+            return
+
+        packet = envelope.get("payload")
+        if not isinstance(packet, dict):
+            plaintext = envelope.get("plaintext")
+            if isinstance(plaintext, str) and plaintext:
+                packet = {"raw_plaintext": plaintext}
+            else:
+                return
+
+        if "sender" not in packet and envelope.get("pubkey"):
+            packet = dict(packet)
+            packet["sender"] = envelope.get("pubkey")
+
+        peer_id, msg_type, msg_payload = parse_injected_hive_packet(packet)
+        if msg_type is None or not isinstance(msg_payload, dict):
+            plugin.log("cl-hive: dropped injected packet (unrecognized format)", level="debug")
+            return
+        if not peer_id:
+            plugin.log("cl-hive: dropped injected packet (missing sender)", level="debug")
+            return
+
+        _submit_hive_message(peer_id, msg_type, msg_payload, plugin)
+    except Exception as exc:
+        plugin.log(f"cl-hive: external transport DM handling error: {exc}", level="warn")
+
+
+def _external_transport_pump():
+    """Drain injected packets from ExternalCommsTransport and dispatch to DM callbacks."""
+    while not shutdown_event.is_set():
+        try:
+            if nostr_transport and isinstance(nostr_transport, ExternalCommsTransport):
+                nostr_transport.process_inbound()
+        except Exception as exc:
+            plugin.log(f"cl-hive: external transport pump error: {exc}", level="warn")
+        shutdown_event.wait(0.1)
+
+
+# =============================================================================
 # INITIALIZATION
 # =============================================================================
 
@@ -1365,7 +1540,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     Note: pyln-client is inherently thread-safe (opens new socket per RPC call),
     so no RPC locking is needed. The global 'plugin' object is used directly.
     """
-    global database, config, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge, vpn_transport, relay_mgr
+    global database, config, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge, vpn_transport, relay_mgr, phase6_optional_plugins
 
     plugin.log("cl-hive: Initializing Swarm Intelligence layer...")
     
@@ -1452,6 +1627,18 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize intent manager (Phase 3)
     # Get our pubkey for tie-breaker logic
     our_pubkey = plugin.rpc.getinfo().get('id', '')
+
+    # Detect optional Phase 6 sibling plugins (advisory only)
+    phase6_optional_plugins = _detect_phase6_optional_plugins(plugin)
+    comms = phase6_optional_plugins["cl_hive_comms"]
+    archon = phase6_optional_plugins["cl_hive_archon"]
+    plugin.log(
+        "cl-hive: Optional siblings - "
+        f"cl-hive-comms(active={comms['active']}, installed={comms['installed']}), "
+        f"cl-hive-archon(active={archon['active']}, installed={archon['installed']})"
+    )
+    for warning in phase6_optional_plugins.get("warnings", []):
+        plugin.log(f"cl-hive: {warning}", level="warn")
 
     # Sync gossip version from persisted state to avoid version reset on restart
     gossip_mgr.sync_version_from_state_manager(our_pubkey)
@@ -1986,21 +2173,54 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     escrow_maintenance_thread.start()
     plugin.log("cl-hive: Escrow maintenance thread started")
 
-    # Phase 5A: Nostr transport foundation (thread + bounded queues)
+    # Phase 5A/6: Nostr transport — Coordinated Mode (comms) or Monolith Mode (internal)
     global nostr_transport
     try:
-        relays_opt = plugin.get_option('hive-nostr-relays')
-        relays = [r.strip() for r in relays_opt.split(',') if r.strip()] if relays_opt else None
-        nostr_transport = NostrTransport(
-            plugin=plugin,
-            database=database,
-            relays=relays,
-        )
-        nostr_transport.start()
-        plugin.log("cl-hive: Nostr transport initialized")
+        comms_active = phase6_optional_plugins["cl_hive_comms"]["active"]
+
+        if comms_active:
+            # Coordinated Mode: delegate transport to cl-hive-comms
+            nostr_transport = ExternalCommsTransport(plugin=plugin)
+            nostr_transport.receive_dm(_handle_external_transport_dm)
+            identity = nostr_transport.get_identity()
+            plugin.log(
+                f"cl-hive: Using External Transport (cl-hive-comms), "
+                f"pubkey={identity.get('pubkey', '')[:16]}..."
+            )
+            # Start inbound pump thread to drain injected packets
+            threading.Thread(
+                target=_external_transport_pump,
+                daemon=True,
+                name="cl-hive-ext-pump",
+            ).start()
+        else:
+            # Monolith Mode: run internal transport (current behavior)
+            relays_opt = plugin.get_option('hive-nostr-relays')
+            relays = [r.strip() for r in relays_opt.split(',') if r.strip()] if relays_opt else None
+            nostr_transport = InternalNostrTransport(
+                plugin=plugin,
+                database=database,
+                relays=relays,
+            )
+            nostr_transport.start()
+            plugin.log("cl-hive: Nostr transport initialized (Monolith Mode)")
     except Exception as e:
         nostr_transport = None
         plugin.log(f"cl-hive: Nostr transport disabled (init error): {e}", level='warn')
+
+    # Phase 6: Identity adapter — delegate signing to archon when present
+    global identity_adapter
+    try:
+        archon_active = phase6_optional_plugins["cl_hive_archon"]["active"]
+        if archon_active:
+            identity_adapter = RemoteArchonIdentity(plugin=plugin)
+            plugin.log("cl-hive: Using Remote Identity (cl-hive-archon)")
+        else:
+            identity_adapter = LocalIdentity(rpc=plugin.rpc)
+            plugin.log("cl-hive: Using Local Identity (CLN HSM)")
+    except Exception as e:
+        identity_adapter = LocalIdentity(rpc=plugin.rpc)
+        plugin.log(f"cl-hive: Identity adapter fallback to local: {e}", level='warn')
 
     # Phase 5B: Advisor marketplace manager
     global marketplace_mgr
@@ -2246,38 +2466,7 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
             plugin.log(f"cl-hive: Malformed message from {peer_id[:16]}...", level='warn')
         return {"result": "continue"}
 
-    # VPN Transport Policy Check
-    if vpn_transport and vpn_transport.is_enabled():
-        accept, reason = vpn_transport.should_accept_hive_message(
-            peer_id=peer_id,
-            message_type=msg_type.name if msg_type else ""
-        )
-        if not accept:
-            plugin.log(
-                f"cl-hive: VPN policy rejected {msg_type.name} from {peer_id[:16]}...: {reason}",
-                level='info'
-            )
-            return {"result": "continue"}
-
-    # Update last_seen for any valid Hive message from a member (Issue #59)
-    if database:
-        member = database.get_member(peer_id)
-        if member:
-            database.update_member(peer_id, last_seen=int(time.time()))
-
-    # Dispatch to a background thread so the hook returns immediately.
-    # Handlers make RPC calls (checkmessage, sendcustommsg, etc.) that may be slow.
-    # Running them on the I/O thread blocks CLN's event loop. pyln-client is
-    # thread-safe (opens new socket per call), so concurrent RPC is safe.
-    # Uses bounded ThreadPoolExecutor to prevent unbounded thread creation under load.
-    if _msg_executor is not None:
-        _msg_executor.submit(_dispatch_hive_message, peer_id, msg_type, msg_payload, plugin)
-    else:
-        threading.Thread(
-            target=_dispatch_hive_message,
-            args=(peer_id, msg_type, msg_payload, plugin),
-            daemon=True,
-        ).start()
+    _submit_hive_message(peer_id, msg_type, msg_payload, plugin)
     return {"result": "continue"}
 
 
@@ -13047,6 +13236,27 @@ def hive_plugin_list(plugin: Plugin):
         return rpc.listplugins()
 
 
+@plugin.method("hive-phase6-plugins")
+def hive_phase6_plugins(plugin: Plugin):
+    """Detect optional Phase 6 sibling plugin status."""
+    global phase6_optional_plugins
+    phase6_optional_plugins = _detect_phase6_optional_plugins(plugin)
+    return phase6_optional_plugins
+
+
+@plugin.method("hive-inject-packet")
+def hive_inject_packet(plugin: Plugin, payload=None, source="nostr", **kwargs):
+    """Inject an inbound packet from cl-hive-comms (Coordinated Mode only)."""
+    comms_active = bool(phase6_optional_plugins.get("cl_hive_comms", {}).get("active"))
+    if not comms_active or not isinstance(nostr_transport, ExternalCommsTransport):
+        return {"error": "inject-packet only available in coordinated mode"}
+    if not isinstance(payload, dict):
+        return {"error": "payload must be a dict"}
+    if not nostr_transport.inject_packet(payload):
+        return {"error": "queue full, packet dropped"}
+    return {"result": "queued", "source": source}
+
+
 @plugin.method("hive-connect")
 def hive_connect(plugin: Plugin, peer_id: str):
     """Connect to a peer via plugin (native RPC)."""
@@ -13072,7 +13282,15 @@ def hive_open_channel(plugin: Plugin, peer_id: str, amount_sats: int, feerate: s
         rpc.connect(peer_id)
     except Exception:
         pass
-    return rpc.fundchannel(peer_id, amount_sats, feerate=feerate, announce=announce)
+    from modules.rpc_commands import _open_channel
+    return _open_channel(
+        rpc=rpc,
+        target=peer_id,
+        amount_sats=amount_sats,
+        feerate=feerate,
+        announce=announce,
+        log_fn=lambda msg, lvl="info": plugin.log(msg, level=lvl),
+    )
 
 
 @plugin.method("hive-close-channel")

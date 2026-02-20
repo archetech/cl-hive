@@ -171,6 +171,21 @@ claude -p "Use hive_status to check the fleet"
 | `hive_topology_analysis` | Get planner log and topology view |
 | `hive_governance_mode` | Get or set governance mode (advisor/autonomous) |
 
+### Optional Archon Tools (`cl-hive-archon`)
+
+| Tool | Description |
+|------|-------------|
+| `hive_archon_status` | Get local Archon identity/governance status |
+| `hive_archon_provision` | Provision or re-provision local DID identity |
+| `hive_archon_bind_nostr` | Bind a Nostr pubkey to DID identity |
+| `hive_archon_bind_cln` | Bind CLN node pubkey to DID identity |
+| `hive_archon_upgrade` | Upgrade identity tier (for governance workflows) |
+| `hive_poll_create` | Create a governance poll |
+| `hive_poll_status` | Get poll status and tally |
+| `hive_poll_vote` | Cast vote on a poll |
+| `hive_my_votes` | List recent local votes |
+| `hive_archon_prune` | Prune old Archon records by retention window |
+
 ### cl-revenue-ops Tools
 
 | Tool | Description |

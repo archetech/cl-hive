@@ -111,9 +111,11 @@ Follow the Every Run Workflow phases defined above exactly:
 **Phase 4**: On BOTH nodes:
   - critical_velocity → identify urgent channels
   - stagnant_channels, remediate_stagnant(dry_run=true) → analyze stagnation
+  - Run explicit MAB exploration on stagnant channels: prioritize untested fee levels {25,50,100,200,500} and set at least 3 exploration anchors per node per cycle when candidates exist
+  - Protect profitable channels: preserve winning anchors/fees, do NOT decrease profitable channel fees by >10% in one cycle unless model confidence >=0.7 and trend confirms upside
   - Review and SET fee anchors for channels needing fee guidance
   - rebalance_recommendations → identify rebalance needs
-  - For needed rebalances: fleet_rebalance_path (check hive route), execute_hive_circular_rebalance (prefer zero-fee), revenue_rebalance (fallback)
+  - For needed rebalances: fleet_rebalance_path (check hive route), execute_hive_circular_rebalance (prefer zero-fee), revenue_rebalance (fallback ONLY when expected incremental fee capture clears routing cost by the 3x safety margin)
   - advisor_scan_opportunities → find additional opportunities
   - advisor_get_trends → revenue/capacity trends
   - advisor_record_decision for EVERY action taken (fee anchors, rebalances, config changes)
@@ -136,7 +138,7 @@ PROMPTEOF
 CLAUDE_EXIT=0
 claude -p \
     --mcp-config "$MCP_CONFIG_TMP" \
-    --model sonnet \
+    --model openai-codex/gpt-5.3-codex \
     --allowedTools "mcp__hive__*" \
     --output-format text \
     < "$ADVISOR_PROMPT_FILE" \

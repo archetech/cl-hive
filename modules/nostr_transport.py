@@ -1,26 +1,23 @@
 """
-Nostr transport foundation for Phase 5A.
+Nostr transport abstraction for Phase 6.
 
-This module provides:
-- Local Nostr identity management with encrypted-at-rest private key storage.
-- Dedicated daemon thread for outbound publish processing.
-- Thread-safe inbound and outbound queues.
-- Subscription and DM callback plumbing for higher-level marketplace layers.
-
-Note: This is intentionally a foundational transport layer. Full relay I/O and
-production-grade NIP-44 cryptography can be incrementally added on top of this
-interface without changing call sites.
+Supports two modes:
+1. InternalNostrTransport: Monolithic mode (runs its own thread/connection)
+2. ExternalCommsTransport: Coordinated mode (delegates to cl-hive-comms via RPC)
 """
 
 import base64
 import hashlib
 import json
 import queue
+import re
 import secrets
 import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional
+
+from modules.bridge import CircuitBreaker, CircuitState
 
 try:
     from coincurve import PrivateKey as CoincurvePrivateKey
@@ -31,18 +28,183 @@ except Exception:  # pragma: no cover - optional dependency
 NOSTR_KEY_DERIVATION_MSG = "nostr_key_derivation"
 
 
-class NostrTransport:
-    """Threaded Nostr transport manager with queue-based publish/receive."""
+class TransportInterface:
+    """Abstract base class for Nostr transport."""
+    
+    def get_identity(self) -> Dict[str, str]:
+        raise NotImplementedError
+
+    def start(self) -> bool:
+        raise NotImplementedError
+
+    def stop(self, timeout: float = 5.0) -> None:
+        raise NotImplementedError
+
+    def publish(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def send_dm(self, recipient_pubkey: str, plaintext: str) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def receive_dm(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        raise NotImplementedError
+
+    def subscribe(self, filters: Dict[str, Any], callback: Callable[[Dict[str, Any]], None]) -> str:
+        raise NotImplementedError
+
+    def unsubscribe(self, sub_id: str) -> bool:
+        raise NotImplementedError
+
+    def process_inbound(self, max_events: int = 100) -> int:
+        raise NotImplementedError
+
+    def get_status(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
+
+class ExternalCommsTransport(TransportInterface):
+    """Delegates transport to cl-hive-comms plugin via RPC with CircuitBreaker."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._identity_cache = {}
+        self._dm_callbacks: List[Callable[[Dict[str, Any]], None]] = []
+        self._lock = threading.Lock()
+        # Inbound queue for messages injected via hive-inject-packet
+        self._inbound_queue: queue.Queue = queue.Queue(maxsize=2000)
+        # Circuit breaker for comms RPC calls
+        self._circuit = CircuitBreaker(name="external-comms", max_failures=3, reset_timeout=60)
+
+    def get_identity(self) -> Dict[str, str]:
+        if not self._identity_cache:
+            if not self._circuit.is_available():
+                self.plugin.log("cl-hive: comms circuit open, using cached/empty identity", level="warn")
+                return {"pubkey": "", "privkey": ""}
+            try:
+                res = self.plugin.rpc.call("hive-client-identity", {"action": "get"})
+                if not isinstance(res, dict):
+                    self._circuit.record_failure()
+                    self.plugin.log("cl-hive: comms identity returned non-dict", level="warn")
+                    return {"pubkey": "", "privkey": ""}
+                pubkey = str(res.get("pubkey") or "")
+                if pubkey and not re.fullmatch(r"[0-9a-f]{64}", pubkey):
+                    self._circuit.record_failure()
+                    self.plugin.log(f"cl-hive: comms returned invalid pubkey format", level="warn")
+                    return {"pubkey": "", "privkey": ""}
+                self._circuit.record_success()
+                self._identity_cache = {
+                    "pubkey": pubkey,
+                    "privkey": "",  # Remote mode doesn't expose privkey
+                }
+            except Exception as e:
+                self._circuit.record_failure()
+                self.plugin.log(f"cl-hive: failed to get identity from comms: {e}", level="warn")
+                return {"pubkey": "", "privkey": ""}
+        return self._identity_cache
+
+    def start(self) -> bool:
+        return True  # Remote is already running
+
+    def stop(self, timeout: float = 5.0) -> None:
+        pass
+
+    def publish(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        if not self._circuit.is_available():
+            self.plugin.log("cl-hive: comms circuit open, dropping publish", level="warn")
+            return {}
+        try:
+            result = self.plugin.rpc.call("hive-comms-publish-event", {"event_json": json.dumps(event)})
+            self._circuit.record_success()
+            return result
+        except Exception as e:
+            self._circuit.record_failure()
+            self.plugin.log(f"cl-hive: remote publish failed: {e}", level="error")
+            return {}
+
+    def send_dm(self, recipient_pubkey: str, plaintext: str) -> Dict[str, Any]:
+        if not recipient_pubkey:
+            self.plugin.log("cl-hive: send_dm called with empty recipient_pubkey", level="warn")
+            return {}
+        if not self._circuit.is_available():
+            self.plugin.log("cl-hive: comms circuit open, dropping send_dm", level="warn")
+            return {}
+        try:
+            result = self.plugin.rpc.call("hive-comms-send-dm", {
+                "recipient": recipient_pubkey,
+                "message": plaintext
+            })
+            self._circuit.record_success()
+            return result
+        except Exception as e:
+            self._circuit.record_failure()
+            self.plugin.log(f"cl-hive: remote send_dm failed: {e}", level="error")
+            return {}
+
+    def receive_dm(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        with self._lock:
+            self._dm_callbacks.append(callback)
+
+    def subscribe(self, filters: Dict[str, Any], callback: Callable[[Dict[str, Any]], None]) -> str:
+        return "remote-sub-placeholder"
+
+    def unsubscribe(self, sub_id: str) -> bool:
+        return True
+
+    def inject_packet(self, payload: Dict[str, Any]) -> bool:
+        """Called by hive-inject-packet RPC. Returns True if queued, False if dropped."""
+        if not isinstance(payload, dict):
+            self.plugin.log("cl-hive: inject_packet called with non-dict payload", level="warn")
+            return False
+        try:
+            self._inbound_queue.put_nowait(payload)
+            return True
+        except queue.Full:
+            self.plugin.log("cl-hive: external transport inbound queue full, dropping packet", level="warn")
+            return False
+
+    def process_inbound(self, max_events: int = 100) -> int:
+        """Process queue populated by hive-inject-packet."""
+        processed = 0
+        while processed < max_events:
+            try:
+                payload = self._inbound_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            processed += 1
+            # Re-serialize payload to plaintext for compatibility with handlers
+            # that expect to parse JSON from the plaintext field
+            envelope = {
+                "plaintext": json.dumps(payload),
+                "pubkey": payload.get("sender") or "",
+                "payload": payload,
+            }
+
+            with self._lock:
+                dm_callbacks = list(self._dm_callbacks)
+            for cb in dm_callbacks:
+                try:
+                    cb(envelope)
+                except Exception as exc:
+                    self.plugin.log(f"cl-hive: DM callback error: {exc}", level="warn")
+        return processed
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "mode": "external",
+            "plugin": "cl-hive-comms",
+            "circuit_state": self._circuit.state.value,
+        }
+
+
+class InternalNostrTransport(TransportInterface):
+    """Threaded Nostr transport manager with queue-based publish/receive. (Legacy Mode)"""
 
     DEFAULT_RELAYS = [
         "wss://nos.lol",
         "wss://relay.damus.io",
     ]
-    SEARCH_RELAYS = ["wss://relay.nostr.band"]
-    PROFILE_RELAYS = ["wss://purplepag.es"]
-
     MAX_RELAY_CONNECTIONS = 8
-    RECONNECT_BACKOFF_MAX = 300
     QUEUE_MAX_ITEMS = 2000
 
     def __init__(self, plugin, database, privkey_hex: Optional[str] = None,
@@ -115,7 +277,6 @@ class NostrTransport:
             raw = bytes(b ^ key[i % len(key)] for i, b in enumerate(encrypted))
             return raw.decode("utf-8")
         except Exception:
-            # Backward-compatible: tolerate older plaintext entries.
             return value
 
     def _load_or_create_identity(self, explicit_privkey_hex: Optional[str]) -> None:
@@ -144,21 +305,18 @@ class NostrTransport:
             if CoincurvePrivateKey:
                 priv = CoincurvePrivateKey(secret)
                 uncompressed = priv.public_key.format(compressed=False)
-                # Nostr pubkey is x-only (32 bytes).
                 return uncompressed[1:33].hex()
             return hashlib.sha256(secret).hexdigest()
         except Exception:
             return hashlib.sha256(privkey_hex.encode("utf-8")).hexdigest()
 
     def get_identity(self) -> Dict[str, str]:
-        """Return local Nostr identity (pubkey always, privkey for local callers)."""
         return {
             "pubkey": self._pubkey_hex,
             "privkey": self._privkey_hex,
         }
 
     def start(self) -> bool:
-        """Start the transport daemon thread."""
         if self._thread and self._thread.is_alive():
             return False
         self._stop_event.clear()
@@ -171,7 +329,6 @@ class NostrTransport:
         return True
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Stop the transport daemon thread."""
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
@@ -208,7 +365,6 @@ class NostrTransport:
                 relay["connected"] = False
 
     def _compute_event_id(self, event: Dict[str, Any]) -> str:
-        """Compute deterministic Nostr event id."""
         serial = [
             0,
             event.get("pubkey", ""),
@@ -221,7 +377,6 @@ class NostrTransport:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _sign_event(self, event: Dict[str, Any]) -> str:
-        """Sign event id (best effort with optional schnorr, fallback hash-sign)."""
         event_id = str(event.get("id", ""))
         if len(event_id) == 64 and CoincurvePrivateKey:
             try:
@@ -234,7 +389,6 @@ class NostrTransport:
         return hashlib.sha256((event_id + self._privkey_hex).encode("utf-8")).hexdigest()
 
     def publish(self, event: Dict[str, Any]) -> Dict[str, Any]:
-        """Queue an event for publish and return the signed canonical form."""
         if not isinstance(event, dict):
             raise ValueError("event must be a dict")
 
@@ -257,12 +411,10 @@ class NostrTransport:
         return canonical
 
     def _encode_dm(self, plaintext: str) -> str:
-        """DM encoding placeholder for transport compatibility."""
         encoded = base64.b64encode(plaintext.encode("utf-8")).decode("ascii")
         return f"b64:{encoded}"
 
     def _decode_dm(self, content: str) -> str:
-        """Decode placeholder DM envelope."""
         if not isinstance(content, str):
             return ""
         if not content.startswith("b64:"):
@@ -273,7 +425,6 @@ class NostrTransport:
             return ""
 
     def send_dm(self, recipient_pubkey: str, plaintext: str) -> Dict[str, Any]:
-        """Create and queue a DM event."""
         if not recipient_pubkey:
             raise ValueError("recipient_pubkey is required")
         event = {
@@ -284,13 +435,11 @@ class NostrTransport:
         return self.publish(event)
 
     def receive_dm(self, callback: Callable[[Dict[str, Any]], None]) -> None:
-        """Register callback for incoming DMs."""
         with self._lock:
             self._dm_callbacks.append(callback)
 
     def subscribe(self, filters: Dict[str, Any],
                   callback: Callable[[Dict[str, Any]], None]) -> str:
-        """Register an event subscription callback and return subscription id."""
         sub_id = str(uuid.uuid4())
         with self._lock:
             self._subscriptions[sub_id] = {
@@ -300,19 +449,16 @@ class NostrTransport:
         return sub_id
 
     def unsubscribe(self, sub_id: str) -> bool:
-        """Remove subscription callback."""
         with self._lock:
             return self._subscriptions.pop(sub_id, None) is not None
 
     def inject_event(self, event: Dict[str, Any]) -> None:
-        """Inject an inbound event (used by transport adapters and tests)."""
         try:
             self._inbound_queue.put_nowait(event)
         except queue.Full:
             self._log("inbound queue full, dropping event", level="warn")
 
     def _matches_filters(self, event: Dict[str, Any], filters: Dict[str, Any]) -> bool:
-        """Match a Nostr event against basic filter keys."""
         if not filters:
             return True
 
@@ -341,11 +487,6 @@ class NostrTransport:
         return True
 
     def process_inbound(self, max_events: int = 100) -> int:
-        """
-        Drain inbound queue and dispatch callbacks.
-
-        Returns number of processed events.
-        """
         processed = 0
         while processed < max_events:
             try:
@@ -356,7 +497,6 @@ class NostrTransport:
             processed += 1
             event_kind = int(event.get("kind", 0))
 
-            # DM callbacks (kind 4)
             if event_kind == 4:
                 envelope = dict(event)
                 envelope["plaintext"] = self._decode_dm(str(event.get("content", "")))
@@ -380,13 +520,13 @@ class NostrTransport:
         return processed
 
     def get_status(self) -> Dict[str, Any]:
-        """Return transport status and queue stats."""
         with self._lock:
             relays = {k: dict(v) for k, v in self._relay_status.items()}
             sub_count = len(self._subscriptions)
             dm_cb_count = len(self._dm_callbacks)
 
         return {
+            "mode": "internal",
             "running": bool(self._thread and self._thread.is_alive()),
             "pubkey": self._pubkey_hex,
             "relay_count": len(self.relays),
@@ -396,3 +536,6 @@ class NostrTransport:
             "subscription_count": sub_count,
             "dm_callback_count": dm_cb_count,
         }
+
+# Alias for backward compatibility if needed, though we will use specific classes
+NostrTransport = InternalNostrTransport

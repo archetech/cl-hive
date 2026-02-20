@@ -2,9 +2,12 @@
 
 Production-ready Docker image for cl-hive Lightning nodes with Tor, WireGuard, and full plugin stack.
 
-Phase 6 planning note:
-- Future split-plugin support (`cl-hive-comms`, `cl-hive-archon`) is documented in the [hive-docs](https://github.com/lightning-goats/hive-docs) repo.
-- This is planning-only and is not enabled in current production images.
+Phase 6 optional plugin support:
+- Image now includes optional `cl-hive-comms` and `cl-hive-archon` binaries.
+- Both remain disabled by default to preserve current production behavior.
+- Enable with environment flags:
+  - `HIVE_COMMS_ENABLED=true`
+  - `HIVE_ARCHON_ENABLED=true` (requires comms enabled)
 
 ## Features
 
@@ -21,6 +24,10 @@ Phase 6 planning note:
 - **c-lightning-REST** - REST API for RTL web interface
 - **cl-revenue-ops** - Fee optimization and profitability tracking
 - **cl-hive** - Fleet coordination and swarm intelligence
+
+### Optional Plugins (Pre-installed, Disabled by Default)
+- **cl-hive-comms** - Optional Phase 6 comms/policy transport layer
+- **cl-hive-archon** - Optional Phase 6 Archon identity/governance layer
 
 ### Production Features
 
@@ -286,6 +293,37 @@ docker-compose exec cln lightning-cli hive-status
 # Check revenue operations
 docker-compose exec cln lightning-cli revenue-status
 ```
+
+### Manual Local Install: `cl-hive-archon`
+
+For a running local container, install from your local checkout in `~/bin/cl-hive-archon`:
+
+```bash
+# From cl-hive/docker
+./scripts/manual-install-archon.sh
+```
+
+Custom source path:
+
+```bash
+./scripts/manual-install-archon.sh --source ~/bin/cl-hive-archon
+```
+
+Install dependencies from `requirements.txt` inside container (optional):
+
+```bash
+./scripts/manual-install-archon.sh --install-deps
+```
+
+Persist plugin startup in CLN config:
+
+```bash
+./scripts/manual-install-archon.sh --persist
+```
+
+Notes:
+- This copies files into `/opt/cl-hive-archon` inside the running container.
+- If the container is rebuilt/recreated, rerun this script unless you mount the repo.
 
 ### Backup and Restore
 
@@ -661,6 +699,7 @@ docker/
 │   ├── restore.sh              # Restore from backup
 │   ├── upgrade.sh              # Full image upgrades
 │   ├── hot-upgrade.sh          # Quick plugin updates (no rebuild)
+│   ├── manual-install-archon.sh # Install cl-hive-archon into running local container
 │   ├── rollback.sh             # Rollback to backup
 │   ├── pre-stop.sh             # Graceful shutdown
 │   └── validate-config.sh      # Configuration validation
@@ -707,6 +746,7 @@ For developers or custom modifications:
 ```bash
 # Prerequisites: Clone cl-revenue-ops next to cl-hive
 git clone https://github.com/lightning-goats/cl_revenue_ops.git ../cl_revenue_ops
+git clone https://github.com/lightning-goats/cl-hive-archon.git ../cl-hive-archon
 
 # Use the build override
 cp docker-compose.build.yml docker-compose.override.yml

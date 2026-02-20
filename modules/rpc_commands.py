@@ -16,6 +16,107 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+# Maximum openchannel_update rounds before giving up
+_MAX_V2_UPDATE_ROUNDS = 10
+
+
+def _open_channel(rpc, target: str, amount_sats: int,
+                  feerate: str = "normal", announce: bool = True,
+                  log_fn=None) -> Dict[str, Any]:
+    """Attempt dual-funded (v2) channel open, fall back to single-funded.
+
+    1. fundpsbt -> openchannel_init -> openchannel_update loop -> signpsbt -> openchannel_signed
+    2. On any v2 failure: unreserveinputs, openchannel_abort, then fundchannel
+    """
+    def _log(msg, level="info"):
+        if log_fn:
+            log_fn(msg, level)
+
+    # --- Attempt 1: Dual-funded (v2) ---
+    psbt = None
+    channel_id = None
+    try:
+        _log(f"cl-hive: Attempting dual-funded open to {target[:16]}... for {amount_sats:,} sats")
+
+        # Create funded PSBT for our contribution
+        psbt_result = rpc.call("fundpsbt", {
+            "satoshi": amount_sats,
+            "feerate": feerate,
+            "startweight": 250,
+        })
+        psbt = psbt_result["psbt"]
+
+        # Initiate v2 open
+        init_result = rpc.call("openchannel_init", {
+            "id": target,
+            "amount": amount_sats,
+            "initialpsbt": psbt,
+            "announce": announce,
+        })
+        channel_id = init_result["channel_id"]
+        current_psbt = init_result.get("psbt", psbt)
+
+        # Update loop until commitments secured
+        for _ in range(_MAX_V2_UPDATE_ROUNDS):
+            update_result = rpc.call("openchannel_update", {
+                "channel_id": channel_id,
+                "psbt": current_psbt,
+            })
+            current_psbt = update_result["psbt"]
+            if update_result.get("commitments_secured"):
+                break
+        else:
+            raise RuntimeError("openchannel_update did not reach commitments_secured")
+
+        # Sign the PSBT
+        signed = rpc.call("signpsbt", {"psbt": current_psbt})
+        signed_psbt = signed["signed_psbt"]
+
+        # Complete
+        result = rpc.call("openchannel_signed", {
+            "channel_id": channel_id,
+            "signed_psbt": signed_psbt,
+        })
+
+        _log(f"cl-hive: Dual-funded channel opened to {target[:16]}...")
+        return {
+            "channel_id": result.get("channel_id", channel_id),
+            "txid": result.get("txid", ""),
+            "funding_type": "dual-funded",
+        }
+
+    except Exception as e:
+        _log(f"cl-hive: Dual-funded open failed ({e}), falling back to single-funded", "info")
+
+        # Abort in-progress v2 negotiation if it started
+        if channel_id:
+            try:
+                rpc.call("openchannel_abort", {"channel_id": channel_id})
+            except Exception:
+                pass
+
+        # Release locked UTXOs from fundpsbt
+        if psbt:
+            try:
+                rpc.call("unreserveinputs", {"psbt": psbt})
+            except Exception:
+                pass
+
+    # --- Attempt 2: Single-funded (v1) fallback ---
+    _log(f"cl-hive: Opening single-funded channel to {target[:16]}... for {amount_sats:,} sats")
+    result = rpc.call("fundchannel", {
+        "id": target,
+        "amount": amount_sats,
+        "feerate": feerate,
+        "announce": announce,
+    })
+
+    return {
+        "channel_id": result.get("channel_id", "unknown"),
+        "txid": result.get("txid", "unknown"),
+        "funding_type": "single-funded",
+    }
+
 
 @dataclass
 class HiveContext:
@@ -903,30 +1004,23 @@ def _execute_channel_open(
     except Exception:
         pass
 
-    # Step 3: Execute fundchannel to actually open the channel
+    # Step 3: Open channel (dual-funded first, single-funded fallback)
     try:
-        if ctx.log:
-            ctx.log(
-                f"cl-hive: Opening channel to {target[:16]}... "
-                f"for {channel_size_sats:,} sats",
-                'info'
-            )
-
-        # fundchannel with the calculated size
-        # Use rpc.call() for explicit control over parameter names
-        result = ctx.safe_plugin.rpc.call("fundchannel", {
-            "id": target,
-            "amount": channel_size_sats,
-            "announce": True  # Public channel
-        })
+        result = _open_channel(
+            rpc=ctx.safe_plugin.rpc,
+            target=target,
+            amount_sats=channel_size_sats,
+            announce=True,
+            log_fn=ctx.log,
+        )
 
         channel_id = result.get('channel_id', 'unknown')
         txid = result.get('txid', 'unknown')
 
         if ctx.log:
             ctx.log(
-                f"cl-hive: Channel opened! txid={txid[:16]}... "
-                f"channel_id={channel_id}",
+                f"cl-hive: Channel opened ({result.get('funding_type', 'unknown')})! "
+                f"txid={txid[:16]}... channel_id={channel_id}",
                 'info'
             )
 
@@ -956,6 +1050,7 @@ def _execute_channel_open(
             "proposed_size_sats": proposed_size,
             "channel_id": channel_id,
             "txid": txid,
+            "funding_type": result.get("funding_type", "unknown"),
             "broadcast_count": broadcast_count,
             "sizing_reasoning": context.get('sizing_reasoning', 'N/A'),
         }

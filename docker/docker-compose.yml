@@ -85,6 +85,8 @@ services:
 
       # cl-hive
       - HIVE_GOVERNANCE_MODE=${HIVE_GOVERNANCE_MODE:-advisor}
+      - HIVE_COMMS_ENABLED=${HIVE_COMMS_ENABLED:-false}
+      - HIVE_ARCHON_ENABLED=${HIVE_ARCHON_ENABLED:-false}
 
       # CLBOSS (optional - set to false to disable)
       - CLBOSS_ENABLED=${CLBOSS_ENABLED:-true}

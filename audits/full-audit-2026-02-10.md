@@ -6,6 +6,24 @@
 
 ---
 
+## Remediation Status (Updated 2026-02-19)
+
+All 9 HIGH findings have been resolved.
+
+| ID | Finding | Status | Date | Evidence |
+|----|---------|--------|------|----------|
+| H-1 | `_path_stats` no lock | **FIXED** | 2026-02-14 | `routing_intelligence.py:110` — `threading.Lock()` added, all methods acquire it |
+| H-2 | Direct write to `_local_state` | **FIXED** | 2026-02-14 | Uses `state_manager.update_local_state()` public API (`state_manager.py:480`) |
+| H-3 | `pending_actions` no indexes | **FIXED** | 2026-02-14 | `database.py:489-491` — two indexes on status/expires and type/proposed |
+| H-4 | `prune_peer_events` never called | **FIXED** | 2026-02-14 | Called at `cl-hive.py:10593` in maintenance loop |
+| H-5 | `budget_tracking` no cleanup | **FIXED** | 2026-02-14 | `prune_budget_tracking()` called at `cl-hive.py:10596` |
+| H-6 | `advisor_db.cleanup_old_data` never called | **FIXED** | 2026-02-14 | Called at `proactive_advisor.py:445` |
+| H-7 | Settlement auto-execution | **MITIGATED** | 2026-02-19 | `proactive_advisor.py:562` — settlement now queued for approval via `advisor_record_decision` instead of auto-executing `settlement_execute` with `dry_run=False` |
+| H-8 | `prune_old_settlement_data` no transaction | **FIXED** | 2026-02-14 | `database.py:6962` — wrapped in `self.transaction()` |
+| H-9 | N+1 query in `sync_uptime_from_presence` | **FIXED** | 2026-02-14 | `database.py:2710-2733` — uses single JOIN query |
+
+---
+
 ## Executive Summary
 
 cl-hive demonstrates strong security fundamentals: parameterized SQL throughout, HSM-delegated crypto, consistent identity binding, bounded caches, and rate limiting on all message types. No critical vulnerabilities were found. The main areas needing attention are:

@@ -105,6 +105,8 @@ See [Joining the Hive](docs/JOINING_THE_HIVE.md) for the complete guide.
 ### Optional Integrations
 - **CLBoss**: Not required. If installed, cl-hive coordinates to prevent redundant channel opens.
 - **Sling**: Not required for cl-hive. Rebalancing is handled by cl-revenue-ops.
+- **cl-hive-comms**: Optional Phase 6 sibling plugin (detected automatically when installed).
+- **cl-hive-archon**: Optional Phase 6 Archon sibling plugin. If active without comms, `hive-phase6-plugins` reports a warning.
 
 ### Setup
 
@@ -133,6 +135,7 @@ Phase 6 planning references: see [hive-docs](https://github.com/lightning-goats/
 | `hive-join <ticket>` | Join an existing Hive using an invitation ticket |
 | `hive-leave` | Leave the current Hive |
 | `hive-status` | Get current membership tier, fleet size, and governance mode |
+| `hive-phase6-plugins` | Show detected optional sibling plugin status (`cl-hive-comms`, `cl-hive-archon`) |
 | `hive-members` | List all Hive members and their current stats |
 | `hive-config` | View current configuration |
 | `hive-set-mode <mode>` | Change governance mode (advisor/failsafe) |
