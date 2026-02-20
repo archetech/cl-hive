@@ -2207,6 +2207,38 @@ Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
             }
         ),
         Tool(
+            name="revenue_boltz_backup",
+            description="Retrieve boltzd backup info: swap mnemonic, wallet list, pending swaps. WARNING: response contains plaintext swap mnemonic. Wallet BIP39 credentials require manual interactive backup.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_backup_verify",
+            description="Verify a swap mnemonic backup matches the current boltzd mnemonic. Read-only, does not modify.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "swap_mnemonic": {
+                        "type": "string",
+                        "description": "The swap mnemonic to verify against the current one"
+                    }
+                },
+                "required": ["node", "swap_mnemonic"]
+            }
+        ),
+        Tool(
             name="askrene_constraints_summary",
             description="Summarize AskRene liquidity constraints for a given layer (default: xpay). Useful routing intelligence for why rebalances fail.",
             inputSchema={
@@ -5440,6 +5472,136 @@ valid ranges, and evidence types.""",
                 "required": ["node"]
             }
         ),
+        # Optional Archon Tools (cl-hive-archon)
+        Tool(
+            name="hive_archon_status",
+            description="Get local Archon identity and governance status.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_archon_provision",
+            description="Provision (or re-provision) local Archon DID identity.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "force": {"type": "boolean", "description": "Force reprovision"},
+                    "label": {"type": "string", "description": "Optional identity label"},
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_archon_bind_nostr",
+            description="Bind a Nostr pubkey to an Archon DID identity.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "nostr_pubkey": {"type": "string", "description": "Nostr pubkey"},
+                    "did": {"type": "string", "description": "Optional DID override"},
+                },
+                "required": ["node", "nostr_pubkey"]
+            }
+        ),
+        Tool(
+            name="hive_archon_bind_cln",
+            description="Bind a CLN pubkey to an Archon DID identity.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "cln_pubkey": {"type": "string", "description": "CLN pubkey (optional, defaults local node)"},
+                    "did": {"type": "string", "description": "Optional DID override"},
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_archon_upgrade",
+            description="Upgrade Archon identity tier (e.g. governance tier).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "target_tier": {"type": "string", "description": "Target tier (default: governance)"},
+                    "bond_sats": {"type": "integer", "description": "Bond size in sats"},
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_poll_create",
+            description="Create an Archon governance poll.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "poll_type": {"type": "string", "description": "Poll type identifier"},
+                    "title": {"type": "string", "description": "Poll title"},
+                    "options_json": {"type": "string", "description": "JSON array of options"},
+                    "deadline": {"type": "integer", "description": "Deadline unix timestamp"},
+                    "metadata_json": {"type": "string", "description": "Optional metadata JSON object"},
+                },
+                "required": ["node", "poll_type", "title", "options_json", "deadline"]
+            }
+        ),
+        Tool(
+            name="hive_poll_status",
+            description="Get Archon poll status.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "poll_id": {"type": "string", "description": "Poll ID"},
+                },
+                "required": ["node", "poll_id"]
+            }
+        ),
+        Tool(
+            name="hive_poll_vote",
+            description="Cast a vote in an Archon poll.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "poll_id": {"type": "string", "description": "Poll ID"},
+                    "choice": {"type": "string", "description": "Selected option"},
+                    "reason": {"type": "string", "description": "Optional vote rationale"},
+                },
+                "required": ["node", "poll_id", "choice"]
+            }
+        ),
+        Tool(
+            name="hive_my_votes",
+            description="List local Archon votes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "limit": {"type": "integer", "description": "Max records (default: 50)"},
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="hive_archon_prune",
+            description="Prune old Archon records.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "retention_days": {"type": "integer", "description": "Retention window in days"},
+                },
+                "required": ["node"]
+            }
+        ),
         # Phase 16: Management Schema Tools
         Tool(
             name="hive_schema_list",
@@ -6022,6 +6184,128 @@ async def handle_hive_did_profiles(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {args.get('node')}"}
     return await node.call("hive-did-profiles")
+
+
+async def handle_hive_archon_status(args: Dict) -> Dict:
+    """Get local Archon status."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-archon-status")
+
+
+async def handle_hive_archon_provision(args: Dict) -> Dict:
+    """Provision or re-provision local Archon identity."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("force") is not None:
+        force_value = args["force"]
+        if isinstance(force_value, bool):
+            params["force"] = "true" if force_value else "false"
+        else:
+            params["force"] = str(force_value)
+    if args.get("label"):
+        params["label"] = args["label"]
+    return await node.call("hive-archon-provision", params)
+
+
+async def handle_hive_archon_bind_nostr(args: Dict) -> Dict:
+    """Bind Nostr pubkey to DID."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {"nostr_pubkey": args["nostr_pubkey"]}
+    if args.get("did"):
+        params["did"] = args["did"]
+    return await node.call("hive-archon-bind-nostr", params)
+
+
+async def handle_hive_archon_bind_cln(args: Dict) -> Dict:
+    """Bind CLN pubkey to DID."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("cln_pubkey"):
+        params["cln_pubkey"] = args["cln_pubkey"]
+    if args.get("did"):
+        params["did"] = args["did"]
+    return await node.call("hive-archon-bind-cln", params)
+
+
+async def handle_hive_archon_upgrade(args: Dict) -> Dict:
+    """Upgrade Archon identity tier."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("target_tier"):
+        params["target_tier"] = args["target_tier"]
+    if args.get("bond_sats") is not None:
+        params["bond_sats"] = args["bond_sats"]
+    return await node.call("hive-archon-upgrade", params)
+
+
+async def handle_hive_poll_create(args: Dict) -> Dict:
+    """Create an Archon governance poll."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {
+        "poll_type": args["poll_type"],
+        "title": args["title"],
+        "options_json": args["options_json"],
+        "deadline": args["deadline"],
+    }
+    if args.get("metadata_json"):
+        params["metadata_json"] = args["metadata_json"]
+    return await node.call("hive-poll-create", params)
+
+
+async def handle_hive_poll_status(args: Dict) -> Dict:
+    """Get Archon poll status."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    return await node.call("hive-poll-status", {"poll_id": args["poll_id"]})
+
+
+async def handle_hive_poll_vote(args: Dict) -> Dict:
+    """Vote in an Archon poll."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {
+        "poll_id": args["poll_id"],
+        "choice": args["choice"],
+    }
+    if args.get("reason"):
+        params["reason"] = args["reason"]
+    return await node.call("hive-vote", params)
+
+
+async def handle_hive_my_votes(args: Dict) -> Dict:
+    """List local Archon votes."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("limit") is not None:
+        params["limit"] = args["limit"]
+    return await node.call("hive-my-votes", params)
+
+
+async def handle_hive_archon_prune(args: Dict) -> Dict:
+    """Prune old Archon records."""
+    node = fleet.get_node(args.get("node", ""))
+    if not node:
+        return {"error": f"Unknown node: {args.get('node')}"}
+    params = {}
+    if args.get("retention_days") is not None:
+        params["retention_days"] = args["retention_days"]
+    return await node.call("hive-archon-prune", params)
 
 
 async def handle_hive_schema_list(args: Dict) -> Dict:
@@ -9953,6 +10237,27 @@ async def handle_revenue_boltz_deposit(args: Dict) -> Dict:
     if currency is None:
         return await node.call("revenue-boltz-deposit")
     return await node.call("revenue-boltz-deposit", {"currency": currency})
+
+
+async def handle_revenue_boltz_backup(args: Dict) -> Dict:
+    """Retrieve boltzd backup info."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("revenue-boltz-backup")
+
+
+async def handle_revenue_boltz_backup_verify(args: Dict) -> Dict:
+    """Verify swap mnemonic backup."""
+    node_name = args.get("node")
+    swap_mnemonic = args.get("swap_mnemonic")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    if not swap_mnemonic:
+        return {"error": "swap_mnemonic is required"}
+    return await node.call("revenue-boltz-backup-verify", {"swap_mnemonic": swap_mnemonic})
 
 
 async def handle_askrene_constraints_summary(args: Dict) -> Dict:
@@ -16404,6 +16709,8 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_boltz_chainswap": handle_revenue_boltz_chainswap,
     "revenue_boltz_withdraw": handle_revenue_boltz_withdraw,
     "revenue_boltz_deposit": handle_revenue_boltz_deposit,
+    "revenue_boltz_backup": handle_revenue_boltz_backup,
+    "revenue_boltz_backup_verify": handle_revenue_boltz_backup_verify,
     "askrene_constraints_summary": handle_askrene_constraints_summary,
     "askrene_reservations": handle_askrene_reservations,
     "revenue_report": handle_revenue_report,
@@ -16554,6 +16861,17 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "hive_did_revoke": handle_hive_did_revoke,
     "hive_did_reputation": handle_hive_did_reputation,
     "hive_did_profiles": handle_hive_did_profiles,
+    # Optional Archon Tools
+    "hive_archon_status": handle_hive_archon_status,
+    "hive_archon_provision": handle_hive_archon_provision,
+    "hive_archon_bind_nostr": handle_hive_archon_bind_nostr,
+    "hive_archon_bind_cln": handle_hive_archon_bind_cln,
+    "hive_archon_upgrade": handle_hive_archon_upgrade,
+    "hive_poll_create": handle_hive_poll_create,
+    "hive_poll_status": handle_hive_poll_status,
+    "hive_poll_vote": handle_hive_poll_vote,
+    "hive_my_votes": handle_hive_my_votes,
+    "hive_archon_prune": handle_hive_archon_prune,
     # Phase 16: Management Schema Tools
     "hive_schema_list": handle_hive_schema_list,
     "hive_schema_validate": handle_hive_schema_validate,
