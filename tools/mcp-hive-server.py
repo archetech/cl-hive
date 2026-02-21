@@ -7283,11 +7283,13 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
     local_pct = round((local_msat / total_msat) * 100, 2) if total_msat else 0.0
 
     # Gather remaining RPC calls in parallel (all independent after finding target_channel)
-    peers, prof, debug, forwards = await asyncio.gather(
+    peers, prof, debug, forwards, nodes_for_alias, info_result = await asyncio.gather(
         node.call("hive-listpeers"),
         node.call("revenue-profitability", {"channel_id": channel_id}),
         node.call("revenue-fee-debug"),
         node.call("hive-listforwards", {"status": "settled"}),
+        node.call("hive-listnodes", {"id": peer_id}),
+        node.call("hive-getinfo"),
         return_exceptions=True,
     )
 
@@ -7299,23 +7301,16 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
     connected = bool(peer_info.get("connected", False))
 
     # Fallback to listnodes if peer not in listpeers (disconnected peer)
-    if not peer_alias and peer_id:
-        try:
-            nodes_result = await node.call("hive-listnodes", {"id": peer_id})
-            if nodes_result.get("nodes"):
-                peer_alias = nodes_result["nodes"][0].get("alias", "")
-        except Exception:
-            pass  # Best effort fallback
+    if not peer_alias and peer_id and not isinstance(nodes_for_alias, Exception):
+        if nodes_for_alias.get("nodes"):
+            peer_alias = nodes_for_alias["nodes"][0].get("alias", "")
 
     # Calculate channel age from SCID
     channel_age_days = None
-    try:
-        info_result = await node.call("hive-getinfo")
+    if not isinstance(info_result, Exception):
         current_blockheight = info_result.get("blockheight", 0)
         if current_blockheight and channel_id:
             channel_age_days = _scid_to_age_days(channel_id, current_blockheight)
-    except Exception:
-        pass  # Best effort
 
     # Profitability
     profitability = {}
@@ -9340,56 +9335,59 @@ async def handle_revenue_status(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    # Get base status from cl-revenue-ops
-    status = await node.call("revenue-status")
+    # Fetch base status and competitor intel in parallel
+    status, intel_result = await asyncio.gather(
+        node.call("revenue-status"),
+        node.call("hive-fee-intel-query", {"action": "list"}),
+        return_exceptions=True,
+    )
 
+    # Handle base status error
+    if isinstance(status, Exception):
+        return {"error": str(status)}
     if "error" in status:
         return status
 
     # Add competitor intelligence status from cl-hive
-    try:
-        intel_result = await node.call("hive-fee-intel-query", {"action": "list"})
-
-        if intel_result.get("error"):
-            status["competitor_intelligence"] = {
-                "enabled": False,
-                "error": intel_result.get("error"),
-                "data_quality": "unavailable"
-            }
-        else:
-            peers = intel_result.get("peers", [])
-            peers_tracked = len(peers)
-
-            # Calculate data quality based on confidence scores
-            if peers_tracked == 0:
-                data_quality = "no_data"
-            else:
-                avg_confidence = sum(p.get("confidence", 0) for p in peers) / peers_tracked
-                if avg_confidence > 0.6:
-                    data_quality = "good"
-                elif avg_confidence > 0.3:
-                    data_quality = "moderate"
-                else:
-                    data_quality = "stale"
-
-            # Find most recent update
-            last_sync = max(
-                (p.get("last_updated", 0) for p in peers),
-                default=0
-            )
-
-            status["competitor_intelligence"] = {
-                "enabled": True,
-                "peers_tracked": peers_tracked,
-                "last_sync": last_sync,
-                "data_quality": data_quality
-            }
-
-    except Exception as e:
+    if isinstance(intel_result, Exception):
         status["competitor_intelligence"] = {
             "enabled": False,
-            "error": str(e),
+            "error": str(intel_result),
             "data_quality": "unavailable"
+        }
+    elif intel_result.get("error"):
+        status["competitor_intelligence"] = {
+            "enabled": False,
+            "error": intel_result.get("error"),
+            "data_quality": "unavailable"
+        }
+    else:
+        peers = intel_result.get("peers", [])
+        peers_tracked = len(peers)
+
+        # Calculate data quality based on confidence scores
+        if peers_tracked == 0:
+            data_quality = "no_data"
+        else:
+            avg_confidence = sum(p.get("confidence", 0) for p in peers) / peers_tracked
+            if avg_confidence > 0.6:
+                data_quality = "good"
+            elif avg_confidence > 0.3:
+                data_quality = "moderate"
+            else:
+                data_quality = "stale"
+
+        # Find most recent update
+        last_sync = max(
+            (p.get("last_updated", 0) for p in peers),
+            default=0
+        )
+
+        status["competitor_intelligence"] = {
+            "enabled": True,
+            "peers_tracked": peers_tracked,
+            "last_sync": last_sync,
+            "data_quality": data_quality
         }
 
     return status
@@ -10811,10 +10809,12 @@ async def handle_config_recommend(args: Dict) -> Dict:
     import time
     now = int(time.time())
     
-    # 1. Get current conditions
+    # 1. Get current conditions (parallel)
     try:
-        dashboard = await node.call("revenue-dashboard", {"window_days": 1})
-        config = await node.call("revenue-config", {"action": "get"})
+        dashboard, config = await asyncio.gather(
+            node.call("revenue-dashboard", {"window_days": 1}),
+            node.call("revenue-config", {"action": "get"}),
+        )
     except Exception as e:
         return {"error": f"Failed to get current state: {e}"}
     
@@ -11478,10 +11478,20 @@ async def handle_rebalance_diagnostic(args: Dict) -> Dict:
     result: Dict[str, Any] = {"node": node_name}
     diagnosis = []
 
+    # Fetch all data in parallel (sling-status speculatively; only used if sling installed)
+    plugins, rebal, sling = await asyncio.gather(
+        node.call("hive-plugin-list", {}),
+        node.call("revenue-rebalance-debug"),
+        node.call("hive-sling-status"),
+        return_exceptions=True,
+    )
+
     # Check sling plugin availability
     sling_available = False
-    try:
-        plugins = await node.call("hive-plugin-list", {})
+    if isinstance(plugins, Exception):
+        result["sling_installed"] = None
+        diagnosis.append(f"Cannot check plugin list: {plugins}")
+    else:
         for p in plugins.get("plugins", []):
             name = p.get("name", "")
             if "sling" in name.lower():
@@ -11490,46 +11500,40 @@ async def handle_rebalance_diagnostic(args: Dict) -> Dict:
         result["sling_installed"] = sling_available
         if not sling_available:
             diagnosis.append("Sling plugin is NOT installed — rebalancing unavailable")
-    except Exception as e:
-        result["sling_installed"] = None
-        diagnosis.append(f"Cannot check plugin list: {e}")
 
-    # Get revenue-rebalance-debug for structured diagnostics
-    try:
-        rebal = await node.call("revenue-rebalance-debug")
-        if "error" in rebal:
-            result["rebalance_debug"] = {"error": rebal["error"]}
-            diagnosis.append(f"revenue-rebalance-debug error: {rebal['error']}")
-        else:
-            result["rebalance_debug"] = rebal
+    # Process revenue-rebalance-debug result
+    if isinstance(rebal, Exception):
+        result["rebalance_debug"] = {"error": str(rebal)}
+        diagnosis.append(f"Cannot call revenue-rebalance-debug: {rebal}")
+    elif "error" in rebal:
+        result["rebalance_debug"] = {"error": rebal["error"]}
+        diagnosis.append(f"revenue-rebalance-debug error: {rebal['error']}")
+    else:
+        result["rebalance_debug"] = rebal
 
-            # Extract key diagnostic info
-            rejections = rebal.get("rejection_reasons", rebal.get("rejections", {}))
-            if rejections:
-                result["rejection_reasons"] = rejections
-                for reason, count in rejections.items() if isinstance(rejections, dict) else []:
-                    if count > 0:
-                        diagnosis.append(f"Rejection: {reason} ({count} channels)")
+        # Extract key diagnostic info
+        rejections = rebal.get("rejection_reasons", rebal.get("rejections", {}))
+        if rejections:
+            result["rejection_reasons"] = rejections
+            for reason, count in rejections.items() if isinstance(rejections, dict) else []:
+                if count > 0:
+                    diagnosis.append(f"Rejection: {reason} ({count} channels)")
 
-            capital_controls = rebal.get("capital_controls", {})
-            if capital_controls:
-                result["capital_controls"] = capital_controls
+        capital_controls = rebal.get("capital_controls", {})
+        if capital_controls:
+            result["capital_controls"] = capital_controls
 
-            budget = rebal.get("budget", rebal.get("budget_state", {}))
-            if budget:
-                result["budget_state"] = budget
-    except Exception as e:
-        result["rebalance_debug"] = {"error": str(e)}
-        diagnosis.append(f"Cannot call revenue-rebalance-debug: {e}")
+        budget = rebal.get("budget", rebal.get("budget_state", {}))
+        if budget:
+            result["budget_state"] = budget
 
-    # Try sling-status for active jobs
+    # Process sling status (only report if sling is actually installed)
     if sling_available:
-        try:
-            sling = await node.call("hive-sling-status")
+        if isinstance(sling, Exception):
+            result["sling_status"] = {"error": str(sling)}
+            diagnosis.append(f"sling-status call failed: {sling}")
+        else:
             result["sling_status"] = sling
-        except Exception as e:
-            result["sling_status"] = {"error": str(e)}
-            diagnosis.append(f"sling-status call failed: {e}")
 
     result["diagnosis"] = diagnosis if diagnosis else ["All rebalance subsystems operational"]
     return result
