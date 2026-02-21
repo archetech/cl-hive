@@ -9292,10 +9292,21 @@ async def read_resource(uri: str) -> str:
                 raise ValueError(f"Unknown node: {node_name}")
 
             if resource_type == "status":
-                status = await node.call("hive-status")
-                info = await node.call("hive-getinfo")
-                funds = await node.call("hive-listfunds")
-                pending = await node.call("hive-pending-actions")
+                status, info, funds, pending = await asyncio.gather(
+                    node.call("hive-status"),
+                    node.call("hive-getinfo"),
+                    node.call("hive-listfunds"),
+                    node.call("hive-pending-actions"),
+                    return_exceptions=True,
+                )
+                if isinstance(status, Exception):
+                    status = {}
+                if isinstance(info, Exception):
+                    info = {}
+                if isinstance(funds, Exception):
+                    funds = {}
+                if isinstance(pending, Exception):
+                    pending = {}
 
                 channels = funds.get("channels", [])
                 outputs = funds.get("outputs", [])
@@ -15643,21 +15654,20 @@ async def handle_run_settlement_cycle(args: Dict) -> Dict:
     now = datetime.utcnow()
     period = f"{now.year}-W{now.isocalendar()[1]:02d}"
 
-    # Step 1: Record contribution snapshot
-    snapshot_result = None
-    try:
-        snapshot_result = await node.call("hive-pool-snapshot", {})
-    except Exception as e:
-        logger.warning(f"Pool snapshot failed: {e}")
+    # Steps 1 & 2: Record contribution snapshot and calculate distribution in parallel
+    snapshot_result, calc_result = await asyncio.gather(
+        node.call("hive-pool-snapshot", {}),
+        node.call("hive-settlement-calculate", {}),
+        return_exceptions=True,
+    )
 
+    if isinstance(snapshot_result, Exception):
+        logger.warning(f"Pool snapshot failed: {snapshot_result}")
+        snapshot_result = None
     snapshot_recorded = snapshot_result is not None and "error" not in snapshot_result
 
-    # Step 2: Calculate distribution
-    try:
-        calc_result = await node.call("hive-settlement-calculate", {})
-    except Exception as e:
-        return {"error": f"Settlement calculation failed: {e}"}
-
+    if isinstance(calc_result, Exception):
+        return {"error": f"Settlement calculation failed: {calc_result}"}
     if "error" in calc_result:
         return calc_result
 
