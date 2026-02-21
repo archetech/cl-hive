@@ -3717,28 +3717,27 @@ def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
 
 @plugin.subscribe("connect")
 def on_peer_connected(**kwargs):
-    """
-    Hook called when a peer connects.
-
-    If the peer is a Hive member, send a STATE_HASH message to
-    initiate anti-entropy check and detect state divergence.
-    """
-    # CLN v25+ sends 'id' in the notification payload
+    """Hook called when a peer connects — offloaded to background thread."""
     peer_id = kwargs.get('id')
     if not peer_id or not database or not gossip_mgr:
         return
-
-    # Check if this peer is a Hive member
+    # Quick DB check is fine on IO thread; offload RPC-heavy work
     member = database.get_member(peer_id)
     if not member:
-        return  # Not a Hive member, ignore
+        return
+    if _msg_executor is not None:
+        _msg_executor.submit(_handle_peer_connected, peer_id, member)
+    else:
+        _handle_peer_connected(peer_id, member)
 
+
+def _handle_peer_connected(peer_id: str, member: Dict):
+    """Process peer connection on background thread (RPC calls inside)."""
     now = int(time.time())
     database.update_member(peer_id, last_seen=now)
     database.update_presence(peer_id, is_online=True, now_ts=now, window_seconds=30 * 86400)
 
     # Track VPN connection status + populate missing addresses (Issue #60)
-    peer_address = None
     if plugin:
         try:
             peers = plugin.rpc.listpeers(id=peer_id)
@@ -3748,7 +3747,6 @@ def on_peer_connected(**kwargs):
                     peer_address = netaddr[0]
                     if vpn_transport:
                         vpn_transport.on_peer_connected(peer_id, peer_address)
-                    # Populate addresses if missing
                     if not member.get('addresses'):
                         database.update_member(peer_id, addresses=json.dumps(netaddr))
         except Exception:
@@ -3810,7 +3808,15 @@ def _parse_msat_value(value: Any) -> int:
 
 @plugin.subscribe("forward_event")
 def on_forward_event(forward_event: Dict, plugin: Plugin, **kwargs):
-    """Track forwarding events for contribution, leech detection, and route probing."""
+    """Track forwarding events — offloaded to background thread to avoid blocking IO."""
+    if _msg_executor is not None:
+        _msg_executor.submit(_handle_forward_event, forward_event)
+    else:
+        _handle_forward_event(forward_event)
+
+
+def _handle_forward_event(forward_event: Dict):
+    """Process forward event on background thread (never on IO thread)."""
     status = forward_event.get("status", "unknown")
     fee_msat = _parse_msat_value(
         forward_event.get("fee_msat", forward_event.get("fee_msatoshi", 0))
