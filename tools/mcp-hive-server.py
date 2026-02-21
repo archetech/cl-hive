@@ -9571,9 +9571,15 @@ async def handle_revenue_profitability(args: Dict) -> Dict:
     if channel_id:
         params["channel_id"] = channel_id
 
-    # Get profitability data
-    profitability = await node.call("revenue-profitability", params if params else None)
+    # Fetch profitability and competitor intel in parallel
+    profitability, intel_result = await asyncio.gather(
+        node.call("revenue-profitability", params if params else None),
+        node.call("hive-fee-intel-query", {"action": "list"}),
+        return_exceptions=True,
+    )
 
+    if isinstance(profitability, Exception):
+        return {"error": str(profitability)}
     if "error" in profitability:
         return profitability
 
@@ -9587,8 +9593,7 @@ async def handle_revenue_profitability(args: Dict) -> Dict:
 
         # Build a map of peer_id -> intel for quick lookup
         intel_map = {}
-        intel_result = await node.call("hive-fee-intel-query", {"action": "list"})
-        if not intel_result.get("error"):
+        if not isinstance(intel_result, Exception) and not intel_result.get("error"):
             for peer in intel_result.get("peers", []):
                 pid = peer.get("peer_id")
                 if pid:
@@ -10997,12 +11002,18 @@ async def handle_revenue_competitor_analysis(args: Dict) -> Dict:
 
     # Query competitor intelligence from cl-hive
     if peer_id:
-        # Single peer query
-        intel_result = await node.call("hive-fee-intel-query", {
-            "peer_id": peer_id,
-            "action": "query"
-        })
+        # Single peer query - fetch intel and channels in parallel
+        intel_result, channels_result = await asyncio.gather(
+            node.call("hive-fee-intel-query", {
+                "peer_id": peer_id,
+                "action": "query"
+            }),
+            node.call("hive-listchannels", {"source": peer_id}),
+            return_exceptions=True,
+        )
 
+        if isinstance(intel_result, Exception):
+            return {"node": node_name, "error": str(intel_result)}
         if intel_result.get("error"):
             return {
                 "node": node_name,
@@ -11011,8 +11022,8 @@ async def handle_revenue_competitor_analysis(args: Dict) -> Dict:
             }
 
         # Get our current fee to this peer for comparison
-        channels_result = await node.call("hive-listchannels", {"source": peer_id})
-
+        if isinstance(channels_result, Exception):
+            channels_result = {"channels": []}
         our_fee = 0
         for channel in channels_result.get("channels", []):
             if channel.get("source") == peer_id:
