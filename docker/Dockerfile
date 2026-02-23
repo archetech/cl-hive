@@ -162,7 +162,7 @@ RUN git clone --depth 1 https://github.com/ksedgwic/clboss.git \
 # Essential for production deployments to maintain uptime and Amboss visibility.
 # Config: vitality-amboss=true (set in docker-entrypoint.sh)
 
-ARG VITALITY_VERSION=v0.4.5
+ARG VITALITY_VERSION=v0.2.3
 RUN ARCH=$(uname -m) \
     && if [ "$ARCH" = "x86_64" ]; then TRIPLE="x86_64-linux-gnu"; fi \
     && if [ "$ARCH" = "aarch64" ]; then TRIPLE="aarch64-linux-gnu"; fi \
