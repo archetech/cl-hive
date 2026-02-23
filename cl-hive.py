@@ -2440,6 +2440,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 _batched_log_writer.stop()
         except Exception:
             pass  # Best-effort on shutdown
+        try:
+            if _msg_executor:
+                _msg_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass  # Best-effort on shutdown
         shutdown_event.set()
     
     try:
