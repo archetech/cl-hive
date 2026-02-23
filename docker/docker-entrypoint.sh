@@ -538,7 +538,7 @@ if [ "$HIVE_ARCHON_ENABLED" = "true" ]; then
 fi
 
 # Core plugin dir is loaded after optional explicit plugins.
-echo "plugin-dir=/root/.lightning/plugins" >> "$CONFIG_FILE"
+echo "plugin-dir=/home/lightning/.lightning/plugins" >> "$CONFIG_FILE"
 
 # -----------------------------------------------------------------------------
 # cl-hive Configuration
@@ -621,7 +621,7 @@ else
 
     while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
         # Test RPC connection and verify credentials
-        RPC_RESPONSE=$(curl -s --max-time 10 --user "$BITCOIN_RPCUSER:$BITCOIN_RPCPASSWORD" \
+        RPC_RESPONSE=$(curl -4 -s --max-time 10 --user "$BITCOIN_RPCUSER:$BITCOIN_RPCPASSWORD" \
             --data-binary '{"jsonrpc":"1.0","method":"getblockchaininfo","params":[]}' \
             -H 'content-type: text/plain;' \
             "http://$BITCOIN_RPCHOST:$BITCOIN_RPCPORT/" 2>&1) || true
@@ -782,9 +782,14 @@ fi
 
 # Ensure lightning user owns data directories before starting services
 if id -u lightning >/dev/null 2>&1; then
-    chown -R lightning:lightning /data /home/lightning /backups /var/lib/tor
+    chown -R lightning:lightning /data /home/lightning /backups
 else
     echo "WARNING: 'lightning' user not found in container; skipping chown to lightning:lightning"
+fi
+
+# Tor directories must be owned by debian-tor (already set in tor/hybrid mode setup above)
+if [ -d /var/lib/tor ]; then
+    chown -R debian-tor:debian-tor /var/lib/tor /var/log/tor 2>/dev/null || true
 fi
 
 echo "Initialization complete. Starting services..."
