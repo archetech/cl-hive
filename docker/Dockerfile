@@ -110,9 +110,9 @@ RUN ARCH=$(uname -m) \
         && rm clightning-${CLN_VERSION}-Ubuntu-24.04-amd64.tar.xz; \
     elif [ "$ARCH" = "aarch64" ]; then \
         echo "Building CLN from source for ARM64..." \
+        && pip install --no-cache-dir mako grpcio-tools grpcio protobuf \
         && git clone --depth 1 --branch ${CLN_VERSION} https://github.com/ElementsProject/lightning.git /tmp/lightning \
         && cd /tmp/lightning \
-        && pip install --no-cache-dir . \
         && ./configure --prefix=/usr/local \
         && make -j$(nproc) \
         && make install \
