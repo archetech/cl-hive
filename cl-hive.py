@@ -13537,7 +13537,7 @@ def hive_status(plugin: Plugin):
 
 
 @plugin.method("hive-report-period-costs")
-def hive_report_period_costs(plugin: Plugin, rebalance_costs_sats: int):
+def hive_report_period_costs(plugin: Plugin, rebalance_costs_sats: int = 0):
     """
     Report rebalancing costs for the current settlement period.
 
@@ -15213,8 +15213,8 @@ def hive_fee_intel_query(plugin: Plugin, peer_id: str = None, action: str = "que
 @plugin.method("hive-report-fee-observation")
 def hive_report_fee_observation(
     plugin: Plugin,
-    peer_id: str,
-    our_fee_ppm: int,
+    peer_id: str = "",
+    our_fee_ppm: int = 0,
     their_fee_ppm: int = None,
     volume_sats: int = 0,
     forward_count: int = 0,
@@ -15514,9 +15514,9 @@ def hive_member_health(plugin: Plugin, member_id: str = None, action: str = "que
 @plugin.method("hive-report-health")
 def hive_report_health(
     plugin: Plugin,
-    profitable_channels: int,
-    underwater_channels: int,
-    stagnant_channels: int,
+    profitable_channels: int = 0,
+    underwater_channels: int = 0,
+    stagnant_channels: int = 0,
     total_channels: int = None,
     revenue_trend: str = "stable",
     liquidity_score: int = 50
@@ -18022,12 +18022,12 @@ def hive_internal_competition(plugin: Plugin):
 @plugin.method("hive-report-kalman-velocity")
 def hive_report_kalman_velocity(
     plugin: Plugin,
-    channel_id: str,
-    peer_id: str,
-    velocity_pct_per_hour: float,
-    uncertainty: float,
-    flow_ratio: float,
-    confidence: float,
+    channel_id: str = "",
+    peer_id: str = "",
+    velocity_pct_per_hour: float = 0.0,
+    uncertainty: float = 0.0,
+    flow_ratio: float = 0.0,
+    confidence: float = 0.0,
     is_regime_change: bool = False
 ):
     """
@@ -18399,7 +18399,7 @@ def hive_defense_status(plugin: Plugin, peer_id: str = None):
 @plugin.method("hive-broadcast-warning")
 def hive_broadcast_warning(
     plugin: Plugin,
-    peer_id: str,
+    peer_id: str = "",
     threat_type: str = "drain",
     severity: float = 0.5
 ):
@@ -18606,11 +18606,11 @@ def hive_fleet_rebalance_path(
 @plugin.method("hive-report-rebalance-outcome")
 def hive_report_rebalance_outcome(
     plugin: Plugin,
-    from_channel: str,
-    to_channel: str,
-    amount_sats: int,
-    cost_sats: int,
-    success: bool,
+    from_channel: str = "",
+    to_channel: str = "",
+    amount_sats: int = 0,
+    cost_sats: int = 0,
+    success: bool = False,
     via_fleet: bool = False,
     failure_reason: str = ""
 ):
@@ -18819,8 +18819,8 @@ def hive_mcf_optimized_path(
 @plugin.method("hive-report-mcf-completion")
 def hive_report_mcf_completion(
     plugin: Plugin,
-    assignment_id: str,
-    success: bool,
+    assignment_id: str = "",
+    success: bool = False,
     actual_amount_sats: int = 0,
     actual_cost_sats: int = 0,
     failure_reason: str = ""
@@ -19077,7 +19077,7 @@ def hive_flow_recommendations(plugin: Plugin, channel_id: str = None):
 
 
 @plugin.method("hive-report-flow-intensity")
-def hive_report_flow_intensity(plugin: Plugin, channel_id: str, peer_id: str, intensity: float):
+def hive_report_flow_intensity(plugin: Plugin, channel_id: str = "", peer_id: str = "", intensity: float = 0.0):
     """
     Report flow intensity for a channel to the Physarum model.
 
