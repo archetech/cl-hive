@@ -538,7 +538,7 @@ if [ "$HIVE_ARCHON_ENABLED" = "true" ]; then
 fi
 
 # Core plugin dir is loaded after optional explicit plugins.
-echo "plugin-dir=/root/.lightning/plugins" >> "$CONFIG_FILE"
+echo "plugin-dir=/home/lightning/.lightning/plugins" >> "$CONFIG_FILE"
 
 # -----------------------------------------------------------------------------
 # cl-hive Configuration
@@ -782,9 +782,14 @@ fi
 
 # Ensure lightning user owns data directories before starting services
 if id -u lightning >/dev/null 2>&1; then
-    chown -R lightning:lightning /data /home/lightning /backups /var/lib/tor
+    chown -R lightning:lightning /data /home/lightning /backups
 else
     echo "WARNING: 'lightning' user not found in container; skipping chown to lightning:lightning"
+fi
+
+# Tor directories must be owned by debian-tor (already set in tor/hybrid mode setup above)
+if [ -d /var/lib/tor ]; then
+    chown -R debian-tor:debian-tor /var/lib/tor /var/log/tor 2>/dev/null || true
 fi
 
 echo "Initialization complete. Starting services..."
