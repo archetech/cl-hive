@@ -1833,6 +1833,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sync bridge policies: {e}", level="warn")
 
+    # Initialize local node presence for settlement uptime tracking (Bug fix #1)
+    # Without this, the local node shows 0% uptime in settlement calculations
+    if our_pubkey:
+        try:
+            database.update_presence(our_pubkey, is_online=True, now_ts=int(time.time()), 
+                                    window_seconds=30 * 86400)
+            plugin.log(f"cl-hive: Initialized local node presence for settlement uptime")
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to initialize local presence: {e}", level="warn")
+    
     # Sync uptime from presence data to hive_members on startup
     try:
         uptime_synced = database.sync_uptime_from_presence(window_seconds=30 * 86400)
@@ -3913,6 +3923,21 @@ def _update_and_broadcast_fees(new_fee_sats: int):
             time_since_broadcast >= FEE_BROADCAST_MIN_INTERVAL
         )
 
+        # Always save fee report to database for settlement (Bug fix #3)
+        # This must happen regardless of broadcast threshold to ensure
+        # low-traffic nodes report their fees for settlement calculations
+        from modules.settlement import SettlementManager
+        period = SettlementManager.get_period_string(_local_fees_period_start)
+        database.save_fee_report(
+            peer_id=our_pubkey,
+            period=period,
+            fees_earned_sats=_local_fees_earned_sats,
+            forward_count=_local_fees_forward_count,
+            period_start=_local_fees_period_start,
+            period_end=now,
+            rebalance_costs_sats=_local_rebalance_costs_sats
+        )
+        
         if not should_broadcast:
             if plugin:
                 plugin.log(
@@ -13446,11 +13471,11 @@ def hive_sling_stats(plugin: Plugin, scid: str = None, json: bool = True):
 
 @plugin.method("hive-sling-status")
 def hive_sling_status(plugin: Plugin):
-    """Proxy to sling-status via plugin (native RPC)."""
+    """Proxy to sling-stats via plugin (native RPC). Bug fix: sling v4.2.0 renamed command."""
     rpc, err = _require_rpc(plugin)
     if err:
         return err
-    return rpc.call("sling-status")
+    return rpc.call("sling-stats")
 
 
 @plugin.method("hive-sling-deletejob")
