@@ -5,11 +5,11 @@
 #   - On push to main (creates :main tag for testing)
 #   - Manual dispatch (for testing)
 #
-# Images published to: ghcr.io/lightning-goats/cl-hive-node
+# Images published to: ghcr.io/archetech/cl-hive-node
 #
 # Usage for end users:
-#   docker pull ghcr.io/lightning-goats/cl-hive-node:latest
-#   docker pull ghcr.io/lightning-goats/cl-hive-node:v2.2.1
+#   docker pull ghcr.io/archetech/cl-hive-node:latest
+#   docker pull ghcr.io/archetech/cl-hive-node:v2.2.1
 
 name: Build and Publish Docker
 
@@ -33,7 +33,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: lightning-goats/cl-hive-node
+  IMAGE_NAME: archetech/cl-hive-node
 
 jobs:
   build-and-push:
@@ -80,7 +80,7 @@ jobs:
             org.opencontainers.image.title=cl-hive-node
             org.opencontainers.image.description=Production Lightning node with cl-hive coordination and cl-revenue-ops
             org.opencontainers.image.vendor=Lightning Goats
-            org.opencontainers.image.documentation=https://github.com/lightning-goats/cl-hive/blob/main/docker/README.md
+            org.opencontainers.image.documentation=https://github.com/archetech/cl-hive/blob/main/docker/README.md
 
       - name: Build and push multi-arch image
         uses: docker/build-push-action@v5
