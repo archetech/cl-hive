@@ -93,6 +93,14 @@ RUN apt-get update && apt-get install -y \
     lowdown \
     && rm -rf /var/lib/apt/lists/*
 
+# =============================================================================
+# PYTHON ENVIRONMENT
+# =============================================================================
+
+# Create virtual environment early so CLN ARM64 source build can use pip
+RUN python3 -m venv /opt/cln-plugins-venv
+ENV PATH="/opt/cln-plugins-venv/bin:$PATH"
+
 # Install CLN: pre-built on AMD64, source build on ARM64
 RUN ARCH=$(uname -m) \
     && if [ "$ARCH" = "x86_64" ]; then \
@@ -113,14 +121,6 @@ RUN ARCH=$(uname -m) \
         && rm -rf /tmp/lightning; \
     fi \
     && ldconfig
-
-# =============================================================================
-# PYTHON ENVIRONMENT
-# =============================================================================
-
-# Create virtual environment for plugins
-RUN python3 -m venv /opt/cln-plugins-venv
-ENV PATH="/opt/cln-plugins-venv/bin:$PATH"
 
 # Install Python dependencies
 RUN pip install --no-cache-dir \
