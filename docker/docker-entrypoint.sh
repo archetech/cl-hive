@@ -621,7 +621,7 @@ else
 
     while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
         # Test RPC connection and verify credentials
-        RPC_RESPONSE=$(curl -s --max-time 10 --user "$BITCOIN_RPCUSER:$BITCOIN_RPCPASSWORD" \
+        RPC_RESPONSE=$(curl -4 -s --max-time 10 --user "$BITCOIN_RPCUSER:$BITCOIN_RPCPASSWORD" \
             --data-binary '{"jsonrpc":"1.0","method":"getblockchaininfo","params":[]}' \
             -H 'content-type: text/plain;' \
             "http://$BITCOIN_RPCHOST:$BITCOIN_RPCPORT/" 2>&1) || true
