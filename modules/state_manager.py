@@ -99,29 +99,38 @@ class HivePeerState:
         Handles old nodes that don't send budget fields by using defaults.
         Returns None if peer_id is missing or empty.
         """
+        def _safe_int(val, default=0):
+            """Coerce value to int, returning default on failure."""
+            if isinstance(val, int):
+                return val
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return default
+
         # Required fields
         peer_id = data.get("peer_id", "")
-        if not peer_id:
+        if not peer_id or not isinstance(peer_id, str):
             return None
-        capacity_sats = data.get("capacity_sats", 0)
-        available_sats = data.get("available_sats", 0)
+        capacity_sats = _safe_int(data.get("capacity_sats", 0))
+        available_sats = _safe_int(data.get("available_sats", 0))
         fee_policy = data.get("fee_policy", {})
         topology = data.get("topology", [])
-        version = data.get("version", 0)
-        last_update = data.get("last_update", data.get("timestamp", 0))
+        version = _safe_int(data.get("version", 0))
+        last_update = _safe_int(data.get("last_update", data.get("timestamp", 0)))
         state_hash = data.get("state_hash", "")
 
         # Budget fields (optional, backward compatible defaults)
-        budget_available_sats = data.get("budget_available_sats", 0)
-        budget_reserved_until = data.get("budget_reserved_until", 0)
-        budget_last_update = data.get("budget_last_update", 0)
+        budget_available_sats = _safe_int(data.get("budget_available_sats", 0))
+        budget_reserved_until = _safe_int(data.get("budget_reserved_until", 0))
+        budget_last_update = _safe_int(data.get("budget_last_update", 0))
 
         # Fee reporting fields (optional, backward compatible defaults)
-        fees_earned_sats = data.get("fees_earned_sats", 0)
-        fees_forward_count = data.get("fees_forward_count", 0)
-        fees_period_start = data.get("fees_period_start", 0)
-        fees_last_report = data.get("fees_last_report", 0)
-        fees_costs_sats = data.get("fees_costs_sats", 0)
+        fees_earned_sats = _safe_int(data.get("fees_earned_sats", 0))
+        fees_forward_count = _safe_int(data.get("fees_forward_count", 0))
+        fees_period_start = _safe_int(data.get("fees_period_start", 0))
+        fees_last_report = _safe_int(data.get("fees_last_report", 0))
+        fees_costs_sats = _safe_int(data.get("fees_costs_sats", 0))
 
         # Capabilities (optional, backward compatible - old nodes have no capabilities)
         capabilities = data.get("capabilities", [])

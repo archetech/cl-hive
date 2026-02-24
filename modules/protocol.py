@@ -1893,7 +1893,7 @@ def validate_fee_intelligence_snapshot_payload(payload: Dict[str, Any]) -> bool:
         forward_volume_sats = peer.get("forward_volume_sats", 0)
         revenue_sats = peer.get("revenue_sats", 0)
 
-        if not isinstance(forward_count, int) or forward_count < 0:
+        if not isinstance(forward_count, int) or not (0 <= forward_count <= MAX_VOLUME_SATS):
             return False
         if not isinstance(forward_volume_sats, int) or not (0 <= forward_volume_sats <= MAX_VOLUME_SATS):
             return False

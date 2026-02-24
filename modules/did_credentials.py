@@ -603,10 +603,15 @@ class DIDCredentialManager:
             if expires_at < now:
                 return False, "credential expired"
 
-        # Revocation check
+        # Revocation check — check both presented credential and local DB
         revoked_at = credential.get("revoked_at")
         if revoked_at is not None:
             return False, "credential revoked"
+        credential_id = credential.get("credential_id", "")
+        if credential_id and self.db:
+            db_cred = self.db.get_did_credential(credential_id)
+            if db_cred and db_cred.get("revoked_at") is not None:
+                return False, "credential revoked (local record)"
 
         # Signature verification via CLN checkmessage (fail-closed)
         if not self.rpc:

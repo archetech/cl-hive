@@ -955,13 +955,13 @@ class SpliceManager:
         """Proceed to signing phase after commitments secured."""
         self._log(f"Proceeding to signing for session {session_id}")
 
-        # Validate state transition
+        # Validate state transition against allowed predecessors
         session = self.db.get_splice_session(session_id)
         if session:
             current_status = session.get("status")
-            if current_status in (SPLICE_STATUS_COMPLETED, SPLICE_STATUS_ABORTED, SPLICE_STATUS_FAILED):
-                self._log(f"Cannot proceed to signing: session {session_id} already in terminal state {current_status}")
-                return {"error": "invalid_state", "message": f"Session already {current_status}"}
+            if current_status not in self._VALID_SIGNING_PREDECESSORS:
+                self._log(f"Cannot proceed to signing: session {session_id} in invalid state {current_status}")
+                return {"error": "invalid_state", "message": f"Session in invalid state {current_status}"}
 
         self.db.update_splice_session(session_id, status=SPLICE_STATUS_SIGNING)
 
