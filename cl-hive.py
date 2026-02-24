@@ -10864,6 +10864,14 @@ def membership_maintenance_loop():
                 # Prune old settlement periods (fee_reports, pool data > 365 days)
                 database.prune_old_settlement_periods(older_than_days=365)
 
+                # Cleanup expired splice sessions (audit fix #21)
+                if splice_mgr:
+                    try:
+                        splice_mgr.cleanup_expired_sessions()
+                    except Exception as e:
+                        if plugin:
+                            plugin.log(f"cl-hive: splice session cleanup error: {e}", level='debug')
+
                 # Prune old ban proposals and votes (180-day retention)
                 database.prune_old_ban_data(older_than_days=180)
 

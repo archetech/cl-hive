@@ -875,8 +875,10 @@ def _execute_channel_open(
                 if ctx.log:
                     ctx.log(f"cl-hive: Could not check feerates: {e}", 'debug')
 
-    # Calculate intelligent budget limits
+    # Calculate intelligent budget limits — config is required for budget enforcement
     budget_info = {}
+    if not cfg:
+        return {"error": "Cannot open channel: config unavailable for budget enforcement", "action_id": action_id}
     if cfg:
         # Get onchain balance for reserve calculation
         try:
@@ -935,12 +937,20 @@ def _execute_channel_open(
                 }
 
         # Validate member override is within bounds
-        if override_applied and channel_size_sats < cfg.planner_min_channel_sats:
-            return {
-                "error": f"Override amount {channel_size_sats:,} below minimum {cfg.planner_min_channel_sats:,}",
-                "action_id": action_id,
-                "min_channel_sats": cfg.planner_min_channel_sats,
-            }
+        if override_applied:
+            if channel_size_sats < cfg.planner_min_channel_sats:
+                return {
+                    "error": f"Override amount {channel_size_sats:,} below minimum {cfg.planner_min_channel_sats:,}",
+                    "action_id": action_id,
+                    "min_channel_sats": cfg.planner_min_channel_sats,
+                }
+            if channel_size_sats > effective_budget:
+                return {
+                    "error": f"Override amount {channel_size_sats:,} exceeds effective budget {effective_budget:,}",
+                    "action_id": action_id,
+                    "effective_budget_sats": effective_budget,
+                    "budget_info": budget_info,
+                }
 
     # Get intent from database (if available)
     intent_record = None

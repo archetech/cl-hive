@@ -499,7 +499,7 @@ class TestMgmtCredentialPresentHandler:
     def _make_registry(self, db=None):
         db = db or MockDatabase()
         rpc = MagicMock()
-        rpc.checkmessage.return_value = {
+        rpc.call.return_value = {
             "verified": True,
             "pubkey": ALICE_PUBKEY,
         }
@@ -558,14 +558,14 @@ class TestMgmtCredentialPresentHandler:
 
     def test_signature_verification_failed(self):
         registry, _, rpc = self._make_registry()
-        rpc.checkmessage.return_value = {"verified": False, "pubkey": ALICE_PUBKEY}
+        rpc.call.return_value = {"verified": False, "pubkey": ALICE_PUBKEY}
         payload = _make_mgmt_present_payload()
         result = registry.handle_mgmt_credential_present(ALICE_PUBKEY, payload)
         assert result is False
 
     def test_signature_pubkey_mismatch(self):
         registry, _, rpc = self._make_registry()
-        rpc.checkmessage.return_value = {"verified": True, "pubkey": DAVE_PUBKEY}
+        rpc.call.return_value = {"verified": True, "pubkey": DAVE_PUBKEY}
         payload = _make_mgmt_present_payload()
         result = registry.handle_mgmt_credential_present(ALICE_PUBKEY, payload)
         assert result is False
@@ -589,7 +589,7 @@ class TestMgmtCredentialPresentHandler:
 
     def test_checkmessage_exception(self):
         registry, _, rpc = self._make_registry()
-        rpc.checkmessage.side_effect = Exception("RPC error")
+        rpc.call.side_effect = Exception("RPC error")
         payload = _make_mgmt_present_payload()
         result = registry.handle_mgmt_credential_present(ALICE_PUBKEY, payload)
         assert result is False
@@ -601,7 +601,7 @@ class TestMgmtCredentialRevokeHandler:
     def _make_registry_with_cred(self):
         db = MockDatabase()
         rpc = MagicMock()
-        rpc.checkmessage.return_value = {
+        rpc.call.return_value = {
             "verified": True,
             "pubkey": ALICE_PUBKEY,
         }
@@ -730,7 +730,7 @@ class TestMgmtCredentialRevokeHandler:
 
     def test_sig_verification_failed(self):
         registry, _, rpc, cred_id = self._make_registry_with_cred()
-        rpc.checkmessage.return_value = {"verified": False}
+        rpc.call.return_value = {"verified": False}
         payload = {
             "credential_id": cred_id,
             "issuer_id": ALICE_PUBKEY,

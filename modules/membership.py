@@ -257,7 +257,7 @@ class MembershipManager:
 
         # Check uptime (use config value)
         uptime = self.calculate_uptime(peer_id)
-        min_uptime = getattr(self.config, 'min_uptime_pct', 95.0)
+        min_uptime = getattr(self.config, 'min_uptime_pct', 99.5)
         if uptime < min_uptime:
             reasons.append(f"uptime_below_threshold ({uptime:.1f}% < {min_uptime}%)")
 
@@ -414,7 +414,7 @@ class MembershipManager:
         """
         Calculate quorum for voting (bans, promotions, etc).
 
-        Uses simple majority (51%) with minimum of 2 votes, except for
+        Uses simple majority (51%) with minimum of 3 votes, except for
         single-member bootstrap case where 1 vote is sufficient.
         """
         # Bootstrap case: single member can approve alone
@@ -422,7 +422,7 @@ class MembershipManager:
             return 1
 
         threshold = math.ceil(active_members * 0.51)  # Simple majority
-        return max(2, threshold)
+        return max(3, threshold)
 
     def check_ban_cooldown(self, target_peer_id: str,
                            cooldown_seconds: int = 0) -> bool:

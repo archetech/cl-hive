@@ -492,7 +492,12 @@ class Bridge:
             raise RpcError(method, payload or {}, f"Invalid JSON response: {exc}")
 
     def _call_direct(self, method: str, payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """Execute an RPC call directly via the RPC proxy."""
+        """Execute an RPC call directly via the RPC proxy.
+
+        Note: relies on RpcPoolProxy timeout (30s) when installed.
+        If called with raw RPC before proxy install, falls back to
+        subprocess path which has explicit RPC_TIMEOUT enforcement.
+        """
         if payload:
             return self.rpc.call(method, payload)
         return self.rpc.call(method)

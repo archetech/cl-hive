@@ -121,7 +121,7 @@ class HiveConfig:
 
     # Auto-Promotion Criteria (no vouching required - meritocratic)
     min_contribution_ratio: float = 1.0        # Must forward at least as much as received
-    min_uptime_pct: float = 95.0               # 95% uptime required
+    min_uptime_pct: float = 99.5               # 99.5% uptime required per spec
     min_unique_peers: int = 1                  # Must bring at least 1 unique peer
     
     # Ecological Limits
@@ -185,10 +185,18 @@ class HiveConfig:
         Returns:
             Error message if invalid, None if valid
         """
-        valid_modes = ('advisor', 'failsafe')
         if hasattr(self, 'governance_mode'):
-            if self.governance_mode not in valid_modes:
-                return f"governance_mode must be one of {valid_modes}, got '{self.governance_mode}'"
+            if self.governance_mode not in VALID_GOVERNANCE_MODES:
+                return f"governance_mode must be one of {sorted(VALID_GOVERNANCE_MODES)}, got '{self.governance_mode}'"
+
+        # Type validation
+        for key, expected_type in CONFIG_FIELD_TYPES.items():
+            value = getattr(self, key, None)
+            if value is not None and not isinstance(value, expected_type):
+                # Allow int where float is expected
+                if expected_type is float and isinstance(value, int):
+                    continue
+                return f"Config {key} must be {expected_type.__name__}, got {type(value).__name__}"
 
         for key, (min_val, max_val) in CONFIG_FIELD_RANGES.items():
             if key == 'max_expansion_feerate_perkb':

@@ -1218,7 +1218,11 @@ class ManagementSchemaRegistry:
         signing_payload = json.dumps(signing_data, sort_keys=True, separators=(',', ':'))
 
         try:
-            result = self.rpc.checkmessage(signing_payload, signature, issuer_id)
+            result = self.rpc.call("checkmessage", {
+                "message": signing_payload,
+                "zbase": signature,
+                "pubkey": issuer_id,
+            })
             if not isinstance(result, dict):
                 self._log("mgmt_credential_present: unexpected checkmessage response type", "warn")
                 return False
@@ -1331,7 +1335,11 @@ class ManagementSchemaRegistry:
         }, sort_keys=True, separators=(',', ':'))
 
         try:
-            result = self.rpc.checkmessage(revoke_payload, signature, issuer_id)
+            result = self.rpc.call("checkmessage", {
+                "message": revoke_payload,
+                "zbase": signature,
+                "pubkey": issuer_id,
+            })
             if not isinstance(result, dict):
                 self._log("mgmt revoke: unexpected checkmessage response type", "warn")
                 return False

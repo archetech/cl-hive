@@ -2263,7 +2263,8 @@ class HiveDatabase:
                 received = row['total'] or 0
         
         if received == 0:
-            return 1.0 if forwarded == 0 else float('inf')
+            # Cap at high ratio instead of inf to avoid propagating infinity
+            return 1.0 if forwarded == 0 else 100.0
         
         return forwarded / received
     

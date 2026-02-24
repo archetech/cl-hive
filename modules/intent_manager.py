@@ -647,7 +647,7 @@ class IntentManager:
         with self._remote_lock:
             stale_keys = [
                 key for key, intent in self._remote_intents.items()
-                if now > intent.expires_at + STALE_INTENT_THRESHOLD
+                if now > intent.timestamp + STALE_INTENT_THRESHOLD or now > intent.expires_at
             ]
             for key in stale_keys:
                 del self._remote_intents[key]

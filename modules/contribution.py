@@ -13,7 +13,7 @@ CHANNEL_MAP_REFRESH_SECONDS = 300
 MAX_CONTRIB_EVENTS_PER_PEER_PER_HOUR = 120
 MAX_EVENT_MSAT = 10 ** 14
 LEECH_WARN_RATIO = 0.5
-LEECH_BAN_RATIO = 0.4
+LEECH_BAN_RATIO = 0.3
 LEECH_WINDOW_DAYS = 7
 MAX_RATE_LIMIT_ENTRIES = 1000
 
@@ -231,8 +231,10 @@ class ContributionManager:
         now = int(time.time())
         flag = self.db.get_leech_flag(peer_id)
         if not flag:
+            # First detection: set flag but don't report as leech yet.
+            # The 7-day window starts now; only report leech after window elapses.
             self.db.set_leech_flag(peer_id, now, False)
-            return {"is_leech": True, "ratio": ratio}
+            return {"is_leech": False, "ratio": ratio, "leech_warning": True}
 
         low_since = flag["low_since_ts"]
         ban_triggered = bool(flag["ban_triggered"])

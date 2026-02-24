@@ -260,7 +260,7 @@ class TestUpdateQuery:
         assert summary["thriving_count"] == 1
         assert summary["struggling_count"] == 1
         assert summary["stable_count"] == 1
-        assert summary["fleet_health"] == 51  # (80+15+60)//3
+        assert summary["fleet_health"] == 52  # round((80+15+60)/3)
         assert len(summary["members"]) == 3
 
     def test_fleet_summary_empty(self, aggregator, mock_database):

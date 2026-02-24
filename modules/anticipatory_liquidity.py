@@ -1182,9 +1182,11 @@ class AnticipatoryLiquidityManager:
         # Get Kalman data if available
         kalman_data = self._get_kalman_consensus_velocity(channel_id)
         kalman_confidence = 0.5  # Default without Kalman
+        kalman_velocity = None
         is_regime_change = False
 
         if kalman_data is not None:
+            kalman_velocity = kalman_data  # Kalman-smoothed velocity estimate
             # Get full Kalman report for uncertainty
             with self._lock:
                 reports = list(self._kalman_velocities.get(channel_id, []))
@@ -1209,7 +1211,8 @@ class AnticipatoryLiquidityManager:
                 hour_end=hour_end,
                 kalman_confidence=kalman_confidence,
                 is_regime_change=is_regime_change,
-                capacity_sats=capacity_sats
+                capacity_sats=capacity_sats,
+                kalman_velocity=kalman_velocity,
             )
             if pattern:
                 patterns.append(pattern)
@@ -1237,7 +1240,8 @@ class AnticipatoryLiquidityManager:
         hour_end: int,
         kalman_confidence: float,
         is_regime_change: bool,
-        capacity_sats: int = 0
+        capacity_sats: int = 0,
+        kalman_velocity: float = None,
     ) -> Optional[IntraDayPattern]:
         """
         Analyze a specific time bucket for patterns.
@@ -1301,7 +1305,16 @@ class AnticipatoryLiquidityManager:
             return None
 
         # Calculate statistics
-        avg_velocity = sum(velocities) / len(velocities)
+        raw_avg_velocity = sum(velocities) / len(velocities)
+
+        # Blend with Kalman-smoothed velocity when available.
+        # Higher kalman_confidence → more weight on Kalman estimate.
+        if kalman_velocity is not None and kalman_confidence > 0.3:
+            blend_weight = min(0.5, kalman_confidence - 0.3)  # 0..0.5
+            avg_velocity = raw_avg_velocity * (1 - blend_weight) + kalman_velocity * blend_weight
+        else:
+            avg_velocity = raw_avg_velocity
+
         velocity_variance = sum((v - avg_velocity) ** 2 for v in velocities) / len(velocities)
         velocity_std = math.sqrt(velocity_variance)
         avg_magnitude = int(sum(flow_magnitudes) / len(flow_magnitudes))

@@ -551,7 +551,7 @@ VALID_WARNINGS = {
 # SERIALIZATION
 # =============================================================================
 
-def serialize(msg_type: HiveMessageType, payload: Dict[str, Any]) -> bytes:
+def serialize(msg_type: HiveMessageType, payload: Dict[str, Any]) -> Optional[bytes]:
     """
     Serialize a Hive message for transmission via sendcustommsg.
     

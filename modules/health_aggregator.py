@@ -367,7 +367,7 @@ class HealthScoreAggregator:
                 "budget_multiplier": self.get_budget_multiplier(tier)
             })
 
-        avg_health = total_health // len(all_health) if all_health else 50
+        avg_health = round(total_health / len(all_health)) if all_health else 50
 
         return {
             "fleet_health": avg_health,

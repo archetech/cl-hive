@@ -1188,7 +1188,7 @@ class TestGossipHandlers:
         issuer_id = payload["credential"]["issuer_id"]
 
         # Mock checkmessage to return verified
-        rpc.checkmessage.return_value = {"verified": True, "pubkey": issuer_id}
+        rpc.call.return_value = {"verified": True, "pubkey": issuer_id}
 
         result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
         assert result is True
@@ -1279,7 +1279,7 @@ class TestGossipHandlers:
         payload = self._make_valid_credential_payload()
         payload["credential"]["allowed_schemas"] = [f"hive:schema-{i}/v1" for i in range(100)]
         issuer_id = payload["credential"]["issuer_id"]
-        rpc.checkmessage.return_value = {"verified": True, "pubkey": issuer_id}
+        rpc.call.return_value = {"verified": True, "pubkey": issuer_id}
 
         result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
         assert result is True
@@ -1290,7 +1290,7 @@ class TestGossipHandlers:
         payload = self._make_valid_credential_payload()
         payload["credential"]["constraints"] = {f"key_{i}": i for i in range(50)}
         issuer_id = payload["credential"]["issuer_id"]
-        rpc.checkmessage.return_value = {"verified": True, "pubkey": issuer_id}
+        rpc.call.return_value = {"verified": True, "pubkey": issuer_id}
 
         result = reg.handle_mgmt_credential_present(BOB_PUBKEY, payload)
         assert result is True
