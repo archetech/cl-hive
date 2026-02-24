@@ -350,6 +350,12 @@ class StateManager:
                 budget_available_sats=gossip_data.get('budget_available_sats', 0),
                 budget_reserved_until=gossip_data.get('budget_reserved_until', 0),
                 budget_last_update=gossip_data.get('budget_last_update', 0),
+                # Preserve fee fields from existing state (set via update_peer_fees)
+                fees_earned_sats=existing.fees_earned_sats if existing else 0,
+                fees_forward_count=existing.fees_forward_count if existing else 0,
+                fees_period_start=existing.fees_period_start if existing else 0,
+                fees_last_report=existing.fees_last_report if existing else 0,
+                fees_costs_sats=existing.fees_costs_sats if existing else 0,
                 # Capabilities (MCF support, etc. - backward compatible, defaults to empty)
                 capabilities=list(gossip_data.get('capabilities', [])),  # defensive copy
             )
