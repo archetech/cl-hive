@@ -2460,8 +2460,18 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     plugin.rpc = RpcPoolProxy(_rpc_pool, timeout=30)
     plugin.log("cl-hive: RPC pool proxy installed")
 
-    # C4 audit fix: Re-assign thread-safe RPC proxy to managers that cached
-    # the raw plugin.rpc reference during init (before proxy was installed).
+    # Re-assign thread-safe RPC proxy to managers that cached the raw
+    # plugin.rpc reference during init (before proxy was installed).
+    if handshake_mgr:
+        handshake_mgr.rpc = plugin.rpc
+    if bridge:
+        bridge.rpc = plugin.rpc
+    if contribution_mgr:
+        contribution_mgr.rpc = plugin.rpc
+    if settlement_mgr:
+        settlement_mgr.rpc = plugin.rpc
+    if clboss_bridge:
+        clboss_bridge.rpc = plugin.rpc
     if did_credential_mgr:
         did_credential_mgr.rpc = plugin.rpc
     if management_schema_registry:

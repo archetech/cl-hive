@@ -138,7 +138,7 @@ PROMPTEOF
 CLAUDE_EXIT=0
 claude -p \
     --mcp-config "$MCP_CONFIG_TMP" \
-    --model openai-codex/gpt-5.3-codex \
+    --model sonnet \
     --allowedTools "mcp__hive__*" \
     --output-format text \
     < "$ADVISOR_PROMPT_FILE" \

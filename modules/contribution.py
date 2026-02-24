@@ -99,6 +99,8 @@ class ContributionManager:
         with self._map_lock:
             if now - self._last_refresh < CHANNEL_MAP_REFRESH_SECONDS:
                 return
+            # Mark as refreshed immediately to prevent duplicate RPC calls
+            self._last_refresh = now
 
         try:
             data = self.rpc.listpeerchannels()
@@ -119,7 +121,6 @@ class ContributionManager:
 
         with self._map_lock:
             self._channel_map = mapping
-            self._last_refresh = now
 
     def _lookup_peer(self, channel_id: str) -> Optional[str]:
         self._refresh_channel_map()
