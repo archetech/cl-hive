@@ -2420,6 +2420,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 fee_coordination_mgr.save_state_to_database()
         except Exception:
             pass  # Best-effort on shutdown
+        # Cancel queued message tasks BEFORE tearing down the RPC pool
+        # they depend on — prevents queued tasks from starting with dead RPC.
+        try:
+            if _msg_executor:
+                _msg_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass  # Best-effort on shutdown
         try:
             if _rpc_pool:
                 _rpc_pool.stop()
@@ -2438,11 +2445,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         try:
             if _batched_log_writer:
                 _batched_log_writer.stop()
-        except Exception:
-            pass  # Best-effort on shutdown
-        try:
-            if _msg_executor:
-                _msg_executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass  # Best-effort on shutdown
         shutdown_event.set()
@@ -15549,6 +15551,10 @@ def hive_report_health(
     if not database or not health_aggregator or not our_pubkey:
         return {"error": "Health tracking not initialized"}
 
+    # Guard against empty-param relay — don't overwrite real health data with zeros
+    if profitable_channels == 0 and underwater_channels == 0 and stagnant_channels == 0:
+        return {"error": "At least one channel category must have a non-zero count"}
+
     # Calculate total if not provided
     if total_channels is None:
         total_channels = profitable_channels + underwater_channels + stagnant_channels
@@ -18416,6 +18422,8 @@ def hive_broadcast_warning(
     Returns:
         Dict with broadcast result.
     """
+    if not peer_id:
+        return {"error": "peer_id is required"}
     return rpc_broadcast_warning(
         _get_hive_context(),
         peer_id=peer_id,
@@ -19092,6 +19100,8 @@ def hive_report_flow_intensity(plugin: Plugin, channel_id: str = "", peer_id: st
     Returns:
         Dict with acknowledgment.
     """
+    if not channel_id or not peer_id:
+        return {"error": "channel_id and peer_id are required"}
     return rpc_report_flow_intensity(
         _get_hive_context(),
         channel_id=channel_id,
