@@ -241,6 +241,13 @@ class DecisionEngine:
             expires_hours=DEFAULT_ACTION_EXPIRY_HOURS
         )
 
+        if not action_id:
+            self._log("Failed to queue action (database error)", level='error')
+            return DecisionResponse(
+                result=DecisionResult.ERROR,
+                reason="Failed to queue action (database error)"
+            )
+
         self._log(f"Action queued for AI/human approval (id={action_id})")
 
         return DecisionResponse(
@@ -289,12 +296,11 @@ class DecisionEngine:
 
         # Atomically check budget+rate, execute, and update tracking
         amount_sats = packet.context.get('amount_sats', 0)
-        if not isinstance(amount_sats, (int, float)):
-            try:
-                amount_sats = int(amount_sats)
-            except (ValueError, TypeError):
-                amount_sats = 0
-        if isinstance(amount_sats, (int, float)) and amount_sats < 0:
+        try:
+            amount_sats = int(amount_sats)
+        except (ValueError, TypeError):
+            amount_sats = 0
+        if amount_sats < 0:
             amount_sats = 0
 
         with self._failsafe_lock:
@@ -400,13 +406,13 @@ class DecisionEngine:
         cutoff = now - 3600
 
         with self._failsafe_lock:
-            # Prune old actions for accurate count
-            recent_actions = [ts for ts in self._hourly_actions if ts > cutoff]
+            # Prune old actions for accurate count and to prevent unbounded growth
+            self._hourly_actions = [ts for ts in self._hourly_actions if ts > cutoff]
 
             return {
                 'daily_spend_sats': self._daily_spend_sats,
                 'daily_spend_reset_day': self._daily_spend_reset_day,
-                'hourly_action_count': len(recent_actions),
+                'hourly_action_count': len(self._hourly_actions),
                 'registered_executors': list(self._executors.keys()),
             }
 

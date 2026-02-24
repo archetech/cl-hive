@@ -129,16 +129,33 @@ class PeerQualityScorer:
             PeerQualityResult with scores and recommendation
         """
         # Get aggregated event summary
-        summary = self.database.get_peer_event_summary(peer_id, days=days)
+        try:
+            summary = self.database.get_peer_event_summary(peer_id, days=days)
+        except Exception as e:
+            self._log(f"Failed to get event summary for {peer_id[:16]}...: {e}", "warn")
+            return PeerQualityResult(
+                peer_id=peer_id,
+                overall_score=0.5,
+                reliability_score=0.5,
+                profitability_score=0.5,
+                routing_score=0.5,
+                consistency_score=0.5,
+                confidence=0.0,
+                recommendation="neutral",
+                factors={"error": str(e)},
+            )
+
+        if not isinstance(summary, dict):
+            summary = {}
 
         factors = {
             "days_analyzed": days,
-            "event_count": summary["event_count"],
+            "event_count": summary.get("event_count", 0),
             "data_source": "peer_events",
         }
 
         # Handle no-data case
-        if summary["event_count"] == 0:
+        if summary.get("event_count", 0) == 0:
             return PeerQualityResult(
                 peer_id=peer_id,
                 overall_score=0.5,  # Neutral for unknown peers
@@ -212,10 +229,10 @@ class PeerQualityScorer:
         score = 0.5  # Start neutral
         reliability_factors = {}
 
-        close_count = summary["close_count"]
+        close_count = summary.get("close_count", 0)
         if close_count > 0:
             # Penalize remote closes
-            remote_close_ratio = summary["remote_close_count"] / close_count
+            remote_close_ratio = summary.get("remote_close_count", 0) / close_count
             remote_penalty = min(
                 self.MAX_REMOTE_CLOSE_PENALTY,
                 remote_close_ratio * self.REMOTE_CLOSE_PENALTY * close_count
@@ -225,7 +242,7 @@ class PeerQualityScorer:
             reliability_factors["remote_penalty"] = round(remote_penalty, 3)
 
             # Bonus for mutual closes (cooperative behavior)
-            mutual_close_ratio = summary["mutual_close_count"] / close_count
+            mutual_close_ratio = summary.get("mutual_close_count", 0) / close_count
             mutual_bonus = mutual_close_ratio * self.MUTUAL_CLOSE_BONUS * close_count
             mutual_bonus = min(0.15, mutual_bonus)  # Cap bonus
             score += mutual_bonus
@@ -411,9 +428,9 @@ class PeerQualityScorer:
         if len(reporter_scores) >= 2:
             # Calculate variance of profitability scores across reporters
             profit_scores = [rs.get("avg_profitability_score", 0.5)
-                           for rs in reporter_scores.values()]
+                           for rs in reporter_scores.values() if isinstance(rs, dict)]
             routing_scores = [rs.get("avg_routing_score", 0.5)
-                            for rs in reporter_scores.values()]
+                            for rs in reporter_scores.values() if isinstance(rs, dict)]
 
             # Calculate standard deviation (measure of disagreement)
             if len(profit_scores) >= 2:

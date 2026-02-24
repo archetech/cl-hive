@@ -68,6 +68,8 @@ class BudgetHold:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'BudgetHold':
         """Create from dictionary."""
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected dict, got {type(data).__name__}")
         return cls(
             hold_id=data.get("hold_id", ""),
             round_id=data.get("round_id", ""),
@@ -170,8 +172,15 @@ class BudgetHoldManager:
                     self._log(f"Hold already exists for round {round_id[:8]}...")
                     return hold.hold_id
 
-            # Cap duration
+            # Validate and cap duration
+            if not isinstance(duration_seconds, int) or duration_seconds <= 0:
+                duration_seconds = MAX_HOLD_DURATION_SECONDS
             duration = min(duration_seconds, MAX_HOLD_DURATION_SECONDS)
+
+            # Validate amount
+            if not isinstance(amount_sats, int) or amount_sats <= 0:
+                self._log(f"Invalid amount_sats: {amount_sats}")
+                return None
 
             now = int(time.time())
             hold_id = self._generate_hold_id()

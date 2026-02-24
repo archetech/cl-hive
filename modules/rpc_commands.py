@@ -5515,17 +5515,20 @@ def marketplace_status(ctx: HiveContext) -> Dict[str, Any]:
     if not ctx.marketplace_mgr or not ctx.database:
         return {"error": "marketplace manager not initialized"}
 
-    conn = ctx.database._get_connection()
-    contracts = conn.execute(
-        "SELECT status, COUNT(*) as cnt FROM marketplace_contracts GROUP BY status"
-    ).fetchall()
-    trials = conn.execute(
-        "SELECT COUNT(*) as cnt FROM marketplace_trials WHERE outcome IS NULL"
-    ).fetchone()
-    return {
-        "contract_counts": {row["status"]: int(row["cnt"]) for row in contracts},
-        "active_trials": int(trials["cnt"]) if trials else 0,
-    }
+    try:
+        conn = ctx.database._get_connection()
+        contracts = conn.execute(
+            "SELECT status, COUNT(*) as cnt FROM marketplace_contracts GROUP BY status"
+        ).fetchall()
+        trials = conn.execute(
+            "SELECT COUNT(*) as cnt FROM marketplace_trials WHERE outcome IS NULL"
+        ).fetchone()
+        return {
+            "contract_counts": {row["status"]: int(row["cnt"]) for row in contracts},
+            "active_trials": int(trials["cnt"]) if trials else 0,
+        }
+    except Exception:
+        return {"contract_counts": {}, "active_trials": 0}
 
 
 # =============================================================================

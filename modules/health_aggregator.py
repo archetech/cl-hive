@@ -189,11 +189,13 @@ class HealthScoreAggregator:
         Returns:
             Liquidity score (0-100)
         """
-        if not channels:
+        if not channels or not isinstance(channels, list):
             return 50  # Default to neutral
 
         total_penalty = 0
         for ch in channels:
+            if not isinstance(ch, dict):
+                continue
             local_pct = ch.get("local_balance_pct", 0.5)
 
             # Calculate distance from ideal (50%)
@@ -206,7 +208,9 @@ class HealthScoreAggregator:
             total_penalty += penalty
 
         # Average penalty across channels
-        avg_penalty = total_penalty / len(channels)
+        if total_penalty == 0:
+            return 100
+        avg_penalty = total_penalty / max(1, len(channels))
 
         # Convert to score (0-100, higher is better)
         score = int(max(0, min(100, 100 - avg_penalty)))
@@ -266,20 +270,23 @@ class HealthScoreAggregator:
         connectivity_score = liquidity_score
 
         # Update database
-        self.database.update_member_health(
-            peer_id=our_pubkey,
-            overall_health=score,
-            capacity_score=capacity_score,
-            revenue_score=revenue_score,
-            connectivity_score=connectivity_score,
-            tier=tier.value,
-            needs_help=needs_help,
-            can_help_others=can_help,
-            needs_inbound=False,  # Could be calculated from liquidity_score
-            needs_outbound=False,
-            needs_channels=False,
-            assistance_budget_sats=0  # Not used - no fund transfers
-        )
+        try:
+            self.database.update_member_health(
+                peer_id=our_pubkey,
+                overall_health=score,
+                capacity_score=capacity_score,
+                revenue_score=revenue_score,
+                connectivity_score=connectivity_score,
+                tier=tier.value,
+                needs_help=needs_help,
+                can_help_others=can_help,
+                needs_inbound=False,  # Could be calculated from liquidity_score
+                needs_outbound=False,
+                needs_channels=False,
+                assistance_budget_sats=0  # Not used - no fund transfers
+            )
+        except Exception as e:
+            self._log(f"Failed to persist health update: {e}", "warn")
 
         self._log(
             f"Updated our health: score={score}, tier={tier.value}, "

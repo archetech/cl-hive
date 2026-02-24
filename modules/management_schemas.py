@@ -1165,7 +1165,10 @@ class ManagementSchemaRegistry:
                 self._log("mgmt_credential_present: constraints string is not valid JSON", "warn")
                 return False
 
-        if not isinstance(valid_from, int) or not isinstance(valid_until, int):
+        try:
+            valid_from = int(valid_from)
+            valid_until = int(valid_until)
+        except (ValueError, TypeError):
             self._log("mgmt_credential_present: bad validity period", "warn")
             return False
 
@@ -1203,6 +1206,8 @@ class ManagementSchemaRegistry:
                 constraints_for_payload = json.loads(constraints_for_payload)
             except (json.JSONDecodeError, TypeError):
                 constraints_for_payload = {}
+        if not isinstance(constraints_for_payload, dict):
+            constraints_for_payload = {}
 
         signing_data = {
             "credential_id": credential_id,

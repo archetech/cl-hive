@@ -278,6 +278,11 @@ class VPNTransportManager:
                     if ':' in addr:
                         ip, port = addr.rsplit(':', 1)
                         port = int(port)
+                        if not (1 <= port <= 65535):
+                            result["warnings"].append(
+                                f"Peer {pubkey[:16]}... port {port} out of range, using default"
+                            )
+                            port = DEFAULT_VPN_PORT
                     else:
                         ip = addr
                         port = DEFAULT_VPN_PORT

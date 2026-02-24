@@ -350,10 +350,14 @@ class PeerReputationManager:
 
     def _update_aggregation(self, peer_id: str):
         """Update aggregated reputation for a peer."""
-        reports = self.database.get_peer_reputation_reports(
-            peer_id,
-            max_age_hours=REPUTATION_STALENESS_HOURS
-        )
+        try:
+            reports = self.database.get_peer_reputation_reports(
+                peer_id,
+                max_age_hours=REPUTATION_STALENESS_HOURS
+            )
+        except Exception as e:
+            self._log(f"Failed to get reputation reports for {peer_id[:16]}...: {e}", "warn")
+            return
 
         if not reports:
             with self._lock:
@@ -380,12 +384,15 @@ class PeerReputationManager:
         htlc_rates = [r.get("htlc_success_rate", 1.0) for r in weighted_reports]
         fee_stabilities = [r.get("fee_stability", 1.0) for r in weighted_reports]
         response_times = [r.get("response_time_ms", 0) for r in weighted_reports]
-        force_closes = max((r.get("force_close_count", 0) for r in filtered), default=0)
+        force_closes = max((r.get("force_close_count", 0) for r in weighted_reports), default=0)
 
         # Aggregate warnings
         warnings_count: Dict[str, int] = defaultdict(int)
         for r in filtered:
-            for warning in r.get("warnings", []):
+            warnings = r.get("warnings", [])
+            if not isinstance(warnings, list):
+                continue
+            for warning in warnings:
                 if warning in VALID_WARNINGS:
                     warnings_count[warning] += 1
 
