@@ -287,7 +287,9 @@ class TestTransportInterfaceRegression:
 
     def test_internal_transport_legacy_stub_raises(self):
         """Legacy InternalNostrTransport import should fail fast with migration guidance."""
-        from modules.nostr_transport import InternalNostrTransport
+        from modules.nostr_transport import InternalNostrTransport, NostrTransport
 
         with pytest.raises(RuntimeError, match="removed from cl-hive"):
             InternalNostrTransport()
+        with pytest.raises(RuntimeError, match="removed from cl-hive"):
+            NostrTransport()

@@ -213,6 +213,6 @@ class InternalNostrTransport(TransportInterface):
         )
 
 
-# Alias kept for backward compatibility with older imports; points to the
-# supported transport implementation.
-NostrTransport = ExternalCommsTransport
+# Alias kept for backward compatibility with older imports. Instantiation fails
+# fast with migration guidance via the legacy stub above.
+NostrTransport = InternalNostrTransport
