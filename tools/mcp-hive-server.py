@@ -2092,6 +2092,61 @@ Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
             }
         ),
         Tool(
+            name="revenue_boltz_balance_recommendations",
+            description="Get profit-constrained Boltz loop-in/out recommendations based on channel balances and profitability.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "low_trigger_pct": {"type": "number", "description": "Loop-in trigger when local balance drops below this percent (default: 40)"},
+                    "low_target_pct": {"type": "number", "description": "Loop-in target local balance percent (default: 55)"},
+                    "high_trigger_pct": {"type": "number", "description": "Loop-out trigger when local balance exceeds this percent (default: 80)"},
+                    "high_target_pct": {"type": "number", "description": "Loop-out target local balance percent (default: 60)"},
+                    "min_amount_sats": {"type": "integer", "description": "Minimum swap amount (default: 100000)"},
+                    "max_amount_sats": {"type": "integer", "description": "Maximum swap amount (default: 1000000)"},
+                    "max_candidates": {"type": "integer", "description": "Maximum recommendations returned (default: 20)"},
+                    "only_peer_id": {"type": "string", "description": "Restrict planning to one peer (optional)"},
+                    "only_channel_id": {"type": "string", "description": "Restrict planning to one channel SCID (optional)"},
+                    "require_profitable": {"type": "boolean", "description": "Require profitability data and profit guard (default: true)"},
+                    "min_marginal_roi": {"type": "number", "description": "Minimum marginal ROI threshold (default: 0.0)"},
+                    "profit_margin_factor": {"type": "number", "description": "Required gross uplift / fee ratio guard (default: 1.2)"},
+                    "expected_horizon_days": {"type": "number", "description": "Expected benefit horizon for profit guard model (default: 3.0)"},
+                    "loop_in_currency": {"type": "string", "enum": ["btc", "lbtc"], "description": "Funding currency for loop-ins (default: lbtc)"},
+                    "loop_out_currency": {"type": "string", "enum": ["btc", "lbtc"], "description": "Settlement currency for loop-outs (default: lbtc)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_balance_cycle",
+            description="Run a profit-constrained Boltz balancing cycle with budget and cooldown guards (dry-run by default).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "dry_run": {"type": "boolean", "description": "Preview actions without executing (default: true)"},
+                    "max_actions": {"type": "integer", "description": "Maximum swaps to execute in this cycle (default: 1)"},
+                    "low_trigger_pct": {"type": "number", "description": "Loop-in trigger when local balance drops below this percent (default: 40)"},
+                    "low_target_pct": {"type": "number", "description": "Loop-in target local balance percent (default: 55)"},
+                    "high_trigger_pct": {"type": "number", "description": "Loop-out trigger when local balance exceeds this percent (default: 80)"},
+                    "high_target_pct": {"type": "number", "description": "Loop-out target local balance percent (default: 60)"},
+                    "min_amount_sats": {"type": "integer", "description": "Minimum swap amount (default: 100000)"},
+                    "max_amount_sats": {"type": "integer", "description": "Maximum swap amount (default: 1000000)"},
+                    "only_peer_id": {"type": "string", "description": "Restrict cycle to one peer (optional)"},
+                    "only_channel_id": {"type": "string", "description": "Restrict cycle to one channel SCID (optional)"},
+                    "require_profitable": {"type": "boolean", "description": "Require profitability data and profit guard (default: true)"},
+                    "min_marginal_roi": {"type": "number", "description": "Minimum marginal ROI threshold (default: 0.0)"},
+                    "profit_margin_factor": {"type": "number", "description": "Required gross uplift / fee ratio guard (default: 1.2)"},
+                    "expected_horizon_days": {"type": "number", "description": "Expected benefit horizon for profit guard model (default: 3.0)"},
+                    "cooldown_hours": {"type": "number", "description": "Per-channel cooldown between Boltz balance actions (default: 4.0)"},
+                    "allow_concurrent_swaps": {"type": "boolean", "description": "Allow execution even if pending Boltz swaps exist (default: false)"},
+                    "loop_in_currency": {"type": "string", "enum": ["btc", "lbtc"], "description": "Funding currency for loop-ins (default: lbtc)"},
+                    "loop_out_currency": {"type": "string", "enum": ["btc", "lbtc"], "description": "Settlement currency for loop-outs (default: lbtc)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
             name="revenue_boltz_refund",
             description="Refund a failed submarine/chain swap.",
             inputSchema={
@@ -10471,6 +10526,75 @@ async def handle_revenue_boltz_wallet(args: Dict) -> Dict:
     return await node.call("revenue-boltz-wallet")
 
 
+async def handle_revenue_boltz_balance_recommendations(args: Dict) -> Dict:
+    """Get profit-constrained Boltz balance recommendations."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params: Dict[str, Any] = {}
+    for key in (
+        "low_trigger_pct",
+        "low_target_pct",
+        "high_trigger_pct",
+        "high_target_pct",
+        "min_amount_sats",
+        "max_amount_sats",
+        "max_candidates",
+        "only_peer_id",
+        "only_channel_id",
+        "require_profitable",
+        "min_marginal_roi",
+        "profit_margin_factor",
+        "expected_horizon_days",
+        "loop_in_currency",
+        "loop_out_currency",
+    ):
+        if args.get(key) is not None:
+            params[key] = args[key]
+
+    if not params:
+        return await node.call("revenue-boltz-balance-recommendations")
+    return await node.call("revenue-boltz-balance-recommendations", params)
+
+
+async def handle_revenue_boltz_balance_cycle(args: Dict) -> Dict:
+    """Run a profit-constrained Boltz balance cycle."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params: Dict[str, Any] = {}
+    for key in (
+        "dry_run",
+        "max_actions",
+        "low_trigger_pct",
+        "low_target_pct",
+        "high_trigger_pct",
+        "high_target_pct",
+        "min_amount_sats",
+        "max_amount_sats",
+        "only_peer_id",
+        "only_channel_id",
+        "require_profitable",
+        "min_marginal_roi",
+        "profit_margin_factor",
+        "expected_horizon_days",
+        "cooldown_hours",
+        "allow_concurrent_swaps",
+        "loop_in_currency",
+        "loop_out_currency",
+    ):
+        if args.get(key) is not None:
+            params[key] = args[key]
+
+    if not params:
+        return await node.call("revenue-boltz-balance-cycle")
+    return await node.call("revenue-boltz-balance-cycle", params)
+
+
 async def handle_revenue_boltz_refund(args: Dict) -> Dict:
     """Refund a failed Boltz swap."""
     node_name = args.get("node")
@@ -17144,6 +17268,8 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_boltz_history": handle_revenue_boltz_history,
     "revenue_boltz_budget": handle_revenue_boltz_budget,
     "revenue_boltz_wallet": handle_revenue_boltz_wallet,
+    "revenue_boltz_balance_recommendations": handle_revenue_boltz_balance_recommendations,
+    "revenue_boltz_balance_cycle": handle_revenue_boltz_balance_cycle,
     "revenue_boltz_refund": handle_revenue_boltz_refund,
     "revenue_boltz_claim": handle_revenue_boltz_claim,
     "revenue_boltz_chainswap": handle_revenue_boltz_chainswap,
