@@ -26,6 +26,7 @@ from modules.rpc_commands import (
     _reject_all_actions,
     defense_status,
     record_rebalance_outcome,
+    status as rpc_status,
 )
 
 
@@ -100,6 +101,26 @@ class TestCreateCloseActionsPermission:
         result = create_close_actions(ctx)
         assert result == {"actions_created": 2}
         mock_mgr.create_close_actions.assert_called_once()
+
+
+class TestStatusCapabilityFields:
+    def test_status_includes_transport_and_signing_capabilities(self, database):
+        pubkey = "02" + "dd" * 32
+        ctx = _make_ctx(database, pubkey, tier='member')
+        ctx.config.governance_mode = "advisor"
+        ctx.config.max_members = 50
+        ctx.config.market_share_cap_pct = 0.20
+        ctx.nostr_transport_enabled = True
+        ctx.comms_active = True
+        ctx.archon_active = False
+        ctx.signing_backend = "cln-hsm"
+
+        result = rpc_status(ctx)
+
+        assert result["nostr_transport_enabled"] is True
+        assert result["comms_active"] is True
+        assert result["archon_active"] is False
+        assert result["signing_backend"] == "cln-hsm"
 
 
 class TestRejectActionWithReason:

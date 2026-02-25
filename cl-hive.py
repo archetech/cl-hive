@@ -1071,6 +1071,16 @@ def _get_hive_context() -> HiveContext:
     _rationalization_mgr = rationalization_mgr if rationalization_mgr is not None else None
     _strategic_positioning_mgr = strategic_positioning_mgr if strategic_positioning_mgr is not None else None
     _anticipatory_liquidity_mgr = anticipatory_liquidity_mgr if anticipatory_liquidity_mgr is not None else None
+    _nostr_transport = nostr_transport if nostr_transport is not None else None
+    _identity_adapter = identity_adapter if identity_adapter is not None else None
+    _phase6_plugins = phase6_optional_plugins if isinstance(phase6_optional_plugins, dict) else {}
+    _comms_active = bool(_phase6_plugins.get("cl_hive_comms", {}).get("active"))
+    _archon_active = bool(_phase6_plugins.get("cl_hive_archon", {}).get("active"))
+    _signing_backend = "unknown"
+    if isinstance(_identity_adapter, RemoteArchonIdentity):
+        _signing_backend = "cl-hive-archon"
+    elif isinstance(_identity_adapter, LocalIdentity):
+        _signing_backend = "cln-hsm"
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -1100,9 +1110,13 @@ def _get_hive_context() -> HiveContext:
         did_credential_mgr=did_credential_mgr,
         management_schema_registry=management_schema_registry,
         cashu_escrow_mgr=cashu_escrow_mgr,
-        nostr_transport=nostr_transport,
+        nostr_transport=_nostr_transport,
         marketplace_mgr=marketplace_mgr,
         liquidity_mgr=liquidity_mgr,
+        nostr_transport_enabled=bool(_nostr_transport),
+        comms_active=_comms_active,
+        archon_active=_archon_active,
+        signing_backend=_signing_backend,
         policy_engine=policy_engine,
         our_id=_our_pubkey or "",
         log=_log,
