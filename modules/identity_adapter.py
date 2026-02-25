@@ -2,8 +2,8 @@
 Identity adapter for Phase 6 handover.
 
 Supports two modes:
-1. LocalIdentity: Signs via CLN HSM directly (Monolith Mode)
-2. RemoteArchonIdentity: Delegates signing to cl-hive-archon via RPC (Coordinated Mode)
+1. LocalIdentity: Signs via CLN HSM directly (default, supported)
+2. RemoteArchonIdentity: Delegates signing to cl-hive-archon via RPC (optional)
 """
 
 from typing import Any, Dict
@@ -28,7 +28,7 @@ class IdentityInterface:
 
 
 class LocalIdentity(IdentityInterface):
-    """Signs via CLN HSM directly (default/monolith mode)."""
+    """Signs via CLN HSM directly (default supported mode)."""
 
     def __init__(self, rpc):
         self._rpc = rpc

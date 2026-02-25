@@ -5,13 +5,14 @@ Tests:
 1. ExternalCommsTransport delegates publish/send_dm via RPC
 2. inject_packet -> process_inbound -> DM callback dispatch
 3. CircuitBreaker opens after failures and recovers
-4. hive-inject-packet rejects in Monolith Mode
-5. InternalNostrTransport still works (regression)
+4. hive-inject-packet rejects when transport is not ExternalCommsTransport
 """
 
 import json
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
+
+import pytest
 
 import sys
 import os
@@ -26,7 +27,6 @@ sys.modules.setdefault("pyln.client", _mock_pyln)
 
 from modules.nostr_transport import (
     ExternalCommsTransport,
-    InternalNostrTransport,
     TransportInterface,
 )
 from modules.bridge import CircuitBreaker, CircuitState
@@ -266,21 +266,9 @@ class TestCircuitBreakerIntegration:
 # ---------------------------------------------------------------------------
 
 class TestInjectPacketRPC:
-    def test_rejects_in_monolith_mode(self):
-        """hive-inject-packet should return error when transport is Internal."""
-        # Simulate what the RPC handler does:
-        # We can't easily call the @plugin.method directly, but we can test
-        # the logic directly
-        from modules.nostr_transport import InternalNostrTransport
-
-        mock_plugin = _mock_plugin()
-        mock_db = MagicMock()
-        mock_db.get_nostr_state.return_value = None
-        mock_plugin.rpc.signmessage.return_value = {"zbase": "testsig"}
-
-        transport = InternalNostrTransport(plugin=mock_plugin, database=mock_db)
-
-        # The RPC handler checks isinstance(nostr_transport, ExternalCommsTransport)
+    def test_rejects_when_transport_is_not_external(self):
+        """hive-inject-packet should reject when transport is not External."""
+        transport = object()
         assert not isinstance(transport, ExternalCommsTransport)
 
     def test_accepts_in_coordinated_mode(self):
@@ -292,63 +280,14 @@ class TestInjectPacketRPC:
         transport.inject_packet({"type": "test", "sender": "abc"}, transport_pubkey="abc")
         assert transport._inbound_queue.qsize() == 1
 
-
-# ---------------------------------------------------------------------------
-# InternalNostrTransport regression tests
-# ---------------------------------------------------------------------------
-
-class TestInternalTransportRegression:
-    def test_internal_transport_implements_interface(self):
-        """InternalNostrTransport should implement TransportInterface."""
-        assert issubclass(InternalNostrTransport, TransportInterface)
-
+class TestTransportInterfaceRegression:
     def test_external_transport_implements_interface(self):
         """ExternalCommsTransport should implement TransportInterface."""
         assert issubclass(ExternalCommsTransport, TransportInterface)
 
-    def test_internal_transport_publish_and_process(self):
-        """InternalNostrTransport should publish and process inbound events."""
-        plugin = _mock_plugin()
-        mock_db = MagicMock()
-        mock_db.get_nostr_state.return_value = None
-        plugin.rpc.signmessage.return_value = {"zbase": "testsig"}
+    def test_internal_transport_legacy_stub_raises(self):
+        """Legacy InternalNostrTransport import should fail fast with migration guidance."""
+        from modules.nostr_transport import InternalNostrTransport
 
-        transport = InternalNostrTransport(plugin=plugin, database=mock_db)
-
-        # Inject a DM event and process it
-        received = []
-        transport.receive_dm(lambda env: received.append(env))
-
-        dm_event = {
-            "kind": 4,
-            "pubkey": "sender123",
-            "content": "b64:" + __import__("base64").b64encode(b"hello world").decode(),
-            "created_at": int(time.time()),
-        }
-        transport.inject_event(dm_event)
-
-        count = transport.process_inbound()
-        assert count == 1
-        assert len(received) == 1
-        assert received[0]["plaintext"] == "hello world"
-
-    def test_internal_transport_subscription_filters(self):
-        """InternalNostrTransport subscription filter matching should work."""
-        plugin = _mock_plugin()
-        mock_db = MagicMock()
-        mock_db.get_nostr_state.return_value = None
-        plugin.rpc.signmessage.return_value = {"zbase": "testsig"}
-
-        transport = InternalNostrTransport(plugin=plugin, database=mock_db)
-
-        received = []
-        transport.subscribe({"kinds": [1]}, lambda ev: received.append(ev))
-
-        # Kind 1 should match
-        transport.inject_event({"kind": 1, "content": "match"})
-        # Kind 4 should not match subscription (but would match DM callbacks)
-        transport.inject_event({"kind": 4, "content": "no-match"})
-
-        transport.process_inbound()
-        assert len(received) == 1
-        assert received[0]["content"] == "match"
+        with pytest.raises(RuntimeError, match="removed from cl-hive"):
+            InternalNostrTransport()

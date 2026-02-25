@@ -1335,7 +1335,7 @@ plugin.add_option(
 plugin.add_option(
     name='hive-nostr-relays',
     default='',
-    description='Comma-separated Nostr relay URLs for Phase 5 transport',
+    description='DEPRECATED/ignored: internal Nostr transport removed; use cl-hive-comms',
     dynamic=True
 )
 
@@ -2320,7 +2320,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         nostr_transport = None
         plugin.log(f"cl-hive: Nostr transport disabled (init error): {e}", level='warn')
 
-    # Phase 6: Identity adapter — prefer archon; local signing is compatibility fallback
+    # Phase 6: Identity adapter — optional archon delegation, local signing remains supported
     global identity_adapter
     try:
         archon_active = phase6_optional_plugins["cl_hive_archon"]["active"]
@@ -2330,13 +2330,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         else:
             identity_adapter = LocalIdentity(rpc=plugin.rpc)
             plugin.log(
-                "cl-hive: Using Local Identity (CLN HSM compatibility fallback); "
-                "install cl-hive-archon for delegated signing",
-                level='warn'
+                "cl-hive: Using Local Identity (CLN HSM); "
+                "cl-hive-archon is optional for delegated signing"
             )
     except Exception as e:
         identity_adapter = LocalIdentity(rpc=plugin.rpc)
-        plugin.log(f"cl-hive: Identity adapter fallback to local compatibility mode: {e}", level='warn')
+        plugin.log(f"cl-hive: Identity adapter fell back to local CLN HSM signing: {e}", level='warn')
 
     # Phase 5B: Advisor marketplace manager
     global marketplace_mgr
