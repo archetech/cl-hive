@@ -659,7 +659,7 @@ class BatchedLogWriter:
             self._stop.wait(self._FLUSH_INTERVAL)
             self._flush_batch()
 
-    def _flush_batch(self) -> None:
+    def _flush_batch(self) -> int:
         """Write up to _MAX_BATCH messages in one lock acquisition."""
         batch = []
         for _ in range(self._MAX_BATCH):
@@ -668,7 +668,7 @@ class BatchedLogWriter:
             except queue.Empty:
                 break
         if not batch:
-            return
+            return 0
 
         # Build all JSON-RPC notification bytes, write with one lock hold
         import json as _json
@@ -692,13 +692,18 @@ class BatchedLogWriter:
                 self._plugin.stdout.flush()
         except Exception:
             pass  # stdout closed during shutdown
+        return len(batch)
 
     def stop(self) -> None:
         """Flush remaining messages and stop the writer thread."""
         self._stop.set()
-        self._flush_batch()        # drain what's left
+        # Restore the original logger first so new shutdown logs bypass the queue.
+        self._plugin.log = self._original_log
         self._thread.join(timeout=2)
-        self._plugin.log = self._original_log  # restore original
+        # Drain all queued messages (not just one batch) so shutdown diagnostics
+        # are not silently dropped during noisy exits.
+        while self._flush_batch():
+            pass
 
 
 # =============================================================================
@@ -1548,12 +1553,6 @@ def _submit_hive_message(peer_id: str, msg_type: HiveMessageType, msg_payload: D
             )
             return False
 
-    # Update last_seen for any valid Hive message from a member (Issue #59)
-    if database:
-        member = database.get_member(peer_id)
-        if member:
-            database.update_member(peer_id, last_seen=int(time.time()))
-
     # Dispatch to a background thread so ingress paths return immediately.
     if _msg_executor is not None:
         _msg_executor.submit(_dispatch_hive_message, peer_id, msg_type, msg_payload, plugin_obj)
@@ -1580,9 +1579,18 @@ def _handle_external_transport_dm(envelope: Dict[str, Any]) -> None:
             else:
                 return
 
-        if "sender" not in packet and envelope.get("pubkey"):
-            packet = dict(packet)
-            packet["sender"] = envelope.get("pubkey")
+        transport_sender = str(envelope.get("pubkey") or "")
+        if not transport_sender:
+            plugin.log("cl-hive: dropped injected packet (missing authenticated sender)", level="warn")
+            return
+
+        claimed_sender = str(packet.get("sender") or "")
+        if claimed_sender and claimed_sender != transport_sender:
+            plugin.log("cl-hive: dropped injected packet (sender mismatch)", level="warn")
+            return
+
+        packet = dict(packet)
+        packet["sender"] = transport_sender
 
         peer_id, msg_type, msg_payload = parse_injected_hive_packet(packet)
         if msg_type is None or not isinstance(msg_payload, dict):
@@ -13399,13 +13407,21 @@ def hive_phase6_plugins(plugin: Plugin):
 
 @plugin.method("hive-inject-packet")
 def hive_inject_packet(plugin: Plugin, payload=None, source="nostr", **kwargs):
-    """Inject an inbound packet from cl-hive-comms (Coordinated Mode only)."""
+    """Inject an inbound packet from cl-hive-comms (Coordinated Mode only).
+
+    Requires an authenticated transport sender in `pubkey`/`sender_pubkey`.
+    The protocol payload's embedded `sender` is treated as untrusted and is
+    checked against this transport identity before dispatch.
+    """
     comms_active = bool(phase6_optional_plugins.get("cl_hive_comms", {}).get("active"))
     if not comms_active or not isinstance(nostr_transport, ExternalCommsTransport):
         return {"error": "inject-packet only available in coordinated mode"}
     if not isinstance(payload, dict):
         return {"error": "payload must be a dict"}
-    if not nostr_transport.inject_packet(payload):
+    transport_pubkey = kwargs.get("sender_pubkey") or kwargs.get("pubkey") or kwargs.get("sender")
+    if not isinstance(transport_pubkey, str) or not transport_pubkey.strip():
+        return {"error": "authenticated sender pubkey is required (use pubkey or sender_pubkey)"}
+    if not nostr_transport.inject_packet(payload, transport_pubkey=transport_pubkey.strip()):
         return {"error": "queue full, packet dropped"}
     return {"result": "queued", "source": source}
 

@@ -70,7 +70,9 @@ class ExternalCommsTransport(TransportInterface):
         self._identity_cache = {}
         self._dm_callbacks: List[Callable[[Dict[str, Any]], None]] = []
         self._lock = threading.Lock()
-        # Inbound queue for messages injected via hive-inject-packet
+        # Inbound queue for messages injected via hive-inject-packet.
+        # Queue items are dicts containing the raw payload plus authenticated
+        # transport metadata (e.g. sender pubkey) supplied by the caller.
         self._inbound_queue: queue.Queue = queue.Queue(maxsize=2000)
         # Circuit breaker for comms RPC calls
         self._circuit = CircuitBreaker(name="external-comms", max_failures=3, reset_timeout=60)
@@ -150,13 +152,17 @@ class ExternalCommsTransport(TransportInterface):
     def unsubscribe(self, sub_id: str) -> bool:
         return True
 
-    def inject_packet(self, payload: Dict[str, Any]) -> bool:
+    def inject_packet(self, payload: Dict[str, Any], transport_pubkey: str = "") -> bool:
         """Called by hive-inject-packet RPC. Returns True if queued, False if dropped."""
         if not isinstance(payload, dict):
             self.plugin.log("cl-hive: inject_packet called with non-dict payload", level="warn")
             return False
+        item = {
+            "payload": payload,
+            "transport_pubkey": str(transport_pubkey or ""),
+        }
         try:
-            self._inbound_queue.put_nowait(payload)
+            self._inbound_queue.put_nowait(item)
             return True
         except queue.Full:
             self.plugin.log("cl-hive: external transport inbound queue full, dropping packet", level="warn")
@@ -167,16 +173,26 @@ class ExternalCommsTransport(TransportInterface):
         processed = 0
         while processed < max_events:
             try:
-                payload = self._inbound_queue.get_nowait()
+                item = self._inbound_queue.get_nowait()
             except queue.Empty:
                 break
+
+            payload = item
+            transport_pubkey = ""
+            if isinstance(item, dict) and "payload" in item:
+                payload = item.get("payload")
+                transport_pubkey = str(item.get("transport_pubkey") or "")
+
+            if not isinstance(payload, dict):
+                self.plugin.log("cl-hive: invalid injected packet entry (payload not dict)", level="warn")
+                continue
 
             processed += 1
             # Re-serialize payload to plaintext for compatibility with handlers
             # that expect to parse JSON from the plaintext field
             envelope = {
                 "plaintext": json.dumps(payload),
-                "pubkey": payload.get("sender") or "",
+                "pubkey": transport_pubkey,
                 "payload": payload,
             }
 

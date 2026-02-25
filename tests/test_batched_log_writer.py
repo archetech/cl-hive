@@ -48,7 +48,7 @@ class BatchedLogWriter:
             self._stop.wait(self._FLUSH_INTERVAL)
             self._flush_batch()
 
-    def _flush_batch(self) -> None:
+    def _flush_batch(self) -> int:
         """Write up to _MAX_BATCH messages in one lock acquisition."""
         batch = []
         for _ in range(self._MAX_BATCH):
@@ -57,7 +57,7 @@ class BatchedLogWriter:
             except queue.Empty:
                 break
         if not batch:
-            return
+            return 0
 
         import json as _json
         parts = []
@@ -80,13 +80,15 @@ class BatchedLogWriter:
                 self._plugin.stdout.flush()
         except Exception:
             pass  # stdout closed during shutdown
+        return len(batch)
 
     def stop(self) -> None:
         """Flush remaining messages and stop the writer thread."""
         self._stop.set()
-        self._flush_batch()
-        self._thread.join(timeout=2)
         self._plugin.log = self._original_log
+        self._thread.join(timeout=2)
+        while self._flush_batch():
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -266,3 +268,22 @@ class TestStopRestore:
 
         output = plugin.stdout.buffer.getvalue().decode('utf-8')
         assert 'final message' in output
+
+    def test_stop_flushes_more_than_one_batch(self):
+        """stop() should drain the full queue, not just one batch."""
+        plugin = _make_mock_plugin()
+        writer = BatchedLogWriter(plugin)
+        _stop_writer_thread(writer)
+
+        plugin.stdout.buffer = io.BytesIO()
+        for i in range(writer._MAX_BATCH + 5):
+            writer._queue.put_nowait(('info', f'msg {i}'))
+
+        writer._stop.clear()
+        writer.stop()
+
+        output = plugin.stdout.buffer.getvalue().decode('utf-8')
+        notifications = [
+            json.loads(line) for line in output.strip().split('\n') if line.strip()
+        ]
+        assert len(notifications) == writer._MAX_BATCH + 5

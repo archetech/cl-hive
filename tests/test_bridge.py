@@ -320,6 +320,17 @@ class TestSafeCall:
 
         assert bridge._revenue_ops_cb._failure_count == 1
 
+    def test_safe_call_direct_timeout_records_failure(self, bridge, mock_rpc):
+        """Direct-path TimeoutError should increment the circuit breaker."""
+        bridge._status = BridgeStatus.ENABLED
+        bridge._use_subprocess = False
+        mock_rpc.call.side_effect = TimeoutError("rpc pool timeout on test-method")
+
+        with pytest.raises(TimeoutError):
+            bridge.safe_call("test-method")
+
+        assert bridge._revenue_ops_cb._failure_count == 1
+
     def test_safe_call_circuit_open_fail_fast(self, bridge, mock_rpc):
         """Circuit open causes fail-fast without RPC call."""
         bridge._status = BridgeStatus.ENABLED

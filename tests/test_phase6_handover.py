@@ -120,7 +120,7 @@ class TestInjectAndProcess:
         transport.receive_dm(lambda env: received.append(env))
 
         payload = {"type": "GOSSIP_STATE", "sender": "peer123", "data": {"version": 1}}
-        transport.inject_packet(payload)
+        transport.inject_packet(payload, transport_pubkey="peer123")
 
         count = transport.process_inbound()
         assert count == 1
@@ -129,6 +129,22 @@ class TestInjectAndProcess:
         envelope = received[0]
         assert envelope["pubkey"] == "peer123"
         assert json.loads(envelope["plaintext"]) == payload
+
+    def test_process_inbound_uses_authenticated_transport_pubkey(self):
+        """Envelope pubkey must come from transport metadata, not payload.sender."""
+        plugin = _mock_plugin()
+        transport = ExternalCommsTransport(plugin=plugin)
+
+        received = []
+        transport.receive_dm(lambda env: received.append(env))
+
+        payload = {"sender": "forged-sender", "data": {"version": 1}}
+        transport.inject_packet(payload, transport_pubkey="authenticated-sender")
+
+        count = transport.process_inbound()
+        assert count == 1
+        assert len(received) == 1
+        assert received[0]["pubkey"] == "authenticated-sender"
 
     def test_inject_multiple_packets(self):
         """Multiple injected packets are all processed."""
@@ -139,7 +155,7 @@ class TestInjectAndProcess:
         transport.receive_dm(lambda env: received.append(env))
 
         for i in range(5):
-            transport.inject_packet({"msg": i, "sender": f"peer{i}"})
+            transport.inject_packet({"msg": i, "sender": f"peer{i}"}, transport_pubkey=f"peer{i}")
 
         count = transport.process_inbound()
         assert count == 5
@@ -160,7 +176,7 @@ class TestInjectAndProcess:
         transport.receive_dm(lambda env: (_ for _ in ()).throw(RuntimeError("boom")))
         transport.receive_dm(lambda env: good_received.append(env))
 
-        transport.inject_packet({"sender": "x", "data": "test"})
+        transport.inject_packet({"sender": "x", "data": "test"}, transport_pubkey="x")
         transport.process_inbound()
 
         assert len(good_received) == 1
@@ -273,7 +289,7 @@ class TestInjectPacketRPC:
         transport = ExternalCommsTransport(plugin=plugin)
 
         assert isinstance(transport, ExternalCommsTransport)
-        transport.inject_packet({"type": "test", "sender": "abc"})
+        transport.inject_packet({"type": "test", "sender": "abc"}, transport_pubkey="abc")
         assert transport._inbound_queue.qsize() == 1
 
 

@@ -546,8 +546,11 @@ class Bridge:
             cb.record_failure()
             self._log(f"RPC call {method} failed: {e}", level='warn')
             raise
-        except TimeoutError:
-            # Re-raised from subprocess.TimeoutExpired above (already recorded)
+        except TimeoutError as e:
+            # Direct RPC path (no subprocess) can raise built-in TimeoutError.
+            # Count it so the circuit breaker still protects degraded mode.
+            cb.record_failure()
+            self._log(f"RPC call {method} timed out: {e}", level='warn')
             raise
         except Exception as e:
             cb.record_failure()
