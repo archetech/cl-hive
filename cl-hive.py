@@ -2230,25 +2230,44 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     outbox_thread.start()
     plugin.log("cl-hive: Outbox retry thread started")
 
-    # Phase 16: DID Credential Manager
-    global did_credential_mgr
-    did_credential_mgr = DIDCredentialManager(
-        database=database,
-        plugin=plugin,
-        rpc=plugin.rpc,
-        our_pubkey=our_pubkey,
-    )
-    plugin.log("cl-hive: DID credential manager initialized")
+    _phase6_plugins = phase6_optional_plugins if isinstance(phase6_optional_plugins, dict) else {}
+    _comms_active = bool(_phase6_plugins.get("cl_hive_comms", {}).get("active"))
+    _archon_active = bool(_phase6_plugins.get("cl_hive_archon", {}).get("active"))
+    _companion_stack_active = _comms_active and _archon_active
 
-    # Phase 2: Management Schema Registry
+    # Phase 16 / Phase 5 ecosystem features are optional and require the
+    # companion plugin stack (comms + archon) to be active.
+    global did_credential_mgr
     global management_schema_registry
-    management_schema_registry = ManagementSchemaRegistry(
-        database=database,
-        plugin=plugin,
-        rpc=plugin.rpc,
-        our_pubkey=our_pubkey,
-    )
-    plugin.log("cl-hive: Management schema registry initialized")
+    global cashu_escrow_mgr
+    did_credential_mgr = None
+    management_schema_registry = None
+    cashu_escrow_mgr = None
+
+    if _companion_stack_active:
+        # Phase 16: DID Credential Manager
+        did_credential_mgr = DIDCredentialManager(
+            database=database,
+            plugin=plugin,
+            rpc=plugin.rpc,
+            our_pubkey=our_pubkey,
+        )
+        plugin.log("cl-hive: DID credential manager initialized")
+
+        # Phase 2: Management Schema Registry
+        management_schema_registry = ManagementSchemaRegistry(
+            database=database,
+            plugin=plugin,
+            rpc=plugin.rpc,
+            our_pubkey=our_pubkey,
+        )
+        plugin.log("cl-hive: Management schema registry initialized")
+    else:
+        plugin.log(
+            "cl-hive: DID/schema/cashu/marketplace features disabled "
+            "(requires active cl-hive-comms and cl-hive-archon companion plugins)",
+            level='info'
+        )
 
     # Wire DID credential manager into planner for reputation-weighted expansion
     if planner and did_credential_mgr:
@@ -2262,41 +2281,41 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     if settlement_mgr and did_credential_mgr:
         settlement_mgr.did_credential_mgr = did_credential_mgr
 
-    # Start DID maintenance background thread
-    did_maintenance_thread = threading.Thread(
-        target=did_maintenance_loop,
-        name="cl-hive-did-maintenance",
-        daemon=True
-    )
-    did_maintenance_thread.start()
-    plugin.log("cl-hive: DID maintenance thread started")
+    if _companion_stack_active:
+        # Start DID maintenance background thread
+        did_maintenance_thread = threading.Thread(
+            target=did_maintenance_loop,
+            name="cl-hive-did-maintenance",
+            daemon=True
+        )
+        did_maintenance_thread.start()
+        plugin.log("cl-hive: DID maintenance thread started")
 
-    # Phase 4A: Cashu Escrow Manager
-    global cashu_escrow_mgr
-    mint_urls_str = plugin.get_option('hive-cashu-mints')
-    acceptable_mints = [u.strip() for u in mint_urls_str.split(',') if u.strip()] if mint_urls_str else []
-    cashu_escrow_mgr = CashuEscrowManager(
-        database=database,
-        plugin=plugin,
-        rpc=plugin.rpc,
-        our_pubkey=our_pubkey,
-        acceptable_mints=acceptable_mints,
-    )
-    plugin.log("cl-hive: Cashu escrow manager initialized")
+        # Phase 4A: Cashu Escrow Manager
+        mint_urls_str = plugin.get_option('hive-cashu-mints')
+        acceptable_mints = [u.strip() for u in mint_urls_str.split(',') if u.strip()] if mint_urls_str else []
+        cashu_escrow_mgr = CashuEscrowManager(
+            database=database,
+            plugin=plugin,
+            rpc=plugin.rpc,
+            our_pubkey=our_pubkey,
+            acceptable_mints=acceptable_mints,
+        )
+        plugin.log("cl-hive: Cashu escrow manager initialized")
 
-    # Phase 4B: Wire extended settlement types into settlement manager
-    if settlement_mgr and cashu_escrow_mgr:
-        settlement_mgr.register_extended_types(cashu_escrow_mgr, did_credential_mgr)
-        plugin.log("cl-hive: Extended settlement types registered")
+        # Phase 4B: Wire extended settlement types into settlement manager
+        if settlement_mgr and cashu_escrow_mgr:
+            settlement_mgr.register_extended_types(cashu_escrow_mgr, did_credential_mgr)
+            plugin.log("cl-hive: Extended settlement types registered")
 
-    # Start escrow maintenance background thread
-    escrow_maintenance_thread = threading.Thread(
-        target=escrow_maintenance_loop,
-        name="cl-hive-escrow-maintenance",
-        daemon=True
-    )
-    escrow_maintenance_thread.start()
-    plugin.log("cl-hive: Escrow maintenance thread started")
+        # Start escrow maintenance background thread
+        escrow_maintenance_thread = threading.Thread(
+            target=escrow_maintenance_loop,
+            name="cl-hive-escrow-maintenance",
+            daemon=True
+        )
+        escrow_maintenance_thread.start()
+        plugin.log("cl-hive: Escrow maintenance thread started")
 
     # Phase 5A/6: Nostr transport — external companion plugin only (cl-hive-comms)
     global nostr_transport
@@ -2352,54 +2371,55 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         identity_adapter = LocalIdentity(rpc=plugin.rpc)
         plugin.log(f"cl-hive: Identity adapter fell back to local CLN HSM signing: {e}", level='warn')
 
-    # Phase 5B: Advisor marketplace manager
+    # Phase 5B/5C marketplace features (only with companion stack)
     global marketplace_mgr
-    try:
-        marketplace_mgr = MarketplaceManager(
-            database=database,
-            plugin=plugin,
-            nostr_transport=nostr_transport,
-            did_credential_mgr=did_credential_mgr,
-            management_schema_registry=management_schema_registry,
-            cashu_escrow_mgr=cashu_escrow_mgr,
-        )
-        plugin.log("cl-hive: Marketplace manager initialized")
-    except Exception as e:
-        marketplace_mgr = None
-        plugin.log(f"cl-hive: Marketplace manager disabled (init error): {e}", level='warn')
-
-    # Phase 5C: Liquidity marketplace manager
     global liquidity_mgr
-    try:
-        liquidity_mgr = LiquidityMarketplaceManager(
-            database=database,
-            plugin=plugin,
-            nostr_transport=nostr_transport,
-            cashu_escrow_mgr=cashu_escrow_mgr,
-            settlement_mgr=settlement_mgr,
-            did_credential_mgr=did_credential_mgr,
+    marketplace_mgr = None
+    liquidity_mgr = None
+    if _companion_stack_active:
+        try:
+            marketplace_mgr = MarketplaceManager(
+                database=database,
+                plugin=plugin,
+                nostr_transport=nostr_transport,
+                did_credential_mgr=did_credential_mgr,
+                management_schema_registry=management_schema_registry,
+                cashu_escrow_mgr=cashu_escrow_mgr,
+            )
+            plugin.log("cl-hive: Marketplace manager initialized")
+        except Exception as e:
+            marketplace_mgr = None
+            plugin.log(f"cl-hive: Marketplace manager disabled (init error): {e}", level='warn')
+
+        try:
+            liquidity_mgr = LiquidityMarketplaceManager(
+                database=database,
+                plugin=plugin,
+                nostr_transport=nostr_transport,
+                cashu_escrow_mgr=cashu_escrow_mgr,
+                settlement_mgr=settlement_mgr,
+                did_credential_mgr=did_credential_mgr,
+            )
+            plugin.log("cl-hive: Liquidity marketplace manager initialized")
+        except Exception as e:
+            liquidity_mgr = None
+            plugin.log(f"cl-hive: Liquidity manager disabled (init error): {e}", level='warn')
+
+        marketplace_maintenance_thread = threading.Thread(
+            target=marketplace_maintenance_loop,
+            name="cl-hive-marketplace-maintenance",
+            daemon=True,
         )
-        plugin.log("cl-hive: Liquidity marketplace manager initialized")
-    except Exception as e:
-        liquidity_mgr = None
-        plugin.log(f"cl-hive: Liquidity manager disabled (init error): {e}", level='warn')
+        marketplace_maintenance_thread.start()
+        plugin.log("cl-hive: Marketplace maintenance thread started")
 
-    # Start Phase 5 maintenance background threads
-    marketplace_maintenance_thread = threading.Thread(
-        target=marketplace_maintenance_loop,
-        name="cl-hive-marketplace-maintenance",
-        daemon=True,
-    )
-    marketplace_maintenance_thread.start()
-    plugin.log("cl-hive: Marketplace maintenance thread started")
-
-    liquidity_maintenance_thread = threading.Thread(
-        target=liquidity_maintenance_loop,
-        name="cl-hive-liquidity-maintenance",
-        daemon=True,
-    )
-    liquidity_maintenance_thread.start()
-    plugin.log("cl-hive: Liquidity maintenance thread started")
+        liquidity_maintenance_thread = threading.Thread(
+            target=liquidity_maintenance_loop,
+            name="cl-hive-liquidity-maintenance",
+            daemon=True,
+        )
+        liquidity_maintenance_thread.start()
+        plugin.log("cl-hive: Liquidity maintenance thread started")
 
     # Link anticipatory manager to fee coordination for time-based fees (Phase 7.4)
     if fee_coordination_mgr:
@@ -13353,11 +13373,16 @@ def hive_listpeers(plugin: Plugin, id: str = None, level: str = None):
     if err:
         return err
     params = {}
+    if isinstance(id, str):
+        id = id.strip()
+    if isinstance(level, str):
+        level = level.strip()
     if id:
         params["id"] = id
     if level:
         params["level"] = level
-    return rpc.listpeers(**params) if params else rpc.listpeers()
+    # Use raw rpc.call() to avoid pyln wrapper defaults injecting empty id="".
+    return rpc.call("listpeers", params if params else {})
 
 
 @plugin.method("hive-listpeerchannels")
@@ -13366,7 +13391,10 @@ def hive_listpeerchannels(plugin: Plugin, id: str = None):
     rpc, err = _require_rpc(plugin)
     if err:
         return err
-    return rpc.listpeerchannels(id=id) if id else rpc.listpeerchannels()
+    if isinstance(id, str):
+        id = id.strip()
+    # Use raw rpc.call() to avoid pyln wrapper defaults injecting empty id="".
+    return rpc.call("listpeerchannels", {"id": id} if id else {})
 
 
 @plugin.method("hive-listforwards")
