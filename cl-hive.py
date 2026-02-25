@@ -2313,7 +2313,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                     level='warn'
                 )
             plugin.log(
-                "cl-hive: Nostr transport disabled (cl-hive-comms not active; companion plugin required)",
+                "cl-hive: Nostr transport disabled (cl-hive-comms not active; "
+                "companion plugin is optional, transport features unavailable)",
                 level='warn'
             )
     except Exception as e:
