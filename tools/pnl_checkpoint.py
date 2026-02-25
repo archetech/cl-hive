@@ -183,32 +183,34 @@ def main():
     # Load runes from the production nodes file (avoid printing secrets)
     nodes_cfg = json.loads(open(os.path.expanduser("~/bin/cl-hive/production/nodes.production.json")).read())
     rune_n1 = None
-    rune_n2 = None
+    has_n2 = False
     for n in nodes_cfg.get("nodes", []):
         if n.get("name") == "hive-nexus-01":
             rune_n1 = n.get("rune")
-        if n.get("name") == "hive-nexus-02":
-            rune_n2 = n.get("rune")
+        elif n.get("name") != "hive-nexus-01":
+            has_n2 = True
 
     # Ground truth: routing fees from listforwards (last 24h)
     n1_fwd = forwards_pnl_from_listforwards(listforwards_last24h_n1(rune_n1))
-    n2_fwd = forwards_pnl_from_listforwards(listforwards_last24h_n2())
+    n2_fwd = forwards_pnl_from_listforwards(listforwards_last24h_n2()) if has_n2 else None
 
     # Ground truth-ish: rebalance spend from sling stats deltas (persistent jobs)
     state = load_state()
     spent_prev = state.get("sling_spent_totals", {})
 
     n1_list = sling_stats_n1(rune_n1)
-    n2_list = sling_stats_n2()
+    n2_list = sling_stats_n2() if has_n2 else []
 
     n1_total = sling_spent_total_for_active_jobs(n1_list, lambda scid: sling_stats_one_n1(rune_n1, scid))
-    n2_total = sling_spent_total_for_active_jobs(n2_list, sling_stats_one_n2)
+    n2_total = sling_spent_total_for_active_jobs(n2_list, sling_stats_one_n2) if has_n2 else 0
 
     n1_spent = max(0, int(n1_total) - int(spent_prev.get("n1", 0) or 0))
-    n2_spent = max(0, int(n2_total) - int(spent_prev.get("n2", 0) or 0))
+    n2_spent = max(0, int(n2_total) - int(spent_prev.get("n2", 0) or 0)) if has_n2 else 0
 
     # update spend totals for next checkpoint
-    state["sling_spent_totals"] = {"n1": n1_total, "n2": n2_total}
+    state["sling_spent_totals"] = {"n1": n1_total}
+    if has_n2:
+        state["sling_spent_totals"]["n2"] = n2_total
 
     n1 = {
         "revenue_sats": n1_fwd["routing_fee_sats"],
@@ -217,20 +219,22 @@ def main():
         "forward_count": n1_fwd["forward_count"],
         "volume_routed_sats": n1_fwd["volume_routed_sats"],
     }
-    n2 = {
-        "revenue_sats": n2_fwd["routing_fee_sats"],
-        "rebalance_cost_sats": n2_spent,
-        "net_sats": n2_fwd["routing_fee_sats"] - n2_spent,
-        "forward_count": n2_fwd["forward_count"],
-        "volume_routed_sats": n2_fwd["volume_routed_sats"],
-    }
+    n2 = None
+    if has_n2 and n2_fwd is not None:
+        n2 = {
+            "revenue_sats": n2_fwd["routing_fee_sats"],
+            "rebalance_cost_sats": n2_spent,
+            "net_sats": n2_fwd["routing_fee_sats"] - n2_spent,
+            "forward_count": n2_fwd["forward_count"],
+            "volume_routed_sats": n2_fwd["volume_routed_sats"],
+        }
 
     fleet = {
-        "revenue_sats": n1["revenue_sats"] + n2["revenue_sats"],
-        "rebalance_cost_sats": n1["rebalance_cost_sats"] + n2["rebalance_cost_sats"],
-        "net_sats": n1["net_sats"] + n2["net_sats"],
-        "forward_count": n1["forward_count"] + n2["forward_count"],
-        "volume_routed_sats": n1["volume_routed_sats"] + n2["volume_routed_sats"],
+        "revenue_sats": n1["revenue_sats"] + (n2["revenue_sats"] if n2 else 0),
+        "rebalance_cost_sats": n1["rebalance_cost_sats"] + (n2["rebalance_cost_sats"] if n2 else 0),
+        "net_sats": n1["net_sats"] + (n2["net_sats"] if n2 else 0),
+        "forward_count": n1["forward_count"] + (n2["forward_count"] if n2 else 0),
+        "volume_routed_sats": n1["volume_routed_sats"] + (n2["volume_routed_sats"] if n2 else 0),
     }
 
     # streak logic: require net > 7000 for the date; only increment once per date
@@ -263,7 +267,8 @@ def main():
     lines.append("Ground truth: routing fees from listforwards (settled, last 24h)")
     lines.append("Rebalance spend: sling-stats total_spent_sats delta for active Rebalancing jobs since last checkpoint")
     lines.append(f"- nexus-01: revenue={n1['revenue_sats']}  reb_cost={n1['rebalance_cost_sats']}  net={n1['net_sats']}  forwards={n1['forward_count']}  vol={n1['volume_routed_sats']}")
-    lines.append(f"- nexus-02: revenue={n2['revenue_sats']}  reb_cost={n2['rebalance_cost_sats']}  net={n2['net_sats']}  forwards={n2['forward_count']}  vol={n2['volume_routed_sats']}")
+    if n2:
+        lines.append(f"- nexus-02: revenue={n2['revenue_sats']}  reb_cost={n2['rebalance_cost_sats']}  net={n2['net_sats']}  forwards={n2['forward_count']}  vol={n2['volume_routed_sats']}")
     lines.append(f"- FLEET : revenue={fleet['revenue_sats']}  reb_cost={fleet['rebalance_cost_sats']}  net={fleet['net_sats']}  forwards={fleet['forward_count']}  vol={fleet['volume_routed_sats']}")
     lines.append(f"- streak(net>7000): {streak} day(s)  (2=sane, 3=better, 5=perfect)")
 
