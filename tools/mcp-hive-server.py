@@ -1768,6 +1768,10 @@ Use static policies to lock in fees for problem channels that Hill Climbing can'
 - Depleted (<10% local): strategy=static, fee_ppm=200, rebalance=sink_only
 - Zombie (offline/inactive): strategy=static, fee_ppm=2000, rebalance=disabled
 
+Dynamic policies can also set a fee autoband using:
+- fee_ppm (anchor)
+- fee_multiplier_min / fee_multiplier_max (relative bounds, e.g. 500-1000ppm => 500 * 1.0-2.0)
+
 Remove policies with action=delete when channels recover.""",
             inputSchema={
                 "type": "object",
@@ -1798,6 +1802,18 @@ Remove policies with action=delete when channels recover.""",
                     "fee_ppm": {
                         "type": "integer",
                         "description": "Fixed fee PPM (required for static strategy)"
+                    },
+                    "fee_multiplier_min": {
+                        "type": "number",
+                        "description": "Dynamic fee autoband floor multiplier (uses fee_ppm as anchor)"
+                    },
+                    "fee_multiplier_max": {
+                        "type": "number",
+                        "description": "Dynamic fee autoband ceiling multiplier (uses fee_ppm as anchor)"
+                    },
+                    "expires_in_hours": {
+                        "type": "integer",
+                        "description": "Optional policy auto-expiry in hours (set action)"
                     }
                 },
                 "required": ["node", "action"]
@@ -6945,8 +6961,12 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
     total_revenue_msat = stats_24h["total_revenue_msat"]
 
     # Channel stats
-    channels = channels_result.get("channels", [])
+    all_channels = channels_result.get("channels", [])
+    # Match hive_node_diagnostic semantics: "channels" means currently normal/routable
+    # channels, not pending/onchain entries returned by listpeerchannels.
+    channels = [ch for ch in all_channels if "CHANNELD_NORMAL" in str(ch.get("state", ""))]
     channel_count = len(channels)
+    total_channel_count = len(all_channels)
     total_capacity_msat = 0
     total_local_msat = 0
     low_balance_channels = []
@@ -7012,6 +7032,10 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
         },
         "channels": {
             "count": channel_count,
+            "total_count": total_channel_count,
+            "active_count": info.get("num_active_channels", channel_count),
+            "inactive_count": info.get("num_inactive_channels", max(total_channel_count - channel_count, 0)),
+            "pending_count": info.get("num_pending_channels", 0),
             "total_capacity_msat": total_capacity_msat,
             "total_local_msat": total_local_msat,
             "local_balance_pct": local_balance_pct
@@ -9756,6 +9780,9 @@ async def handle_revenue_policy(args: Dict) -> Dict:
     strategy = args.get("strategy")
     rebalance = args.get("rebalance")
     fee_ppm = args.get("fee_ppm")
+    fee_multiplier_min = args.get("fee_multiplier_min")
+    fee_multiplier_max = args.get("fee_multiplier_max")
+    expires_in_hours = args.get("expires_in_hours")
 
     node = fleet.get_node(node_name)
     if not node:
@@ -9786,6 +9813,12 @@ async def handle_revenue_policy(args: Dict) -> Dict:
             params["rebalance"] = rebalance
         if fee_ppm is not None:
             params["fee_ppm"] = fee_ppm
+        if fee_multiplier_min is not None:
+            params["fee_multiplier_min"] = fee_multiplier_min
+        if fee_multiplier_max is not None:
+            params["fee_multiplier_max"] = fee_multiplier_max
+        if expires_in_hours is not None:
+            params["expires_in_hours"] = expires_in_hours
         return await node.call("revenue-policy", params)
     else:
         return {"error": f"Unknown action: {action}"}
@@ -9856,6 +9889,256 @@ async def handle_revenue_fee_anchor(args: Dict) -> Dict:
     return await node.call("revenue-fee-anchor", params)
 
 
+def _rebalance_channel_snapshot(ch: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return a compact balance snapshot for a channel entry."""
+    if not ch:
+        return None
+    totals = _channel_totals(ch)
+    total_msat = totals["total_msat"]
+    local_msat = totals["local_msat"]
+    remote_msat = max(0, total_msat - local_msat)
+    return {
+        "channel_id": ch.get("short_channel_id"),
+        "peer_id": ch.get("peer_id"),
+        "state": ch.get("state"),
+        "total_msat": total_msat,
+        "local_msat": local_msat,
+        "remote_msat": remote_msat,
+        "local_balance_pct": round((local_msat / total_msat) * 100, 2) if total_msat else 0.0,
+    }
+
+
+def _rebalance_extract_snapshots_from_listpeerchannels(
+    channels_result: Any, from_channel: str, to_channel: str
+) -> Dict[str, Any]:
+    """Extract source/destination channel snapshots from hive-listpeerchannels output."""
+    if not isinstance(channels_result, dict):
+        return {"error": f"unexpected listpeerchannels response type: {type(channels_result).__name__}"}
+
+    channels = channels_result.get("channels", [])
+    from_entry = next((c for c in channels if c.get("short_channel_id") == from_channel), None)
+    to_entry = next((c for c in channels if c.get("short_channel_id") == to_channel), None)
+    return {
+        "from": _rebalance_channel_snapshot(from_entry),
+        "to": _rebalance_channel_snapshot(to_entry),
+        "found": {
+            "from": from_entry is not None,
+            "to": to_entry is not None,
+        },
+    }
+
+
+def _parse_sling_status_for_channel(sling_status_result: Any, channel_id: str) -> Dict[str, Any]:
+    """
+    Parse hive-sling-status table output for a specific channel.
+
+    The plugin often returns an ASCII table string under {"result": "..."}.
+    We track the current scid across wrapped rows and collect status_str values.
+    """
+    table_text = ""
+    if isinstance(sling_status_result, dict):
+        table_text = str(sling_status_result.get("result", "") or "")
+    elif isinstance(sling_status_result, str):
+        table_text = sling_status_result
+
+    entries: List[str] = []
+    rebamount: Optional[int] = None
+    weighted_fee_ppm: Optional[int] = None
+    last_route_taken: Optional[str] = None
+    last_success_reb: Optional[str] = None
+    current_scid = ""
+
+    for raw_line in table_text.splitlines():
+        line = raw_line.rstrip()
+        if not line.startswith("|"):
+            continue
+        parts = [p.strip() for p in line.split("|")[1:-1]]
+        if len(parts) < 8:
+            continue
+        scid_col = parts[1]
+        if scid_col:
+            current_scid = scid_col
+        if current_scid != channel_id:
+            continue
+
+        status_col = parts[3]
+        if status_col:
+            entries.append(status_col)
+
+        if rebamount is None and parts[4]:
+            try:
+                rebamount = int(parts[4].replace(",", ""))
+            except ValueError:
+                rebamount = None
+        if weighted_fee_ppm is None and parts[5]:
+            try:
+                weighted_fee_ppm = int(parts[5].replace(",", ""))
+            except ValueError:
+                weighted_fee_ppm = None
+        if last_route_taken is None and parts[6]:
+            last_route_taken = parts[6]
+        if last_success_reb is None and parts[7]:
+            last_success_reb = parts[7]
+
+    lower_entries = [e.lower() for e in entries]
+    status_kind = "unknown"
+    if any("nocheaproute" in e or "no route" in e for e in lower_entries):
+        status_kind = "no_route"
+    elif any("rebalancing" in e for e in lower_entries):
+        status_kind = "in_progress"
+    elif any("fail" in e or "timeout" in e or "error" in e for e in lower_entries):
+        status_kind = "failed"
+    elif entries:
+        status_kind = "idle"
+
+    return {
+        "channel_id": channel_id,
+        "status_entries": entries,
+        "status_kind": status_kind,
+        "rebamount_sats": rebamount,
+        "weighted_fee_ppm": weighted_fee_ppm,
+        "last_route_taken": last_route_taken,
+        "last_success_reb": last_success_reb,
+        "raw_available": bool(table_text),
+    }
+
+
+async def _verify_rebalance_outcome(
+    node: "NodeConnection",
+    from_channel: str,
+    to_channel: str,
+    before_balances: Optional[Dict[str, Any]],
+    *,
+    amount_sats: Optional[int] = None,
+    timeout_sec: float = 30.0,
+    poll_interval_sec: float = 2.0,
+) -> Dict[str, Any]:
+    """
+    Verify whether a rebalance actually moved liquidity.
+
+    Uses channel balance deltas as the primary signal and Sling status as a secondary
+    signal to classify command completion into:
+      - succeeded (confirmed movement)
+      - no_route / failed (confirmed no execution)
+      - in_progress / accepted (command accepted but no confirmed movement yet)
+    """
+    deadline = time.time() + max(0.0, timeout_sec)
+    attempt = 0
+    last_after: Optional[Dict[str, Any]] = None
+    last_sling_parsed: Optional[Dict[str, Any]] = None
+    last_sling_raw: Any = None
+    seen_in_progress = False
+
+    before_from = (before_balances or {}).get("from") if isinstance(before_balances, dict) else None
+    before_to = (before_balances or {}).get("to") if isinstance(before_balances, dict) else None
+
+    while True:
+        if attempt > 0:
+            await asyncio.sleep(poll_interval_sec)
+        attempt += 1
+
+        channels_result, sling_status_result = await asyncio.gather(
+            node.call("hive-listpeerchannels"),
+            node.call("hive-sling-status"),
+            return_exceptions=True,
+        )
+
+        if not isinstance(channels_result, Exception):
+            last_after = _rebalance_extract_snapshots_from_listpeerchannels(
+                channels_result, from_channel, to_channel
+            )
+        if not isinstance(sling_status_result, Exception):
+            last_sling_raw = sling_status_result
+            last_sling_parsed = _parse_sling_status_for_channel(sling_status_result, to_channel)
+            if last_sling_parsed.get("status_kind") == "in_progress":
+                seen_in_progress = True
+
+        after_from = (last_after or {}).get("from") if isinstance(last_after, dict) else None
+        after_to = (last_after or {}).get("to") if isinstance(last_after, dict) else None
+
+        from_local_delta_msat = None
+        to_local_delta_msat = None
+        if before_from and after_from:
+            from_local_delta_msat = after_from["local_msat"] - before_from["local_msat"]
+        if before_to and after_to:
+            to_local_delta_msat = after_to["local_msat"] - before_to["local_msat"]
+
+        # Primary truth signal: liquidity actually moved.
+        if (
+            isinstance(to_local_delta_msat, int)
+            and to_local_delta_msat > 0
+            and (
+                not isinstance(from_local_delta_msat, int)
+                or from_local_delta_msat < 0
+            )
+        ):
+            source_spend_msat = -from_local_delta_msat if isinstance(from_local_delta_msat, int) and from_local_delta_msat < 0 else None
+            dest_gain_msat = to_local_delta_msat
+            fee_estimate_msat = None
+            if isinstance(source_spend_msat, int):
+                fee_estimate_msat = max(0, source_spend_msat - dest_gain_msat)
+
+            return {
+                "status": "succeeded",
+                "confirmed": True,
+                "attempts": attempt,
+                "amount_requested_sats": amount_sats,
+                "balance_before": before_balances,
+                "balance_after": last_after,
+                "deltas": {
+                    "from_local_delta_msat": from_local_delta_msat,
+                    "to_local_delta_msat": to_local_delta_msat,
+                    "to_local_delta_sats": dest_gain_msat // 1000,
+                    "source_spend_delta_sats": (source_spend_msat // 1000) if isinstance(source_spend_msat, int) else None,
+                    "estimated_fee_sats": (fee_estimate_msat // 1000) if isinstance(fee_estimate_msat, int) else None,
+                },
+                "sling_status": last_sling_parsed,
+            }
+
+        # Secondary signal: Sling already knows it cannot route.
+        if last_sling_parsed and last_sling_parsed.get("status_kind") in ("no_route", "failed"):
+            return {
+                "status": last_sling_parsed["status_kind"],
+                "confirmed": False,
+                "attempts": attempt,
+                "amount_requested_sats": amount_sats,
+                "balance_before": before_balances,
+                "balance_after": last_after,
+                "deltas": {
+                    "from_local_delta_msat": from_local_delta_msat,
+                    "to_local_delta_msat": to_local_delta_msat,
+                },
+                "sling_status": last_sling_parsed,
+            }
+
+        if time.time() >= deadline:
+            break
+
+    final_status = "in_progress" if seen_in_progress else "accepted"
+    return {
+        "status": final_status,
+        "confirmed": False,
+        "attempts": attempt,
+        "amount_requested_sats": amount_sats,
+        "balance_before": before_balances,
+        "balance_after": last_after,
+        "deltas": None if not isinstance(last_after, dict) else {
+            "from_local_delta_msat": (
+                ((last_after.get("from") or {}).get("local_msat") - before_from["local_msat"])
+                if before_from and (last_after.get("from") or {}).get("local_msat") is not None
+                else None
+            ),
+            "to_local_delta_msat": (
+                ((last_after.get("to") or {}).get("local_msat") - before_to["local_msat"])
+                if before_to and (last_after.get("to") or {}).get("local_msat") is not None
+                else None
+            ),
+        },
+        "sling_status": last_sling_parsed,
+        "sling_status_raw_present": last_sling_raw is not None,
+    }
+
+
 async def handle_revenue_rebalance(args: Dict) -> Dict:
     """Trigger manual rebalance."""
     node_name = args.get("node")
@@ -9912,6 +10195,100 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
     except Exception as e:
         logger.warning(f"advisor_db record_decision failed for revenue_rebalance: {e}")
 
+    pre_rebalance_balances = None
+    try:
+        pre_channels_result = await node.call("hive-listpeerchannels")
+        pre_rebalance_balances = _rebalance_extract_snapshots_from_listpeerchannels(
+            pre_channels_result, from_channel, to_channel
+        )
+    except Exception as e:
+        logger.debug(f"Could not capture pre-rebalance balances for {from_channel}->{to_channel}: {e}")
+
+    def _update_rebalance_decision_status(status: str, execution_result: Dict[str, Any]) -> None:
+        if decision_id is None:
+            return
+        with db._get_conn() as conn:
+            conn.execute(
+                "UPDATE ai_decisions SET status=?, executed_at=?, execution_result=? WHERE id=?",
+                (status, int(datetime.now().timestamp()), json.dumps(execution_result), decision_id),
+            )
+
+    def _insert_rebalance_outcome(success: int) -> None:
+        if decision_id is None:
+            return
+        with db._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO action_outcomes (
+                    decision_id, action_type, opportunity_type, channel_id, node_name,
+                    decision_confidence, predicted_benefit, actual_benefit, success,
+                    prediction_error, measured_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision_id,
+                    "rebalance",
+                    "market",
+                    to_channel,
+                    node_name,
+                    0.5,
+                    None,
+                    None,
+                    success,
+                    0.0,
+                    int(datetime.now().timestamp()),
+                ),
+            )
+
+    async def _finalize_rebalance_command_success(raw_result: Any, note: Optional[str] = None) -> Dict[str, Any]:
+        verification = await _verify_rebalance_outcome(
+            node,
+            from_channel,
+            to_channel,
+            pre_rebalance_balances,
+            amount_sats=amount_sats,
+        )
+
+        # Backward-compatible historical stats plus richer verification details.
+        sling_stats = None
+        try:
+            sling_stats = await node.call("hive-sling-stats", {"scid": to_channel, "json": True})
+        except Exception:
+            sling_stats = None
+
+        verification_status = verification.get("status", "accepted")
+        execution_payload = {
+            "status": verification_status,
+            "result": raw_result,
+            "verification": verification,
+        }
+        if note:
+            execution_payload["note"] = note
+
+        if decision_id is not None:
+            try:
+                if verification_status == "succeeded":
+                    _update_rebalance_decision_status("executed", execution_payload)
+                    _insert_rebalance_outcome(1)
+                elif verification_status in ("no_route", "failed"):
+                    _update_rebalance_decision_status("failed", execution_payload)
+                    _insert_rebalance_outcome(0)
+                elif verification_status == "in_progress":
+                    _update_rebalance_decision_status("in_progress", execution_payload)
+                else:
+                    _update_rebalance_decision_status("accepted", execution_payload)
+            except Exception as e:
+                logger.warning(f"Failed to record verified rebalance outcome in advisor_db: {e}")
+
+        response = {
+            "rebalance_result": raw_result,
+            "verification": verification,
+            "sling_stats": sling_stats,
+        }
+        if note:
+            response["note"] = note
+        return response
+
     try:
         result = await node.call("revenue-rebalance", params)
 
@@ -9920,54 +10297,7 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
         if isinstance(result, dict):
             if result.get("ok") is False or result.get("success") is False or result.get("status") == "error" or result.get("error"):
                 raise RuntimeError(str(result.get("error") or result))
-
-        # Mark executed
-        if decision_id is not None:
-            with db._get_conn() as conn:
-                conn.execute(
-                    "UPDATE ai_decisions SET status='executed', executed_at=?, execution_result=? WHERE id=?",
-                    (int(datetime.now().timestamp()), json.dumps({"status": "success", "result": result}), decision_id),
-                )
-
-            # Also record outcome immediately as success (benefit measured later separately)
-            try:
-                with db._get_conn() as conn:
-                    conn.execute(
-                        """
-                        INSERT INTO action_outcomes (
-                            decision_id, action_type, opportunity_type, channel_id, node_name,
-                            decision_confidence, predicted_benefit, actual_benefit, success,
-                            prediction_error, measured_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            decision_id,
-                            "rebalance",
-                            "market",
-                            to_channel,
-                            node_name,
-                            0.5,
-                            None,
-                            None,
-                            1,
-                            0.0,
-                            int(datetime.now().timestamp()),
-                        ),
-                    )
-            except Exception as e:
-                logger.debug(f"action_outcomes insert (success) failed: {e}")
-
-        # Verification: ask sling-stats whether sats actually moved (vs job accepted)
-        sling_stats = None
-        try:
-            sling_stats = await node.call("hive-sling-stats", {"scid": to_channel, "json": True})
-        except Exception:
-            sling_stats = None
-
-        return {
-            "rebalance_result": result,
-            "sling_stats": sling_stats,
-        }
+        return await _finalize_rebalance_command_success(result)
 
     except Exception as e:
         err = str(e)
@@ -9989,51 +10319,9 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
                 if isinstance(retry_result, dict):
                     if retry_result.get("ok") is False or retry_result.get("success") is False or retry_result.get("status") == "error" or retry_result.get("error"):
                         raise RuntimeError(str(retry_result.get("error") or retry_result))
-                # If we got here, retry succeeded: mark executed + outcome success
-                if decision_id is not None:
-                    with db._get_conn() as conn:
-                        conn.execute(
-                            "UPDATE ai_decisions SET status='executed', executed_at=?, execution_result=? WHERE id=?",
-                            (int(datetime.now().timestamp()), json.dumps({"status": "success_after_clear", "result": retry_result}), decision_id),
-                        )
-                    try:
-                        with db._get_conn() as conn:
-                            conn.execute(
-                                """
-                                INSERT INTO action_outcomes (
-                                    decision_id, action_type, opportunity_type, channel_id, node_name,
-                                    decision_confidence, predicted_benefit, actual_benefit, success,
-                                    prediction_error, measured_at
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    decision_id,
-                                    "rebalance",
-                                    "market",
-                                    to_channel,
-                                    node_name,
-                                    0.5,
-                                    None,
-                                    None,
-                                    1,
-                                    0.0,
-                                    int(datetime.now().timestamp()),
-                                ),
-                            )
-                    except Exception as eee:
-                        logger.debug(f"action_outcomes insert (success_after_clear) failed: {eee}")
-
-                sling_stats = None
-                try:
-                    sling_stats = await node.call("hive-sling-stats", {"scid": to_channel, "json": True})
-                except Exception:
-                    sling_stats = None
-
-                return {
-                    "rebalance_result": retry_result,
-                    "sling_stats": sling_stats,
-                    "note": "success after clearing stale sling job locks",
-                }
+                return await _finalize_rebalance_command_success(
+                    retry_result, note="success after clearing stale sling job locks"
+                )
             except Exception as clear_err:
                 # Retry failed; fall through to record failure
                 err = f"{err} | retry_after_sling_deletejob_failed: {clear_err}"
@@ -12901,6 +13189,20 @@ async def handle_auto_evaluate_proposal(args: Dict, _action_data: Dict = None) -
         # Budget check (placeholder - could be configurable)
         budget_limit = 10_000_000  # 10M sats default
         within_budget = capacity_sats <= budget_limit
+        # Expansion gate: allow growth up to a higher channel count before
+        # auto-approving opens. This keeps automation aligned with an
+        # expansion-oriented strategy while still capping uncontrolled growth.
+        max_active_channels_for_auto_expand = 50
+        active_channels = None
+        try:
+            info_result = await node.call("hive-getinfo")
+            if isinstance(info_result, dict):
+                active_channels = (
+                    info_result.get("num_active_channels")
+                    or ((info_result.get("info") or {}).get("num_active_channels"))
+                )
+        except Exception:
+            active_channels = None
 
         # Evaluate criteria
         if recommendation == "avoid" or local_data.get("force_closes", 0) > 0:
@@ -12913,6 +13215,11 @@ async def handle_auto_evaluate_proposal(args: Dict, _action_data: Dict = None) -
         elif channel_count < 10:
             decision = "reject"
             reasoning.append(f"Peer has only {channel_count} channels (<10 minimum)")
+        elif active_channels is not None and active_channels > max_active_channels_for_auto_expand:
+            decision = "escalate"
+            reasoning.append(
+                f"Node has {active_channels} active channels (>{max_active_channels_for_auto_expand} auto-expand threshold)"
+            )
         elif not within_budget:
             decision = "reject"
             reasoning.append(f"Capacity {capacity_sats:,} sats exceeds budget of {budget_limit:,} sats")
