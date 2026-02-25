@@ -7,7 +7,17 @@ import pytest
 
 from modules.database import HiveDatabase
 from modules.liquidity_marketplace import LiquidityMarketplaceManager
-from modules.nostr_transport import NostrTransport
+
+
+class DummyNostrTransport:
+    def start(self):
+        return True
+
+    def stop(self):
+        return None
+
+    def publish(self, event):
+        return {"id": "dummy-event-id"}
 
 
 @pytest.fixture
@@ -28,7 +38,7 @@ def database(mock_plugin, tmp_path):
 
 @pytest.fixture
 def transport(mock_plugin, database):
-    t = NostrTransport(mock_plugin, database)
+    t = DummyNostrTransport()
     t.start()
     yield t
     t.stop()

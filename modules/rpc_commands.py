@@ -14,96 +14,15 @@ Design Pattern:
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
-
-# Maximum openchannel_update rounds before giving up
-_MAX_V2_UPDATE_ROUNDS = 10
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 def _open_channel(rpc, target: str, amount_sats: int,
                   feerate: str = "normal", announce: bool = True,
                   log_fn=None) -> Dict[str, Any]:
-    """Attempt dual-funded (v2) channel open, fall back to single-funded.
-
-    1. fundpsbt -> openchannel_init -> openchannel_update loop -> signpsbt -> openchannel_signed
-    2. On any v2 failure: unreserveinputs, openchannel_abort, then fundchannel
-    """
-    def _log(msg, level="info"):
-        if log_fn:
-            log_fn(msg, level)
-
-    # --- Attempt 1: Dual-funded (v2) ---
-    psbt = None
-    channel_id = None
-    try:
-        _log(f"cl-hive: Attempting dual-funded open to {target[:16]}... for {amount_sats:,} sats")
-
-        # Create funded PSBT for our contribution
-        psbt_result = rpc.call("fundpsbt", {
-            "satoshi": amount_sats,
-            "feerate": feerate,
-            "startweight": 250,
-        })
-        psbt = psbt_result["psbt"]
-
-        # Initiate v2 open
-        init_result = rpc.call("openchannel_init", {
-            "id": target,
-            "amount": amount_sats,
-            "initialpsbt": psbt,
-            "announce": announce,
-        })
-        channel_id = init_result["channel_id"]
-        current_psbt = init_result.get("psbt", psbt)
-
-        # Update loop until commitments secured
-        for _ in range(_MAX_V2_UPDATE_ROUNDS):
-            update_result = rpc.call("openchannel_update", {
-                "channel_id": channel_id,
-                "psbt": current_psbt,
-            })
-            current_psbt = update_result["psbt"]
-            if update_result.get("commitments_secured"):
-                break
-        else:
-            raise RuntimeError("openchannel_update did not reach commitments_secured")
-
-        # Sign the PSBT
-        signed = rpc.call("signpsbt", {"psbt": current_psbt})
-        signed_psbt = signed["signed_psbt"]
-
-        # Complete
-        result = rpc.call("openchannel_signed", {
-            "channel_id": channel_id,
-            "signed_psbt": signed_psbt,
-        })
-
-        _log(f"cl-hive: Dual-funded channel opened to {target[:16]}...")
-        return {
-            "channel_id": result.get("channel_id", channel_id),
-            "txid": result.get("txid", ""),
-            "funding_type": "dual-funded",
-        }
-
-    except Exception as e:
-        _log(f"cl-hive: Dual-funded open failed ({e}), falling back to single-funded", "info")
-
-        # Abort in-progress v2 negotiation if it started
-        if channel_id:
-            try:
-                rpc.call("openchannel_abort", {"channel_id": channel_id})
-            except Exception:
-                pass
-
-        # Release locked UTXOs from fundpsbt
-        if psbt:
-            try:
-                rpc.call("unreserveinputs", {"psbt": psbt})
-            except Exception:
-                pass
-
-    # --- Attempt 2: Single-funded (v1) fallback ---
-    _log(f"cl-hive: Opening single-funded channel to {target[:16]}... for {amount_sats:,} sats")
+    """Open a channel using fundchannel."""
+    if log_fn:
+        log_fn(f"cl-hive: Opening channel to {target[:16]}... for {amount_sats:,} sats", "info")
     result = rpc.call("fundchannel", {
         "id": target,
         "amount": amount_sats,
@@ -114,7 +33,87 @@ def _open_channel(rpc, target: str, amount_sats: int,
     return {
         "channel_id": result.get("channel_id", "unknown"),
         "txid": result.get("txid", "unknown"),
-        "funding_type": "single-funded",
+    }
+
+
+def _batch_open_channels(
+    rpc,
+    targets: List[Dict[str, Any]],
+    feerate: str = "normal",
+    announce: bool = True,
+    log_fn=None,
+) -> Dict[str, Any]:
+    """Batch-open multiple channels in a single on-chain transaction."""
+    if log_fn:
+        log_fn(
+            f"cl-hive: Batch opening {len(targets)} channels via multifundchannel",
+            "info",
+        )
+
+    destinations = [{"id": t["id"], "amount": t["amount"]} for t in targets]
+    raw = rpc.call("multifundchannel", {
+        "destinations": destinations,
+        "feerate": feerate,
+        "announce": announce,
+        "minchannels": 1,  # Allow partial success
+    })
+
+    txid = raw.get("txid", "unknown")
+    raw_failed = raw.get("failed") or []
+    failed = []
+    failed_ids = set()
+    for entry in raw_failed:
+        peer_id = entry.get("id") or entry.get("peer_id")
+        if peer_id:
+            failed_ids.add(peer_id)
+        failed.append({
+            "id": peer_id,
+            "error": entry.get("error") or entry.get("message") or "multifundchannel failed",
+        })
+
+    results_by_id: Dict[str, Dict[str, Any]] = {}
+
+    # Some CLN variants may include detailed per-channel success entries.
+    for ch in raw.get("channels") or []:
+        peer_id = ch.get("id") or ch.get("peer_id")
+        if not peer_id:
+            continue
+        results_by_id[peer_id] = {
+            "status": "opened",
+            "channel_id": ch.get("channel_id", "unknown"),
+            "txid": ch.get("txid", txid),
+        }
+
+    channel_ids = raw.get("channel_ids") or []
+    success_targets = [t for t in targets if t["id"] not in failed_ids]
+    unmapped_success_targets = [t for t in success_targets if t["id"] not in results_by_id]
+
+    for target, channel_id in zip(unmapped_success_targets, channel_ids):
+        results_by_id[target["id"]] = {
+            "status": "opened",
+            "channel_id": channel_id,
+            "txid": txid,
+        }
+
+    for target in unmapped_success_targets[len(channel_ids):]:
+        results_by_id[target["id"]] = {
+            "status": "opened",
+            "channel_id": "unknown",
+            "txid": txid,
+        }
+
+    for item in failed:
+        if item.get("id"):
+            results_by_id[item["id"]] = {
+                "status": "failed",
+                "error": item["error"],
+            }
+
+    return {
+        "channel_ids": channel_ids,
+        "failed": failed,
+        "txid": txid,
+        "results_by_id": results_by_id,
     }
 
 
@@ -711,6 +710,347 @@ def approve_action(ctx: HiveContext, action_id, amount_sats: int = None) -> Dict
         }
 
 
+def _extract_channel_open_details(
+    action_id: int,
+    payload: Dict[str, Any],
+    amount_sats: int = None,
+) -> Dict[str, Any]:
+    """Parse and validate channel_open payload details."""
+    target = payload.get('target')
+    context = payload.get('context', {})
+    intent_id = context.get('intent_id') or payload.get('intent_id')
+
+    proposed_size = (
+        context.get('channel_size_sats') or
+        context.get('amount_sats') or
+        payload.get('amount_sats') or
+        payload.get('channel_size_sats') or
+        1_000_000
+    )
+    try:
+        proposed_size = int(proposed_size)
+    except (ValueError, TypeError):
+        return {"error": "Invalid channel_size_sats in action payload", "action_id": action_id}
+
+    if amount_sats is not None:
+        try:
+            channel_size_sats = int(amount_sats)
+        except (ValueError, TypeError):
+            return {"error": "Invalid amount_sats", "action_id": action_id}
+        override_applied = True
+    else:
+        channel_size_sats = proposed_size
+        override_applied = False
+
+    if not target:
+        return {"error": "Missing target in action payload", "action_id": action_id}
+
+    return {
+        "target": target,
+        "context": context,
+        "intent_id": intent_id,
+        "proposed_size_sats": proposed_size,
+        "channel_size_sats": channel_size_sats,
+        "override_applied": override_applied,
+        "override_amount": amount_sats if override_applied else None,
+    }
+
+
+def _preflight_channel_open(
+    ctx: HiveContext,
+    action_id: int,
+    target: str,
+    channel_size_sats: int,
+    override_applied: bool = False,
+    reserved_budget_sats: int = 0,
+) -> Tuple[bool, int, Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Run reusable preflight checks for a channel open, including peer connect."""
+    # Check for existing or pending channels to this target
+    try:
+        peer_channels = ctx.safe_plugin.rpc.listpeerchannels(target)
+        channels = peer_channels.get('channels', [])
+        for ch in channels:
+            state = ch.get('state', '')
+            if state in ('CHANNELD_AWAITING_LOCKIN', 'CHANNELD_NORMAL', 'DUALOPEND_AWAITING_LOCKIN'):
+                existing_capacity = ch.get('total_msat', 0) // 1000
+                funding_txid = ch.get('funding_txid', 'unknown')
+                return False, channel_size_sats, {}, {
+                    "error": f"Already have {'pending' if 'AWAITING' in state else 'active'} channel to this peer",
+                    "action_id": action_id,
+                    "target": target,
+                    "existing_channel_state": state,
+                    "existing_capacity_sats": existing_capacity,
+                    "existing_funding_txid": funding_txid,
+                    "hint": "Wait for pending channel to confirm or close existing channel first"
+                }
+    except Exception as e:
+        if ctx.log:
+            ctx.log(f"cl-hive: Could not check existing channels: {e}", 'debug')
+
+    cfg = ctx.config.snapshot() if ctx.config else None
+    if cfg and ctx.safe_plugin:
+        max_feerate = getattr(cfg, 'max_expansion_feerate_perkb', 5000)
+        if max_feerate != 0:
+            try:
+                feerates = ctx.safe_plugin.rpc.feerates("perkb")
+                opening_feerate = feerates.get("perkb", {}).get("opening")
+                if opening_feerate is None:
+                    opening_feerate = feerates.get("perkb", {}).get("min_acceptable", 0)
+                if opening_feerate > 0 and opening_feerate > max_feerate:
+                    ctx.database.update_action_status(action_id, 'failed')
+                    return False, channel_size_sats, {}, {
+                        "error": "Feerate gate: on-chain fees too high for channel open",
+                        "action_id": action_id,
+                        "opening_feerate_perkb": opening_feerate,
+                        "max_feerate_perkb": max_feerate,
+                        "hint": "Wait for feerates to drop or increase hive-max-expansion-feerate"
+                    }
+            except Exception as e:
+                if ctx.log:
+                    ctx.log(f"cl-hive: Could not check feerates: {e}", 'debug')
+
+    if not cfg:
+        return False, channel_size_sats, {}, {
+            "error": "Cannot open channel: config unavailable for budget enforcement",
+            "action_id": action_id
+        }
+
+    # Get onchain balance for reserve calculation
+    try:
+        funds = ctx.safe_plugin.rpc.listfunds()
+        onchain_sats = sum(
+            o.get('amount_msat', 0) // 1000
+            for o in funds.get('outputs', [])
+            if o.get('status') == 'confirmed'
+        )
+    except Exception:
+        onchain_sats = 0
+
+    daily_remaining_raw = ctx.database.get_available_budget(cfg.failsafe_budget_per_day)
+    daily_remaining = max(0, daily_remaining_raw - reserved_budget_sats)
+    spendable_onchain_raw = int(onchain_sats * (1.0 - cfg.budget_reserve_pct))
+    spendable_onchain = max(0, spendable_onchain_raw - reserved_budget_sats)
+    max_per_channel = int(cfg.failsafe_budget_per_day * cfg.budget_max_per_channel_pct)
+    effective_budget = min(daily_remaining, spendable_onchain, max_per_channel)
+
+    budget_info = {
+        "onchain_sats": onchain_sats,
+        "reserve_pct": cfg.budget_reserve_pct,
+        "spendable_onchain": spendable_onchain,
+        "daily_budget": cfg.failsafe_budget_per_day,
+        "daily_remaining": daily_remaining,
+        "max_per_channel_pct": cfg.budget_max_per_channel_pct,
+        "max_per_channel": max_per_channel,
+        "effective_budget": effective_budget,
+    }
+    if reserved_budget_sats:
+        budget_info["reserved_batch_sats"] = reserved_budget_sats
+        budget_info["daily_remaining_before_batch"] = daily_remaining_raw
+        budget_info["spendable_onchain_before_batch"] = spendable_onchain_raw
+
+    if channel_size_sats > effective_budget:
+        if effective_budget >= cfg.planner_min_channel_sats:
+            if ctx.log:
+                ctx.log(
+                    f"cl-hive: Reducing channel size from {channel_size_sats:,} to {effective_budget:,} "
+                    f"due to budget constraints (daily={daily_remaining:,}, reserve={spendable_onchain:,}, "
+                    f"per-channel={max_per_channel:,})",
+                    'info'
+                )
+            channel_size_sats = effective_budget
+        else:
+            limiting_factor = (
+                "daily budget" if daily_remaining == effective_budget else
+                "reserve limit" if spendable_onchain == effective_budget else
+                "per-channel limit"
+            )
+            return False, channel_size_sats, budget_info, {
+                "error": f"Insufficient budget for channel open ({limiting_factor})",
+                "action_id": action_id,
+                "requested_sats": channel_size_sats,
+                "effective_budget_sats": effective_budget,
+                "min_channel_sats": cfg.planner_min_channel_sats,
+                "budget_info": budget_info,
+            }
+
+    if override_applied:
+        if channel_size_sats < cfg.planner_min_channel_sats:
+            return False, channel_size_sats, budget_info, {
+                "error": f"Override amount {channel_size_sats:,} below minimum {cfg.planner_min_channel_sats:,}",
+                "action_id": action_id,
+                "min_channel_sats": cfg.planner_min_channel_sats,
+            }
+        if channel_size_sats > effective_budget:
+            return False, channel_size_sats, budget_info, {
+                "error": f"Override amount {channel_size_sats:,} exceeds effective budget {effective_budget:,}",
+                "action_id": action_id,
+                "effective_budget_sats": effective_budget,
+                "budget_info": budget_info,
+            }
+
+    # Connect to target if not already connected
+    try:
+        peerchannels = ctx.safe_plugin.rpc.listpeerchannels(target)
+        if not peerchannels.get('channels'):
+            try:
+                ctx.safe_plugin.rpc.connect(target)
+                if ctx.log:
+                    ctx.log(f"cl-hive: Connected to {target[:16]}...", 'info')
+            except Exception as conn_err:
+                if ctx.log:
+                    ctx.log(f"cl-hive: Could not connect to {target[:16]}...: {conn_err}", 'warn')
+    except Exception:
+        pass
+
+    return True, channel_size_sats, budget_info, None
+
+
+def _broadcast_channel_open_intent(ctx: HiveContext, intent_id: Optional[str]) -> int:
+    """Broadcast intent coordination message for a channel open action."""
+    if not intent_id or not ctx.intent_mgr or not ctx.database:
+        return 0
+
+    intent_record = ctx.database.get_intent_by_id(intent_id)
+    if not intent_record:
+        return 0
+
+    # Lazy imports to avoid circular deps
+    from modules.protocol import HiveMessageType, serialize
+    from modules.intent_manager import Intent
+
+    broadcast_count = 0
+    try:
+        intent = Intent(
+            intent_id=intent_record['id'],
+            intent_type=intent_record['intent_type'],
+            target=intent_record['target'],
+            initiator=intent_record['initiator'],
+            timestamp=intent_record['timestamp'],
+            expires_at=intent_record['expires_at'],
+            status=intent_record['status']
+        )
+
+        intent_payload = ctx.intent_mgr.create_intent_message(intent)
+        msg = serialize(HiveMessageType.INTENT, intent_payload)
+        members = ctx.database.get_all_members()
+
+        for member in members:
+            member_id = member.get('peer_id')
+            if not member_id or member_id == ctx.our_pubkey:
+                continue
+            try:
+                ctx.safe_plugin.rpc.call("sendcustommsg", {
+                    "node_id": member_id,
+                    "msg": msg.hex()
+                })
+                broadcast_count += 1
+            except Exception as send_err:
+                if ctx.log:
+                    ctx.log(f"cl-hive: Intent send to {member_id[:16]}... failed: {send_err}", 'debug')
+
+        if ctx.log:
+            ctx.log(f"cl-hive: Broadcast intent to {broadcast_count} hive members", 'info')
+    except Exception as e:
+        if ctx.log:
+            ctx.log(f"cl-hive: Intent broadcast failed: {e}", 'warn')
+
+    return broadcast_count
+
+
+def _finalize_channel_open_success(
+    ctx: HiveContext,
+    action_id: int,
+    action_type: str,
+    details: Dict[str, Any],
+    channel_size_sats: int,
+    budget_info: Dict[str, Any],
+    broadcast_count: int,
+    channel_id: str,
+    txid: str,
+) -> Dict[str, Any]:
+    """Persist side effects and build success response for channel open."""
+    target = details["target"]
+    intent_id = details.get("intent_id")
+
+    if ctx.log:
+        ctx.log(f"cl-hive: Channel opened! txid={txid[:16]}... channel_id={channel_id}", 'info')
+
+    if intent_id and ctx.database:
+        ctx.database.update_intent_status(intent_id, 'committed', reason="action_executed")
+
+    ctx.database.update_action_status(action_id, 'executed')
+    ctx.database.record_budget_spend(
+        action_type='channel_open',
+        amount_sats=channel_size_sats,
+        target=target,
+        action_id=action_id
+    )
+    if ctx.log:
+        ctx.log(f"cl-hive: Recorded budget spend of {channel_size_sats:,} sats", 'debug')
+
+    result = {
+        "status": "executed",
+        "action_id": action_id,
+        "action_type": action_type,
+        "target": target,
+        "channel_size_sats": channel_size_sats,
+        "proposed_size_sats": details.get("proposed_size_sats"),
+        "channel_id": channel_id,
+        "txid": txid,
+        "funding_type": "fundchannel",
+        "broadcast_count": broadcast_count,
+        "sizing_reasoning": details.get("context", {}).get('sizing_reasoning', 'N/A'),
+    }
+    if details.get("override_applied"):
+        result["override_applied"] = True
+        result["override_amount"] = details.get("override_amount")
+    if budget_info:
+        result["budget_info"] = budget_info
+    return result
+
+
+def _build_channel_open_failure_result(
+    ctx: HiveContext,
+    action_id: int,
+    action_type: str,
+    target: str,
+    channel_size_sats: int,
+    broadcast_count: int,
+    error_msg: str,
+) -> Dict[str, Any]:
+    """Persist side effects and build failure response for channel open."""
+    if ctx.log:
+        ctx.log(f"cl-hive: fundchannel failed: {error_msg}", 'error')
+
+    try:
+        ctx.database.update_action_status(action_id, 'failed')
+    except Exception as db_err:
+        if ctx.log:
+            ctx.log(f"cl-hive: Failed to update action status: {db_err}", 'error')
+
+    failure_info = _classify_channel_open_failure(error_msg)
+    result = {
+        "status": "failed",
+        "action_id": action_id,
+        "action_type": action_type,
+        "target": target,
+        "channel_size_sats": channel_size_sats,
+        "error": error_msg,
+        "broadcast_count": broadcast_count,
+        "failure_type": failure_info["type"],
+        "delegation_recommended": failure_info["delegation_recommended"],
+    }
+
+    if failure_info["delegation_recommended"] and ctx.database:
+        delegation_result = _attempt_channel_open_delegation(
+            ctx, target, channel_size_sats, action_id, failure_info
+        )
+        if delegation_result:
+            result["delegation"] = delegation_result
+
+    return result
+
+
 def _approve_all_actions(ctx: HiveContext) -> Dict[str, Any]:
     """Approve and execute all pending actions (up to MAX_BULK_ACTIONS)."""
     actions = ctx.database.get_pending_actions()
@@ -718,7 +1058,6 @@ def _approve_all_actions(ctx: HiveContext) -> Dict[str, Any]:
     if not actions:
         return {"status": "no_actions", "message": "No pending actions to approve"}
 
-    # Bound the number of actions processed (CLAUDE.md safety constraint)
     total_pending = len(actions)
     actions = actions[:MAX_BULK_ACTIONS]
 
@@ -726,45 +1065,184 @@ def _approve_all_actions(ctx: HiveContext) -> Dict[str, Any]:
     errors = []
     now = int(time.time())
 
+    channel_open_actions = []
+    other_actions = []
+
     for action in actions:
         action_id = action['id']
-        action_type = action['action_type']
-
         try:
-            # Check if expired
             if action.get('expires_at') and now > action['expires_at']:
                 ctx.database.update_action_status(action_id, 'expired')
-                errors.append({
-                    "action_id": action_id,
-                    "error": "Action has expired"
-                })
+                errors.append({"action_id": action_id, "error": "Action has expired"})
                 continue
 
-            payload = action.get('payload', {})
-
-            # Execute based on action type
-            if action_type == 'channel_open':
-                result = _execute_channel_open(ctx, action_id, action_type, payload)
-                if 'error' in result:
-                    errors.append({
-                        "action_id": action_id,
-                        "error": result['error']
-                    })
-                else:
-                    approved.append({
-                        "action_id": action_id,
-                        "action_type": action_type,
-                        "result": result.get('status', 'approved')
-                    })
+            if action.get('action_type') == 'channel_open':
+                channel_open_actions.append(action)
             else:
-                # Unknown action type - just mark as approved
-                ctx.database.update_action_status(action_id, 'approved')
-                approved.append({
-                    "action_id": action_id,
-                    "action_type": action_type,
-                    "note": "Unknown action type, marked as approved only"
-                })
+                other_actions.append(action)
+        except Exception as e:
+            errors.append({"action_id": action_id, "error": str(e) or f"{type(e).__name__}"})
 
+    batch_items = []
+    reserved_batch_sats = 0
+    for action in channel_open_actions:
+        action_id = action['id']
+        payload = action.get('payload', {})
+        try:
+            details = _extract_channel_open_details(action_id, payload)
+            if 'error' in details:
+                errors.append({"action_id": action_id, "error": details['error']})
+                continue
+
+            ok, channel_size_sats, budget_info, error_result = _preflight_channel_open(
+                ctx=ctx,
+                action_id=action_id,
+                target=details["target"],
+                channel_size_sats=details["channel_size_sats"],
+                override_applied=details.get("override_applied", False),
+                reserved_budget_sats=reserved_batch_sats,
+            )
+            if not ok:
+                errors.append({"action_id": action_id, "error": error_result.get("error", "Preflight failed")})
+                continue
+
+            details["channel_size_sats"] = channel_size_sats
+            broadcast_count = _broadcast_channel_open_intent(ctx, details.get("intent_id"))
+
+            batch_items.append({
+                "action": action,
+                "details": details,
+                "budget_info": budget_info,
+                "broadcast_count": broadcast_count,
+            })
+            reserved_batch_sats += channel_size_sats
+        except Exception as e:
+            errors.append({"action_id": action_id, "error": str(e) or f"{type(e).__name__}"})
+
+    def _record_approved(action_id: int, action_type: str, result_status: str = "approved"):
+        approved.append({
+            "action_id": action_id,
+            "action_type": action_type,
+            "result": result_status,
+        })
+
+    if len(batch_items) == 1:
+        item = batch_items[0]
+        action = item["action"]
+        action_id = action["id"]
+        details = item["details"]
+        try:
+            open_result = _open_channel(
+                rpc=ctx.safe_plugin.rpc,
+                target=details["target"],
+                amount_sats=details["channel_size_sats"],
+                announce=True,
+                log_fn=ctx.log,
+            )
+            final = _finalize_channel_open_success(
+                ctx=ctx,
+                action_id=action_id,
+                action_type=action["action_type"],
+                details=details,
+                channel_size_sats=details["channel_size_sats"],
+                budget_info=item["budget_info"],
+                broadcast_count=item["broadcast_count"],
+                channel_id=open_result.get("channel_id", "unknown"),
+                txid=open_result.get("txid", "unknown"),
+            )
+            _record_approved(action_id, action["action_type"], final.get("status", "approved"))
+        except Exception as e:
+            failure = _build_channel_open_failure_result(
+                ctx=ctx,
+                action_id=action_id,
+                action_type=action["action_type"],
+                target=details["target"],
+                channel_size_sats=details["channel_size_sats"],
+                broadcast_count=item["broadcast_count"],
+                error_msg=str(e) or f"{type(e).__name__} during channel open",
+            )
+            errors.append({"action_id": action_id, "error": failure["error"]})
+
+    elif len(batch_items) > 1:
+        try:
+            batch_result = _batch_open_channels(
+                rpc=ctx.safe_plugin.rpc,
+                targets=[{"id": i["details"]["target"], "amount": i["details"]["channel_size_sats"]} for i in batch_items],
+                announce=True,
+                log_fn=ctx.log,
+            )
+            txid = batch_result.get("txid", "unknown")
+            results_by_id = batch_result.get("results_by_id", {})
+            failed_map = {f.get("id"): f for f in batch_result.get("failed", []) if f.get("id")}
+
+            for item in batch_items:
+                action = item["action"]
+                action_id = action["id"]
+                details = item["details"]
+                peer_id = details["target"]
+                peer_result = results_by_id.get(peer_id, {})
+
+                try:
+                    if peer_result.get("status") == "failed" or peer_id in failed_map:
+                        error_msg = (
+                            peer_result.get("error") or
+                            failed_map.get(peer_id, {}).get("error") or
+                            "multifundchannel failed"
+                        )
+                        failure = _build_channel_open_failure_result(
+                            ctx=ctx,
+                            action_id=action_id,
+                            action_type=action["action_type"],
+                            target=peer_id,
+                            channel_size_sats=details["channel_size_sats"],
+                            broadcast_count=item["broadcast_count"],
+                            error_msg=error_msg,
+                        )
+                        errors.append({"action_id": action_id, "error": failure["error"]})
+                        continue
+
+                    channel_id = peer_result.get("channel_id", "unknown")
+                    final = _finalize_channel_open_success(
+                        ctx=ctx,
+                        action_id=action_id,
+                        action_type=action["action_type"],
+                        details=details,
+                        channel_size_sats=details["channel_size_sats"],
+                        budget_info=item["budget_info"],
+                        broadcast_count=item["broadcast_count"],
+                        channel_id=channel_id,
+                        txid=peer_result.get("txid", txid),
+                    )
+                    _record_approved(action_id, action["action_type"], final.get("status", "approved"))
+                except Exception as e:
+                    errors.append({"action_id": action_id, "error": str(e) or f"{type(e).__name__}"})
+        except Exception as e:
+            batch_error = str(e) or f"{type(e).__name__} during multifundchannel"
+            for item in batch_items:
+                action = item["action"]
+                action_id = action["id"]
+                details = item["details"]
+                failure = _build_channel_open_failure_result(
+                    ctx=ctx,
+                    action_id=action_id,
+                    action_type=action["action_type"],
+                    target=details["target"],
+                    channel_size_sats=details["channel_size_sats"],
+                    broadcast_count=item["broadcast_count"],
+                    error_msg=batch_error,
+                )
+                errors.append({"action_id": action_id, "error": failure["error"]})
+
+    for action in other_actions:
+        action_id = action['id']
+        action_type = action['action_type']
+        try:
+            ctx.database.update_action_status(action_id, 'approved')
+            approved.append({
+                "action_id": action_id,
+                "action_type": action_type,
+                "note": "Unknown action type, marked as approved only"
+            })
         except Exception as e:
             errors.append({"action_id": action_id, "error": str(e) or f"{type(e).__name__}"})
 
@@ -778,7 +1256,6 @@ def _approve_all_actions(ctx: HiveContext) -> Dict[str, Any]:
         "errors": errors if errors else None
     }
 
-    # Warn if there were more actions than we processed
     if total_pending > MAX_BULK_ACTIONS:
         result["warning"] = f"Only processed {MAX_BULK_ACTIONS} of {total_pending} pending actions"
 
@@ -795,326 +1272,57 @@ def _execute_channel_open(
     """
     Execute a channel_open action.
 
-    This is a helper function for approve_action that handles all the
-    channel opening logic including budget calculation, intent broadcast,
-    peer connection, and fundchannel execution.
+    This helper handles budget calculation, intent broadcast, peer connection,
+    and fundchannel execution.
     """
-    # Import protocol for message serialization (lazy import to avoid circular deps)
-    from modules.protocol import HiveMessageType, serialize
-    from modules.intent_manager import Intent
+    details = _extract_channel_open_details(action_id, payload, amount_sats)
+    if 'error' in details:
+        return details
 
-    # Extract channel details from payload
-    target = payload.get('target')
-    context = payload.get('context', {})
-    intent_id = context.get('intent_id') or payload.get('intent_id')
-
-    # Get channel size from context (planner) or top-level (cooperative expansion)
-    # Ensure we get an int - JSON parsing can sometimes return strings
-    proposed_size = (
-        context.get('channel_size_sats') or
-        context.get('amount_sats') or
-        payload.get('amount_sats') or
-        payload.get('channel_size_sats') or
-        1_000_000  # Default 1M sats
+    ok, channel_size_sats, budget_info, error_result = _preflight_channel_open(
+        ctx=ctx,
+        action_id=action_id,
+        target=details["target"],
+        channel_size_sats=details["channel_size_sats"],
+        override_applied=details.get("override_applied", False),
     )
-    try:
-        proposed_size = int(proposed_size)
-    except (ValueError, TypeError):
-        return {"error": "Invalid channel_size_sats in action payload", "action_id": action_id}
+    if not ok:
+        return error_result
 
-    # Apply member override if provided
-    if amount_sats is not None:
-        try:
-            channel_size_sats = int(amount_sats)
-        except (ValueError, TypeError):
-            return {"error": "Invalid amount_sats", "action_id": action_id}
-        override_applied = True
-    else:
-        channel_size_sats = proposed_size
-        override_applied = False
+    details["channel_size_sats"] = channel_size_sats
+    broadcast_count = _broadcast_channel_open_intent(ctx, details.get("intent_id"))
 
-    if not target:
-        return {"error": "Missing target in action payload", "action_id": action_id}
-
-    # Check for existing or pending channels to this target
-    try:
-        peer_channels = ctx.safe_plugin.rpc.listpeerchannels(target)
-        channels = peer_channels.get('channels', [])
-        for ch in channels:
-            state = ch.get('state', '')
-            # Block if there's already an active or pending channel
-            if state in ('CHANNELD_AWAITING_LOCKIN', 'CHANNELD_NORMAL', 'DUALOPEND_AWAITING_LOCKIN'):
-                existing_capacity = ch.get('total_msat', 0) // 1000
-                funding_txid = ch.get('funding_txid', 'unknown')
-                return {
-                    "error": f"Already have {'pending' if 'AWAITING' in state else 'active'} channel to this peer",
-                    "action_id": action_id,
-                    "target": target,
-                    "existing_channel_state": state,
-                    "existing_capacity_sats": existing_capacity,
-                    "existing_funding_txid": funding_txid,
-                    "hint": "Wait for pending channel to confirm or close existing channel first"
-                }
-    except Exception as e:
-        # If listpeerchannels fails, log but continue (peer might not be known yet)
-        if ctx.log:
-            ctx.log(f"cl-hive: Could not check existing channels: {e}", 'debug')
-
-    # Re-check feerate gate at approval time (feerates may have changed since proposal)
-    cfg = ctx.config.snapshot() if ctx.config else None
-    if cfg and ctx.safe_plugin:
-        max_feerate = getattr(cfg, 'max_expansion_feerate_perkb', 5000)
-        if max_feerate != 0:
-            try:
-                feerates = ctx.safe_plugin.rpc.feerates("perkb")
-                opening_feerate = feerates.get("perkb", {}).get("opening")
-                if opening_feerate is None:
-                    opening_feerate = feerates.get("perkb", {}).get("min_acceptable", 0)
-                if opening_feerate > 0 and opening_feerate > max_feerate:
-                    ctx.database.update_action_status(action_id, 'failed')
-                    return {
-                        "error": "Feerate gate: on-chain fees too high for channel open",
-                        "action_id": action_id,
-                        "opening_feerate_perkb": opening_feerate,
-                        "max_feerate_perkb": max_feerate,
-                        "hint": "Wait for feerates to drop or increase hive-max-expansion-feerate"
-                    }
-            except Exception as e:
-                if ctx.log:
-                    ctx.log(f"cl-hive: Could not check feerates: {e}", 'debug')
-
-    # Calculate intelligent budget limits — config is required for budget enforcement
-    budget_info = {}
-    if not cfg:
-        return {"error": "Cannot open channel: config unavailable for budget enforcement", "action_id": action_id}
-    if cfg:
-        # Get onchain balance for reserve calculation
-        try:
-            funds = ctx.safe_plugin.rpc.listfunds()
-            onchain_sats = sum(o.get('amount_msat', 0) // 1000 for o in funds.get('outputs', [])
-                               if o.get('status') == 'confirmed')
-        except Exception:
-            onchain_sats = 0
-
-        # Calculate budget components:
-        # 1. Daily budget remaining
-        daily_remaining = ctx.database.get_available_budget(cfg.failsafe_budget_per_day)
-
-        # 2. Onchain reserve limit (keep reserve_pct for future expansion)
-        spendable_onchain = int(onchain_sats * (1.0 - cfg.budget_reserve_pct))
-
-        # 3. Max per-channel limit (percentage of daily budget)
-        max_per_channel = int(cfg.failsafe_budget_per_day * cfg.budget_max_per_channel_pct)
-
-        # Effective budget is the minimum of all constraints
-        effective_budget = min(daily_remaining, spendable_onchain, max_per_channel)
-
-        budget_info = {
-            "onchain_sats": onchain_sats,
-            "reserve_pct": cfg.budget_reserve_pct,
-            "spendable_onchain": spendable_onchain,
-            "daily_budget": cfg.failsafe_budget_per_day,
-            "daily_remaining": daily_remaining,
-            "max_per_channel_pct": cfg.budget_max_per_channel_pct,
-            "max_per_channel": max_per_channel,
-            "effective_budget": effective_budget,
-        }
-
-        if channel_size_sats > effective_budget:
-            # Reduce to effective budget if it's above minimum
-            if effective_budget >= cfg.planner_min_channel_sats:
-                if ctx.log:
-                    ctx.log(
-                        f"cl-hive: Reducing channel size from {channel_size_sats:,} to {effective_budget:,} "
-                        f"due to budget constraints (daily={daily_remaining:,}, reserve={spendable_onchain:,}, "
-                        f"per-channel={max_per_channel:,})",
-                        'info'
-                    )
-                channel_size_sats = effective_budget
-            else:
-                limiting_factor = "daily budget" if daily_remaining == effective_budget else \
-                                 "reserve limit" if spendable_onchain == effective_budget else \
-                                 "per-channel limit"
-                return {
-                    "error": f"Insufficient budget for channel open ({limiting_factor})",
-                    "action_id": action_id,
-                    "requested_sats": channel_size_sats,
-                    "effective_budget_sats": effective_budget,
-                    "min_channel_sats": cfg.planner_min_channel_sats,
-                    "budget_info": budget_info,
-                }
-
-        # Validate member override is within bounds
-        if override_applied:
-            if channel_size_sats < cfg.planner_min_channel_sats:
-                return {
-                    "error": f"Override amount {channel_size_sats:,} below minimum {cfg.planner_min_channel_sats:,}",
-                    "action_id": action_id,
-                    "min_channel_sats": cfg.planner_min_channel_sats,
-                }
-            if channel_size_sats > effective_budget:
-                return {
-                    "error": f"Override amount {channel_size_sats:,} exceeds effective budget {effective_budget:,}",
-                    "action_id": action_id,
-                    "effective_budget_sats": effective_budget,
-                    "budget_info": budget_info,
-                }
-
-    # Get intent from database (if available)
-    intent_record = None
-    if intent_id and ctx.database:
-        intent_record = ctx.database.get_intent_by_id(intent_id)
-
-    # Step 1: Broadcast the intent to all hive members (coordination)
-    broadcast_count = 0
-    if ctx.intent_mgr and intent_record:
-        try:
-            intent = Intent(
-                intent_id=intent_record['id'],
-                intent_type=intent_record['intent_type'],
-                target=intent_record['target'],
-                initiator=intent_record['initiator'],
-                timestamp=intent_record['timestamp'],
-                expires_at=intent_record['expires_at'],
-                status=intent_record['status']
-            )
-
-            # Broadcast to all members
-            intent_payload = ctx.intent_mgr.create_intent_message(intent)
-            msg = serialize(HiveMessageType.INTENT, intent_payload)
-            members = ctx.database.get_all_members()
-
-            for member in members:
-                member_id = member.get('peer_id')
-                if not member_id or member_id == ctx.our_pubkey:
-                    continue
-                try:
-                    ctx.safe_plugin.rpc.call("sendcustommsg", {
-                        "node_id": member_id,
-                        "msg": msg.hex()
-                    })
-                    broadcast_count += 1
-                except Exception as send_err:
-                    if ctx.log:
-                        ctx.log(f"cl-hive: Intent send to {member_id[:16]}... failed: {send_err}", 'debug')
-
-            if ctx.log:
-                ctx.log(f"cl-hive: Broadcast intent to {broadcast_count} hive members", 'info')
-
-        except Exception as e:
-            if ctx.log:
-                ctx.log(f"cl-hive: Intent broadcast failed: {e}", 'warn')
-
-    # Step 2: Connect to target if not already connected
-    try:
-        # Check if already connected
-        peerchannels = ctx.safe_plugin.rpc.listpeerchannels(target)
-        if not peerchannels.get('channels'):
-            # Try to connect (will fail if no address known, but that's OK)
-            try:
-                ctx.safe_plugin.rpc.connect(target)
-                if ctx.log:
-                    ctx.log(f"cl-hive: Connected to {target[:16]}...", 'info')
-            except Exception as conn_err:
-                if ctx.log:
-                    ctx.log(f"cl-hive: Could not connect to {target[:16]}...: {conn_err}", 'warn')
-                # Continue anyway - fundchannel might still work if peer connects to us
-    except Exception:
-        pass
-
-    # Step 3: Open channel (dual-funded first, single-funded fallback)
+    # Step 3: Open channel using fundchannel
     try:
         result = _open_channel(
             rpc=ctx.safe_plugin.rpc,
-            target=target,
+            target=details["target"],
             amount_sats=channel_size_sats,
             announce=True,
             log_fn=ctx.log,
         )
-
-        channel_id = result.get('channel_id', 'unknown')
-        txid = result.get('txid', 'unknown')
-
-        if ctx.log:
-            ctx.log(
-                f"cl-hive: Channel opened ({result.get('funding_type', 'unknown')})! "
-                f"txid={txid[:16]}... channel_id={channel_id}",
-                'info'
-            )
-
-        # Update intent status if we have one
-        if intent_id and ctx.database:
-            ctx.database.update_intent_status(intent_id, 'committed', reason="action_executed")
-
-        # Update action status
-        ctx.database.update_action_status(action_id, 'executed')
-
-        # Record budget spending
-        ctx.database.record_budget_spend(
-            action_type='channel_open',
-            amount_sats=channel_size_sats,
-            target=target,
-            action_id=action_id
+        return _finalize_channel_open_success(
+            ctx=ctx,
+            action_id=action_id,
+            action_type=action_type,
+            details=details,
+            channel_size_sats=channel_size_sats,
+            budget_info=budget_info,
+            broadcast_count=broadcast_count,
+            channel_id=result.get('channel_id', 'unknown'),
+            txid=result.get('txid', 'unknown'),
         )
-        if ctx.log:
-            ctx.log(f"cl-hive: Recorded budget spend of {channel_size_sats:,} sats", 'debug')
-
-        result = {
-            "status": "executed",
-            "action_id": action_id,
-            "action_type": action_type,
-            "target": target,
-            "channel_size_sats": channel_size_sats,
-            "proposed_size_sats": proposed_size,
-            "channel_id": channel_id,
-            "txid": txid,
-            "funding_type": result.get("funding_type", "unknown"),
-            "broadcast_count": broadcast_count,
-            "sizing_reasoning": context.get('sizing_reasoning', 'N/A'),
-        }
-        if override_applied:
-            result["override_applied"] = True
-            result["override_amount"] = amount_sats
-        if budget_info:
-            result["budget_info"] = budget_info
-        return result
-
     except Exception as e:
         error_msg = str(e) or f"{type(e).__name__} during channel open"
-        if ctx.log:
-            ctx.log(f"cl-hive: fundchannel failed: {error_msg}", 'error')
-
-        # Update action status to failed
-        try:
-            ctx.database.update_action_status(action_id, 'failed')
-        except Exception as db_err:
-            if ctx.log:
-                ctx.log(f"cl-hive: Failed to update action status: {db_err}", 'error')
-
-        # Classify the error to determine if delegation is appropriate
-        failure_info = _classify_channel_open_failure(error_msg)
-
-        result = {
-            "status": "failed",
-            "action_id": action_id,
-            "action_type": action_type,
-            "target": target,
-            "channel_size_sats": channel_size_sats,
-            "error": error_msg,
-            "broadcast_count": broadcast_count,
-            "failure_type": failure_info["type"],
-            "delegation_recommended": failure_info["delegation_recommended"],
-        }
-
-        # If delegation is recommended, try to find a hive member to delegate
-        if failure_info["delegation_recommended"] and ctx.database:
-            delegation_result = _attempt_channel_open_delegation(
-                ctx, target, channel_size_sats, action_id, failure_info
-            )
-            if delegation_result:
-                result["delegation"] = delegation_result
-
-        return result
+        return _build_channel_open_failure_result(
+            ctx=ctx,
+            action_id=action_id,
+            action_type=action_type,
+            target=details["target"],
+            channel_size_sats=channel_size_sats,
+            broadcast_count=broadcast_count,
+            error_msg=error_msg,
+        )
 
 
 def _classify_channel_open_failure(error_msg: str) -> Dict[str, Any]:

@@ -84,7 +84,6 @@ Want to join an existing hive fleet? The Lightning Hive is actively accepting ne
 | Node | Connection |
 |------|------------|
 | ⚡Lightning Goats CLN⚡ | `0382d558331b9a0c1d141f56b71094646ad6111e34e197d47385205019b03afdc3@45.76.234.192:9735` |
-| Hive-Nexus-02 | `03fe48e8a64f14fa0aa7d9d16500754b3b906c729acfb867c00423fd4b0b9b56c2@45.76.234.192:9736` |
 
 **To join:**
 1. Run your own CLN node with cl-hive

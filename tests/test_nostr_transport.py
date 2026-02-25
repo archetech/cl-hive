@@ -1,12 +1,24 @@
-"""Tests for Phase 5A Nostr transport foundation."""
+"""Tests for current Nostr transport behavior (legacy alias + external transport)."""
 
-import time
+import sys
+import types
 from unittest.mock import MagicMock
 
 import pytest
 
-from modules.database import HiveDatabase
-from modules.nostr_transport import NostrTransport
+# Minimal stub for environments without pyln installed.
+if "pyln.client" not in sys.modules:
+    pyln_module = sys.modules.setdefault("pyln", types.ModuleType("pyln"))
+    client_module = types.ModuleType("pyln.client")
+
+    class RpcError(Exception):
+        pass
+
+    client_module.RpcError = RpcError
+    sys.modules["pyln.client"] = client_module
+    pyln_module.client = client_module
+
+from modules.nostr_transport import ExternalCommsTransport, NostrTransport
 
 
 @pytest.fixture
@@ -14,91 +26,65 @@ def mock_plugin():
     plugin = MagicMock()
     plugin.log = MagicMock()
     plugin.rpc = MagicMock()
-    plugin.rpc.signmessage.return_value = {"zbase": "nostr-derivation-sig"}
     return plugin
 
 
-@pytest.fixture
-def database(mock_plugin, tmp_path):
-    db_path = str(tmp_path / "test_nostr.db")
-    db = HiveDatabase(db_path, mock_plugin)
-    db.initialize()
-    return db
+def test_legacy_nostr_transport_alias_raises(mock_plugin):
+    with pytest.raises(RuntimeError, match="removed from cl-hive"):
+        NostrTransport(mock_plugin, MagicMock())
 
 
-def test_identity_persists_across_restarts(mock_plugin, database):
-    t1 = NostrTransport(mock_plugin, database)
-    id1 = t1.get_identity()
-    assert len(id1["pubkey"]) == 64
-    assert len(id1["privkey"]) == 64
+def test_external_transport_identity_uses_rpc(mock_plugin):
+    mock_plugin.rpc.call.return_value = {"pubkey": "a" * 64}
+    transport = ExternalCommsTransport(mock_plugin)
 
-    t2 = NostrTransport(mock_plugin, database)
-    id2 = t2.get_identity()
-    assert id2["pubkey"] == id1["pubkey"]
-    assert id2["privkey"] == id1["privkey"]
+    identity = transport.get_identity()
 
-
-def test_start_stop_and_status(mock_plugin, database):
-    transport = NostrTransport(mock_plugin, database)
-    assert transport.start()
-    status = transport.get_status()
-    assert status["running"] is True
-    assert status["relay_count"] >= 1
-
-    transport.stop()
-    status = transport.get_status()
-    assert status["running"] is False
+    assert identity["pubkey"] == "a" * 64
+    assert identity["privkey"] == ""
+    mock_plugin.rpc.call.assert_called_once_with("hive-client-identity", {"action": "get"})
 
 
-def test_publish_updates_last_event_state(mock_plugin, database):
-    transport = NostrTransport(mock_plugin, database)
-    transport.start()
-    event = transport.publish({"kind": 1, "content": "hello"})
-    assert "id" in event
-    assert "sig" in event
+def test_publish_calls_comms_rpc(mock_plugin):
+    mock_plugin.rpc.call.return_value = {"id": "evt1"}
+    transport = ExternalCommsTransport(mock_plugin)
 
-    deadline = time.time() + 2.0
-    while time.time() < deadline:
-        if database.get_nostr_state("event:last_published_id") == event["id"]:
-            break
-        time.sleep(0.05)
+    result = transport.publish({"kind": 1, "content": "hello"})
 
-    assert database.get_nostr_state("event:last_published_id") == event["id"]
-    assert database.get_nostr_state("event:last_published_at") is not None
-    transport.stop()
+    assert result == {"id": "evt1"}
+    method, params = mock_plugin.rpc.call.call_args[0]
+    assert method == "hive-comms-publish-event"
+    assert "event_json" in params
 
 
-def test_send_dm_and_process_inbound_callbacks(mock_plugin, database):
-    transport = NostrTransport(mock_plugin, database)
+def test_send_dm_empty_recipient_is_dropped(mock_plugin):
+    transport = ExternalCommsTransport(mock_plugin)
 
+    result = transport.send_dm("", "hello")
+
+    assert result == {}
+    mock_plugin.rpc.call.assert_not_called()
+
+
+def test_inject_packet_processes_callbacks(mock_plugin):
+    transport = ExternalCommsTransport(mock_plugin)
     seen = []
     transport.receive_dm(lambda evt: seen.append(evt))
 
-    outbound_dm = transport.send_dm("02" + "11" * 32, "ping")
-    inbound_dm = dict(outbound_dm)
-    transport.inject_event(inbound_dm)
+    assert transport.inject_packet({"kind": 4, "content": "hi"}, transport_pubkey="b" * 64) is True
     processed = transport.process_inbound()
 
     assert processed == 1
     assert len(seen) == 1
-    assert seen[0]["kind"] == 4
-    assert seen[0]["plaintext"] == "ping"
+    assert seen[0]["pubkey"] == "b" * 64
+    assert seen[0]["payload"]["content"] == "hi"
+    assert "\"content\": \"hi\"" in seen[0]["plaintext"]
 
 
-def test_subscribe_filters(mock_plugin, database):
-    transport = NostrTransport(mock_plugin, database)
+def test_subscribe_and_unsubscribe_placeholders(mock_plugin):
+    transport = ExternalCommsTransport(mock_plugin)
 
-    events = []
-    sub_id = transport.subscribe({"kinds": [38901]}, lambda evt: events.append(evt))
-    assert sub_id
+    sub_id = transport.subscribe({"kinds": [38901]}, lambda evt: None)
 
-    transport.inject_event({"kind": 1, "id": "a" * 64, "pubkey": "b" * 64, "created_at": int(time.time())})
-    transport.inject_event({"kind": 38901, "id": "c" * 64, "pubkey": "d" * 64, "created_at": int(time.time())})
-    processed = transport.process_inbound()
-
-    assert processed == 2
-    assert len(events) == 1
-    assert events[0]["kind"] == 38901
-
-    assert transport.unsubscribe(sub_id)
-
+    assert sub_id == "remote-sub-placeholder"
+    assert transport.unsubscribe(sub_id) is True

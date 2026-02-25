@@ -8,7 +8,20 @@ import pytest
 
 from modules.database import HiveDatabase
 from modules.marketplace import MarketplaceManager
-from modules.nostr_transport import NostrTransport
+
+
+class DummyNostrTransport:
+    def get_identity(self):
+        return {"pubkey": "ab" * 32, "privkey": ""}
+
+    def start(self):
+        return True
+
+    def stop(self):
+        return None
+
+    def publish(self, event):
+        return {"id": "dummy-event-id"}
 
 
 @pytest.fixture
@@ -29,7 +42,7 @@ def database(mock_plugin, tmp_path):
 
 @pytest.fixture
 def transport(mock_plugin, database):
-    t = NostrTransport(mock_plugin, database)
+    t = DummyNostrTransport()
     t.start()
     yield t
     t.stop()
