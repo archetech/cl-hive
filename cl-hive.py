@@ -114,7 +114,7 @@ from modules.outbox import OutboxManager
 from modules.did_credentials import DIDCredentialManager
 from modules.management_schemas import ManagementSchemaRegistry
 from modules.cashu_escrow import CashuEscrowManager
-from modules.nostr_transport import InternalNostrTransport, ExternalCommsTransport, TransportInterface
+from modules.nostr_transport import ExternalCommsTransport, TransportInterface
 from modules.identity_adapter import IdentityInterface, LocalIdentity, RemoteArchonIdentity
 from modules.phase6_ingest import parse_injected_hive_packet
 from modules.marketplace import MarketplaceManager
@@ -1418,8 +1418,9 @@ def _detect_phase6_optional_plugins(plugin_obj: Plugin) -> Dict[str, Any]:
     """
     Detect optional Phase 6 sibling plugins.
 
-    This is advisory-only. cl-hive stays fully functional when siblings are
-    absent. The result is cached in the global phase6_optional_plugins map.
+    This is used for runtime capability selection and status reporting.
+    When cl-hive-comms is absent, external transport features are disabled.
+    The result is cached in the global phase6_optional_plugins map.
     """
     result: Dict[str, Any] = {
         "cl_hive_comms": {"installed": False, "active": False, "name": ""},
@@ -1728,12 +1729,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Get our pubkey for tie-breaker logic
     our_pubkey = plugin.rpc.getinfo().get('id', '')
 
-    # Detect optional Phase 6 sibling plugins (advisory only)
+    # Detect Phase 6 sibling plugins (used for runtime capability selection)
     phase6_optional_plugins = _detect_phase6_optional_plugins(plugin)
     comms = phase6_optional_plugins["cl_hive_comms"]
     archon = phase6_optional_plugins["cl_hive_archon"]
     plugin.log(
-        "cl-hive: Optional siblings - "
+        "cl-hive: Sibling plugins - "
         f"cl-hive-comms(active={comms['active']}, installed={comms['installed']}), "
         f"cl-hive-archon(active={archon['active']}, installed={archon['installed']})"
     )
@@ -2283,13 +2284,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     escrow_maintenance_thread.start()
     plugin.log("cl-hive: Escrow maintenance thread started")
 
-    # Phase 5A/6: Nostr transport — Coordinated Mode (comms) or Monolith Mode (internal)
+    # Phase 5A/6: Nostr transport — external companion plugin only (cl-hive-comms)
     global nostr_transport
     try:
         comms_active = phase6_optional_plugins["cl_hive_comms"]["active"]
 
         if comms_active:
-            # Coordinated Mode: delegate transport to cl-hive-comms
+            # Delegate transport to cl-hive-comms
             nostr_transport = ExternalCommsTransport(plugin=plugin)
             nostr_transport.receive_dm(_handle_external_transport_dm)
             identity = nostr_transport.get_identity()
@@ -2304,21 +2305,22 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 name="cl-hive-ext-pump",
             ).start()
         else:
-            # Monolith Mode: run internal transport (current behavior)
+            nostr_transport = None
             relays_opt = plugin.get_option('hive-nostr-relays')
-            relays = [r.strip() for r in relays_opt.split(',') if r.strip()] if relays_opt else None
-            nostr_transport = InternalNostrTransport(
-                plugin=plugin,
-                database=database,
-                relays=relays,
+            if relays_opt:
+                plugin.log(
+                    "cl-hive: hive-nostr-relays is ignored; internal Nostr transport has been removed",
+                    level='warn'
+                )
+            plugin.log(
+                "cl-hive: Nostr transport disabled (cl-hive-comms not active; companion plugin required)",
+                level='warn'
             )
-            nostr_transport.start()
-            plugin.log("cl-hive: Nostr transport initialized (Monolith Mode)")
     except Exception as e:
         nostr_transport = None
         plugin.log(f"cl-hive: Nostr transport disabled (init error): {e}", level='warn')
 
-    # Phase 6: Identity adapter — delegate signing to archon when present
+    # Phase 6: Identity adapter — prefer archon; local signing is compatibility fallback
     global identity_adapter
     try:
         archon_active = phase6_optional_plugins["cl_hive_archon"]["active"]
@@ -2327,10 +2329,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             plugin.log("cl-hive: Using Remote Identity (cl-hive-archon)")
         else:
             identity_adapter = LocalIdentity(rpc=plugin.rpc)
-            plugin.log("cl-hive: Using Local Identity (CLN HSM)")
+            plugin.log(
+                "cl-hive: Using Local Identity (CLN HSM compatibility fallback); "
+                "install cl-hive-archon for delegated signing",
+                level='warn'
+            )
     except Exception as e:
         identity_adapter = LocalIdentity(rpc=plugin.rpc)
-        plugin.log(f"cl-hive: Identity adapter fallback to local: {e}", level='warn')
+        plugin.log(f"cl-hive: Identity adapter fallback to local compatibility mode: {e}", level='warn')
 
     # Phase 5B: Advisor marketplace manager
     global marketplace_mgr
