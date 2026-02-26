@@ -4090,32 +4090,22 @@ def _update_and_broadcast_fees(new_fee_sats: int):
             time_since_broadcast >= FEE_BROADCAST_MIN_INTERVAL
         )
 
-        # Always save fee report to database for settlement (Bug fix #3)
-        # This must happen regardless of broadcast threshold to ensure
-        # low-traffic nodes report their fees for settlement calculations
-        from modules.settlement import SettlementManager
-        period = SettlementManager.get_period_string(_local_fees_period_start)
-        database.save_fee_report(
-            peer_id=our_pubkey,
-            period=period,
-            fees_earned_sats=_local_fees_earned_sats,
-            forward_count=_local_fees_forward_count,
-            period_start=_local_fees_period_start,
-            period_end=now,
-            rebalance_costs_sats=_local_rebalance_costs_sats
-        )
+        # Always snapshot fee report values for DB persistence (outside lock).
+        fees_to_persist = _local_fees_earned_sats
+        forwards_to_persist = _local_fees_forward_count
+        period_start_to_persist = _local_fees_period_start
+        costs_to_persist = _local_rebalance_costs_sats
         
         if not should_broadcast:
-            if plugin:
-                plugin.log(
-                    f"FEE_GOSSIP: Not broadcasting - cumulative={cumulative_fee_change}sats "
-                    f"(need {FEE_BROADCAST_MIN_SATS}), time={time_since_broadcast}s "
-                    f"(need {FEE_BROADCAST_MIN_INTERVAL})",
-                    level="debug"
-                )
-            # Still save updated totals for persistence across restarts
-            _save_fee_tracking_state()
-            return
+            no_broadcast_reason = (
+                f"FEE_GOSSIP: Not broadcasting - cumulative={cumulative_fee_change}sats "
+                f"(need {FEE_BROADCAST_MIN_SATS}), time={time_since_broadcast}s "
+                f"(need {FEE_BROADCAST_MIN_INTERVAL})"
+            )
+            should_return_without_broadcast = True
+        else:
+            no_broadcast_reason = None
+            should_return_without_broadcast = False
 
         # Capture values for broadcast
         fees_to_broadcast = _local_fees_earned_sats
@@ -4124,6 +4114,29 @@ def _update_and_broadcast_fees(new_fee_sats: int):
         costs_to_broadcast = _local_rebalance_costs_sats
         _local_fees_last_broadcast = now
         _local_fees_last_broadcast_amount = _local_fees_earned_sats
+
+    # Always save fee report to database for settlement (Bug fix #3).
+    # This must happen regardless of broadcast threshold to ensure low-traffic
+    # nodes report their fees for settlement calculations.
+    from modules.settlement import SettlementManager
+    period = SettlementManager.get_period_string(period_start_to_persist)
+    database.save_fee_report(
+        peer_id=our_pubkey,
+        period=period,
+        fees_earned_sats=fees_to_persist,
+        forward_count=forwards_to_persist,
+        period_start=period_start_to_persist,
+        period_end=now,
+        rebalance_costs_sats=costs_to_persist
+    )
+
+    if should_return_without_broadcast:
+        if plugin:
+            plugin.log(no_broadcast_reason, level="debug")
+        # Save updated totals for persistence across restarts (outside lock to
+        # avoid re-entering _local_fees_lock).
+        _save_fee_tracking_state()
+        return
 
     # Broadcast outside the lock
     if plugin:
