@@ -50,6 +50,12 @@ services:
       - HIVE_COMMS_ENABLED=${HIVE_COMMS_ENABLED:-false}
       - HIVE_ARCHON_ENABLED=${HIVE_ARCHON_ENABLED:-false}
 
+      # Boltz Client / cl-revenue-ops integration (disabled by default)
+      - BOLTZ_ENABLED=${BOLTZ_ENABLED:-false}
+      - REVENUE_OPS_BOLTZ_BTC_WALLET=${REVENUE_OPS_BOLTZ_BTC_WALLET:-CLN}
+      - REVENUE_OPS_BOLTZ_LBTC_WALLET=${REVENUE_OPS_BOLTZ_LBTC_WALLET:-LOOP-LBTC}
+      - REVENUE_OPS_BOLTZ_DAILY_BUDGET_SATS=${REVENUE_OPS_BOLTZ_DAILY_BUDGET_SATS:-3000}
+
       # Logging
       - LOG_LEVEL=${LOG_LEVEL:-info}
 
@@ -66,6 +72,7 @@ services:
     # Additional production volumes
     volumes:
       - lightning-data:/data/lightning
+      - boltz-data:/data/boltz
       - ${WIREGUARD_CONFIG_PATH:-./wireguard}:/etc/wireguard:ro
       - ${CUSTOM_CONFIG_PATH:-./config}:/etc/lightning/custom:ro
       # Backup mount point
@@ -108,4 +115,8 @@ volumes:
   lightning-data:
     labels:
       - "com.cl-hive.backup=critical"
+      - "com.cl-hive.backup.schedule=daily"
+  boltz-data:
+    labels:
+      - "com.cl-hive.backup=important"
       - "com.cl-hive.backup.schedule=daily"

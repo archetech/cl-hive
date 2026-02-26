@@ -98,6 +98,10 @@ services:
 
       # Boltz Client (submarine/reverse swaps - disabled by default)
       - BOLTZ_ENABLED=${BOLTZ_ENABLED:-false}
+      # cl-revenue-ops Boltz integration defaults (used when BOLTZ_ENABLED=true)
+      - REVENUE_OPS_BOLTZ_BTC_WALLET=${REVENUE_OPS_BOLTZ_BTC_WALLET:-CLN}
+      - REVENUE_OPS_BOLTZ_LBTC_WALLET=${REVENUE_OPS_BOLTZ_LBTC_WALLET:-LOOP-LBTC}
+      - REVENUE_OPS_BOLTZ_DAILY_BUDGET_SATS=${REVENUE_OPS_BOLTZ_DAILY_BUDGET_SATS:-3000}
 
       # Logging
       - LOG_LEVEL=${LOG_LEVEL:-info}
