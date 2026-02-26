@@ -871,8 +871,13 @@ class SettlementManager:
 
             bolt12_invoice = invoice_result["invoice"]
 
-            # Pay the invoice
-            pay_result = self.rpc.pay(bolt12_invoice)
+            # Pay the invoice with a tiny fee budget to avoid xpay/msat edge cases
+            # (e.g. "max is amount-1msat" despite effectively free routes).
+            pay_result = self.rpc.pay(
+                bolt12_invoice,
+                maxfee="1sat",
+                retry_for=30,
+            )
 
             if pay_result.get("status") == "complete":
                 payment.status = "completed"
@@ -1675,12 +1680,25 @@ class SettlementManager:
         ready = self.db.get_ready_settlement_proposals()
         settled = self.db.get_settled_periods(limit=5)
 
+        def _enrich(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            enriched = []
+            for item in items:
+                row = dict(item)
+                if row.get("last_broadcast_at") is None and row.get("proposed_at") is not None:
+                    row["effective_last_broadcast_at"] = row.get("proposed_at")
+                    row["last_broadcast_at_inferred_from_proposed_at"] = True
+                else:
+                    row["effective_last_broadcast_at"] = row.get("last_broadcast_at")
+                    row["last_broadcast_at_inferred_from_proposed_at"] = False
+                enriched.append(row)
+            return enriched
+
         return {
             'pending_proposals': len(pending),
             'ready_proposals': len(ready),
             'recent_settlements': len(settled),
-            'pending': pending,
-            'ready': ready,
+            'pending': _enrich(pending),
+            'ready': _enrich(ready),
             'settled_periods': settled,
         }
 

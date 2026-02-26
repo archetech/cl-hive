@@ -17869,6 +17869,12 @@ def hive_distributed_settlement_proposals(plugin: Plugin, status: str = None):
         prop['vote_count'] = database.count_settlement_ready_votes(proposal_id)
         votes = database.get_settlement_ready_votes(proposal_id)
         prop['voters'] = [v.get('voter_peer_id')[:16] + '...' for v in votes]
+        if prop.get('last_broadcast_at') is None and prop.get('proposed_at') is not None:
+            prop['effective_last_broadcast_at'] = prop.get('proposed_at')
+            prop['last_broadcast_at_inferred_from_proposed_at'] = True
+        else:
+            prop['effective_last_broadcast_at'] = prop.get('last_broadcast_at')
+            prop['last_broadcast_at_inferred_from_proposed_at'] = False
 
     return {
         "proposals": proposals,
