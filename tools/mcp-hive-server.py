@@ -2230,6 +2230,20 @@ Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
             }
         ),
         Tool(
+            name="revenue_hot_channel_protection_peers",
+            description="Manage persistent peer overrides for hot-channel protection (list/add/remove/clear).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "action": {"type": "string", "enum": ["list", "add", "remove", "clear"], "description": "Management action (default: list)"},
+                    "peer_id": {"type": "string", "description": "Peer public key (required for add/remove)"},
+                    "note": {"type": "string", "description": "Optional operator note when adding a peer override"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
             name="revenue_boltz_refund",
             description="Refund a failed submarine/chain swap.",
             inputSchema={
@@ -7428,21 +7442,64 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
                 peer_id = ch.get("peer_id")
                 break
     elif peer_id:
-        for ch in channels:
-            if ch.get("peer_id") == peer_id:
-                target_channel = ch
-                channel_id = ch.get("short_channel_id")
-                break
+        peer_channels = [ch for ch in channels if ch.get("peer_id") == peer_id]
+        if peer_channels:
+            # Prefer active routing channels when multiple channels exist to a peer,
+            # otherwise fall back to the most recent SCID-like entry.
+            def _peer_channel_rank(ch: Dict[str, Any]) -> tuple[int, int]:
+                state = str(ch.get("state") or "")
+                if state == "CHANNELD_NORMAL":
+                    pri = 0
+                elif "AWAITING_LOCKIN" in state:
+                    pri = 1
+                elif state in {"ONCHAIN", "CLOSINGD_COMPLETE", "FUNDING_SPEND_SEEN", "CHANNELD_SHUTTING_DOWN"}:
+                    pri = 3
+                else:
+                    pri = 2
+                scid = str(ch.get("short_channel_id") or "")
+                try:
+                    parts = scid.split("x")
+                    scid_num = (
+                        (int(parts[0]) << 40)
+                        + (int(parts[1]) << 16)
+                        + int(parts[2])
+                    ) if len(parts) == 3 else 0
+                except Exception:
+                    scid_num = 0
+                return (pri, -scid_num)
+
+            target_channel = sorted(peer_channels, key=_peer_channel_rank)[0]
+            channel_id = target_channel.get("short_channel_id")
 
     if not target_channel:
         return {"error": "Channel not found for given channel_id/peer_id"}
 
-    # Basic info
+    # Basic info + lifecycle state from live CLN channel entry
     totals = _channel_totals(target_channel)
     total_msat = totals["total_msat"]
     local_msat = totals["local_msat"]
     remote_msat = max(0, total_msat - local_msat)
     local_pct = round((local_msat / total_msat) * 100, 2) if total_msat else 0.0
+    channel_state = str(target_channel.get("state") or "")
+    channel_owner = target_channel.get("owner")
+    channel_closer = target_channel.get("closer")
+    channel_status = target_channel.get("status") or []
+    state_changes = target_channel.get("state_changes") or []
+    is_active_routing_channel = channel_state == "CHANNELD_NORMAL"
+    is_closing_or_onchain = (
+        not is_active_routing_channel
+        and (
+            channel_owner == "onchaind"
+            or channel_state in {
+                "ONCHAIN",
+                "FUNDING_SPEND_SEEN",
+                "CLOSINGD_COMPLETE",
+                "CLOSINGD_SIGEXCHANGE",
+                "CHANNELD_SHUTTING_DOWN",
+                "AWAITING_UNILATERAL",
+            }
+        )
+    )
 
     # Gather remaining RPC calls in parallel (all independent after finding target_channel)
     peers, prof, debug, forwards, nodes_for_alias, info_result = await asyncio.gather(
@@ -7460,7 +7517,7 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
         peers = {"peers": []}
     peer_info = next((p for p in peers.get("peers", []) if p.get("id") == peer_id), {})
     peer_alias = peer_info.get("alias") or peer_info.get("alias_or_local", "") or ""
-    connected = bool(peer_info.get("connected", False))
+    connected = bool(target_channel.get("peer_connected", peer_info.get("connected", False)))
 
     # Fallback to listnodes if peer not in listpeers (disconnected peer)
     if not peer_alias and peer_id and not isinstance(nodes_for_alias, Exception):
@@ -7551,7 +7608,17 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
 
     # Issues
     issues = []
-    if local_pct < 20:
+    if is_closing_or_onchain:
+        issues.append({
+            "type": "closing_or_onchain",
+            "severity": "info",
+            "details": {
+                "state": channel_state,
+                "owner": channel_owner,
+                "closer": channel_closer,
+            },
+        })
+    elif local_pct < 20:
         issues.append({"type": "critical_low_balance", "severity": "critical", "details": {"local_pct": local_pct}})
     if profitability.get("classification") in {"bleeder", "zombie"}:
         issues.append({
@@ -7570,7 +7637,16 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
             "local_balance_pct": local_pct,
             "peer_alias": peer_alias,
             "connected": connected,
-            "channel_age_days": channel_age_days
+            "channel_age_days": channel_age_days,
+            "state": channel_state,
+            "owner": channel_owner,
+            "closer": channel_closer,
+            "status": channel_status,
+        },
+        "lifecycle": {
+            "is_active_routing_channel": is_active_routing_channel,
+            "is_closing_or_onchain": is_closing_or_onchain,
+            "state_changes": state_changes[-10:],
         },
         "profitability": profitability,
         "flow_analysis": flow_analysis,
@@ -10755,6 +10831,23 @@ async def handle_revenue_boltz_balance_cycle(args: Dict) -> Dict:
     if not params:
         return await node.call("revenue-boltz-balance-cycle")
     return await node.call("revenue-boltz-balance-cycle", params)
+
+
+async def handle_revenue_hot_channel_protection_peers(args: Dict) -> Dict:
+    """Manage persistent hot-channel protection peer overrides."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params: Dict[str, Any] = {}
+    for key in ("action", "peer_id", "note"):
+        if args.get(key) is not None:
+            params[key] = args[key]
+
+    if not params:
+        return await node.call("revenue-hot-channel-protection-peers")
+    return await node.call("revenue-hot-channel-protection-peers", params)
 
 
 async def handle_revenue_boltz_refund(args: Dict) -> Dict:
@@ -17432,6 +17525,7 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_boltz_wallet": handle_revenue_boltz_wallet,
     "revenue_boltz_balance_recommendations": handle_revenue_boltz_balance_recommendations,
     "revenue_boltz_balance_cycle": handle_revenue_boltz_balance_cycle,
+    "revenue_hot_channel_protection_peers": handle_revenue_hot_channel_protection_peers,
     "revenue_boltz_refund": handle_revenue_boltz_refund,
     "revenue_boltz_claim": handle_revenue_boltz_claim,
     "revenue_boltz_chainswap": handle_revenue_boltz_chainswap,
