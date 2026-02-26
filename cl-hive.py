@@ -11567,19 +11567,87 @@ def settlement_loop():
             try:
                 previous_period = settlement_mgr.get_previous_period()
 
-                # Only propose if period not settled and no pending proposal
-                if not database.is_period_settled(previous_period):
-                    existing = database.get_settlement_proposal_by_period(previous_period)
+                # Backlog-first: propose the oldest eligible unsettled period up to
+                # the previous week, not just the immediately previous week.
+                target_period = None
+                blocked_by_active_period = None
+                try:
+                    candidate_periods = database.get_fee_report_periods_up_to(previous_period)
+                except Exception:
+                    candidate_periods = [previous_period]
+                if previous_period not in candidate_periods:
+                    candidate_periods = sorted(set(candidate_periods + [previous_period]))
+
+                for period_candidate in candidate_periods:
+                    if database.is_period_settled(period_candidate):
+                        continue
+
+                    existing = database.get_settlement_proposal_by_period(period_candidate)
                     if not existing:
-                        # Create and broadcast proposal
+                        target_period = period_candidate
+                        break
+
+                    status = (existing.get("status") or "").lower()
+                    if status == "expired":
+                        target_period = period_candidate
+                        break
+
+                    if status in ("pending", "ready"):
+                        blocked_by_active_period = period_candidate
+                        break
+
+                    # Unknown/legacy statuses (including completed without a settled_period row)
+                    # are treated as blocking to avoid duplicate settlement risk.
+                    blocked_by_active_period = period_candidate
+                    break
+
+                if blocked_by_active_period:
+                    plugin.log(
+                        f"SETTLEMENT: Backlog-first proposal blocked by active {blocked_by_active_period} proposal",
+                        level='debug'
+                    )
+
+                if target_period:
+                    proposal = None
+                    attempted_periods = [
+                        p for p in candidate_periods
+                        if p >= target_period and not database.is_period_settled(p)
+                    ]
+                    for attempt_idx, attempt_period in enumerate(attempted_periods):
+                        existing_attempt = database.get_settlement_proposal_by_period(attempt_period)
+                        if existing_attempt and (existing_attempt.get("status") or "").lower() not in ("expired",):
+                            # Active/unknown proposal appeared since selection pass; stop backlog attempts.
+                            if attempt_idx == 0:
+                                plugin.log(
+                                    f"SETTLEMENT: Backlog-first proposal blocked by active {attempt_period} proposal",
+                                    level='debug'
+                                )
+                            break
+
+                        if attempt_period != previous_period:
+                            plugin.log(
+                                f"SETTLEMENT: Backlog-first selecting oldest unsettled period "
+                                f"{attempt_period} (latest eligible={previous_period})",
+                                level='info'
+                            )
+
                         proposal = settlement_mgr.create_proposal(
-                            period=previous_period,
+                            period=attempt_period,
                             our_peer_id=our_pubkey,
                             state_manager=state_manager,
                             rpc=plugin.rpc
                         )
-
                         if proposal:
+                            break
+
+                        if attempt_idx + 1 < len(attempted_periods):
+                            plugin.log(
+                                f"SETTLEMENT: Could not create proposal for {attempt_period}; "
+                                f"trying next eligible unsettled period",
+                                level='debug'
+                            )
+
+                    if proposal:
                             # Sign the outgoing proposal payload (binds to timestamp).
                             outgoing = {
                                 "proposal_id": proposal["proposal_id"],
@@ -11619,7 +11687,7 @@ def settlement_loop():
                                     msg_id=proposal['proposal_id']
                                 )
                                 plugin.log(
-                                    f"SETTLEMENT: Proposed settlement for {previous_period}"
+                                    f"SETTLEMENT: Proposed settlement for {proposal['period']}"
                                 )
 
                                 # Vote on our own proposal (skip hash re-verification

@@ -6536,6 +6536,28 @@ class HiveDatabase:
         """, (period,)).fetchall()
         return [dict(row) for row in rows]
 
+    def get_fee_report_periods_up_to(self, max_period: str) -> List[str]:
+        """
+        Get distinct fee-report periods up to and including max_period.
+
+        Periods are stored in YYYY-WW format, so lexicographic ordering matches
+        chronological ordering.
+
+        Args:
+            max_period: Inclusive upper bound (YYYY-WW)
+
+        Returns:
+            Sorted list of distinct period strings.
+        """
+        conn = self._get_connection()
+        rows = conn.execute("""
+            SELECT DISTINCT period
+            FROM fee_reports
+            WHERE period <= ?
+            ORDER BY period ASC
+        """, (max_period,)).fetchall()
+        return [str(row[0]) for row in rows if row and row[0]]
+
     def get_latest_fee_reports(self) -> List[Dict[str, Any]]:
         """
         Get the most recent fee report for each peer.
@@ -6626,8 +6648,75 @@ class HiveDatabase:
                   data_hash, plan_hash, total_fees_sats, member_count, now, contributions_json))
             return True
         except sqlite3.IntegrityError:
-            # Period already has a proposal
-            return False
+            # Period already has a proposal. If the existing proposal for this
+            # period is expired, replace it so the period can be re-proposed.
+            try:
+                existing = conn.execute(
+                    "SELECT proposal_id, status FROM settlement_proposals WHERE period = ?",
+                    (period,)
+                ).fetchone()
+                if not existing:
+                    return False
+                existing_status = existing["status"] if isinstance(existing, sqlite3.Row) else existing[1]
+                existing_proposal_id = existing["proposal_id"] if isinstance(existing, sqlite3.Row) else existing[0]
+                if existing_status != "expired":
+                    return False
+
+                # Safety: never replace an expired proposal that has any
+                # execution history or crash-recovery sub-payments. Re-proposing
+                # in that case could lead to double payment if the old proposal
+                # partially executed before being marked expired.
+                ex_count_row = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM settlement_executions WHERE proposal_id = ?",
+                    (existing_proposal_id,)
+                ).fetchone()
+                subpay_count_row = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM settlement_sub_payments WHERE proposal_id = ?",
+                    (existing_proposal_id,)
+                ).fetchone()
+                ex_count = int(ex_count_row["cnt"] or 0) if ex_count_row else 0
+                subpay_count = int(subpay_count_row["cnt"] or 0) if subpay_count_row else 0
+                if ex_count > 0 or subpay_count > 0:
+                    self.plugin.log(
+                        f"HiveDatabase: Refusing to replace expired settlement proposal "
+                        f"{existing_proposal_id[:16]}... for {period} because it has "
+                        f"execution history (executions={ex_count}, sub_payments={subpay_count})",
+                        level='warn'
+                    )
+                    return False
+
+                with self.transaction() as tx:
+                    tx.execute("DELETE FROM settlement_ready_votes WHERE proposal_id = ?", (existing_proposal_id,))
+                    tx.execute("DELETE FROM settlement_executions WHERE proposal_id = ?", (existing_proposal_id,))
+                    tx.execute("DELETE FROM settlement_sub_payments WHERE proposal_id = ?", (existing_proposal_id,))
+                    tx.execute("DELETE FROM settlement_proposals WHERE proposal_id = ?", (existing_proposal_id,))
+                    tx.execute("""
+                        INSERT INTO settlement_proposals
+                        (proposal_id, period, proposer_peer_id, proposed_at, expires_at,
+                         status, data_hash, plan_hash, total_fees_sats, member_count, last_broadcast_at,
+                         contributions_json)
+                        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                    """, (proposal_id, period, proposer_peer_id, now, expires_at,
+                          data_hash, plan_hash, total_fees_sats, member_count, now, contributions_json))
+
+                try:
+                    self.plugin.log(
+                        f"HiveDatabase: Replaced expired settlement proposal {existing_proposal_id[:16]}... "
+                        f"for period {period} with {proposal_id[:16]}...",
+                        level='info'
+                    )
+                except Exception:
+                    pass
+                return True
+            except Exception as e:
+                try:
+                    self.plugin.log(
+                        f"HiveDatabase: Failed to replace expired settlement proposal for {period}: {e}",
+                        level='warn'
+                    )
+                except Exception:
+                    pass
+                return False
 
     def get_settlement_proposal(self, proposal_id: str) -> Optional[Dict[str, Any]]:
         """Get a settlement proposal by ID."""
@@ -6993,6 +7082,14 @@ class HiveDatabase:
             SET status = 'expired'
             WHERE status = 'ready'
               AND COALESCE(expires_at, proposed_at, 0) < ?
+              AND NOT EXISTS (
+                    SELECT 1 FROM settlement_executions se
+                    WHERE se.proposal_id = settlement_proposals.proposal_id
+                )
+              AND NOT EXISTS (
+                    SELECT 1 FROM settlement_sub_payments ssp
+                    WHERE ssp.proposal_id = settlement_proposals.proposal_id
+                )
               AND NOT EXISTS (
                     SELECT 1 FROM settled_periods sp
                     WHERE sp.period = settlement_proposals.period
