@@ -1037,7 +1037,8 @@ Runs independently of the advisor cycle to provide immediate onboarding support 
                 "properties": {
                     "node": {"type": "string", "description": "Node name"},
                     "peer_id": {"type": "string", "description": "Public key of the member to remove"},
-                    "reason": {"type": "string", "description": "Reason for removal (default: maintenance)"}
+                    "reason": {"type": "string", "description": "Reason for removal (default: maintenance)"},
+                    "force": {"type": "boolean", "description": "Force removal even if the peer still has active/open LN channels"}
                 },
                 "required": ["node", "peer_id"]
             }
@@ -8502,10 +8503,11 @@ async def handle_remove_member(args: Dict) -> Dict:
     node_name = args.get("node")
     peer_id = args.get("peer_id")
     reason = args.get("reason", "maintenance")
+    force = bool(args.get("force", False))
     node = fleet.get_node(node_name)
     if not node:
         return {"error": f"Unknown node: {node_name}"}
-    return await node.call("hive-remove-member", {"peer_id": peer_id, "reason": reason})
+    return await node.call("hive-remove-member", {"peer_id": peer_id, "reason": reason, "force": force})
 
 
 async def handle_genesis(args: Dict) -> Dict:

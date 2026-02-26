@@ -16874,7 +16874,7 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
 
 
 @plugin.method("hive-remove-member")
-def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"):
+def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance", force: bool = False):
     """
     Remove a member from the hive (admin maintenance).
 
@@ -16884,6 +16884,7 @@ def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"
     Args:
         peer_id: Public key of the member to remove
         reason: Reason for removal (default: "maintenance")
+        force: Allow removal even if the peer still has active/open channels
 
     Returns:
         Dict with removal status.
@@ -16909,18 +16910,65 @@ def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"
 
     target_tier = member.get("tier")
 
+    # Safety check: refuse removal when the peer still has active/open channels
+    # unless the caller explicitly forces it. This prevents accidentally removing
+    # active external peers (e.g. cyber-hornet) from Hive membership.
+    try:
+        lpc = plugin.rpc.listpeerchannels(id=peer_id)
+        peer_channels = lpc.get("channels", []) if isinstance(lpc, dict) else []
+    except Exception as e:
+        return {
+            "error": "channel_check_failed",
+            "peer_id": peer_id,
+            "message": f"Failed to verify channel state before removal: {e}"
+        }
+
+    active_channel_states = []
+    for ch in peer_channels:
+        state = ch.get("state") or ""
+        owner = ch.get("owner") or ""
+        # ONCHAIN/onchaind channels are already closed from routing perspective.
+        if state.startswith("ONCHAIN") or owner == "onchaind":
+            continue
+        active_channel_states.append({
+            "channel_id": ch.get("short_channel_id"),
+            "state": state,
+            "owner": owner
+        })
+
+    if active_channel_states and not force:
+        try:
+            peer_alias = (plugin.rpc.listnodes(peer_id).get("nodes") or [{}])[0].get("alias")
+        except Exception:
+            peer_alias = None
+        return {
+            "error": "active_channels_present",
+            "peer_id": peer_id,
+            "peer_alias": peer_alias,
+            "active_channel_count": len(active_channel_states),
+            "active_channels": active_channel_states[:10],
+            "message": (
+                "Refusing to remove hive member with active/open channels. "
+                "Use force=true only if you intend to remove Hive membership while keeping LN channels."
+            )
+        }
+
     # Remove the member
     success = database.remove_member(peer_id)
     if not success:
         return {"error": "removal_failed", "peer_id": peer_id}
 
-    plugin.log(f"cl-hive: Removed member {peer_id[:16]}... ({target_tier}): {reason}")
+    plugin.log(
+        f"cl-hive: Removed member {peer_id[:16]}... ({target_tier})"
+        f"{' [FORCED]' if force and active_channel_states else ''}: {reason}"
+    )
 
     return {
         "status": "removed",
         "peer_id": peer_id,
         "former_tier": target_tier,
         "reason": reason,
+        "forced": bool(force and active_channel_states),
         "message": f"Member removed. They can rejoin with a new invite ticket."
     }
 
