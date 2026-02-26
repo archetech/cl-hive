@@ -2301,6 +2301,66 @@ Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
             }
         ),
         Tool(
+            name="revenue_boltz_expansion_treasury_status",
+            description="Show expansion treasury reserve target status and current on-chain reserve.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_expansion_treasury_recommendations",
+            description="Recommend Boltz reverse swaps (LN -> BTC/LBTC) to build on-chain expansion treasury funds.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "onchain_target_sats": {"type": "integer", "description": "Target confirmed on-chain reserve in sats"},
+                    "min_deficit_sats": {"type": "integer", "description": "Minimum reserve deficit before treasury swaps are considered"},
+                    "preferred_currency": {"type": "string", "enum": ["btc", "lbtc"], "description": "Preferred reverse-swap output currency (default: btc)"},
+                    "max_actions": {"type": "integer", "description": "Max treasury reverse swaps to recommend (default: 1)"},
+                    "min_source_local_pct": {"type": "number", "description": "Minimum local balance percent for source channels (default: 80.0)"},
+                    "exclude_protected": {"type": "boolean", "description": "Exclude protected hot channels from treasury harvesting (default: true)"},
+                    "require_profitable": {"type": "boolean", "description": "Require profitability data and profit guard (default: true)"},
+                    "min_marginal_roi": {"type": "number", "description": "Minimum marginal ROI threshold (default: 0.0)"},
+                    "profit_margin_factor": {"type": "number", "description": "Required gross uplift / fee ratio guard (default: 1.2)"},
+                    "expected_horizon_days": {"type": "number", "description": "Expected benefit horizon for profit guard model (default: 3.0)"},
+                    "min_amount_sats": {"type": "integer", "description": "Minimum reverse swap amount (default: 100000)"},
+                    "max_amount_sats": {"type": "integer", "description": "Maximum reverse swap amount (default: 1500000)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_expansion_treasury_cycle",
+            description="Run an expansion treasury reverse-swap cycle (LN -> BTC/LBTC) to build on-chain funds for opens/splices.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node name"},
+                    "dry_run": {"type": "boolean", "description": "Preview actions without executing (default: true)"},
+                    "max_actions": {"type": "integer", "description": "Maximum treasury swaps to execute in this cycle"},
+                    "onchain_target_sats": {"type": "integer", "description": "Target confirmed on-chain reserve in sats"},
+                    "min_deficit_sats": {"type": "integer", "description": "Minimum reserve deficit before treasury swaps are considered"},
+                    "preferred_currency": {"type": "string", "enum": ["btc", "lbtc"], "description": "Preferred reverse-swap output currency (default: btc)"},
+                    "min_source_local_pct": {"type": "number", "description": "Minimum local balance percent for source channels (default: 80.0)"},
+                    "exclude_protected": {"type": "boolean", "description": "Exclude protected hot channels from treasury harvesting (default: true)"},
+                    "require_profitable": {"type": "boolean", "description": "Require profitability data and profit guard (default: true)"},
+                    "min_marginal_roi": {"type": "number", "description": "Minimum marginal ROI threshold (default: 0.0)"},
+                    "profit_margin_factor": {"type": "number", "description": "Required gross uplift / fee ratio guard (default: 1.2)"},
+                    "expected_horizon_days": {"type": "number", "description": "Expected benefit horizon for profit guard model (default: 3.0)"},
+                    "min_amount_sats": {"type": "integer", "description": "Minimum reverse swap amount (default: 100000)"},
+                    "max_amount_sats": {"type": "integer", "description": "Maximum reverse swap amount (default: 1500000)"},
+                    "cooldown_hours": {"type": "number", "description": "Per-channel cooldown between treasury actions (default: 4.0)"},
+                    "allow_concurrent_swaps": {"type": "boolean", "description": "Allow execution even if pending Boltz swaps exist (default: false)"}
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
             name="revenue_hot_channel_protection_peers",
             description="Manage persistent peer overrides for hot-channel protection (list/add/remove/clear).",
             inputSchema={
@@ -10962,6 +11022,78 @@ async def handle_revenue_boltz_balance_cycle(args: Dict) -> Dict:
     return await node.call("revenue-boltz-balance-cycle", params)
 
 
+async def handle_revenue_boltz_expansion_treasury_status(args: Dict) -> Dict:
+    """Get expansion treasury status and on-chain reserve deficit state."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+    return await node.call("revenue-boltz-expansion-treasury-status")
+
+
+async def handle_revenue_boltz_expansion_treasury_recommendations(args: Dict) -> Dict:
+    """Recommend treasury reverse swaps to build on-chain expansion reserve."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params: Dict[str, Any] = {}
+    for key in (
+        "onchain_target_sats",
+        "min_deficit_sats",
+        "preferred_currency",
+        "max_actions",
+        "min_source_local_pct",
+        "exclude_protected",
+        "require_profitable",
+        "min_marginal_roi",
+        "profit_margin_factor",
+        "expected_horizon_days",
+        "min_amount_sats",
+        "max_amount_sats",
+    ):
+        if args.get(key) is not None:
+            params[key] = args[key]
+
+    if not params:
+        return await node.call("revenue-boltz-expansion-treasury-recommendations")
+    return await node.call("revenue-boltz-expansion-treasury-recommendations", params)
+
+
+async def handle_revenue_boltz_expansion_treasury_cycle(args: Dict) -> Dict:
+    """Run a treasury-funding Boltz reverse-swap cycle."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params: Dict[str, Any] = {}
+    for key in (
+        "dry_run",
+        "max_actions",
+        "onchain_target_sats",
+        "min_deficit_sats",
+        "preferred_currency",
+        "min_source_local_pct",
+        "exclude_protected",
+        "require_profitable",
+        "min_marginal_roi",
+        "profit_margin_factor",
+        "expected_horizon_days",
+        "min_amount_sats",
+        "max_amount_sats",
+        "cooldown_hours",
+        "allow_concurrent_swaps",
+    ):
+        if args.get(key) is not None:
+            params[key] = args[key]
+
+    if not params:
+        return await node.call("revenue-boltz-expansion-treasury-cycle")
+    return await node.call("revenue-boltz-expansion-treasury-cycle", params)
+
+
 async def handle_revenue_hot_channel_protection_peers(args: Dict) -> Dict:
     """Manage persistent hot-channel protection peer overrides."""
     node_name = args.get("node")
@@ -17656,6 +17788,9 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_boltz_wallet": handle_revenue_boltz_wallet,
     "revenue_boltz_balance_recommendations": handle_revenue_boltz_balance_recommendations,
     "revenue_boltz_balance_cycle": handle_revenue_boltz_balance_cycle,
+    "revenue_boltz_expansion_treasury_status": handle_revenue_boltz_expansion_treasury_status,
+    "revenue_boltz_expansion_treasury_recommendations": handle_revenue_boltz_expansion_treasury_recommendations,
+    "revenue_boltz_expansion_treasury_cycle": handle_revenue_boltz_expansion_treasury_cycle,
     "revenue_hot_channel_protection_peers": handle_revenue_hot_channel_protection_peers,
     "revenue_boltz_refund": handle_revenue_boltz_refund,
     "revenue_boltz_claim": handle_revenue_boltz_claim,
