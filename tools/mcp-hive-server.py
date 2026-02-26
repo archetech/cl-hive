@@ -616,6 +616,19 @@ async def list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="hive_rpc_pool_status",
+            description="Inspect cl-hive RPC pool health (workers, pending requests, dispatcher state). Useful when the plugin appears hung or stops accepting requests.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Specific node name (optional, defaults to all nodes)"
+                    }
+                }
+            }
+        ),
+        Tool(
             name="hive_fleet_snapshot",
             description="Consolidated fleet snapshot for quick monitoring. Returns node health, channel stats, 24h routing stats, pending actions, and top issues.",
             inputSchema={
@@ -7255,6 +7268,31 @@ async def handle_health(args: Dict) -> Dict:
     """Quick health check on all nodes."""
     timeout = args.get("timeout", 5.0)
     return await fleet.health_check(timeout=timeout)
+
+
+async def handle_rpc_pool_status(args: Dict) -> Dict:
+    """Inspect cl-hive RPC pool health on one or all nodes."""
+    node_name = args.get("node")
+
+    async def _one(node: NodeConnection) -> Dict:
+        return await node.call("hive-rpc-pool-status")
+
+    if node_name:
+        node = fleet.get_node(node_name)
+        if not node:
+            return {"error": f"Unknown node: {node_name}"}
+        return await _one(node)
+
+    tasks = [_one(node) for node in fleet.nodes.values()]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    out: Dict[str, Any] = {}
+    names = list(fleet.nodes.keys())
+    for i, res in enumerate(results):
+        if isinstance(res, Exception):
+            out[names[i]] = {"error": str(res)}
+        else:
+            out[names[i]] = res
+    return out
 
 
 async def handle_fleet_snapshot(args: Dict) -> Dict:
@@ -17506,6 +17544,7 @@ async def handle_enrich_proposal(args: Dict) -> Dict:
 TOOL_HANDLERS: Dict[str, Any] = {
     # Hive core tools
     "hive_health": handle_health,
+    "hive_rpc_pool_status": handle_rpc_pool_status,
     "hive_fleet_snapshot": handle_fleet_snapshot,
     "hive_anomalies": handle_anomalies,
     "hive_compare_periods": handle_compare_periods,

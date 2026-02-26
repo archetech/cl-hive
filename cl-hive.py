@@ -326,6 +326,9 @@ class RpcPool:
 
         self._lifecycle_lock = threading.Lock()
         self._last_restart_time = 0.0
+        self._last_resp_time = time.time()
+        self._restart_scheduled = False
+        self._restart_scheduled_lock = threading.Lock()
 
         self.start()
 
@@ -393,23 +396,53 @@ class RpcPool:
 
         while not self._dispatcher_stop.is_set():
             try:
-                resp = self._resp_q.get(timeout=1.0)
-            except (queue.Empty, OSError, AttributeError, TypeError):
-                resp = None
+                try:
+                    resp = self._resp_q.get(timeout=1.0)
+                except (queue.Empty, OSError, AttributeError, TypeError, EOFError, BrokenPipeError):
+                    resp = None
 
-            if resp is not None:
-                req_id = resp.get("id")
-                if req_id:
-                    with self._pending_lock:
-                        slot = self._pending.get(req_id)
-                    if slot is not None:
-                        slot["resp"] = resp
-                        slot["event"].set()
+                if resp is not None:
+                    self._last_resp_time = time.time()
+                    req_id = resp.get("id")
+                    if req_id:
+                        with self._pending_lock:
+                            slot = self._pending.get(req_id)
+                        if slot is not None:
+                            slot["resp"] = resp
+                            slot["event"].set()
 
-            now = time.time()
-            if now - last_health_check >= health_check_interval:
-                last_health_check = now
-                self._check_worker_health()
+                now = time.time()
+                if now - last_health_check >= health_check_interval:
+                    last_health_check = now
+                    self._check_worker_health()
+            except Exception as e:
+                # Never let the dispatcher die silently; losing this thread makes
+                # the plugin appear hung because responses stop reaching callers.
+                self._log(f"RPC pool dispatcher error: {e}", "error")
+                if not self._dispatcher_stop.is_set():
+                    self._schedule_restart("dispatcher exception")
+                # Avoid a tight error loop if queue/IPC is broken.
+                time.sleep(0.2)
+
+    def _schedule_restart(self, reason: str):
+        """Restart pool from a helper thread (safe when called by dispatcher)."""
+        with self._restart_scheduled_lock:
+            if self._restart_scheduled:
+                return
+            self._restart_scheduled = True
+
+        def _run():
+            try:
+                self.restart(reason)
+            finally:
+                with self._restart_scheduled_lock:
+                    self._restart_scheduled = False
+
+        threading.Thread(
+            target=_run,
+            daemon=True,
+            name="hive_rpc_pool_restart",
+        ).start()
 
     def _check_worker_health(self):
         # Non-blocking acquire: avoids deadlock when stop() holds this lock
@@ -433,6 +466,20 @@ class RpcPool:
                     new_w.start()
                     self._workers[i] = new_w
                     self._log(f"RPC pool: respawned dead worker {i}", "warn")
+            # Detect wedged workers/process pipeline: requests pending for too long
+            # with no responses seen recently usually means workers are alive but stuck.
+            now = time.time()
+            stale_pending = None
+            with self._pending_lock:
+                if self._pending:
+                    oldest = min(float(slot.get("started_at", now)) for slot in self._pending.values())
+                    stale_pending = max(0.0, now - oldest)
+            if stale_pending is not None and stale_pending > 45.0 and (now - self._last_resp_time) > 20.0:
+                self._log(
+                    f"RPC pool appears wedged (oldest pending {stale_pending:.1f}s, no responses for {now - self._last_resp_time:.1f}s)",
+                    "warn",
+                )
+                self._schedule_restart("wedged workers / no responses")
         finally:
             self._lifecycle_lock.release()
 
@@ -493,12 +540,56 @@ class RpcPool:
         self.stop()
         self.start()
 
+    def status(self) -> Dict[str, Any]:
+        """Lightweight pool health/status for debugging stalls."""
+        now = time.time()
+        with self._pending_lock:
+            pending_items = [
+                {
+                    "method": str(slot.get("method") or ""),
+                    "age_seconds": round(max(0.0, now - float(slot.get("started_at", now))), 3),
+                }
+                for slot in self._pending.values()
+                if isinstance(slot, dict)
+            ]
+        pending_items.sort(key=lambda x: x["age_seconds"], reverse=True)
+        workers = []
+        for i, w in enumerate(self._workers):
+            try:
+                alive = bool(w.is_alive())
+                pid = int(w.pid) if w.pid else None
+                exitcode = w.exitcode
+            except Exception:
+                alive = False
+                pid = None
+                exitcode = None
+            workers.append({
+                "index": i,
+                "pid": pid,
+                "alive": alive,
+                "exitcode": exitcode,
+            })
+        return {
+            "running": bool(self._req_q is not None and self._resp_q is not None),
+            "pool_size": self._pool_size,
+            "workers": workers,
+            "dispatcher_alive": bool(self._dispatcher and self._dispatcher.is_alive()),
+            "dispatcher_stop_set": self._dispatcher_stop.is_set(),
+            "pending_count": len(pending_items),
+            "pending_top": pending_items[:10],
+            "last_response_age_seconds": round(max(0.0, now - float(self._last_resp_time)), 3),
+            "last_restart_age_seconds": round(max(0.0, now - float(self._last_restart_time)), 3)
+            if self._last_restart_time else None,
+            "restart_scheduled": bool(self._restart_scheduled),
+            "socket_path": self.socket_path,
+        }
+
     def request(self, *, method: str,
                 payload: Any = None, args: list = None,
                 kwargs: dict = None, timeout: int = 30):
         """Send an RPC request through the pool. Blocks only this caller."""
         req_id = uuid.uuid4().hex
-        slot = {"event": threading.Event(), "resp": None}
+        slot = {"event": threading.Event(), "resp": None, "started_at": time.time(), "method": method}
 
         with self._pending_lock:
             self._pending[req_id] = slot
@@ -513,8 +604,8 @@ class RpcPool:
             try:
                 if self._req_q is None:
                     self.restart("pool not running")
-                self._req_q.put(req)
-            except (OSError, ValueError, AttributeError):
+                self._req_q.put(req, timeout=1.0)
+            except (queue.Full, OSError, ValueError, AttributeError, EOFError, BrokenPipeError, TypeError):
                 self.restart(f"queue error on {method}")
                 raise TimeoutError(f"RPC pool queue error on {method}")
 
@@ -556,6 +647,13 @@ class RpcPoolProxy:
     def __init__(self, pool: RpcPool, timeout: int = 30):
         self._pool = pool
         self._timeout = timeout
+
+    @property
+    def socket_path(self) -> str:
+        return self._pool.socket_path
+
+    def get_socket_path(self) -> str:
+        return self._pool.socket_path
 
     def _maybe_sign_via_identity(self, message: Any) -> Optional[Dict[str, Any]]:
         """
@@ -2526,6 +2624,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         management_schema_registry.rpc = plugin.rpc
     if cashu_escrow_mgr:
         cashu_escrow_mgr.rpc = plugin.rpc
+    # LocalIdentity is created before RPC proxy install and otherwise keeps the
+    # raw pyln RPC handle (no pool timeout/restart protection).
+    if isinstance(identity_adapter, LocalIdentity):
+        identity_adapter.set_rpc(plugin.rpc)
 
     plugin.log("cl-hive: Initialization complete. Swarm Intelligence ready.")
 
@@ -13607,6 +13709,18 @@ def hive_health(plugin: Plugin):
         "uptime_seconds": int(time.time() - _start_time),
         "threads_alive": threading.active_count(),
     }
+
+
+@plugin.method("hive-rpc-pool-status")
+def hive_rpc_pool_status(plugin: Plugin):
+    """Inspect cl-hive RPC pool health (workers, pending requests, dispatcher state)."""
+    global _rpc_pool
+    if _rpc_pool is None:
+        return {"status": "not_initialized"}
+    try:
+        return {"status": "ok", "rpc_pool": _rpc_pool.status()}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 @plugin.method("hive-status")

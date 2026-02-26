@@ -33,6 +33,10 @@ class LocalIdentity(IdentityInterface):
     def __init__(self, rpc):
         self._rpc = rpc
 
+    def set_rpc(self, rpc) -> None:
+        """Rebind RPC backend (used after cl-hive installs the RpcPoolProxy)."""
+        self._rpc = rpc
+
     def sign_message(self, message: str) -> str:
         try:
             result = self._rpc.signmessage(message)
