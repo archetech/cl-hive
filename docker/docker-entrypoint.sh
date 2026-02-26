@@ -537,8 +537,22 @@ if [ "$HIVE_ARCHON_ENABLED" = "true" ]; then
     echo "plugin=/opt/cl-hive-archon/cl-hive-archon.py" >> "$CONFIG_FILE"
 fi
 
-# Core plugin dir is loaded after optional explicit plugins.
-echo "plugin-dir=/home/lightning/.lightning/plugins" >> "$CONFIG_FILE"
+# Core plugin dir (for Sling and other packaged plugins) is loaded before plugin-owned
+# options so CLN recognizes those options during config parsing.
+PLUGIN_DIR="/home/lightning/.lightning/plugins"
+if [ ! -d "$PLUGIN_DIR" ]; then
+    PLUGIN_DIR="/root/.lightning/plugins"
+fi
+echo "plugin-dir=$PLUGIN_DIR" >> "$CONFIG_FILE"
+
+# Some image variants may not have cl-hive/cl-revenue-ops symlinked into plugin-dir.
+# In that case, load them explicitly before their options are parsed.
+if [ -x /opt/cl-hive/cl-hive.py ] && [ ! -e "$PLUGIN_DIR/cl-hive.py" ]; then
+    echo "plugin=/opt/cl-hive/cl-hive.py" >> "$CONFIG_FILE"
+fi
+if [ -x /opt/cl-revenue-ops/cl-revenue-ops.py ] && [ ! -e "$PLUGIN_DIR/cl-revenue-ops.py" ]; then
+    echo "plugin=/opt/cl-revenue-ops/cl-revenue-ops.py" >> "$CONFIG_FILE"
+fi
 
 # -----------------------------------------------------------------------------
 # cl-hive Configuration
@@ -811,6 +825,13 @@ fi
 if [ -d /var/lib/tor ]; then
     chown -R debian-tor:debian-tor /var/lib/tor /var/log/tor 2>/dev/null || true
 fi
+
+# Set supervisord boltzd user for this image variant (used by supervisord env interpolation)
+export BOLTZD_SUPERVISOR_USER="root"
+if id -u lightning >/dev/null 2>&1; then
+    export BOLTZD_SUPERVISOR_USER="lightning"
+fi
+echo "Boltz client: supervisord boltzd user set to ${BOLTZD_SUPERVISOR_USER}"
 
 echo "Initialization complete. Starting services..."
 
