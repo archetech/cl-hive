@@ -287,6 +287,28 @@ async def _release_total_cost_budget(node: "NodeConnection", reservation_id: Opt
         pass
 
 
+async def _settle_total_cost_budget(
+    node: "NodeConnection",
+    reservation_id: Optional[str],
+    *,
+    actual_spent_sats: Optional[int] = None,
+    source: Optional[str] = None,
+    record_event: bool = False,
+) -> None:
+    if not reservation_id:
+        return
+    params: Dict[str, Any] = {"reservation_id": reservation_id, "record_event": bool(record_event)}
+    if actual_spent_sats is not None:
+        params["actual_spent_sats"] = max(0, int(actual_spent_sats))
+    if source:
+        params["source"] = source
+    try:
+        await node.call("revenue-spend-settle", params)
+    except Exception:
+        # Best-effort compatibility: older cl-revenue-ops may not have settle RPC.
+        pass
+
+
 @dataclass
 class NodeConnection:
     """Connection to a CLN node via REST API or Docker exec (for Polar)."""
@@ -7970,14 +7992,22 @@ async def handle_open_channel(args: Dict) -> Dict:
         result = await node.call("hive-open-channel", params)
         if isinstance(result, dict) and result.get("error"):
             await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
+        elif budget_gate and budget_gate.get("reserved"):
+            # Settle reservation immediately to avoid temporary double-counting with canonical open costs.
+            await _settle_total_cost_budget(
+                node,
+                budget_gate.get("reservation_id"),
+                source="mcp_hive_open_channel",
+                record_event=False,
+            )
         if isinstance(result, dict):
             result["budget_gate"] = {
                 "reservation_id": budget_gate.get("reservation_id"),
                 "estimated_reserved_sats": est_open_cost_sats,
                 "reserved": bool(budget_gate.get("reserved")),
                 "note": (
-                    "Unified spend budget reserved for channel open. Reservation remains active until "
-                    "actual costs are accounted or stale reservation cleanup releases it."
+                    "Unified spend budget reserved and settled for channel open to avoid double-counting "
+                    "against canonical on-chain costs."
                 ) if budget_gate.get("reserved") else "Unified spend budget reservation unavailable or skipped."
             }
         # Record the decision
@@ -8927,13 +8957,21 @@ async def handle_splice(args: Dict) -> Dict:
             await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
         return {"error": str(e)}
     if budget_gate and isinstance(result, dict):
+        if result.get("success"):
+            # Settle reservation immediately to avoid temporary double-counting with canonical splice costs.
+            await _settle_total_cost_budget(
+                node,
+                budget_gate.get("reservation_id"),
+                source="mcp_hive_splice",
+                record_event=False,
+            )
         result["budget_gate"] = {
             "reservation_id": budget_gate.get("reservation_id"),
             "estimated_reserved_sats": est_splice_fee_sats,
             "reserved": bool(budget_gate.get("reserved")),
             "note": (
-                "Unified spend budget reserved for splice. Reservation remains active until actual costs "
-                "are accounted or stale reservation cleanup releases it."
+                "Unified spend budget reserved and settled for splice to avoid double-counting "
+                "against canonical on-chain costs."
             ) if budget_gate.get("reserved") else "Unified spend budget reservation unavailable or skipped."
         }
 
