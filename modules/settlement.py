@@ -154,6 +154,9 @@ class SettlementManager:
         self.rpc = rpc
         self._local = threading.local()
         self.did_credential_mgr = None  # Set after DID init (Phase 16)
+        # Diagnostic reason for why create_proposal() most recently returned None.
+        # Used by the settlement loop to explain backlog-first skips.
+        self.last_create_proposal_skip_reason: Optional[str] = None
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get thread-local database connection."""
@@ -1153,10 +1156,12 @@ class SettlementManager:
             Proposal dict if created, None if period already has proposal
         """
         import secrets
+        self.last_create_proposal_skip_reason = None
 
         # Check if period already has a proposal
         existing = self.db.get_settlement_proposal_by_period(period)
         if existing:
+            self.last_create_proposal_skip_reason = "proposal_exists"
             self.plugin.log(
                 f"Settlement proposal already exists for {period}",
                 level='debug'
@@ -1165,6 +1170,7 @@ class SettlementManager:
 
         # Check if period is already settled
         if self.db.is_period_settled(period):
+            self.last_create_proposal_skip_reason = "period_already_settled"
             self.plugin.log(
                 f"Period {period} already settled",
                 level='debug'
@@ -1175,6 +1181,7 @@ class SettlementManager:
         contributions = self.gather_contributions_from_gossip(state_manager, period)
 
         if not contributions:
+            self.last_create_proposal_skip_reason = "no_contributions"
             self.plugin.log("No contributions to settle", level='debug')
             return None
 
@@ -1190,6 +1197,7 @@ class SettlementManager:
         # Skip zero-fee periods: they add noise to participation metrics and
         # create "successful" settlements with no economic transfer.
         if total_fees <= 0:
+            self.last_create_proposal_skip_reason = "zero_total_fees"
             self.plugin.log(
                 f"Skipping settlement proposal for {period}: total_fees_sats=0",
                 level='debug'
@@ -1212,8 +1220,10 @@ class SettlementManager:
             member_count=member_count,
             contributions_json=contributions_json
         ):
+            self.last_create_proposal_skip_reason = "db_insert_failed_or_conflict"
             return None
 
+        self.last_create_proposal_skip_reason = None
         self.plugin.log(
             f"Created settlement proposal {proposal_id[:16]}... for {period}: "
             f"{total_fees} sats, {member_count} members"

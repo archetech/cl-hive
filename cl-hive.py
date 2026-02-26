@@ -11587,18 +11587,35 @@ def settlement_loop():
 
             # Step 1: Check if we should propose settlement for previous week
             try:
-                previous_period = settlement_mgr.get_previous_period()
+                # Need at least 2 members for distributed settlement proposals.
+                # With a single-member hive (e.g. after decommissioning peers),
+                # proposal generation should pause quietly instead of scanning
+                # backlog periods every cycle.
+                try:
+                    member_count = len(database.get_all_members() or [])
+                except Exception:
+                    member_count = 0
+                if member_count < 2:
+                    plugin.log(
+                        f"SETTLEMENT: Skipping proposal generation (member_count={member_count}, requires >=2)",
+                        level='debug'
+                    )
+                    previous_period = None
+                else:
+                    previous_period = settlement_mgr.get_previous_period()
 
                 # Backlog-first: propose the oldest eligible unsettled period up to
                 # the previous week, not just the immediately previous week.
                 target_period = None
                 blocked_by_active_period = None
-                try:
-                    candidate_periods = database.get_fee_report_periods_up_to(previous_period)
-                except Exception:
-                    candidate_periods = [previous_period]
-                if previous_period not in candidate_periods:
-                    candidate_periods = sorted(set(candidate_periods + [previous_period]))
+                candidate_periods = []
+                if previous_period:
+                    try:
+                        candidate_periods = database.get_fee_report_periods_up_to(previous_period)
+                    except Exception:
+                        candidate_periods = [previous_period]
+                    if previous_period not in candidate_periods:
+                        candidate_periods = sorted(set(candidate_periods + [previous_period]))
 
                 for period_candidate in candidate_periods:
                     if database.is_period_settled(period_candidate):
@@ -11663,9 +11680,10 @@ def settlement_loop():
                             break
 
                         if attempt_idx + 1 < len(attempted_periods):
+                            skip_reason = getattr(settlement_mgr, "last_create_proposal_skip_reason", None)
                             plugin.log(
                                 f"SETTLEMENT: Could not create proposal for {attempt_period}; "
-                                f"trying next eligible unsettled period",
+                                f"reason={skip_reason or 'unknown'}; trying next eligible unsettled period",
                                 level='debug'
                             )
 
