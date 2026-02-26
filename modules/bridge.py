@@ -617,9 +617,9 @@ class Bridge:
                 with self._budget_lock:
                     self._policy_last_change[peer_id] = now
                     if len(self._policy_last_change) > MAX_POLICY_CACHE:
-                        if self._policy_last_change:
-                            oldest_key = min(self._policy_last_change, key=self._policy_last_change.get)
-                            del self._policy_last_change[oldest_key]
+                        # Evict oldest-inserted entry (dict preserves insertion order in Python 3.7+)
+                        oldest_key = next(iter(self._policy_last_change))
+                        del self._policy_last_change[oldest_key]
                 self._log(f"Set {'hive' if is_member else 'dynamic'} policy for {peer_id[:16]}...")
             else:
                 self._log(f"Policy set returned: {result}", level='warn')
