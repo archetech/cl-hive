@@ -1943,20 +1943,30 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
 
-        # Phase 1: Soft-delete - mark pending expired intents
-        r1 = conn.execute(
-            "UPDATE intent_locks SET status = 'expired', reason = 'ttl_expired' "
-            "WHERE status = 'pending' AND expires_at < ?",
-            (now,)
-        )
+        # D2 FIX: Wrap multi-statement cleanup in transaction for atomicity
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Phase 1: Soft-delete - mark pending expired intents
+            r1 = conn.execute(
+                "UPDATE intent_locks SET status = 'expired', reason = 'ttl_expired' "
+                "WHERE status = 'pending' AND expires_at < ?",
+                (now,)
+            )
 
-        # Phase 2: Purge terminal intents older than 24 hours
-        purge_cutoff = now - 86400
-        r2 = conn.execute(
-            "DELETE FROM intent_locks "
-            "WHERE status IN ('expired', 'aborted', 'failed') AND expires_at < ?",
-            (purge_cutoff,)
-        )
+            # Phase 2: Purge terminal intents older than 24 hours
+            purge_cutoff = now - 86400
+            r2 = conn.execute(
+                "DELETE FROM intent_locks "
+                "WHERE status IN ('expired', 'aborted', 'failed') AND expires_at < ?",
+                (purge_cutoff,)
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
         return r1.rowcount + r2.rowcount
     
