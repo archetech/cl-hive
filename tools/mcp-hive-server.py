@@ -2169,6 +2169,33 @@ Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
             }
         ),
         Tool(
+            name="revenue_boltz_external_pay_ignores",
+            description="Manage operator ignore list for pending external-pay Boltz swaps (list/add/remove/clear).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "add", "remove", "clear"],
+                        "description": "Ignore-list action (default: list)"
+                    },
+                    "swap_id": {
+                        "type": "string",
+                        "description": "Boltz swap ID (required for add/remove)"
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Optional operator note for add"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
             name="revenue_boltz_budget",
             description="Show Boltz daily swap budget usage.",
             inputSchema={
@@ -10780,6 +10807,23 @@ async def handle_revenue_boltz_history(args: Dict) -> Dict:
     return await node.call("revenue-boltz-history", {"limit": limit})
 
 
+async def handle_revenue_boltz_external_pay_ignores(args: Dict) -> Dict:
+    """Manage ignore list for pending external-pay Boltz swaps."""
+    node_name = args.get("node")
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params: Dict[str, Any] = {}
+    for key in ("action", "swap_id", "note"):
+        if args.get(key) is not None:
+            params[key] = args[key]
+
+    if not params:
+        return await node.call("revenue-boltz-external-pay-ignores")
+    return await node.call("revenue-boltz-external-pay-ignores", params)
+
+
 async def handle_revenue_boltz_budget(args: Dict) -> Dict:
     """Get Boltz budget status."""
     node_name = args.get("node")
@@ -17559,6 +17603,7 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_boltz_loop_in": handle_revenue_boltz_loop_in,
     "revenue_boltz_status": handle_revenue_boltz_status,
     "revenue_boltz_history": handle_revenue_boltz_history,
+    "revenue_boltz_external_pay_ignores": handle_revenue_boltz_external_pay_ignores,
     "revenue_boltz_budget": handle_revenue_boltz_budget,
     "revenue_boltz_wallet": handle_revenue_boltz_wallet,
     "revenue_boltz_balance_recommendations": handle_revenue_boltz_balance_recommendations,
