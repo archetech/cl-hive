@@ -39,6 +39,7 @@ import queue
 import signal
 import threading
 import time
+import traceback
 import secrets
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -2898,7 +2899,7 @@ def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Pl
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
 
     except Exception as e:
-        plugin.log(f"cl-hive: Error handling {msg_type.name}: {e}", level='warn')
+        plugin.log(f"cl-hive: Error handling {msg_type.name}: {e}\n{traceback.format_exc()}", level='warn')
 
 
 def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
@@ -4282,17 +4283,25 @@ def _record_forward_as_route_probe(forward_event: Dict):
             return
 
         # Use cached channel -> peer_id mapping (refreshed every 5 min)
+        # H-1 FIX: Fetch RPC data outside lock to prevent starvation/deadlock
         now = time.time()
+        needs_refresh = False
         with _channel_peer_cache_lock:
             if not _channel_peer_cache or now - _channel_peer_cache_time > _CHANNEL_PEER_CACHE_TTL:
-                funds = plugin.rpc.listfunds()
-                _channel_peer_cache = {
-                    ch.get("short_channel_id"): ch.get("peer_id", "")
-                    for ch in funds.get("channels", [])
-                    if ch.get("short_channel_id")
-                }
-                _channel_peer_cache_time = now
+                needs_refresh = True
 
+        if needs_refresh:
+            funds = plugin.rpc.listfunds()
+            new_cache = {
+                ch.get("short_channel_id"): ch.get("peer_id", "")
+                for ch in funds.get("channels", [])
+                if ch.get("short_channel_id")
+            }
+            with _channel_peer_cache_lock:
+                _channel_peer_cache = new_cache
+                _channel_peer_cache_time = time.time()
+
+        with _channel_peer_cache_lock:
             in_peer = _channel_peer_cache.get(in_channel, "")
             out_peer = _channel_peer_cache.get(out_channel, "")
 

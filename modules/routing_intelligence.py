@@ -109,9 +109,10 @@ class HiveRoutingMap:
         self._path_stats: Dict[Tuple[str, Tuple[str, ...]], PathStats] = {}
         self._lock = threading.Lock()
 
-        # Rate limiting
+        # Rate limiting (protected by _rate_lock for thread safety)
         self._probe_rate: Dict[str, List[float]] = defaultdict(list)
         self._batch_rate: Dict[str, List[float]] = defaultdict(list)
+        self._rate_lock = threading.Lock()
 
     def _check_rate_limit(
         self,
@@ -254,16 +255,17 @@ class HiveRoutingMap:
         if not member:
             return {"error": "reporter not a member"}
 
-        # Rate limit check
-        if not self._check_rate_limit(
-            reporter_id,
-            self._probe_rate,
-            ROUTE_PROBE_RATE_LIMIT
-        ):
-            return {"error": "rate limited"}
+        # Rate limit check (H-2 FIX: protect rate dicts with dedicated lock)
+        with self._rate_lock:
+            if not self._check_rate_limit(
+                reporter_id,
+                self._probe_rate,
+                ROUTE_PROBE_RATE_LIMIT
+            ):
+                return {"error": "rate limited"}
 
-        # Record rate limit
-        self._record_message(reporter_id, self._probe_rate)
+            # Record rate limit
+            self._record_message(reporter_id, self._probe_rate)
 
         # Extract probe data
         destination = payload.get("destination", "")
@@ -367,16 +369,17 @@ class HiveRoutingMap:
         if not member:
             return {"error": "reporter not a member"}
 
-        # Rate limit check for batch messages
-        if not self._check_rate_limit(
-            reporter_id,
-            self._batch_rate,
-            ROUTE_PROBE_BATCH_RATE_LIMIT
-        ):
-            return {"error": "rate limited"}
+        # Rate limit check for batch messages (H-2 FIX: protect rate dicts with lock)
+        with self._rate_lock:
+            if not self._check_rate_limit(
+                reporter_id,
+                self._batch_rate,
+                ROUTE_PROBE_BATCH_RATE_LIMIT
+            ):
+                return {"error": "rate limited"}
 
-        # Record rate limit
-        self._record_message(reporter_id, self._batch_rate)
+            # Record rate limit
+            self._record_message(reporter_id, self._batch_rate)
 
         # Process each probe in the batch
         probes = payload.get("probes", [])
