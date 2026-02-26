@@ -2369,7 +2369,8 @@ Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
                     "node": {"type": "string", "description": "Node name"},
                     "action": {"type": "string", "enum": ["list", "add", "remove", "clear"], "description": "Management action (default: list)"},
                     "peer_id": {"type": "string", "description": "Peer public key (required for add/remove)"},
-                    "note": {"type": "string", "description": "Optional operator note when adding a peer override"}
+                    "note": {"type": "string", "description": "Optional operator note when adding a peer override"},
+                    "min_depletion_trigger_pct": {"type": "number", "description": "Optional peer-specific depletion trigger percent (e.g. 45.0) for earlier rebalance protection"}
                 },
                 "required": ["node"]
             }
@@ -11129,7 +11130,7 @@ async def handle_revenue_hot_channel_protection_peers(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     params: Dict[str, Any] = {}
-    for key in ("action", "peer_id", "note"):
+    for key in ("action", "peer_id", "note", "min_depletion_trigger_pct"):
         if args.get(key) is not None:
             params[key] = args[key]
 
