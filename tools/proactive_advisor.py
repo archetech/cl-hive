@@ -625,6 +625,7 @@ class ProactiveAdvisor:
             # Core data
             "node_info": ("hive_node_info", {"node": node_name}),
             "channels": ("hive_channels", {"node": node_name}),
+            "revenue_status": ("revenue_status", {"node": node_name}),
             "dashboard": ("revenue_dashboard", {"node": node_name, "window_days": 30}),
             "profitability": ("revenue_profitability", {"node": node_name}),
             "context": ("advisor_get_context_brief", {"days": 7}),
@@ -649,16 +650,6 @@ class ProactiveAdvisor:
             "rebalance_recommendations": ("rebalance_recommendations", {"node": node_name}),
             "circular_flows": ("circular_flow_status", {"node": node_name}),
             "rebalance_diagnostic": ("revenue_rebalance_debug", {"node": node_name}),
-            # External liquidity (Boltz) - used as fallback after internal/market rebalancing
-            "boltz_wallet": ("revenue_boltz_wallet", {"node": node_name}),
-            "boltz_budget": ("revenue_boltz_budget", {"node": node_name}),
-            "boltz_rebalance_recommendations": ("revenue_boltz_balance_recommendations", {
-                "node": node_name,
-                "require_profitable": True,
-                "loop_in_currency": "lbtc",
-                "loop_out_currency": "lbtc",
-                "max_candidates": 20,
-            }),
             # Collective warnings
             "ban_candidates": ("ban_candidates", {"node": node_name}),
             # Channel rationalization
@@ -692,6 +683,51 @@ class ProactiveAdvisor:
             *[safe_call(k, method, params) for k, (method, params) in calls.items()]
         )
         results = dict(gathered)
+
+        # External liquidity (Boltz) is optional. Only query Boltz-specific RPCs when
+        # the node appears to have Boltz integration enabled/available.
+        def _boltz_enabled_from_revenue_status(status: Dict[str, Any]) -> bool:
+            if not isinstance(status, dict) or status.get("error"):
+                return False
+            cfg = status.get("config", {}) or {}
+            # Support multiple naming conventions across plugin versions.
+            candidates = [
+                cfg.get("boltz_enabled"),
+                cfg.get("revenue_ops_boltz_enabled"),
+                (cfg.get("boltz") or {}).get("enabled") if isinstance(cfg.get("boltz"), dict) else None,
+            ]
+            for val in candidates:
+                if isinstance(val, bool):
+                    return val
+                if isinstance(val, str):
+                    if val.lower() in {"true", "1", "yes", "on"}:
+                        return True
+                    if val.lower() in {"false", "0", "no", "off"}:
+                        return False
+            return False
+
+        boltz_enabled = _boltz_enabled_from_revenue_status(results.get("revenue_status", {}))
+        if boltz_enabled:
+            boltz_calls = {
+                "boltz_wallet": ("revenue_boltz_wallet", {"node": node_name}),
+                "boltz_budget": ("revenue_boltz_budget", {"node": node_name}),
+                "boltz_rebalance_recommendations": ("revenue_boltz_balance_recommendations", {
+                    "node": node_name,
+                    "require_profitable": True,
+                    "loop_in_currency": "lbtc",
+                    "loop_out_currency": "lbtc",
+                    "max_candidates": 20,
+                }),
+            }
+            boltz_gathered = await asyncio.gather(
+                *[safe_call(k, method, params) for k, (method, params) in boltz_calls.items()]
+            )
+            results.update(dict(boltz_gathered))
+        else:
+            # Keep explicit placeholders so scanners can treat Boltz as unavailable
+            results.setdefault("boltz_wallet", {"error": "Boltz not enabled"})
+            results.setdefault("boltz_budget", {"error": "Boltz not enabled"})
+            results.setdefault("boltz_rebalance_recommendations", {})
 
         # Calculate summary metrics
         channels = results.get("channels", {}).get("channels", [])
@@ -796,6 +832,7 @@ class ProactiveAdvisor:
             "context": results.get("context", {}),
             "velocities": results.get("velocities", {}),
             "dashboard": dashboard,
+            "revenue_status": results.get("revenue_status", {}),
             # Fleet intelligence
             "defense_status": defense,
             "internal_competition": competition,
