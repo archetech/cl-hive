@@ -648,6 +648,17 @@ class ProactiveAdvisor:
             # Cost reduction
             "rebalance_recommendations": ("rebalance_recommendations", {"node": node_name}),
             "circular_flows": ("circular_flow_status", {"node": node_name}),
+            "rebalance_diagnostic": ("revenue_rebalance_debug", {"node": node_name}),
+            # External liquidity (Boltz) - used as fallback after internal/market rebalancing
+            "boltz_wallet": ("revenue_boltz_wallet", {"node": node_name}),
+            "boltz_budget": ("revenue_boltz_budget", {"node": node_name}),
+            "boltz_rebalance_recommendations": ("revenue_boltz_balance_recommendations", {
+                "node": node_name,
+                "require_profitable": True,
+                "loop_in_currency": "lbtc",
+                "loop_out_currency": "lbtc",
+                "max_candidates": 20,
+            }),
             # Collective warnings
             "ban_candidates": ("ban_candidates", {"node": node_name}),
             # Channel rationalization
@@ -802,6 +813,10 @@ class ProactiveAdvisor:
             # Cost reduction
             "rebalance_recommendations": results.get("rebalance_recommendations", {}),
             "circular_flows": results.get("circular_flows", {}),
+            "rebalance_diagnostic": results.get("rebalance_diagnostic", {}),
+            "boltz_wallet": results.get("boltz_wallet", {}),
+            "boltz_budget": results.get("boltz_budget", {}),
+            "boltz_rebalance_recommendations": results.get("boltz_rebalance_recommendations", {}),
             # Collective warnings
             "ban_candidates": results.get("ban_candidates", {}),
             # Rationalization
@@ -809,6 +824,7 @@ class ProactiveAdvisor:
             "close_recommendations": results.get("close_recommendations", {}),
             # Competitor analysis
             "competitor_analysis": results.get("competitor_analysis", {}),
+            "valuable_corridors": results.get("valuable_corridors", {}),
             # Fleet consensus data (for opportunity_scanner._scan_fleet_consensus)
             "fleet_close_proposals": fleet_close_proposals,
             "fleet_corridor_consensus": fleet_corridor_consensus,

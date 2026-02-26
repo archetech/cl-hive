@@ -42,6 +42,7 @@ class OpportunityType(Enum):
 
     # Hive internal
     HIVE_INTERNAL_REBALANCE = "hive_internal_rebalance"
+    BOLTZ_LIQUIDITY_SWAP = "boltz_liquidity_swap"
 
     # Balance-related
     CRITICAL_DEPLETION = "critical_depletion"
@@ -256,6 +257,7 @@ class OpportunityScanner:
             # Cost reduction scanners (Phase 3)
             self._scan_circular_flows(node_name, state),
             self._scan_rebalance_recommendations(node_name, state),
+            self._scan_boltz_fallback_recommendations(node_name, state),
             # Strategic positioning scanners (Phase 4)
             self._scan_positioning_opportunities(node_name, state),
             self._scan_competitor_opportunities(node_name, state),
@@ -308,7 +310,13 @@ class OpportunityScanner:
             
             # Estimate cost based on action type
             if opp.action_type == ActionType.REBALANCE:
-                cost = expected_benefit * 0.01  # ~1% rebalance cost
+                if opp.opportunity_type == OpportunityType.BOLTZ_LIQUIDITY_SWAP:
+                    cost = float(opp.current_state.get("estimated_swap_fee_sats", 0) or 0)
+                    # Fallback estimate if recommendation omitted explicit fee estimate
+                    if cost <= 0:
+                        cost = expected_benefit * 0.005
+                else:
+                    cost = expected_benefit * 0.01  # ~1% market rebalance cost
             elif opp.action_type == ActionType.CHANNEL_OPEN:
                 cost = 5000  # On-chain fees + opportunity cost
             elif opp.action_type == ActionType.CHANNEL_CLOSE:
@@ -345,6 +353,255 @@ class OpportunityScanner:
             opp.final_score = max(0, ev * opp.priority_score * diminish_factor * urgency_mult)
             opp.adjusted_confidence = p_success
         
+        return opportunities
+
+    async def _scan_boltz_fallback_recommendations(
+        self,
+        node_name: str,
+        state: Dict[str, Any]
+    ) -> List[Opportunity]:
+        """
+        Scan Boltz profit-constrained liquidity recommendations as a Hive-aware fallback.
+
+        Policy intent:
+        1. Prefer hive internal rebalances (zero-fee hive corridors)
+        2. Then market/Sling rebalances
+        3. Use Boltz only when external liquidity is justified by profitability
+        """
+        opportunities: List[Opportunity] = []
+
+        boltz_wallet = state.get("boltz_wallet", {}) or {}
+        boltz_budget = state.get("boltz_budget", {}) or {}
+        boltz_recs = state.get("boltz_rebalance_recommendations", {}) or {}
+
+        # Boltz disabled/unavailable is a normal state for many nodes.
+        if boltz_wallet.get("error") or boltz_budget.get("error"):
+            return opportunities
+
+        recs = boltz_recs.get("recommendations", []) or boltz_recs.get("candidates", []) or []
+        if not recs:
+            return opportunities
+
+        # Skip Boltz suggestions entirely if a hive-internal channel is critically imbalanced:
+        # restoring the hive backbone usually unlocks cheaper zero-fee rebalances for many channels.
+        hive_internal_blocked = False
+        hive_internal_blocking_channels = []
+        hive_members = state.get("hive_members", {}) or {}
+        member_pubkeys = {
+            (m.get("pubkey") or m.get("peer_id"))
+            for m in (hive_members.get("members", []) or [])
+            if (m.get("pubkey") or m.get("peer_id"))
+        }
+        for ch in state.get("channels", []) or []:
+            peer_id = ch.get("peer_id")
+            if not peer_id or peer_id not in member_pubkeys:
+                continue
+            try:
+                local = ch.get("local_sats", 0) or 0
+                cap = ch.get("capacity_sats", 0) or 0
+                if cap <= 0:
+                    continue
+                ratio = local / cap
+                if ratio < 0.30 or ratio > 0.70:
+                    hive_internal_blocked = True
+                    hive_internal_blocking_channels.append(ch.get("short_channel_id") or ch.get("channel_id"))
+            except Exception:
+                continue
+
+        # Build market rebalance coverage to suppress redundant Boltz opportunities.
+        market_rebal = state.get("rebalance_recommendations", {}) or {}
+        market_recs = market_rebal.get("recommendations", []) or []
+        market_targets = {r.get("to_channel") for r in market_recs if r.get("to_channel")}
+        market_sources = {r.get("from_channel") for r in market_recs if r.get("from_channel")}
+
+        # Budget context (prefer unified budget if available)
+        unified_remaining = (
+            boltz_budget.get("remaining_24h_sats_estimate")
+            or boltz_budget.get("budget_remaining_sats")
+            or boltz_budget.get("remaining_sats")
+            or 0
+        )
+        boltz_only_remaining = (
+            boltz_budget.get("boltz_remaining_24h_sats_estimate")
+            or boltz_budget.get("budget_remaining_sats")
+            or 0
+        )
+
+        # Strategic corridor scoring map (peer appears in high-value corridors)
+        corridor_scores: Dict[str, float] = {}
+        for corridor in (state.get("valuable_corridors", {}) or {}).get("corridors", []) or []:
+            value = float(corridor.get("value_score", 0) or 0)
+            for key in ("source_peer_id", "source", "dest_peer_id", "destination"):
+                pid = corridor.get(key)
+                if pid:
+                    corridor_scores[pid] = max(corridor_scores.get(pid, 0.0), value)
+
+        # Velocity map keyed by channel for urgency/priority boosts
+        velocity_map: Dict[str, Dict[str, Any]] = {}
+        for item in (state.get("velocities", {}) or {}).get("channels", []) or []:
+            cid = item.get("channel_id")
+            if cid:
+                velocity_map[cid] = item
+        for item in (state.get("critical_velocity", {}) or {}).get("channels", []) or []:
+            cid = item.get("channel_id")
+            if cid and cid not in velocity_map:
+                velocity_map[cid] = item
+
+        # Rebalance diagnostic hints (route failures, active jobs)
+        rebal_diag = state.get("rebalance_diagnostic", {}) or {}
+        diag_rejections = rebal_diag.get("rejection_reasons") or rebal_diag.get("rejections") or {}
+        active_sling_jobs = (rebal_diag.get("sling_status") or {}).get("active_jobs")
+
+        for rec in recs:
+            if not isinstance(rec, dict):
+                continue
+
+            if not rec.get("passes_profit_guard", True):
+                continue
+
+            direction = (rec.get("direction") or rec.get("swap_direction") or "").lower()
+            channel_id = rec.get("channel_id") or rec.get("target_channel") or rec.get("to_channel") or rec.get("from_channel")
+            peer_id = rec.get("peer_id")
+            amount_sats = int(rec.get("amount_sats", 0) or 0)
+            if not channel_id or amount_sats < 10_000:
+                continue
+
+            # Prefer market/Sling if it is already recommending the same channel in the appropriate direction.
+            if direction == "loop_in" and channel_id in market_targets:
+                continue
+            if direction == "loop_out" and channel_id in market_sources:
+                continue
+
+            est_fee = int(rec.get("estimated_swap_fee_sats", 0) or 0)
+            gross_uplift = int(rec.get("expected_gross_uplift_sats", 0) or rec.get("expected_gross_benefit_sats", 0) or 0)
+            net_benefit = int(rec.get("expected_net_benefit_sats", 0) or rec.get("expected_net_profit_sats", 0) or 0)
+            risk_adj_net = int(rec.get("risk_adjusted_net_benefit_sats", 0) or net_benefit)
+
+            # If the recommendation only provides net values, avoid double-counting cost in EV.
+            predicted_benefit = gross_uplift if gross_uplift > 0 else max(0, net_benefit + est_fee)
+
+            # Budget gating in scanner: don't emit impossible opportunities.
+            if est_fee > 0 and unified_remaining > 0 and est_fee > unified_remaining:
+                continue
+
+            # Boltz is a fallback; confidence is lower for loop-ins on CLN due non-pinnable routing.
+            base_conf = float(rec.get("confidence", 0.7) or 0.7)
+            if direction == "loop_in":
+                base_conf = min(base_conf, 0.7)
+
+            # Priority components: profitability, urgency/velocity, strategic corridor importance.
+            priority = 0.45
+            if risk_adj_net > 0:
+                priority += min(0.20, risk_adj_net / 20_000)
+            if net_benefit > 0:
+                priority += min(0.10, net_benefit / 10_000)
+
+            v = velocity_map.get(channel_id, {})
+            hours_until = v.get("hours_until_depleted")
+            if hours_until is None:
+                hours_until = v.get("hours_until_full")
+            if hours_until is not None:
+                try:
+                    h = float(hours_until)
+                    if h < 6:
+                        priority += 0.20
+                    elif h < 12:
+                        priority += 0.12
+                    elif h < 24:
+                        priority += 0.06
+                except Exception:
+                    pass
+
+            corridor_score = float(corridor_scores.get(peer_id or "", 0.0))
+            if corridor_score > 0:
+                priority += min(0.15, corridor_score * 0.25)
+
+            # If the hive backbone is imbalanced, deprioritize (but do not suppress) external swaps.
+            if hive_internal_blocked:
+                priority *= 0.8
+
+            # If rebalancer is clearly failing to route, Boltz fallback becomes more attractive.
+            route_fail_signals = 0
+            for k, count in (diag_rejections.items() if isinstance(diag_rejections, dict) else []):
+                lk = str(k).lower()
+                if any(tag in lk for tag in ("no_route", "temporary", "capacity", "fee")):
+                    try:
+                        route_fail_signals += int(count or 0)
+                    except Exception:
+                        route_fail_signals += 1
+            if route_fail_signals > 0:
+                priority += min(0.12, 0.02 * route_fail_signals)
+
+            priority = max(0.2, min(priority, 0.95))
+
+            description = (
+                f"Boltz fallback {direction.replace('_', '-')}: {amount_sats:,} sats "
+                f"{'into' if direction == 'loop_in' else 'out of'} {channel_id}"
+            )
+            reasoning_parts = [
+                "Hive policy prefers internal zero-fee routes and market rebalances first.",
+                "Boltz is proposed as external-liquidity fallback based on profit-constrained recommendation.",
+            ]
+            if est_fee:
+                reasoning_parts.append(f"Estimated swap fee: {est_fee:,} sats")
+            if gross_uplift:
+                reasoning_parts.append(f"Expected gross uplift: {gross_uplift:,} sats")
+            if risk_adj_net:
+                reasoning_parts.append(f"Risk-adjusted net benefit: {risk_adj_net:,} sats")
+            if corridor_score > 0:
+                reasoning_parts.append(f"Strategic corridor relevance score: {corridor_score:.2f}")
+            if hours_until is not None:
+                reasoning_parts.append(f"Velocity alert horizon: {hours_until}h")
+            if hive_internal_blocked:
+                reasoning_parts.append(
+                    f"Hive internal channel imbalance present ({len(hive_internal_blocking_channels)} channels) — "
+                    "external swap priority reduced until backbone is healthier"
+                )
+            if direction == "loop_in":
+                reasoning_parts.append(
+                    "Loop-ins are not channel-pinnable on current CLN/Boltz path; verify post-swap target impact."
+                )
+            if active_sling_jobs:
+                reasoning_parts.append(f"Active Sling jobs present: {len(active_sling_jobs)}")
+
+            # Boltz swaps are cost-bearing and should be human-reviewed in advisor flow.
+            opp = Opportunity(
+                opportunity_type=OpportunityType.BOLTZ_LIQUIDITY_SWAP,
+                action_type=ActionType.REBALANCE,
+                channel_id=channel_id,
+                peer_id=peer_id,
+                node_name=node_name,
+                priority_score=priority,
+                confidence_score=max(0.4, min(base_conf, 0.9)),
+                roi_estimate=max(0.0, (risk_adj_net / est_fee) if est_fee > 0 else 1.0),
+                description=description,
+                reasoning=" ".join(reasoning_parts),
+                recommended_action=(
+                    "Use revenue-boltz-balance-cycle (dry_run first) and only execute if "
+                    "internal hive and market/Sling paths remain unavailable or EV-inferior."
+                ),
+                predicted_benefit=max(0, predicted_benefit),
+                classification=ActionClassification.QUEUE_FOR_REVIEW,
+                auto_execute_safe=False,
+                current_state={
+                    **rec,
+                    "fallback_chain": ["hive_internal", "market_rebalance", "boltz"],
+                    "estimated_swap_fee_sats": est_fee,
+                    "expected_gross_uplift_sats": gross_uplift,
+                    "expected_net_benefit_sats": net_benefit,
+                    "risk_adjusted_net_benefit_sats": risk_adj_net,
+                    "unified_budget_remaining_sats": unified_remaining,
+                    "boltz_budget_remaining_sats": boltz_only_remaining,
+                    "strategic_corridor_score": round(corridor_score, 4),
+                    "hive_internal_backbone_imbalanced": hive_internal_blocked,
+                    "market_rebalance_alternative_present": (
+                        (direction == "loop_in" and channel_id in market_targets) or
+                        (direction == "loop_out" and channel_id in market_sources)
+                    ),
+                }
+            )
+            opportunities.append(opp)
+
         return opportunities
 
     async def _scan_hive_internal_channel(
