@@ -6960,6 +6960,47 @@ class HiveDatabase:
 
         return result.rowcount
 
+    def cleanup_stale_ready_settlement_proposals(
+        self,
+        stale_after_seconds: int = 72 * 3600,
+    ) -> int:
+        """
+        Mark stale 'ready' settlement proposals as expired.
+
+        This handles proposals that reached quorum but became unexecutable
+        (for example, legacy rows missing contributions_json / plan_hash) and
+        would otherwise remain stuck in 'ready' forever.
+
+        Criteria:
+        - status = 'ready'
+        - no settled_periods row for the proposal's period
+        - proposal age exceeds stale_after_seconds (based on expires_at if set,
+          falling back to proposed_at)
+
+        Args:
+            stale_after_seconds: Grace period after proposal timeout before
+                expiring stale ready proposals.
+
+        Returns:
+            Number of proposals marked expired.
+        """
+        conn = self._get_connection()
+        now = int(time.time())
+        cutoff = now - stale_after_seconds
+
+        result = conn.execute("""
+            UPDATE settlement_proposals
+            SET status = 'expired'
+            WHERE status = 'ready'
+              AND COALESCE(expires_at, proposed_at, 0) < ?
+              AND NOT EXISTS (
+                    SELECT 1 FROM settled_periods sp
+                    WHERE sp.period = settlement_proposals.period
+                )
+        """, (cutoff,))
+
+        return result.rowcount
+
     def prune_old_settlement_data(self, older_than_days: int = 90) -> int:
         """
         Remove old settlement data (proposals, votes, executions).

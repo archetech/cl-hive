@@ -11768,9 +11768,15 @@ def settlement_loop():
 
             # Step 5: Cleanup expired proposals
             try:
-                expired = database.cleanup_expired_settlement_proposals()
-                if expired > 0:
-                    plugin.log(f"SETTLEMENT: Cleaned up {expired} expired proposals")
+                expired_pending = database.cleanup_expired_settlement_proposals()
+                expired_ready = database.cleanup_stale_ready_settlement_proposals(
+                    stale_after_seconds=SETTLEMENT_READY_STALE_EXPIRY_GRACE_SECONDS
+                )
+                if expired_pending > 0 or expired_ready > 0:
+                    plugin.log(
+                        "SETTLEMENT: Cleaned up expired proposals "
+                        f"(pending={expired_pending}, ready_stale={expired_ready})"
+                    )
             except Exception as e:
                 plugin.log(f"SETTLEMENT: Cleanup error: {e}", level='warn')
 
@@ -11792,6 +11798,7 @@ def settlement_loop():
 SETTLEMENT_GAMING_MIN_PERIODS = 3  # Minimum periods to analyze
 SETTLEMENT_GAMING_LOW_VOTE_THRESHOLD = 30  # Below 30% vote rate = suspicious
 SETTLEMENT_GAMING_LOW_EXEC_THRESHOLD = 30  # Below 30% execution rate = suspicious
+SETTLEMENT_READY_STALE_EXPIRY_GRACE_SECONDS = 72 * 3600  # 72h grace for stuck ready proposals
 
 
 def _check_settlement_gaming_and_propose_bans():
