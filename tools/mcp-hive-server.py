@@ -54,6 +54,7 @@ import ssl
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -202,6 +203,88 @@ def _normalize_response(result: Any) -> Dict[str, Any]:
         error_msg = result.get("error") or result.get("message") or "Unknown error"
         return {"ok": False, "error": error_msg, "details": result}
     return {"ok": True, "data": result}
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+async def _get_revenue_config_int(node: "NodeConnection", key: str, default: int) -> int:
+    """Best-effort fetch of a cl-revenue-ops numeric config value."""
+    try:
+        resp = await node.call("revenue-config", {"action": "get", "key": key})
+        if isinstance(resp, dict) and "error" in resp:
+            return default
+        return _as_int((resp or {}).get("value"), default)
+    except Exception:
+        return default
+
+
+async def _reserve_total_cost_budget(
+    node: "NodeConnection",
+    *,
+    category: str,
+    amount_sats: int,
+    subcategory: Optional[str] = None,
+    reference_id: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Best-effort unified spend reservation via cl-revenue-ops.
+
+    Returns:
+      {enabled: bool, reserved: bool, reservation_id: str|None, response: dict|None, error: str|None}
+    """
+    reservation_id = f"mcp:{category}:{uuid.uuid4().hex[:16]}"
+    params: Dict[str, Any] = {
+        "reservation_id": reservation_id,
+        "category": category,
+        "amount_sats": max(0, int(amount_sats)),
+    }
+    if subcategory:
+        params["subcategory"] = subcategory
+    if reference_id:
+        params["reference_id"] = reference_id
+    if channel_id:
+        params["channel_id"] = channel_id
+    if metadata:
+        params["metadata_json"] = json.dumps(metadata, sort_keys=True)
+    try:
+        resp = await node.call("revenue-spend-reserve", params)
+    except Exception as e:
+        return {"enabled": False, "reserved": False, "reservation_id": None, "error": str(e)}
+    if isinstance(resp, dict) and "error" in resp:
+        # If cl-revenue-ops is older and missing the RPC, don't block action.
+        msg = str(resp.get("error") or "")
+        unavailable = ("Method" in msg and "allowlist" in msg) or ("not in allowlist" in msg) or ("Unknown" in msg)
+        return {
+            "enabled": not unavailable,
+            "reserved": False,
+            "reservation_id": None if unavailable else reservation_id,
+            "response": resp,
+            "error": msg,
+            "unavailable": unavailable,
+        }
+    status = str((resp or {}).get("status") or "")
+    return {
+        "enabled": True,
+        "reserved": status == "success",
+        "reservation_id": reservation_id if status == "success" else None,
+        "response": resp,
+        "error": None if status == "success" else str((resp or {}).get("reason") or (resp or {}).get("error") or ""),
+    }
+
+
+async def _release_total_cost_budget(node: "NodeConnection", reservation_id: Optional[str]) -> None:
+    if not reservation_id:
+        return
+    try:
+        await node.call("revenue-spend-release", {"reservation_id": reservation_id})
+    except Exception:
+        pass
 
 
 @dataclass
@@ -7769,6 +7852,28 @@ async def handle_open_channel(args: Dict) -> Dict:
     if amount_sats > 16777215:  # ~0.168 BTC wumbo limit for non-wumbo
         logger.info(f"Large channel requested: {amount_sats} sats (wumbo)")
 
+    # Reserve unified total-cost budget before attempting an on-chain channel open.
+    est_open_cost_sats = await _get_revenue_config_int(node, "estimated_open_cost_sats", 5000)
+    budget_gate = await _reserve_total_cost_budget(
+        node,
+        category="open",
+        subcategory="channel_open",
+        amount_sats=max(1, est_open_cost_sats),
+        reference_id=peer_id[:32],
+        metadata={
+            "peer_id": peer_id,
+            "requested_amount_sats": int(amount_sats),
+            "feerate": str(feerate),
+            "announce": bool(announce),
+            "source": "mcp_hive_open_channel",
+        },
+    )
+    if budget_gate.get("enabled") and not budget_gate.get("reserved"):
+        return {
+            "error": budget_gate.get("error") or "Unified spend budget rejected channel open",
+            "budget_gate": budget_gate,
+        }
+
     # Try connect first (ignore errors if already connected)
     try:
         await node.call("hive-connect", {"peer_id": peer_id})
@@ -7787,6 +7892,18 @@ async def handle_open_channel(args: Dict) -> Dict:
 
     try:
         result = await node.call("hive-open-channel", params)
+        if isinstance(result, dict) and result.get("error"):
+            await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
+        if isinstance(result, dict):
+            result["budget_gate"] = {
+                "reservation_id": budget_gate.get("reservation_id"),
+                "estimated_reserved_sats": est_open_cost_sats,
+                "reserved": bool(budget_gate.get("reserved")),
+                "note": (
+                    "Unified spend budget reserved for channel open. Reservation remains active until "
+                    "actual costs are accounted or stale reservation cleanup releases it."
+                ) if budget_gate.get("reserved") else "Unified spend budget reservation unavailable or skipped."
+            }
         # Record the decision
         try:
             db = ensure_advisor_db()
@@ -7800,6 +7917,7 @@ async def handle_open_channel(args: Dict) -> Dict:
             pass
         return result
     except Exception as e:
+        await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
         return {"error": str(e)}
 
 
@@ -8699,7 +8817,49 @@ async def handle_splice(args: Dict) -> Dict:
     if feerate_per_kw is not None:
         params["feerate_per_kw"] = feerate_per_kw
 
-    result = await node.call("hive-splice", params)
+    budget_gate = None
+    est_splice_fee_sats = None
+    if not dry_run:
+        est_open_cost_sats = await _get_revenue_config_int(node, "estimated_open_cost_sats", 5000)
+        est_splice_fee_sats = max(1000, int(est_open_cost_sats))
+        splice_kind = "splice_in" if _as_int(relative_amount, 0) >= 0 else "splice_out"
+        budget_gate = await _reserve_total_cost_budget(
+            node,
+            category="splice",
+            subcategory=splice_kind,
+            amount_sats=est_splice_fee_sats,
+            channel_id=channel_id,
+            reference_id=channel_id,
+            metadata={
+                "channel_id": channel_id,
+                "relative_amount": relative_amount,
+                "feerate_per_kw": feerate_per_kw,
+                "force": bool(force),
+                "source": "mcp_hive_splice",
+            },
+        )
+        if budget_gate.get("enabled") and not budget_gate.get("reserved"):
+            return {
+                "error": budget_gate.get("error") or "Unified spend budget rejected splice",
+                "budget_gate": budget_gate,
+            }
+
+    try:
+        result = await node.call("hive-splice", params)
+    except Exception as e:
+        if budget_gate:
+            await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
+        return {"error": str(e)}
+    if budget_gate and isinstance(result, dict):
+        result["budget_gate"] = {
+            "reservation_id": budget_gate.get("reservation_id"),
+            "estimated_reserved_sats": est_splice_fee_sats,
+            "reserved": bool(budget_gate.get("reserved")),
+            "note": (
+                "Unified spend budget reserved for splice. Reservation remains active until actual costs "
+                "are accounted or stale reservation cleanup releases it."
+            ) if budget_gate.get("reserved") else "Unified spend budget reservation unavailable or skipped."
+        }
 
     # Add context about the result
     if result.get("dry_run"):
@@ -8714,6 +8874,8 @@ async def handle_splice(args: Dict) -> Dict:
         )
     elif result.get("error"):
         result["ai_note"] = f"Splice failed: {result.get('message', result.get('error'))}"
+        if budget_gate:
+            await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
 
     return result
 
