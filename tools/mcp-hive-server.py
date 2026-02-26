@@ -2635,6 +2635,26 @@ Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
                     "node": {
                         "type": "string",
                         "description": "Node name"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Optional channel SCID to restrict debug output"
+                    },
+                    "peer_id": {
+                        "type": "string",
+                        "description": "Optional peer pubkey to restrict debug output"
+                    },
+                    "summary_only": {
+                        "type": "boolean",
+                        "description": "Return counts/summary without full channel lists (default: false)"
+                    },
+                    "include_hot_markers": {
+                        "type": "boolean",
+                        "description": "Include hot-channel protection markers (default: true)"
+                    },
+                    "max_candidates": {
+                        "type": "integer",
+                        "description": "Max channels to include per bucket (0 = no limit)"
                     }
                 },
                 "required": ["node"]
@@ -9912,7 +9932,14 @@ async def handle_revenue_rebalance_debug(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    return await node.call("revenue-rebalance-debug")
+    params: Dict[str, Any] = {}
+    for key in ("channel_id", "peer_id", "summary_only", "include_hot_markers", "max_candidates"):
+        if args.get(key) is not None:
+            params[key] = args[key]
+
+    if not params:
+        return await node.call("revenue-rebalance-debug")
+    return await node.call("revenue-rebalance-debug", params)
 
 
 async def handle_revenue_fee_debug(args: Dict) -> Dict:
