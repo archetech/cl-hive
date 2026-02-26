@@ -321,6 +321,7 @@ class NodeConnection:
     docker_container: Optional[str] = None
     lightning_dir: str = "/home/clightning/.lightning"
     network: str = "regtest"
+    omit_network_flag: bool = False
 
     async def connect(self):
         """Initialize the HTTP client (if using REST)."""
@@ -410,10 +411,17 @@ class NodeConnection:
             "docker", "exec", self.docker_container,
             "lightning-cli",
             f"--lightning-dir={self.lightning_dir}",
-            f"--network={self.network}",
+        ]
+        # If lightning_dir already points at a network-specific CLN dir (e.g. /.../bitcoin),
+        # CLN rejects a duplicate network setting in that nested config.
+        network_specific_dirs = {"bitcoin", "testnet", "testnet4", "signet", "regtest"}
+        dir_basename = os.path.basename(self.lightning_dir.rstrip("/"))
+        if not self.omit_network_flag and dir_basename not in network_specific_dirs:
+            cmd.append(f"--network={self.network}")
+        cmd.extend([
             "--",  # Separate options from method/params
             method
-        ]
+        ])
 
         # Add params as JSON if provided
         if params:
@@ -501,7 +509,8 @@ class HiveFleet:
                     name=node_config["name"],
                     docker_container=node_config.get("docker_container"),
                     lightning_dir=node_config.get("lightning_dir", global_lightning_dir),
-                    network=node_config.get("network", global_network)
+                    network=node_config.get("network", global_network),
+                    omit_network_flag=bool(node_config.get("omit_network_flag", False))
                 )
             else:
                 # REST mode (default)
