@@ -1191,8 +1191,8 @@ class Planner:
                     capacity_sats = ch.get('total_msat', 0) // 1000
                     return (True, state, capacity_sats)
         except Exception:
-            # If RPC fails, assume no channel (conservative)
-            pass
+            # If RPC fails, assume channel exists to prevent duplicate opens.
+            return (True, None, None)
 
         return (False, None, None)
 

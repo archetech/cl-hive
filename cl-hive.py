@@ -2562,6 +2562,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Set up graceful shutdown handler
     def handle_shutdown_signal(signum, frame):
         plugin.log("cl-hive: Received shutdown signal, cleaning up...")
+        # Signal background threads to stop FIRST so they don't try to
+        # use resources we're about to tear down.
+        shutdown_event.set()
         try:
             if fee_coordination_mgr:
                 fee_coordination_mgr.save_state_to_database()
@@ -2594,7 +2597,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 _batched_log_writer.stop()
         except Exception:
             pass  # Best-effort on shutdown
-        shutdown_event.set()
     
     try:
         signal.signal(signal.SIGTERM, handle_shutdown_signal)
@@ -3223,14 +3225,17 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Store Hive membership info for ourselves
     if database and our_pubkey:
         now = int(time.time())
-        # Add ourselves as a member with the configured tier
-        database.add_member(our_pubkey, tier=tier or 'neophyte', joined_at=now)
+        # Always start as neophyte regardless of what the remote peer claims —
+        # our tier should be determined by local governance, not trusted from
+        # an untrusted remote payload.
+        database.add_member(our_pubkey, tier='neophyte', joined_at=now)
         # Store hive_id in metadata
         database.update_member(our_pubkey, metadata=json.dumps({"hive_id": hive_id}))
-        plugin.log(f"cl-hive: Stored membership (tier={tier}, hive_id={hive_id})")
+        plugin.log(f"cl-hive: Stored membership (tier=neophyte, hive_id={hive_id})")
 
-        # Also add the peer that welcomed us (they're an existing member)
-        database.add_member(peer_id, tier='member', joined_at=now)
+        # Add the peer that welcomed us as neophyte — their actual tier
+        # will be resolved via state sync rather than trusted from WELCOME.
+        database.add_member(peer_id, tier='neophyte', joined_at=now)
 
         # Auto-generate and register BOLT12 offer for settlement
         if settlement_mgr:
@@ -4113,8 +4118,11 @@ def _update_and_broadcast_fees(new_fee_sats: int):
         forwards_to_broadcast = _local_fees_forward_count
         period_start = _local_fees_period_start
         costs_to_broadcast = _local_rebalance_costs_sats
-        _local_fees_last_broadcast = now
-        _local_fees_last_broadcast_amount = _local_fees_earned_sats
+        # Only update broadcast tracking when we actually broadcast —
+        # otherwise small fees never accumulate to the threshold.
+        if not should_return_without_broadcast:
+            _local_fees_last_broadcast = now
+            _local_fees_last_broadcast_amount = _local_fees_earned_sats
 
     # Always save fee report to database for settlement (Bug fix #3).
     # This must happen regardless of broadcast threshold to ensure low-traffic
@@ -7182,6 +7190,19 @@ def _check_feerate_for_expansion(max_feerate_perkb: int) -> tuple:
         return (True, 0, f"feerate check error: {e}")
 
 
+def _parse_amount_msat(val) -> int:
+    """Safely parse amount_msat from CLN (int or 'NNNmsat' string)."""
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        try:
+            cleaned = val.replace('msat', '') if val.endswith('msat') else val
+            return int(cleaned)
+        except (ValueError, TypeError):
+            return 0
+    return 0
+
+
 def _get_spendable_balance(cfg) -> int:
     """
     Get onchain balance minus reserve, or 0 if unavailable.
@@ -7201,9 +7222,7 @@ def _get_spendable_balance(cfg) -> int:
         funds = plugin.rpc.listfunds()
         outputs = funds.get('outputs', [])
         onchain_balance = sum(
-            (o.get('amount_msat', 0) // 1000 if isinstance(o.get('amount_msat'), int)
-             else int(o.get('amount_msat', '0msat')[:-4]) // 1000
-             if isinstance(o.get('amount_msat'), str) else o.get('value', 0))
+            _parse_amount_msat(o.get('amount_msat', 0)) // 1000
             for o in outputs if o.get('status') == 'confirmed'
         )
         return int(onchain_balance * (1.0 - cfg.budget_reserve_pct))
@@ -7230,6 +7249,12 @@ def _cap_channel_size_to_budget(size_sats: int, cfg, context: str = "") -> tuple
     """
     spendable = _get_spendable_balance(cfg)
 
+    # Enforce configured maximum channel size
+    was_capped = False
+    if size_sats > cfg.planner_max_channel_sats:
+        size_sats = cfg.planner_max_channel_sats
+        was_capped = True
+
     # Check if we can afford minimum channel size
     if spendable < cfg.planner_min_channel_sats:
         if context and plugin:
@@ -7249,7 +7274,7 @@ def _cap_channel_size_to_budget(size_sats: int, cfg, context: str = "") -> tuple
             )
         return (spendable, False, True)
 
-    return (size_sats, False, False)
+    return (size_sats, False, was_capped)
 
 
 def _store_peer_available_action(target_peer_id: str, reporter_peer_id: str,
@@ -7423,9 +7448,7 @@ def _broadcast_expansion_nomination(round_id: str, target_peer_id: str) -> int:
         funds = plugin.rpc.listfunds()
         outputs = funds.get('outputs', [])
         available_liquidity = sum(
-            (o.get('amount_msat', 0) // 1000 if isinstance(o.get('amount_msat'), int)
-             else int(o.get('amount_msat', '0msat')[:-4]) // 1000
-             if isinstance(o.get('amount_msat'), str) else o.get('value', 0))
+            _parse_amount_msat(o.get('amount_msat', 0)) // 1000
             for o in outputs if o.get('status') == 'confirmed'
         )
     except Exception:
@@ -13739,7 +13762,7 @@ def hive_close_channel(plugin: Plugin, peer_id: str = None, channel_id: str = No
     if peer_id:
         params["id"] = peer_id
     if channel_id:
-        params["short_channel_id"] = channel_id
+        params["id"] = channel_id
     if unilateraltimeout is not None:
         params["unilateraltimeout"] = unilateraltimeout
     return rpc.close(**params)
@@ -14629,9 +14652,7 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
         funds = plugin.rpc.listfunds()
         outputs = funds.get('outputs', [])
         onchain_balance = sum(
-            (o.get('amount_msat', 0) // 1000 if isinstance(o.get('amount_msat'), int)
-             else int(o.get('amount_msat', '0msat')[:-4]) // 1000
-             if isinstance(o.get('amount_msat'), str) else o.get('value', 0))
+            _parse_amount_msat(o.get('amount_msat', 0)) // 1000
             for o in outputs if o.get('status') == 'confirmed'
         )
     except Exception:
@@ -16705,15 +16726,25 @@ def hive_force_promote(plugin: Plugin, peer_id: str):
     plugin.log(f"cl-hive: Force-promoted {peer_id[:16]}... to member (bootstrap)")
 
     # Broadcast PROMOTION message to sync state
+    now_ts = int(time.time())
+    request_id = f"bootstrap_{now_ts}"
+    # Sign the vouch with our node key for authenticity
+    vouch_msg = f"VOUCH:{peer_id}:{request_id}:{now_ts}"
+    vouch_sig = ""
+    if identity_adapter:
+        vouch_sig = identity_adapter.sign_message(vouch_msg)
+    if not vouch_sig:
+        vouch_sig = "unsigned_bootstrap"
+        plugin.log("cl-hive: WARNING - could not sign bootstrap promotion vouch", level='warn')
     promotion_payload = {
         "target_pubkey": peer_id,
-        "request_id": f"bootstrap_{int(time.time())}",
+        "request_id": request_id,
         "vouches": [{
             "target_pubkey": peer_id,
-            "request_id": f"bootstrap_{int(time.time())}",
-            "timestamp": int(time.time()),
+            "request_id": request_id,
+            "timestamp": now_ts,
             "voucher_pubkey": our_pubkey,
-            "sig": "admin_bootstrap"
+            "sig": vouch_sig
         }]
     }
     promo_msg = serialize(HiveMessageType.PROMOTION, promotion_payload)

@@ -422,7 +422,9 @@ class MembershipManager:
             return 1
 
         threshold = math.ceil(active_members * 0.51)  # Simple majority
-        return max(3, threshold)
+        # Minimum 2 votes to prevent unilateral governance actions,
+        # but never more than the number of active members.
+        return min(active_members, max(2, threshold))
 
     def check_ban_cooldown(self, target_peer_id: str,
                            cooldown_seconds: int = 0) -> bool:

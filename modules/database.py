@@ -2195,23 +2195,33 @@ class HiveDatabase:
             True if recorded, False if rejected due to DB cap
         """
         conn = self._get_connection()
-
-        # P5-03: Check absolute row limit before inserting
-        row = conn.execute("SELECT COUNT(*) as cnt FROM contribution_ledger").fetchone()
-        if row and row['cnt'] >= self.MAX_CONTRIBUTION_ROWS:
-            self.plugin.log(
-                f"HiveDatabase: Contribution ledger at cap ({self.MAX_CONTRIBUTION_ROWS}), rejecting insert",
-                level='warn'
-            )
-            return False
-
         now = int(time.time())
 
-        conn.execute("""
-            INSERT INTO contribution_ledger (peer_id, direction, amount_sats, timestamp)
-            VALUES (?, ?, ?, ?)
-        """, (peer_id, direction, amount_sats, now))
-        return True
+        try:
+            # Atomic check-and-insert under BEGIN IMMEDIATE to prevent
+            # concurrent threads from both passing the cap check.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT COUNT(*) as cnt FROM contribution_ledger").fetchone()
+            if row and row['cnt'] >= self.MAX_CONTRIBUTION_ROWS:
+                conn.execute("ROLLBACK")
+                self.plugin.log(
+                    f"HiveDatabase: Contribution ledger at cap ({self.MAX_CONTRIBUTION_ROWS}), rejecting insert",
+                    level='warn'
+                )
+                return False
+
+            conn.execute("""
+                INSERT INTO contribution_ledger (peer_id, direction, amount_sats, timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (peer_id, direction, amount_sats, now))
+            conn.execute("COMMIT")
+            return True
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     def get_contribution_stats(self, peer_id: str, window_days: int = 30) -> Dict[str, int]:
         """

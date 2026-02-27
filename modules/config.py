@@ -63,7 +63,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'min_uptime_pct': (50.0, 100.0),
     'min_unique_peers': (0, 10),
     'max_members': (2, 100),
-    'market_share_cap_pct': (0.0, 1.0),
+    'market_share_cap_pct': (0.01, 1.0),
     'intent_hold_seconds': (10, 600),
     'intent_expire_seconds': (60, 3600),
     'gossip_threshold_pct': (0.01, 0.5),
@@ -115,7 +115,7 @@ class HiveConfig:
     ban_autotrigger_enabled: bool = False
     
     # Membership Economics
-    neophyte_fee_discount_pct: float = 0.5    # 50% of public rate for neophytes
+    neophyte_fee_discount_pct: float = 0.5    # NOT YET APPLIED — set_hive_policy treats all tiers identically
     member_fee_ppm: int = 0                    # 0-fee for full members
     probation_days: int = 90                   # 90 days probation before auto-promotion
 
