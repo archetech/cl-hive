@@ -39,6 +39,7 @@ def mock_database():
     """Create a mock database for testing."""
     db = MagicMock()
     db.create_intent.return_value = 1
+    db.create_intent_if_no_conflict.return_value = 1
     db.get_conflicting_intents.return_value = []
     db.update_intent_status.return_value = True
     db.cleanup_expired_intents.return_value = 0

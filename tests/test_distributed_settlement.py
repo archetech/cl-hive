@@ -419,8 +419,16 @@ class TestQuorum:
     def test_quorum_reached_with_majority(
         self, settlement_manager, mock_database
     ):
-        """Should mark ready when 51% quorum reached."""
-        mock_database.count_settlement_ready_votes.return_value = 2  # 2/3 = 67%
+        """Should mark ready when 51% quorum reached (only current members count)."""
+        mock_database.get_settlement_ready_votes.return_value = [
+            {'voter_peer_id': 'peer_a'},
+            {'voter_peer_id': 'peer_b'},
+        ]
+        mock_database.get_all_members.return_value = [
+            {'peer_id': 'peer_a'},
+            {'peer_id': 'peer_b'},
+            {'peer_id': 'peer_c'},
+        ]
         mock_database.get_settlement_proposal.return_value = {
             'proposal_id': 'test_proposal',
             'status': 'pending'
@@ -440,7 +448,14 @@ class TestQuorum:
         self, settlement_manager, mock_database
     ):
         """Should not mark ready when quorum not reached."""
-        mock_database.count_settlement_ready_votes.return_value = 1  # 1/3 = 33%
+        mock_database.get_settlement_ready_votes.return_value = [
+            {'voter_peer_id': 'peer_a'},
+        ]
+        mock_database.get_all_members.return_value = [
+            {'peer_id': 'peer_a'},
+            {'peer_id': 'peer_b'},
+            {'peer_id': 'peer_c'},
+        ]
 
         result = settlement_manager.check_quorum_and_mark_ready(
             proposal_id='test_proposal',

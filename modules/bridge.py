@@ -15,6 +15,7 @@ Author: Lightning Goats Team
 """
 
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -467,8 +468,16 @@ class Bridge:
                     cmd.append(f"{key}={str(value).lower()}")
                 elif isinstance(value, (dict, list)):
                     cmd.append(f"{key}={json.dumps(value, separators=(',', ':'))}")
-                else:
+                elif isinstance(value, float):
+                    if math.isnan(value) or math.isinf(value):
+                        raise ValueError(f"Non-finite float for key {key}")
                     cmd.append(f"{key}={value}")
+                elif isinstance(value, (int, str)):
+                    if isinstance(value, str) and any(c in value for c in '\x00\n\r'):
+                        raise ValueError(f"Invalid characters in string value for key {key}")
+                    cmd.append(f"{key}={value}")
+                else:
+                    raise ValueError(f"Unsupported payload type for key {key}: {type(value).__name__}")
 
         result = subprocess.run(
             cmd,

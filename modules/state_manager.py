@@ -228,7 +228,8 @@ class StateManager:
             return False
         if not isinstance(available_sats, int) or available_sats < 0:
             return False
-        if not isinstance(version, int) or version < 0:
+        MAX_VERSION = 2**31  # Prevent version poisoning via FULL_SYNC
+        if not isinstance(version, int) or version < 0 or version > MAX_VERSION:
             return False
         if not isinstance(timestamp, int) or timestamp < 0:
             return False
@@ -238,6 +239,12 @@ class StateManager:
         fee_policy = data.get("fee_policy", {})
         if not isinstance(fee_policy, dict) or len(fee_policy) > MAX_FEE_POLICY_KEYS:
             return False
+        MAX_FEE_VALUE = 10_000_000
+        for k, v in fee_policy.items():
+            if not isinstance(k, str) or len(k) > 64:
+                return False
+            if not isinstance(v, (int, float)) or v < 0 or v > MAX_FEE_VALUE:
+                return False
 
         topology = data.get("topology", [])
         if not isinstance(topology, list) or len(topology) > MAX_TOPOLOGY_ENTRIES:
@@ -856,10 +863,11 @@ class StateManager:
             for peer_id in stale_peers:
                 del self._local_state[peer_id]
 
-        # Also remove from database outside lock
+        # Also remove from database outside lock (conditional on still-stale
+        # to prevent deleting freshly-re-inserted state from concurrent gossip)
         for peer_id in stale_peers:
             try:
-                self.db.delete_hive_state(peer_id)
+                self.db.delete_hive_state_if_stale(peer_id, cutoff)
             except Exception as e:
                 self._log(f"Failed to delete stale state from DB for {peer_id[:16]}...: {e}",
                          level="warn")

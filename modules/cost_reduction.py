@@ -1386,12 +1386,13 @@ class CircularFlowDetector:
         """Remove old remote circular flow alerts."""
 
         cutoff = time.time() - (max_age_hours * 3600)
-        before = len(self._remote_circular_alerts)
-        self._remote_circular_alerts = [
-            a for a in self._remote_circular_alerts
-            if a.get("timestamp", 0) > cutoff
-        ]
-        return before - len(self._remote_circular_alerts)
+        with self._history_lock:
+            before = len(self._remote_circular_alerts)
+            self._remote_circular_alerts = [
+                a for a in self._remote_circular_alerts
+                if a.get("timestamp", 0) > cutoff
+            ]
+            return before - len(self._remote_circular_alerts)
 
 
 # =============================================================================

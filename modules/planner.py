@@ -42,7 +42,7 @@ except ImportError:
 
 try:
     from modules.intent_manager import IntentType
-    from modules.protocol import serialize, HiveMessageType
+    from modules.protocol import serialize, HiveMessageType, get_intent_signing_payload
 except ImportError:
     # For testing - define stubs
     class IntentType:
@@ -2345,6 +2345,16 @@ class Planner:
         try:
             # Create intent message payload
             payload = self.intent_manager.create_intent_message(intent)
+
+            # Sign the intent payload
+            try:
+                signing_payload = get_intent_signing_payload(payload)
+                sig_result = self.plugin.rpc.signmessage(signing_payload)
+                payload['signature'] = sig_result.get('signature', sig_result.get('zbase', ''))
+            except Exception as e:
+                self._log(f"Failed to sign intent: {e}", level='warn')
+                return False
+
             msg_bytes = serialize(HiveMessageType.INTENT, payload)
 
             # Get all Hive members

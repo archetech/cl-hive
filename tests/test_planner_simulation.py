@@ -60,6 +60,7 @@ def mock_database():
     db.get_all_members.return_value = []
     db.get_pending_intents.return_value = []
     db.create_intent.return_value = 1
+    db.create_intent_if_no_conflict.return_value = 1
     # Mock pending action tracking methods (rejection tracking)
     db.has_pending_action_for_target.return_value = False
     db.was_recently_rejected.return_value = False

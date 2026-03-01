@@ -564,8 +564,15 @@ class GossipManager:
     
     def record_gossip_sent(self, peer_id: str) -> None:
         """Record that we sent gossip to a peer."""
+        now = int(time.time())
         with self._lock:
-            self._peer_gossip_times[peer_id] = int(time.time())
+            self._peer_gossip_times[peer_id] = now
+            # Periodic cleanup: remove stale entries to prevent unbounded growth
+            if len(self._peer_gossip_times) > 200:
+                cutoff = now - self.heartbeat_interval * 2
+                stale = [k for k, t in self._peer_gossip_times.items() if t < cutoff]
+                for k in stale:
+                    del self._peer_gossip_times[k]
     
     # =========================================================================
     # STATISTICS

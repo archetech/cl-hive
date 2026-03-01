@@ -915,7 +915,7 @@ def _broadcast_channel_open_intent(ctx: HiveContext, intent_id: Optional[str]) -
         return 0
 
     # Lazy imports to avoid circular deps
-    from modules.protocol import HiveMessageType, serialize
+    from modules.protocol import HiveMessageType, serialize, get_intent_signing_payload
     from modules.intent_manager import Intent
 
     broadcast_count = 0
@@ -931,6 +931,17 @@ def _broadcast_channel_open_intent(ctx: HiveContext, intent_id: Optional[str]) -
         )
 
         intent_payload = ctx.intent_mgr.create_intent_message(intent)
+
+        # Sign the intent payload
+        try:
+            signing_payload = get_intent_signing_payload(intent_payload)
+            sig_result = ctx.safe_plugin.rpc.signmessage(signing_payload)
+            intent_payload['signature'] = sig_result.get('signature', sig_result.get('zbase', ''))
+        except Exception as sign_err:
+            if ctx.log:
+                ctx.log(f"cl-hive: Intent signing failed: {sign_err}", 'warn')
+            return 0
+
         msg = serialize(HiveMessageType.INTENT, intent_payload)
         members = ctx.database.get_all_members()
 
@@ -5303,7 +5314,7 @@ def escrow_redeem(ctx: HiveContext, ticket_id: str,
     if not ticket_id or not preimage:
         return {"error": "ticket_id and preimage are required"}
 
-    result = ctx.cashu_escrow_mgr.redeem_ticket(ticket_id, preimage)
+    result = ctx.cashu_escrow_mgr.redeem_ticket(ticket_id, preimage, caller_id=ctx.our_pubkey)
     return result if result else {"error": "redemption failed"}
 
 
@@ -5319,7 +5330,7 @@ def escrow_refund(ctx: HiveContext, ticket_id: str) -> Dict[str, Any]:
     if not ticket_id:
         return {"error": "ticket_id is required"}
 
-    result = ctx.cashu_escrow_mgr.refund_ticket(ticket_id)
+    result = ctx.cashu_escrow_mgr.refund_ticket(ticket_id, caller_id=ctx.our_pubkey)
     return result if result else {"error": "refund failed"}
 
 

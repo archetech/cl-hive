@@ -1258,6 +1258,21 @@ def validate_intent_abort(payload: Dict[str, Any]) -> bool:
     return True
 
 
+def get_intent_signing_payload(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing HIVE_INTENT messages.
+
+    The signature proves the intent was created by the claimed initiator.
+    """
+    signing_fields = {
+        "intent_type": payload.get("intent_type", ""),
+        "target": payload.get("target", ""),
+        "initiator": payload.get("initiator", ""),
+        "timestamp": payload.get("timestamp", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
 def get_intent_abort_signing_payload(payload: Dict[str, Any]) -> str:
     """
     Get the canonical payload string for signing INTENT_ABORT messages.
@@ -1317,13 +1332,14 @@ def create_attest(pubkey: str, version: str, features: list,
 
 
 def create_welcome(hive_id: str, tier: str, member_count: int,
-                   state_hash: str) -> bytes:
+                   state_hash: str, signature: str = "") -> bytes:
     """Create a HIVE_WELCOME message."""
     return serialize(HiveMessageType.WELCOME, {
         "hive_id": hive_id,
         "tier": tier,
         "member_count": member_count,
-        "state_hash": state_hash
+        "state_hash": state_hash,
+        "signature": signature
     })
 
 

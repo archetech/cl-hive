@@ -179,6 +179,11 @@ class RoutingPool:
         if amount_sats <= 0:
             return False
 
+        # Require payment_hash for deduplication (NULL bypasses UNIQUE constraint)
+        if not payment_hash:
+            self._log("record_revenue: payment_hash required for dedup, skipping", level='warn')
+            return False
+
         try:
             self.db.record_pool_revenue(
                 member_id=member_id,
@@ -494,6 +499,12 @@ class RoutingPool:
         if period is None:
             # Settle previous period, not current
             period = self._previous_period()
+
+        # Guard: prevent double-settlement of the same period
+        existing = self.db.get_pool_distributions(period)
+        if existing:
+            self._log(f"Period {period} already settled ({len(existing)} distributions), skipping")
+            return []
 
         distributions = self.calculate_distribution(period)
         if not distributions:

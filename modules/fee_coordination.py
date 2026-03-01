@@ -41,6 +41,7 @@ MIN_EVAPORATION_RATE = 0.1        # Minimum evaporation
 MAX_EVAPORATION_RATE = 0.9        # Maximum evaporation
 PHEROMONE_EXPLOIT_THRESHOLD = 2.0   # Above this: exploit current fee (lowered for low-traffic nodes)
 PHEROMONE_DEPOSIT_SCALE = 0.001   # Scale factor for deposits
+MAX_PHEROMONE_LEVEL = 100.0       # Upper bound prevents permanent exploitation lock-in
 
 # Stigmergic markers
 MARKER_HALF_LIFE_HOURS = 168      # Markers decay with 7-day half-life (extended for low-traffic nodes)
@@ -48,7 +49,7 @@ MARKER_MIN_STRENGTH = 0.1         # Below this, markers are ignored
 
 # Mycelium defense
 DRAIN_RATIO_THRESHOLD = 5.0       # 5:1 outflow ratio = drain attack
-DEFENSE_QUORUM_THRESHOLD = 2      # Min independent reports before fleet defense activates
+DEFENSE_QUORUM_THRESHOLD = 3      # Min independent reports before fleet defense activates
 FAILURE_RATE_THRESHOLD = 0.5      # >50% failures = unreliable peer
 WARNING_TTL_HOURS = 24            # Warnings expire after 24 hours
 DEFENSIVE_FEE_MAX_MULTIPLIER = 3.0  # Max 3x fee increase for defense
@@ -715,9 +716,9 @@ class AdaptiveFeeController:
         if len(observations) < 2:
             return 0.0
 
-        # Filter to recent observations (last hour)
+        # Filter to recent observations (last hour), exclude zero-fee (hive internal)
         now = time.time()
-        recent = [f for t, f in observations if now - t < 3600]
+        recent = [f for t, f in observations if now - t < 3600 and f > 0]
 
         if len(recent) < 2:
             return 0.0
@@ -773,14 +774,24 @@ class AdaptiveFeeController:
         lose their pheromone over time.
         """
         now = time.time()
-        evap_rate = self.calculate_evaporation_rate(channel_id)
+        # Pre-compute fee volatility outside _lock (uses separate _fee_obs_lock)
+        fee_volatility = self._calculate_fee_volatility()
 
         with self._lock:
+            # Inline evaporation rate (avoid TOCTOU from calling
+            # calculate_evaporation_rate outside lock)
+            velocity = self._velocity_cache.get(channel_id, 0.0)
+            base = BASE_EVAPORATION_RATE
+            velocity_factor = min(0.4, abs(velocity) * 4)
+            volatility_factor = min(0.3, fee_volatility / 200)
+            evap_rate = base + velocity_factor + volatility_factor
+            evap_rate = max(MIN_EVAPORATION_RATE, min(MAX_EVAPORATION_RATE, evap_rate))
+
             # Apply time-based exponential decay (half-life model)
             # If no timestamp exists, apply at least one cycle of decay
             if channel_id in self._pheromone_last_update:
                 last_update = self._pheromone_last_update[channel_id]
-                hours_elapsed = (now - last_update) / 3600.0
+                hours_elapsed = max(0, min(168, (now - last_update) / 3600.0))
                 if hours_elapsed > 0 and self._pheromone[channel_id] > 0:
                     # Convert per-cycle evaporation to continuous decay
                     # If evap_rate = 0.2 means 20% loss per hour, apply proportionally
@@ -795,9 +806,12 @@ class AdaptiveFeeController:
             self._pheromone_last_update[channel_id] = now
 
             if routing_success:
-                # Deposit proportional to revenue
+                # Deposit proportional to revenue (capped to prevent permanent lock-in)
                 deposit = revenue_sats * PHEROMONE_DEPOSIT_SCALE
-                self._pheromone[channel_id] += deposit
+                self._pheromone[channel_id] = min(
+                    MAX_PHEROMONE_LEVEL,
+                    self._pheromone[channel_id] + deposit
+                )
 
                 # Track fee via exponential moving average (not just last value)
                 prev_fee = self._pheromone_fee.get(channel_id, current_fee)
@@ -1119,7 +1133,7 @@ class AdaptiveFeeController:
                     continue
 
                 last_update = self._pheromone_last_update.get(channel_id, now)
-                hours_elapsed = (now - last_update) / 3600.0
+                hours_elapsed = max(0, min(168, (now - last_update) / 3600.0))
 
                 if hours_elapsed > 0:
                     # Inline evaporation rate calc to avoid deadlock
@@ -1202,6 +1216,8 @@ class StigmergicCoordinator:
         Other fleet members will see this and adjust their fees
         for the same route accordingly.
         """
+        # Clamp fee to fleet bounds before recording marker
+        fee_charged = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, fee_charged))
         marker = RouteMarker(
             depositor=self.our_pubkey or "",
             source_peer_id=source,
@@ -1299,7 +1315,7 @@ class StigmergicCoordinator:
             total_weight = sum(m.strength for m in successful)
             if total_weight > 0:
                 weighted_fee = sum(m.fee_ppm * m.strength for m in successful) / total_weight
-                recommended = max(FLEET_FEE_FLOOR_PPM, int(weighted_fee))
+                recommended = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, int(weighted_fee)))
             else:
                 recommended = max(FLEET_FEE_FLOOR_PPM, default_fee)
             confidence = min(0.9, 0.5 + len(successful) * 0.05)
@@ -2550,10 +2566,11 @@ class FeeCoordinationManager:
                 stigmergic_influence = stig_confidence
                 reasons.append(f"stigmergic_{stig_confidence:.2f}")
 
-        # 4. Apply defensive multiplier
+        # 4. Apply defensive multiplier (clamp to ceiling before passing to step 5)
         defensive_multiplier = self.defense_system.get_defensive_multiplier(peer_id)
         if defensive_multiplier > 1.0:
             recommended_fee = int(recommended_fee * defensive_multiplier)
+            recommended_fee = min(recommended_fee, FLEET_FEE_CEILING_PPM)
             reasons.append(f"defensive_{defensive_multiplier:.2f}x")
 
         # 5. Apply time-based adjustment (Phase 7.4)
@@ -2797,8 +2814,9 @@ class FeeCoordinationManager:
                 level = row['level']
                 last_update = row['last_update']
 
-                # Apply time-based decay since last save
-                hours_elapsed = (now - last_update) / 3600.0
+                # Apply time-based decay since last save (clamped to prevent
+                # extreme values from clock skew or long offline periods)
+                hours_elapsed = max(0, min(168, (now - last_update) / 3600.0))
                 if hours_elapsed > 0:
                     decay_factor = math.pow(1 - BASE_EVAPORATION_RATE, hours_elapsed)
                     level *= decay_factor

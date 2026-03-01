@@ -537,7 +537,7 @@ class TestMyceliumDefenseSystem:
         result = self.defense.handle_warning(warning1)
         assert result is None  # Quorum not met
 
-        # Second independent report - quorum met
+        # Second independent report - still not at quorum (threshold=3)
         warning2 = PeerWarning(
             peer_id=peer_id,
             threat_type="drain",
@@ -547,9 +547,21 @@ class TestMyceliumDefenseSystem:
             ttl=24 * 3600
         )
         result = self.defense.handle_warning(warning2)
+        assert result is None  # Quorum not met yet
+
+        # Third independent report - quorum met
+        warning3 = PeerWarning(
+            peer_id=peer_id,
+            threat_type="drain",
+            severity=0.5,
+            reporter="02" + "d" * 64,  # Third reporter
+            timestamp=time.time(),
+            ttl=24 * 3600
+        )
+        result = self.defense.handle_warning(warning3)
         assert result is not None
         assert result["multiplier"] > 1.0
-        assert result["report_count"] == 2
+        assert result["report_count"] == 3
 
     def test_defensive_multiplier(self):
         """Test getting defensive multiplier."""

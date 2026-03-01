@@ -36,6 +36,7 @@ def mock_database():
     """Create a mock database for testing."""
     db = MagicMock()
     db.create_intent.return_value = 1
+    db.create_intent_if_no_conflict.return_value = 1
     db.get_conflicting_intents.return_value = []
     db.update_intent_status.return_value = True
     db.cleanup_expired_intents.return_value = 0
@@ -282,19 +283,19 @@ class TestIntentCreation:
     
     def test_create_intent(self, intent_manager, mock_database):
         """create_intent should insert into DB and return Intent."""
-        mock_database.create_intent.return_value = 42
-        
+        mock_database.create_intent_if_no_conflict.return_value = 42
+
         intent = intent_manager.create_intent(
             intent_type=IntentType.CHANNEL_OPEN,
             target='02' + 'x' * 64
         )
-        
+
         assert intent.intent_id == 42
         assert intent.intent_type == IntentType.CHANNEL_OPEN
         assert intent.initiator == intent_manager.our_pubkey
         assert intent.status == STATUS_PENDING
-        
-        mock_database.create_intent.assert_called_once()
+
+        mock_database.create_intent_if_no_conflict.assert_called_once()
     
     def test_create_intent_message(self, intent_manager):
         """create_intent_message should produce correct payload."""
@@ -334,8 +335,10 @@ class TestIntentAbort:
         result = intent_manager.abort_local_intent('target', 'channel_open')
 
         assert result is True
-        mock_database.update_intent_status.assert_called_with(5, STATUS_ABORTED, reason="tie_breaker_loss")
-    
+        mock_database.update_intent_status.assert_called_with(
+            5, STATUS_ABORTED, expected_status='pending', reason="tie_breaker_loss"
+        )
+
     def test_abort_no_local_intent(self, intent_manager, mock_database):
         """abort_local_intent should return False if no intent exists."""
         mock_database.get_conflicting_intents.return_value = []
@@ -425,7 +428,7 @@ class TestIntentCommit:
         result = intent_manager.commit_intent(42)
 
         assert result is True
-        mock_database.update_intent_status.assert_called_with(42, STATUS_COMMITTED)
+        mock_database.update_intent_status.assert_called_with(42, STATUS_COMMITTED, expected_status='pending')
     
     def test_execute_committed_intent_with_callback(self, intent_manager):
         """execute_committed_intent should call registered callback."""
@@ -581,9 +584,8 @@ class TestIntentTypeValidation:
 
     def test_valid_intent_types_accepted(self, intent_manager, mock_database):
         """All IntentType enum values should be accepted."""
-        mock_database.create_intent.return_value = 1
+        mock_database.create_intent_if_no_conflict.return_value = 1
         for it in IntentType:
-            mock_database.get_conflicting_intents.return_value = []
             intent = intent_manager.create_intent(it.value, '02' + 'x' * 64)
             assert intent is not None, f"Valid type {it.value} was rejected"
 
@@ -730,7 +732,7 @@ class TestAuditTrailReason:
         mock_database.get_intent_by_id.return_value = {'id': 5, 'status': 'pending'}
         intent_manager.abort_local_intent('target', 'channel_open')
         mock_database.update_intent_status.assert_called_with(
-            5, STATUS_ABORTED, reason="tie_breaker_loss"
+            5, STATUS_ABORTED, expected_status='pending', reason="tie_breaker_loss"
         )
 
     def test_clear_intents_by_peer_passes_reason(self, intent_manager, mock_database):
@@ -741,7 +743,7 @@ class TestAuditTrailReason:
         ]
         intent_manager.clear_intents_by_peer(peer)
         mock_database.update_intent_status.assert_called_with(
-            10, STATUS_ABORTED, reason="peer_banned"
+            10, STATUS_ABORTED, expected_status='pending', reason="peer_banned"
         )
 
     def test_callback_exception_passes_reason(self, intent_manager, mock_database):
@@ -917,8 +919,7 @@ class TestExpireSecondsConfig:
 
     def test_expire_seconds_used_in_create_intent(self, mock_database, mock_plugin):
         """create_intent should use expire_seconds for TTL, not hold_seconds * 2."""
-        mock_database.create_intent.return_value = 1
-        mock_database.get_conflicting_intents.return_value = []
+        mock_database.create_intent_if_no_conflict.return_value = 1
 
         mgr = IntentManager(mock_database, mock_plugin, our_pubkey='02' + 'a' * 64,
                             hold_seconds=60, expire_seconds=300)
@@ -929,7 +930,7 @@ class TestExpireSecondsConfig:
         assert intent.expires_at - intent.timestamp == 300
 
         # DB should get expire_seconds too
-        call_kwargs = mock_database.create_intent.call_args
+        call_kwargs = mock_database.create_intent_if_no_conflict.call_args
         assert call_kwargs[1]['expires_seconds'] == 300
 
     def test_stats_include_expire_seconds(self, mock_database, mock_plugin):

@@ -282,25 +282,22 @@ class IntentManager:
                      f"(valid: {sorted(valid_types)})", level="warn")
             return None
 
-        # Check for existing pending intent for same target/type
-        existing = self.db.get_conflicting_intents(target, intent_type)
-        for row in existing:
-            if row.get('initiator') == self.our_pubkey:
-                self._log(f"Duplicate intent rejected: {intent_type} -> {target[:16]}... "
-                         f"(existing ID: {row.get('id')})", level="warn")
-                return None
-
         now = int(time.time())
         expires_at = now + self.expire_seconds
 
-        # Pass timestamp to DB to ensure Intent object and DB record match
-        intent_id = self.db.create_intent(
+        # Atomic check-and-insert to prevent TOCTOU race
+        # (two threads could both pass the check, both insert)
+        intent_id = self.db.create_intent_if_no_conflict(
             intent_type=intent_type,
             target=target,
             initiator=self.our_pubkey,
             expires_seconds=self.expire_seconds,
             timestamp=now
         )
+        if intent_id is None:
+            self._log(f"Duplicate intent rejected: {intent_type} -> {target[:16]}...",
+                     level="warn")
+            return None
 
         intent = Intent(
             intent_type=intent_type,
@@ -398,7 +395,13 @@ class IntentManager:
                 if not self._validate_transition(intent_id, STATUS_ABORTED):
                     self._log(f"Cannot abort intent {intent_id}: invalid transition", level="warn")
                     continue
-                self.db.update_intent_status(intent_id, STATUS_ABORTED, reason="tie_breaker_loss")
+                success = self.db.update_intent_status(
+                    intent_id, STATUS_ABORTED,
+                    expected_status='pending', reason="tie_breaker_loss"
+                )
+                if not success:
+                    self._log(f"Abort lost CAS race for intent {intent_id} (already transitioned)", level="warn")
+                    continue
                 self._log(f"Aborted local intent {intent_id} for {target[:16]}... (lost tie-breaker)")
                 aborted = True
 
@@ -547,10 +550,14 @@ class IntentManager:
         if not self._validate_transition(intent_id, STATUS_COMMITTED):
             return False
 
-        success = self.db.update_intent_status(intent_id, STATUS_COMMITTED)
+        success = self.db.update_intent_status(
+            intent_id, STATUS_COMMITTED, expected_status='pending'
+        )
 
         if success:
             self._log(f"Committed intent {intent_id}")
+        else:
+            self._log(f"Commit lost CAS race for intent {intent_id} (already transitioned)", level="warn")
 
         return success
     
@@ -613,8 +620,11 @@ class IntentManager:
                 if intent_row.get("initiator") == peer_id:
                     intent_id = intent_row.get("id")
                     if intent_id:
-                        self.db.update_intent_status(intent_id, STATUS_ABORTED, reason="peer_banned")
-                        cleared += 1
+                        if self.db.update_intent_status(
+                            intent_id, STATUS_ABORTED,
+                            expected_status='pending', reason="peer_banned"
+                        ):
+                            cleared += 1
         except Exception as e:
             self._log(f"Error clearing DB intents for {peer_id[:16]}...: {e}", level='warn')
 

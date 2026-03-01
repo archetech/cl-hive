@@ -15,7 +15,7 @@ from . import network_metrics
 ACTIVE_MEMBER_WINDOW_SECONDS = 24 * 3600
 BAN_QUORUM_THRESHOLD = 0.51  # 51% quorum for ban proposals
 BAN_COOLDOWN_SECONDS = 7 * 24 * 3600  # 7-day cooldown before re-proposing ban
-CONTRIBUTION_RATIO_NO_DATA = 999999999
+CONTRIBUTION_RATIO_NO_DATA = 10.0
 
 
 class MembershipTier(str, Enum):

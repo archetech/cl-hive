@@ -548,9 +548,10 @@ class SettlementManager:
         total_balance = sum(r.balance for r in results)
         if total_balance != 0:
             self.plugin.log(
-                f"Warning: Settlement balance mismatch of {total_balance} sats",
-                level='warn'
+                f"CRITICAL: Settlement balance mismatch of {total_balance} sats - aborting",
+                level='error'
             )
+            return []  # Abort to prevent incorrect settlements
 
         return results
 
@@ -1271,6 +1272,15 @@ class SettlementManager:
         proposed_hash = proposal.get('data_hash')
         proposed_plan_hash = proposal.get('plan_hash')
 
+        # Check proposal expiry before voting
+        db_proposal = self.db.get_settlement_proposal(proposal_id)
+        if db_proposal and db_proposal.get('expires_at', 0) < int(time.time()):
+            self.plugin.log(
+                f"Proposal {proposal_id[:16]}... has expired, skipping vote",
+                level='info'
+            )
+            return None
+
         # Check if we already voted
         if self.db.has_voted_settlement(proposal_id, our_peer_id):
             self.plugin.log(
@@ -1378,8 +1388,13 @@ class SettlementManager:
         Returns:
             True if quorum reached and status updated
         """
-        vote_count = self.db.count_settlement_ready_votes(proposal_id)
-        quorum_needed = (member_count // 2) + 1
+        # Count only votes from current hive members (not ejected/departed peers)
+        votes = self.db.get_settlement_ready_votes(proposal_id)
+        current_members = {m['peer_id'] for m in self.db.get_all_members()}
+        vote_count = sum(1 for v in votes if v.get('voter_peer_id') in current_members)
+        # Use current member count for quorum (not stale count from proposal creation)
+        active_count = max(len(current_members), 1)
+        quorum_needed = (active_count // 2) + 1
 
         if vote_count >= quorum_needed:
             proposal = self.db.get_settlement_proposal(proposal_id)
@@ -1387,7 +1402,7 @@ class SettlementManager:
                 self.db.update_settlement_proposal_status(proposal_id, 'ready')
                 self.plugin.log(
                     f"Settlement proposal {proposal_id[:16]}... reached quorum "
-                    f"({vote_count}/{member_count})"
+                    f"({vote_count}/{active_count})"
                 )
                 return True
 

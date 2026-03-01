@@ -9,6 +9,7 @@ Author: Lightning Goats Team
 """
 
 import json
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -69,7 +70,8 @@ class TaskManager:
         # Governance engine reference (set by cl-hive.py after init)
         self.decision_engine: Any = None
 
-        # Rate limiting trackers
+        # Rate limiting trackers (guarded by _rate_lock for thread safety)
+        self._rate_lock = threading.Lock()
         self._request_rate: Dict[str, List[int]] = {}
         self._response_rate: Dict[str, List[int]] = {}
 
@@ -102,37 +104,39 @@ class TaskManager:
         limit: tuple
     ) -> bool:
         """Check if sender is within rate limit."""
-        max_count, window_seconds = limit
-        now = int(time.time())
-        cutoff = now - window_seconds
+        with self._rate_lock:
+            max_count, window_seconds = limit
+            now = int(time.time())
+            cutoff = now - window_seconds
 
-        if sender_id not in tracker:
-            tracker[sender_id] = []
+            if sender_id not in tracker:
+                tracker[sender_id] = []
 
-        # Remove old entries
-        tracker[sender_id] = [t for t in tracker[sender_id] if t > cutoff]
+            # Remove old entries
+            tracker[sender_id] = [t for t in tracker[sender_id] if t > cutoff]
 
-        # Evict empty/stale keys to prevent unbounded dict growth
-        if len(tracker) > 200:
-            stale = [k for k, v in tracker.items() if not v]
-            for k in stale:
+            # Evict empty/stale keys to prevent unbounded dict growth
+            if len(tracker) > 200:
+                stale = [k for k, v in tracker.items() if not v]
+                for k in stale:
+                    del tracker[k]
+            # Also evict keys whose most recent timestamp is older than the window
+            stale_window = [
+                k for k, v in tracker.items()
+                if v and max(v) <= cutoff
+            ]
+            for k in stale_window:
                 del tracker[k]
-        # Also evict keys whose most recent timestamp is older than the window
-        stale_window = [
-            k for k, v in tracker.items()
-            if v and max(v) <= cutoff
-        ]
-        for k in stale_window:
-            del tracker[k]
 
-        return len(tracker[sender_id]) < max_count
+            return len(tracker.get(sender_id, [])) < max_count
 
     def _record_message(self, sender_id: str, tracker: Dict[str, List[int]]):
         """Record a message for rate limiting."""
-        now = int(time.time())
-        if sender_id not in tracker:
-            tracker[sender_id] = []
-        tracker[sender_id].append(now)
+        with self._rate_lock:
+            now = int(time.time())
+            if sender_id not in tracker:
+                tracker[sender_id] = []
+            tracker[sender_id].append(now)
 
     # =========================================================================
     # OUTGOING TASK REQUESTS
@@ -377,7 +381,7 @@ class TaskManager:
                 )
                 return {"status": "rejected", "reason": reject_reason}
 
-        # Accept the task
+        # Record the task request
         self.db.create_incoming_task_request(
             request_id=request_id,
             requester_id=requester_id,
@@ -389,19 +393,7 @@ class TaskManager:
             failure_context=json.dumps(payload.get('failure_context')) if payload.get('failure_context') else None
         )
 
-        self.db.update_incoming_task_status(request_id, 'accepted')
-
-        # Send acceptance
-        self._send_task_response(
-            requester_id, request_id, TASK_STATUS_ACCEPTED, rpc
-        )
-
-        self._log(
-            f"Accepted task {request_id} from {requester_id[:16]}... "
-            f"(type={task_type}, target={task_params.get('target', '')[:16]}...)"
-        )
-
-        # Route through governance engine for approval
+        # Route through governance engine BEFORE sending acceptance
         if self.decision_engine:
             try:
                 context = {
@@ -423,11 +415,19 @@ class TaskManager:
                         f"(mode={getattr(decision, 'mode', 'unknown')})"
                     )
                     self.db.update_incoming_task_status(request_id, "pending_approval")
+                    self._send_task_response(
+                        requester_id, request_id, TASK_STATUS_REJECTED,
+                        rpc, reason="pending_governance_approval"
+                    )
                     return {"status": "pending_approval", "request_id": request_id}
             except Exception as e:
                 self._log(f"Governance check failed for task {request_id}: {e}", level='error')
                 # Fail closed: do not execute without governance approval
                 self.db.update_incoming_task_status(request_id, "pending_approval")
+                self._send_task_response(
+                    requester_id, request_id, TASK_STATUS_REJECTED,
+                    rpc, reason="governance_check_failed"
+                )
                 return {"status": "pending_approval", "request_id": request_id}
         else:
             # No decision engine available — fail closed, queue for manual review
@@ -436,9 +436,23 @@ class TaskManager:
                 level='warn'
             )
             self.db.update_incoming_task_status(request_id, "pending_approval")
+            self._send_task_response(
+                requester_id, request_id, TASK_STATUS_REJECTED,
+                rpc, reason="no_governance_engine"
+            )
             return {"status": "pending_approval", "request_id": request_id}
 
-        # Only reaches here if governance explicitly approved (failsafe emergency)
+        # Governance approved — accept and execute
+        self.db.update_incoming_task_status(request_id, 'accepted')
+        self._send_task_response(
+            requester_id, request_id, TASK_STATUS_ACCEPTED, rpc
+        )
+
+        self._log(
+            f"Accepted task {request_id} from {requester_id[:16]}... "
+            f"(type={task_type}, target={task_params.get('target', '')[:16]}...)"
+        )
+
         self._execute_task(request_id, task_type, task_params, requester_id, rpc)
 
         return {"status": "accepted", "request_id": request_id}

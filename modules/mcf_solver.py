@@ -934,9 +934,10 @@ class SSPSolver:
         if sink not in dist:
             return [], 0
 
-        # Update potentials: h[v] += dist_reduced[v]
-        for node_id, d in dist.items():
-            h[node_id] = h.get(node_id, 0) + d
+        # Update potentials only for visited (confirmed shortest-path) nodes
+        for node_id in visited:
+            if node_id in dist:
+                h[node_id] = h.get(node_id, 0) + dist[node_id]
 
         # Reconstruct path and compute original cost
         path: List[int] = []

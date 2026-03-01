@@ -756,15 +756,16 @@ class HiveRoutingMap:
             # Lower fees are better
             fee_score = 1.0 / (1 + route.expected_fee_ppm / 1000)
 
-            # Prefer paths through hive members (0 fee hops)
-            hive_bonus = 0.1 * route.hive_hop_count
+            # Prefer paths through hive members (0 fee hops), capped at 3 hops
+            hive_bonus = min(0.3, 0.1 * route.hive_hop_count)
 
-            # Centrality bonus (Use Case 7)
+            # Centrality bonus (Use Case 7), capped to fill remaining weight
             centrality_bonus = 0.0
             if use_centrality_scoring and route.path_centrality_score > 0:
                 centrality_bonus = route.path_centrality_score * CENTRALITY_WEIGHT_IN_ROUTING
                 if route.is_high_centrality_path:
                     centrality_bonus *= HIGH_CENTRALITY_ROUTING_BONUS
+                centrality_bonus = min(centrality_bonus, 0.15)
 
             # Confidence multiplier
             confidence_mult = 0.5 + (route.confidence * 0.5)

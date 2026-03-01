@@ -1903,7 +1903,54 @@ class HiveDatabase:
         """, (intent_type, target, initiator, now, expires))
 
         return cursor.lastrowid
-    
+
+    def create_intent_if_no_conflict(self, intent_type: str, target: str,
+                                      initiator: str, expires_seconds: int = 300,
+                                      timestamp: Optional[int] = None) -> Optional[int]:
+        """
+        Atomically check for conflicting intents and create a new one.
+
+        Uses BEGIN IMMEDIATE to prevent TOCTOU race between the conflict
+        check and the insert.
+
+        Returns:
+            Intent ID if created, None if a conflicting intent already exists.
+        """
+        conn = self._get_connection()
+        now = timestamp if timestamp is not None else int(time.time())
+        expires = now + expires_seconds
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Check ALL initiators for conflicts (not just self)
+            rows = conn.execute("""
+                SELECT id FROM intent_locks
+                WHERE target = ? AND intent_type = ?
+                  AND status = 'pending' AND expires_at > ?
+            """, (target, intent_type, now)).fetchall()
+            if rows:
+                conn.execute("ROLLBACK")
+                return None
+
+            cursor = conn.execute("""
+                INSERT INTO intent_locks (intent_type, target, initiator, timestamp, expires_at, status)
+                VALUES (?, ?, ?, ?, ?, 'pending')
+            """, (intent_type, target, initiator, now, expires))
+            intent_id = cursor.lastrowid
+            conn.execute("COMMIT")
+            return intent_id
+        except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: create_intent_if_no_conflict error: {e}",
+                    level='error'
+                )
+            return None
+
     def get_conflicting_intents(self, target: str, intent_type: str) -> List[Dict]:
         """Get active intents for the same target."""
         conn = self._get_connection()
@@ -1916,19 +1963,42 @@ class HiveDatabase:
         
         return [dict(row) for row in rows]
     
-    def update_intent_status(self, intent_id: int, status: str, reason: str = None) -> bool:
-        """Update Intent status with optional reason for audit trail."""
+    def update_intent_status(self, intent_id: int, status: str,
+                             expected_status: str = None, reason: str = None) -> bool:
+        """Update Intent status with optional CAS guard and reason for audit trail.
+
+        Args:
+            intent_id: Intent lock ID
+            status: New status to set
+            expected_status: If provided, UPDATE only succeeds if current status matches (CAS guard)
+            reason: Optional reason string for audit trail
+
+        Returns:
+            True if row was updated, False if not found or expected_status mismatch
+        """
         conn = self._get_connection()
-        if reason:
-            result = conn.execute(
-                "UPDATE intent_locks SET status = ?, reason = ? WHERE id = ?",
-                (status, reason, intent_id)
-            )
+        if expected_status:
+            if reason:
+                result = conn.execute(
+                    "UPDATE intent_locks SET status = ?, reason = ? WHERE id = ? AND status = ?",
+                    (status, reason, intent_id, expected_status)
+                )
+            else:
+                result = conn.execute(
+                    "UPDATE intent_locks SET status = ? WHERE id = ? AND status = ?",
+                    (status, intent_id, expected_status)
+                )
         else:
-            result = conn.execute(
-                "UPDATE intent_locks SET status = ? WHERE id = ?",
-                (status, intent_id)
-            )
+            if reason:
+                result = conn.execute(
+                    "UPDATE intent_locks SET status = ?, reason = ? WHERE id = ?",
+                    (status, reason, intent_id)
+                )
+            else:
+                result = conn.execute(
+                    "UPDATE intent_locks SET status = ? WHERE id = ?",
+                    (status, intent_id)
+                )
         return result.rowcount > 0
     
     def cleanup_expired_intents(self) -> int:
@@ -2137,6 +2207,22 @@ class HiveDatabase:
         """Delete a peer's cached Hive state from the database."""
         conn = self._get_connection()
         conn.execute("DELETE FROM hive_state WHERE peer_id = ?", (peer_id,))
+
+    def delete_hive_state_if_stale(self, peer_id: str, cutoff_timestamp: int) -> bool:
+        """Delete a peer's state only if it's still stale (last_gossip < cutoff).
+
+        Prevents race where a fresh gossip re-inserts state between
+        in-memory removal and DB deletion.
+
+        Returns:
+            True if a row was deleted.
+        """
+        conn = self._get_connection()
+        result = conn.execute(
+            "DELETE FROM hive_state WHERE peer_id = ? AND last_gossip < ?",
+            (peer_id, cutoff_timestamp)
+        )
+        return result.rowcount > 0
 
     # =========================================================================
     # CONTRIBUTION TRACKING
@@ -7314,9 +7400,11 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
         try:
-            # Check row cap before inserting
+            # Atomic check-and-insert to prevent TOCTOU race on row cap
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT COUNT(*) AS cnt FROM proto_events").fetchone()
             if row and row['cnt'] >= self.MAX_PROTO_EVENT_ROWS:
+                conn.execute("ROLLBACK")
                 self.plugin.log(
                     f"HiveDatabase: proto_events at cap ({self.MAX_PROTO_EVENT_ROWS}), rejecting insert",
                     level='warn'
@@ -7328,8 +7416,13 @@ class HiveDatabase:
                    VALUES (?, ?, ?, ?, ?)""",
                 (event_id, event_type, actor_id, now, now)
             )
+            conn.execute("COMMIT")
             return result.rowcount > 0
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(f"HiveDatabase: record_proto_event error: {e}", level='warn')
             return False
 
@@ -7386,9 +7479,11 @@ class HiveDatabase:
         conn = self._get_connection()
         now = int(time.time())
         try:
-            # Check row cap before inserting
+            # Atomic check-and-insert to prevent TOCTOU race on row cap
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT COUNT(*) AS cnt FROM proto_outbox").fetchone()
             if row and row['cnt'] >= self.MAX_PROTO_OUTBOX_ROWS:
+                conn.execute("ROLLBACK")
                 self.plugin.log(
                     f"HiveDatabase: proto_outbox at cap ({self.MAX_PROTO_OUTBOX_ROWS}), rejecting enqueue",
                     level='warn'
@@ -7401,8 +7496,13 @@ class HiveDatabase:
                    VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)""",
                 (msg_id, peer_id, msg_type, payload_json, now, now, expires_at)
             )
+            conn.execute("COMMIT")
             return result.rowcount > 0
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(f"enqueue_outbox error: {e}", level='warn')
             return False
 
@@ -7847,8 +7947,11 @@ class HiveDatabase:
         """Store a DID credential. Returns True on success."""
         conn = self._get_connection()
         try:
+            # Atomic check-and-insert to prevent TOCTOU race on row cap
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT COUNT(*) as cnt FROM did_credentials").fetchone()
             if row and row['cnt'] >= self.MAX_DID_CREDENTIAL_ROWS:
+                conn.execute("ROLLBACK")
                 self.plugin.log(
                     f"HiveDatabase: did_credentials at cap ({self.MAX_DID_CREDENTIAL_ROWS}), rejecting",
                     level='warn'
@@ -7865,8 +7968,13 @@ class HiveDatabase:
                   period_start, period_end, metrics_json, outcome,
                   evidence_json, signature, issued_at, expires_at,
                   received_from))
+            conn.execute("COMMIT")
             return True
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(f"HiveDatabase: store_did_credential error: {e}", level='error')
             return False
 
@@ -8013,10 +8121,13 @@ class HiveDatabase:
         """Store a management credential. Returns True on success."""
         conn = self._get_connection()
         try:
+            # Atomic check-and-insert to prevent TOCTOU race on row cap
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT COUNT(*) as cnt FROM management_credentials"
             ).fetchone()
             if row and row['cnt'] >= self.MAX_MANAGEMENT_CREDENTIAL_ROWS:
+                conn.execute("ROLLBACK")
                 self.plugin.log(
                     f"HiveDatabase: management_credentials at cap "
                     f"({self.MAX_MANAGEMENT_CREDENTIAL_ROWS}), rejecting",
@@ -8032,8 +8143,13 @@ class HiveDatabase:
             """, (credential_id, issuer_id, agent_id, node_id, tier,
                   allowed_schemas_json, constraints_json,
                   valid_from, valid_until, signature))
+            conn.execute("COMMIT")
             return True
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(
                 f"HiveDatabase: store_management_credential error: {e}",
                 level='error'
@@ -8108,10 +8224,13 @@ class HiveDatabase:
         """Store a management action receipt. Returns True on success."""
         conn = self._get_connection()
         try:
+            # Atomic check-and-insert to prevent TOCTOU race on row cap
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT COUNT(*) as cnt FROM management_receipts"
             ).fetchone()
             if row and row['cnt'] >= self.MAX_MANAGEMENT_RECEIPT_ROWS:
+                conn.execute("ROLLBACK")
                 self.plugin.log(
                     f"HiveDatabase: management_receipts at cap "
                     f"({self.MAX_MANAGEMENT_RECEIPT_ROWS}), rejecting",
@@ -8129,8 +8248,13 @@ class HiveDatabase:
                   params_json, danger_score, result_json,
                   state_hash_before, state_hash_after,
                   executed_at, executor_signature))
+            conn.execute("COMMIT")
             return True
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(
                 f"HiveDatabase: store_management_receipt error: {e}",
                 level='error'
@@ -8161,6 +8285,8 @@ class HiveDatabase:
 
         conn = self._get_connection()
         try:
+            # Atomic check-and-insert to prevent TOCTOU race on row cap
+            conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT 1 FROM nostr_state WHERE key = ?",
                 (key,)
@@ -8170,6 +8296,7 @@ class HiveDatabase:
                     "SELECT COUNT(*) as cnt FROM nostr_state"
                 ).fetchone()
                 if row and row['cnt'] >= self.MAX_NOSTR_STATE_ROWS:
+                    conn.execute("ROLLBACK")
                     self.plugin.log(
                         f"HiveDatabase: nostr_state at cap ({self.MAX_NOSTR_STATE_ROWS}), rejecting new key",
                         level='warn'
@@ -8180,8 +8307,13 @@ class HiveDatabase:
                 "INSERT OR REPLACE INTO nostr_state (key, value) VALUES (?, ?)",
                 (key, value)
             )
+            conn.execute("COMMIT")
             return True
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(
                 f"HiveDatabase: set_nostr_state error: {e}",
                 level='error'
@@ -8263,10 +8395,13 @@ class HiveDatabase:
         """Store an escrow ticket. Returns True on success."""
         conn = self._get_connection()
         try:
+            # Atomic check-and-insert to prevent TOCTOU race on row cap
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT COUNT(*) as cnt FROM escrow_tickets"
             ).fetchone()
             if row and row['cnt'] >= self.MAX_ESCROW_TICKET_ROWS:
+                conn.execute("ROLLBACK")
                 self.plugin.log(
                     f"HiveDatabase: escrow_tickets at cap ({self.MAX_ESCROW_TICKET_ROWS})",
                     level='warn'
@@ -8283,6 +8418,7 @@ class HiveDatabase:
                   mint_url, amount_sats, token_json, htlc_hash,
                   timelock, danger_score, schema_id, action,
                   status, created_at))
+            conn.execute("COMMIT")
             if cursor.rowcount == 0:
                 self.plugin.log(
                     f"HiveDatabase: store_escrow_ticket ignored duplicate ticket_id={ticket_id[:16]}",
@@ -8291,6 +8427,10 @@ class HiveDatabase:
                 return False
             return True
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(
                 f"HiveDatabase: store_escrow_ticket error: {e}", level='error'
             )
@@ -8372,10 +8512,13 @@ class HiveDatabase:
         """Store an escrow HTLC secret. Returns True on success."""
         conn = self._get_connection()
         try:
+            # Atomic check-and-insert to prevent TOCTOU race on row cap
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT COUNT(*) as cnt FROM escrow_secrets"
             ).fetchone()
             if row and row['cnt'] >= self.MAX_ESCROW_SECRET_ROWS:
+                conn.execute("ROLLBACK")
                 self.plugin.log(
                     f"HiveDatabase: escrow_secrets at cap ({self.MAX_ESCROW_SECRET_ROWS})",
                     level='warn'
@@ -8386,6 +8529,7 @@ class HiveDatabase:
                     task_id, ticket_id, secret_hex, hash_hex
                 ) VALUES (?, ?, ?, ?)
             """, (task_id, ticket_id, secret_hex, hash_hex))
+            conn.execute("COMMIT")
             if cursor.rowcount == 0:
                 self.plugin.log(
                     f"HiveDatabase: store_escrow_secret ignored duplicate task_id={task_id[:16]}",
@@ -8394,6 +8538,10 @@ class HiveDatabase:
                 return False
             return True
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(
                 f"HiveDatabase: store_escrow_secret error: {e}", level='error'
             )
@@ -8464,10 +8612,13 @@ class HiveDatabase:
         """Store an escrow receipt. Returns True on success."""
         conn = self._get_connection()
         try:
+            # Atomic check-and-insert to prevent TOCTOU race on row cap
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT COUNT(*) as cnt FROM escrow_receipts"
             ).fetchone()
             if row and row['cnt'] >= self.MAX_ESCROW_RECEIPT_ROWS:
+                conn.execute("ROLLBACK")
                 self.plugin.log(
                     f"HiveDatabase: escrow_receipts at cap ({self.MAX_ESCROW_RECEIPT_ROWS})",
                     level='warn'
@@ -8484,6 +8635,7 @@ class HiveDatabase:
                   params_json, result_json, success,
                   preimage_revealed, agent_signature,
                   node_signature, created_at))
+            conn.execute("COMMIT")
             if cursor.rowcount == 0:
                 self.plugin.log(
                     f"HiveDatabase: store_escrow_receipt ignored duplicate receipt_id={receipt_id[:16]}",
@@ -8492,6 +8644,10 @@ class HiveDatabase:
                 return False
             return True
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(
                 f"HiveDatabase: store_escrow_receipt error: {e}", level='error'
             )
@@ -8526,10 +8682,13 @@ class HiveDatabase:
         """Store a settlement bond. Returns True on success."""
         conn = self._get_connection()
         try:
+            # Atomic check-and-insert to prevent TOCTOU race on row cap
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT COUNT(*) as cnt FROM settlement_bonds"
             ).fetchone()
             if row and row['cnt'] >= self.MAX_SETTLEMENT_BOND_ROWS:
+                conn.execute("ROLLBACK")
                 self.plugin.log(
                     f"HiveDatabase: settlement_bonds at cap ({self.MAX_SETTLEMENT_BOND_ROWS})",
                     level='warn'
@@ -8542,6 +8701,7 @@ class HiveDatabase:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'active')
             """, (bond_id, peer_id, amount_sats, token_json,
                   posted_at, timelock, tier))
+            conn.execute("COMMIT")
             if cursor.rowcount == 0:
                 self.plugin.log(
                     f"HiveDatabase: store_bond ignored duplicate bond_id={bond_id[:16]}",
@@ -8550,6 +8710,10 @@ class HiveDatabase:
                 return False
             return True
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(
                 f"HiveDatabase: store_bond error: {e}", level='error'
             )
@@ -8632,10 +8796,13 @@ class HiveDatabase:
         """Store a settlement obligation. Returns True on success."""
         conn = self._get_connection()
         try:
+            # Atomic check-and-insert to prevent TOCTOU race on row cap
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT COUNT(*) as cnt FROM settlement_obligations"
             ).fetchone()
             if row and row['cnt'] >= self.MAX_SETTLEMENT_OBLIGATION_ROWS:
+                conn.execute("ROLLBACK")
                 self.plugin.log(
                     f"HiveDatabase: settlement_obligations at cap ({self.MAX_SETTLEMENT_OBLIGATION_ROWS})",
                     level='warn'
@@ -8649,6 +8816,7 @@ class HiveDatabase:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             """, (obligation_id, settlement_type, from_peer, to_peer,
                   amount_sats, window_id, receipt_id, created_at))
+            conn.execute("COMMIT")
             if cursor.rowcount == 0:
                 self.plugin.log(
                     f"HiveDatabase: store_obligation ignored duplicate "
@@ -8658,6 +8826,10 @@ class HiveDatabase:
                 return False
             return True
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(
                 f"HiveDatabase: store_obligation error: {e}", level='error'
             )
@@ -8761,10 +8933,13 @@ class HiveDatabase:
         """Store a settlement dispute. Returns True on success."""
         conn = self._get_connection()
         try:
+            # Atomic check-and-insert to prevent TOCTOU race on row cap
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT COUNT(*) as cnt FROM settlement_disputes"
             ).fetchone()
             if row and row['cnt'] >= self.MAX_SETTLEMENT_DISPUTE_ROWS:
+                conn.execute("ROLLBACK")
                 self.plugin.log(
                     f"HiveDatabase: settlement_disputes at cap ({self.MAX_SETTLEMENT_DISPUTE_ROWS})",
                     level='warn'
@@ -8778,6 +8953,7 @@ class HiveDatabase:
                 ) VALUES (?, ?, ?, ?, ?, ?)
             """, (dispute_id, obligation_id, filing_peer,
                   respondent_peer, evidence_json, filed_at))
+            conn.execute("COMMIT")
             if cursor.rowcount == 0:
                 self.plugin.log(
                     f"HiveDatabase: store_dispute ignored duplicate "
@@ -8787,6 +8963,10 @@ class HiveDatabase:
                 return False
             return True
         except Exception as e:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
             self.plugin.log(
                 f"HiveDatabase: store_dispute error: {e}", level='error'
             )

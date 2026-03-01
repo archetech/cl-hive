@@ -65,7 +65,7 @@ from modules.protocol import (
     # Signed message validation (security hardening)
     validate_gossip, validate_state_hash, validate_full_sync, validate_intent_abort,
     get_gossip_signing_payload, get_state_hash_signing_payload,
-    get_full_sync_signing_payload, get_intent_abort_signing_payload,
+    get_full_sync_signing_payload, get_intent_signing_payload, get_intent_abort_signing_payload,
     get_peer_available_signing_payload, compute_states_hash,
     # Settlement offer broadcast
     create_settlement_offer, get_settlement_offer_signing_payload,
@@ -3175,8 +3175,19 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     else:
         state_hash = "0" * 64
 
-    # Send WELCOME with actual tier
-    welcome_msg = create_welcome(hive_id, initial_tier, len(members), state_hash)
+    # Sign and send WELCOME with actual tier
+    welcome_signing_fields = json.dumps({
+        "hive_id": hive_id,
+        "member_count": len(members),
+        "state_hash": state_hash,
+        "tier": initial_tier,
+    }, sort_keys=True, separators=(',', ':'))
+    welcome_sig = ""
+    try:
+        welcome_sig = plugin.rpc.signmessage(welcome_signing_fields).get("zbase", "")
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign WELCOME: {e}", level='warn')
+    welcome_msg = create_welcome(hive_id, initial_tier, len(members), state_hash, signature=welcome_sig)
 
     try:
         plugin.rpc.call("sendcustommsg", {
@@ -3205,10 +3216,35 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     Handle HIVE_WELCOME message (session established).
 
     We've been accepted into the Hive!
+
+    SECURITY: Requires signature to prevent spoofed WELCOME from non-hive peers.
     """
+    # SECURITY: Verify signature to prevent hive-join spoofing
+    signature = payload.get('signature')
+    if not signature:
+        plugin.log(f"cl-hive: WELCOME rejected (unsigned) from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
     hive_id = payload.get('hive_id')
-    tier = payload.get('tier')
+    state_hash = payload.get('state_hash', '')
     member_count = payload.get('member_count')
+    tier = payload.get('tier')
+
+    # Build canonical signing payload and verify
+    signing_fields = json.dumps({
+        "hive_id": hive_id,
+        "member_count": member_count,
+        "state_hash": state_hash,
+        "tier": tier,
+    }, sort_keys=True, separators=(',', ':'))
+    try:
+        verify_result = plugin.rpc.checkmessage(signing_fields, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != peer_id:
+            plugin.log(f"cl-hive: WELCOME invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: WELCOME signature check failed: {e}", level='warn')
+        return {"result": "continue"}
 
     plugin.log(
         f"cl-hive: WELCOME received! Joined '{hive_id}' as {tier} "
@@ -3584,14 +3620,14 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
             needs_update = False
 
             if existing_tier == "neophyte" and tier == "member":
-                # Promotion detected - update tier
-                try:
-                    database.update_member(member_peer_id, tier="member", promoted_at=int(time.time()))
-                    plugin.log(f"cl-hive: Synced tier upgrade for {member_peer_id[:16]}... (neophyte -> member)")
-                    needs_update = True
-                    updated += 1
-                except Exception as e:
-                    plugin.log(f"cl-hive: Failed to sync tier upgrade: {e}", level='warn')
+                # Tier upgrades via sync are no longer accepted.
+                # Promotions must go through the vouch/quorum protocol
+                # to prevent a single compromised member from unilateral promotion.
+                plugin.log(
+                    f"cl-hive: Ignoring tier upgrade for {member_peer_id[:16]}... from sync "
+                    f"(requires vouch/quorum protocol)",
+                    level='debug'
+                )
 
             # Update addresses if provided and we don't have them
             if addresses:
@@ -4445,6 +4481,21 @@ def handle_intent(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: INTENT from {peer_id[:16]}... initiator mismatch", level='warn')
         return {"result": "continue"}
 
+    # SECURITY: Verify cryptographic signature
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: INTENT from {peer_id[:16]}... missing signature", level='warn')
+        return {"result": "continue"}
+    signing_payload = get_intent_signing_payload(payload)
+    try:
+        result = plugin.rpc.checkmessage(signing_payload, signature)
+        if not result.get("verified") or result.get("pubkey") != peer_id:
+            plugin.log(f"cl-hive: INTENT signature invalid from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: INTENT signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
     # SECURITY: Timestamp freshness check (reject stale replayed intents)
     if not _check_timestamp_freshness(payload, MAX_INTENT_AGE_SECONDS, "INTENT"):
         return {"result": "continue"}
@@ -4715,24 +4766,21 @@ def handle_msg_ack(peer_id: str, payload: Dict, plugin) -> Dict:
         plugin.log(f"cl-hive: MSG_ACK invalid payload from {peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    # SECURITY: Verify signature if present (backward compat: unsigned ACKs still accepted
-    # from peers that haven't upgraded yet, but sender_id must match peer_id)
+    # SECURITY: Always require signature on MSG_ACK to prevent forged delivery confirmations
     sender_id = payload.get("sender_id", "")
     signature = payload.get("signature")
-    if signature and plugin:
-        from modules.protocol import get_msg_ack_signing_payload
-        signing_payload = get_msg_ack_signing_payload(payload)
-        try:
-            verify_result = plugin.rpc.checkmessage(signing_payload, signature)
-            if not verify_result.get("verified") or verify_result.get("pubkey") != sender_id:
-                plugin.log(f"cl-hive: MSG_ACK invalid signature from {peer_id[:16]}...", level='warn')
-                return {"result": "continue"}
-        except Exception as e:
-            plugin.log(f"cl-hive: MSG_ACK signature check failed: {e}", level='debug')
+    if not signature:
+        plugin.log(f"cl-hive: MSG_ACK rejected (unsigned) from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+    from modules.protocol import get_msg_ack_signing_payload
+    signing_payload = get_msg_ack_signing_payload(payload)
+    try:
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != sender_id:
+            plugin.log(f"cl-hive: MSG_ACK invalid signature from {peer_id[:16]}...", level='warn')
             return {"result": "continue"}
-    elif sender_id != peer_id:
-        # Unsigned ACK with mismatched sender_id — reject
-        plugin.log(f"cl-hive: MSG_ACK unsigned with mismatched sender from {peer_id[:16]}...", level='warn')
+    except Exception as e:
+        plugin.log(f"cl-hive: MSG_ACK signature check failed: {e}", level='debug')
         return {"result": "continue"}
 
     ack_msg_id = payload.get("ack_msg_id")
@@ -8033,8 +8081,30 @@ def handle_fee_intelligence_snapshot(peer_id: str, payload: Dict, plugin: Plugin
         plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT from non-member {reporter_id[:16]}...", level='debug')
         return {"result": "continue"}
 
+    # Identity binding: for direct messages, reporter must be the sender
+    if not is_relayed and reporter_id != peer_id:
+        plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT reporter mismatch from {peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
     # SECURITY: Timestamp freshness check
     if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "FEE_INTELLIGENCE_SNAPSHOT"):
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT missing signature from {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_fee_intelligence_snapshot_signing_payload
+    signing_payload = get_fee_intelligence_snapshot_signing_payload(payload)
+    try:
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT invalid signature from {peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # Delegate to fee intelligence manager (validate data BEFORE relaying)
@@ -10243,8 +10313,13 @@ def handle_splice_update(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not sender or database.is_banned(peer_id):
         return {"result": "continue"}
 
-    # SECURITY: Verify signature
+    # SECURITY: Identity binding — splice messages are NOT relayed
     sender_id_field = payload.get("sender_id", peer_id)
+    if sender_id_field != peer_id:
+        plugin.log(f"cl-hive: SPLICE_UPDATE identity mismatch: sender {sender_id_field[:16]}... != peer {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
     signature = payload.get("signature")
     if not signature:
         plugin.log(f"cl-hive: SPLICE_UPDATE missing signature from {peer_id[:16]}...", level='warn')
@@ -10299,8 +10374,13 @@ def handle_splice_signed(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not sender or database.is_banned(peer_id):
         return {"result": "continue"}
 
-    # SECURITY: Verify signature
+    # SECURITY: Identity binding — splice messages are NOT relayed
     sender_id_field = payload.get("sender_id", peer_id)
+    if sender_id_field != peer_id:
+        plugin.log(f"cl-hive: SPLICE_SIGNED identity mismatch: sender {sender_id_field[:16]}... != peer {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
     signature = payload.get("signature")
     if not signature:
         plugin.log(f"cl-hive: SPLICE_SIGNED missing signature from {peer_id[:16]}...", level='warn')
@@ -10360,8 +10440,13 @@ def handle_splice_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not sender or database.is_banned(peer_id):
         return {"result": "continue"}
 
-    # SECURITY: Verify signature
+    # SECURITY: Identity binding — splice messages are NOT relayed
     sender_id_field = payload.get("sender_id", peer_id)
+    if sender_id_field != peer_id:
+        plugin.log(f"cl-hive: SPLICE_ABORT identity mismatch: sender {sender_id_field[:16]}... != peer {peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Verify signature
     signature = payload.get("signature")
     if not signature:
         plugin.log(f"cl-hive: SPLICE_ABORT missing signature from {peer_id[:16]}...", level='warn')
@@ -13770,12 +13855,25 @@ def hive_close_channel(plugin: Plugin, peer_id: str = None, channel_id: str = No
 
 @plugin.method("hive-setchannel")
 def hive_setchannel(plugin: Plugin, id: str = None, feebase: int = None, feeppm: int = None):
-    """Proxy to CLN setchannel via plugin (native RPC)."""
+    """Proxy to CLN setchannel with fleet fee bound enforcement."""
     rpc, err = _require_rpc(plugin)
     if err:
         return err
     if not id:
         return {"error": "id is required"}
+
+    # Enforce fleet fee bounds on feeppm
+    from modules.fee_coordination import FLEET_FEE_FLOOR_PPM, FLEET_FEE_CEILING_PPM
+    if feeppm is not None:
+        if not isinstance(feeppm, int) or feeppm < 0:
+            return {"error": f"feeppm must be a non-negative integer, got {feeppm}"}
+        # Allow zero-fee for hive member channels, but clamp positive fees
+        if feeppm > 0:
+            feeppm = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, feeppm))
+    if feebase is not None:
+        if not isinstance(feebase, int) or feebase < 0:
+            return {"error": f"feebase must be a non-negative integer, got {feebase}"}
+
     params = {"id": id}
     if feebase is not None:
         params["feebase"] = feebase

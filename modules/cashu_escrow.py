@@ -692,9 +692,10 @@ class CashuEscrowManager:
             if preimage_hash != ticket['htlc_hash']:
                 return {"error": "preimage does not match HTLC hash"}
 
-            # Update status under lock
+            # Update status under lock (CAS guard prevents race with expire/refund)
             now = int(time.time())
-            self.db.update_escrow_ticket_status(ticket_id, 'redeemed', now)
+            if not self.db.update_escrow_ticket_status(ticket_id, 'redeemed', now, expected_status='active'):
+                return {"error": "ticket status transition failed (race condition)"}
 
             # Re-read to confirm the transition took effect
             updated = self.db.get_escrow_ticket(ticket_id)
@@ -816,6 +817,7 @@ class CashuEscrowManager:
                 node_signature = sig_result.get("zbase", "") if isinstance(sig_result, dict) else ""
             except Exception as e:
                 self._log(f"receipt signing failed: {e}", level='warn')
+                return None  # Don't store unsigned receipts
 
         # Check if preimage was revealed for this ticket
         ticket = self.db.get_escrow_ticket(ticket_id)

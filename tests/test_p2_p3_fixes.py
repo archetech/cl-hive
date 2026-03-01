@@ -263,12 +263,12 @@ class TestMembershipJSONSafety:
     def test_no_data_sentinel_is_json_safe(self):
         """CONTRIBUTION_RATIO_NO_DATA should be JSON-serializable."""
         result = json.dumps({"ratio": CONTRIBUTION_RATIO_NO_DATA})
-        assert "999999999" in result
+        assert "10.0" in result
 
     def test_sentinel_is_not_inf(self):
         """Sentinel should not be float('inf')."""
         assert CONTRIBUTION_RATIO_NO_DATA != float('inf')
-        assert isinstance(CONTRIBUTION_RATIO_NO_DATA, int)
+        assert isinstance(CONTRIBUTION_RATIO_NO_DATA, (int, float))
 
 
 # =============================================================================

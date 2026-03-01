@@ -810,7 +810,7 @@ class CooperativeExpansionManager:
             available_liquidity_sats=max(0, min(100_000_000_000, payload.get("available_liquidity_sats", 0))),  # Cap at 1000 BTC
             quality_score=max(0.0, min(1.0, payload.get("quality_score", 0.5))),  # Clamp 0-1
             has_existing_channel=payload.get("has_existing_channel", False),
-            channel_count=payload.get("channel_count", 0),
+            channel_count=max(0, min(1000, payload.get("channel_count", 0))),
             reason=payload.get("reason", "")
         )
 

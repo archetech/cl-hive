@@ -80,6 +80,9 @@ class MockDatabase:
     def get_member_distribution_history(self, member_id, limit=10):
         return [d for d in self.pool_distributions if d.get("member_id") == member_id][:limit]
 
+    def get_pool_distributions(self, period):
+        return [d for d in self.pool_distributions if d.get("period") == period]
+
     def record_pool_distribution(self, **kwargs):
         self.pool_distributions.append(kwargs)
         return True
@@ -123,7 +126,8 @@ class TestRevenueRecording:
         result = pool.record_revenue(
             member_id="02" + "a" * 64,
             amount_sats=1000,
-            channel_id="123x1x0"
+            channel_id="123x1x0",
+            payment_hash="ab" * 32
         )
 
         assert result is True
@@ -165,9 +169,9 @@ class TestRevenueRecording:
         plugin = MockPlugin()
         pool = RoutingPool(database=db, plugin=plugin)
 
-        pool.record_revenue("02" + "a" * 64, 1000)
-        pool.record_revenue("02" + "b" * 64, 2000)
-        pool.record_revenue("02" + "a" * 64, 500)
+        pool.record_revenue("02" + "a" * 64, 1000, payment_hash="aa" * 32)
+        pool.record_revenue("02" + "b" * 64, 2000, payment_hash="bb" * 32)
+        pool.record_revenue("02" + "a" * 64, 500, payment_hash="cc" * 32)
 
         assert len(db.pool_revenue) == 3
         revenue = db.get_pool_revenue()
@@ -249,8 +253,8 @@ class TestDistributionCalculation:
         }
 
         # Add revenue
-        pool.record_revenue("02" + "a" * 64, 5000)
-        pool.record_revenue("02" + "b" * 64, 5000)
+        pool.record_revenue("02" + "a" * 64, 5000, payment_hash="d1" * 32)
+        pool.record_revenue("02" + "b" * 64, 5000, payment_hash="d2" * 32)
 
         # Add contributions manually
         db.pool_contributions = [
@@ -271,7 +275,7 @@ class TestDistributionCalculation:
         pool = RoutingPool(database=db, plugin=plugin)
 
         # Add revenue
-        pool.record_revenue("02" + "a" * 64, 10000)
+        pool.record_revenue("02" + "a" * 64, 10000, payment_hash="e1" * 32)
 
         # Add contributions with unequal shares
         db.pool_contributions = [
@@ -292,7 +296,7 @@ class TestDistributionCalculation:
         pool = RoutingPool(database=db, plugin=plugin)
 
         # Add revenue
-        pool.record_revenue("02" + "a" * 64, 10000)
+        pool.record_revenue("02" + "a" * 64, 10000, payment_hash="f1" * 32)
 
         # Add contributions with one tiny share
         db.pool_contributions = [
@@ -342,7 +346,7 @@ class TestPoolStatus:
         state_mgr.set_peer_state("02" + "a" * 64, capacity=10_000_000)
 
         # Add revenue
-        pool.record_revenue("02" + "a" * 64, 1000)
+        pool.record_revenue("02" + "a" * 64, 1000, payment_hash="g1" * 32)
 
         status = pool.get_pool_status()
 
@@ -428,7 +432,7 @@ class TestSettlement:
         pool = RoutingPool(database=db, plugin=plugin)
 
         # Add revenue
-        pool.record_revenue("02" + "a" * 64, 10000)
+        pool.record_revenue("02" + "a" * 64, 10000, payment_hash="h1" * 32)
 
         # Add contributions
         db.pool_contributions = [
@@ -466,9 +470,9 @@ class TestIntegration:
         state_mgr.set_peer_state(member_b, capacity=10_000_000, topology=["p3"])
 
         # Record revenue over time
-        pool.record_revenue(member_a, 5000)
-        pool.record_revenue(member_b, 3000)
-        pool.record_revenue(member_a, 2000)
+        pool.record_revenue(member_a, 5000, payment_hash="i1" * 32)
+        pool.record_revenue(member_b, 3000, payment_hash="i2" * 32)
+        pool.record_revenue(member_a, 2000, payment_hash="i3" * 32)
 
         # Snapshot contributions
         period = pool._current_period()

@@ -1929,7 +1929,7 @@ class AnticipatoryLiquidityManager:
         for report in valid_reports:
             # Weight by inverse variance (1/sigma^2): lower uncertainty = much higher weight
             # Modulated by confidence and exponential recency decay
-            variance = max(1e-6, report.uncertainty ** 2)
+            variance = max(0.001, report.uncertainty ** 2)  # Floor ~3.2% to prevent single-report dominance
             age_hours = (now - report.timestamp) / 3600
             recency_weight = math.exp(-age_hours / 6)  # Decay over 6 hours
 

@@ -9,6 +9,7 @@ Implements cooperative fee coordination through:
 Author: Lightning Goats Team
 """
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -127,6 +128,7 @@ class FeeIntelligenceManager:
         self.our_pubkey = our_pubkey
 
         # Rate limiting: {sender_id: [timestamp, ...]}
+        self._rate_lock = threading.Lock()
         self._fee_intel_snapshot_rate: Dict[str, List[int]] = {}
         self._health_report_rate: Dict[str, List[int]] = {}
 
@@ -160,21 +162,22 @@ class FeeIntelligenceManager:
         now = int(time.time())
         cutoff = now - period
 
-        # Get sender's history, filter old entries
-        history = rate_dict.get(sender_id, [])
-        history = [t for t in history if t > cutoff]
-        rate_dict[sender_id] = history
+        with self._rate_lock:
+            # Get sender's history, filter old entries
+            history = rate_dict.get(sender_id, [])
+            history = [t for t in history if t > cutoff]
+            rate_dict[sender_id] = history
 
-        # Evict stale keys to prevent unbounded dict growth
-        if len(rate_dict) > 200:
-            stale = [k for k, v in rate_dict.items() if not v]
-            for k in stale:
-                del rate_dict[k]
+            # Evict stale keys to prevent unbounded dict growth
+            if len(rate_dict) > 200:
+                stale = [k for k, v in rate_dict.items() if not v]
+                for k in stale:
+                    del rate_dict[k]
 
-        if len(history) >= max_count:
-            return False
+            if len(history) >= max_count:
+                return False
 
-        return True
+            return True
 
     def _record_message(
         self,
@@ -183,9 +186,10 @@ class FeeIntelligenceManager:
     ) -> None:
         """Record a message for rate limiting."""
         now = int(time.time())
-        if sender_id not in rate_dict:
-            rate_dict[sender_id] = []
-        rate_dict[sender_id].append(now)
+        with self._rate_lock:
+            if sender_id not in rate_dict:
+                rate_dict[sender_id] = []
+            rate_dict[sender_id].append(now)
 
     # =========================================================================
     # FEE INTELLIGENCE CREATION
@@ -473,6 +477,8 @@ class FeeIntelligenceManager:
                 fee_pct_change = fee_change / report.get("our_fee_ppm", 1)
                 if fee_pct_change != 0:
                     elasticity_point = -volume_delta / fee_pct_change
+                    # Bound per-point to prevent single manipulated observation skew
+                    elasticity_point = max(-5.0, min(5.0, elasticity_point))
                     deltas.append(elasticity_point)
 
         if not deltas:
@@ -628,7 +634,7 @@ class FeeIntelligenceManager:
             health_reason = "lowered for NNLB (struggling node)"
         elif our_health > HEALTH_THRIVING:
             # Thriving: can yield to others
-            health_mult = 1.0 + ((our_health - 75) / 100 * 0.15)  # 1.0x (health=75) to 1.0375x (health=100)
+            health_mult = 1.0 + ((our_health - HEALTH_THRIVING) / 100 * 0.15)  # 1.0x at threshold to ~1.05x at 100
             health_reason = "slightly raised (thriving, yielding to others)"
         else:
             health_mult = 1.0
