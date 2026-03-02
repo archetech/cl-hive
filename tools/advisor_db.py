@@ -460,6 +460,13 @@ class AdvisorDB:
         # Initialize schema
         self._init_schema()
 
+    def get_conn(self):
+        """Get a fresh database connection per operation (async-safe).
+
+        Public API for callers needing raw SQL access (e.g. learning_engine).
+        """
+        return self._get_conn()
+
     @contextmanager
     def _get_conn(self):
         """Get a fresh database connection per operation (async-safe)."""
@@ -554,7 +561,8 @@ class AdvisorDB:
             conn.commit()
             return cursor.lastrowid
 
-    def record_channel_states(self, report: Dict[str, Any]) -> int:
+    def record_channel_states(self, report: Dict[str, Any],
+                              max_channels_per_snapshot: int = 1000) -> int:
         """Record channel states from all nodes in a report."""
         timestamp = int(datetime.now().timestamp())
         count = 0
@@ -564,7 +572,8 @@ class AdvisorDB:
                 if not node_data.get("healthy"):
                     continue
 
-                for ch in node_data.get("channels_detail", []):
+                channels = node_data.get("channels_detail", [])[:max_channels_per_snapshot]
+                for ch in channels:
                     conn.execute("""
                         INSERT INTO channel_history (
                             timestamp, node_name, channel_id, peer_id,
@@ -977,6 +986,7 @@ class AdvisorDB:
                     LIMIT ?
                 )
             """, (excess,))
+            return cursor.rowcount
 
     def get_decisions_for_channel(
         self,
@@ -1108,7 +1118,7 @@ class AdvisorDB:
                          channel_id: str = None) -> str:
         """Create unique hash for alert deduplication."""
         key = f"{alert_type}:{node_name}:{channel_id or 'none'}"
-        return hashlib.md5(key.encode()).hexdigest()[:16]
+        return hashlib.sha256(key.encode()).hexdigest()[:16]
 
     def check_alert(self, alert_type: str, node_name: str,
                     channel_id: str = None) -> AlertStatus:

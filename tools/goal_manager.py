@@ -14,10 +14,16 @@ Usage:
 """
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+
+
+def _unique_suffix() -> str:
+    """Short random hex suffix for ID uniqueness."""
+    return os.urandom(4).hex()
 
 
 # =============================================================================
@@ -202,7 +208,7 @@ class GoalManager:
             # Double ROC or reach 0.5%, whichever is less aggressive
             target = min(0.5, current_roc * 2) if current_roc > 0.1 else 0.3
             goal = Goal(
-                goal_id=f"roc_{now}",
+                goal_id=f"roc_{now}_{_unique_suffix()}",
                 goal_type="profitability",
                 target_metric="roc_pct",
                 current_value=current_roc,
@@ -221,7 +227,7 @@ class GoalManager:
             # Reduce by 15% or to 20%, whichever is higher
             target = max(20, underwater_pct - 15)
             goal = Goal(
-                goal_id=f"underwater_{now}",
+                goal_id=f"underwater_{now}_{_unique_suffix()}",
                 goal_type="channel_health",
                 target_metric="underwater_pct",
                 current_value=underwater_pct,
@@ -240,7 +246,7 @@ class GoalManager:
             # Target: reduce to 3 or by half
             target = max(3, bleeder_count // 2)
             goal = Goal(
-                goal_id=f"bleeders_{now}",
+                goal_id=f"bleeders_{now}_{_unique_suffix()}",
                 goal_type="channel_health",
                 target_metric="bleeder_count",
                 current_value=bleeder_count,
@@ -258,7 +264,7 @@ class GoalManager:
         if abs(avg_balance - 0.5) > 0.15:
             # Target is always 0.5 (perfectly balanced)
             goal = Goal(
-                goal_id=f"balance_{now}",
+                goal_id=f"balance_{now}_{_unique_suffix()}",
                 goal_type="channel_health",
                 target_metric="avg_balance_ratio",
                 current_value=avg_balance,
@@ -277,7 +283,7 @@ class GoalManager:
             # Target: increase to 60% or by 20 percentage points
             target = min(60, profitable_pct + 20)
             goal = Goal(
-                goal_id=f"profitable_{now}",
+                goal_id=f"profitable_{now}_{_unique_suffix()}",
                 goal_type="profitability",
                 target_metric="profitable_pct",
                 current_value=profitable_pct,
@@ -334,15 +340,15 @@ class GoalManager:
         velocity_needed = (goal.target_value - current_value) / max(1, days_remaining) if days_remaining > 0 else 0
 
         # Determine recommendation and emoji
+        new_status = None
         if progress_pct >= 100:
             recommendation = "Goal achieved! Consider setting a new target."
             status_emoji = "\u2705"  # checkmark
-            # Update goal status
-            goal.status = "achieved"
+            new_status = "achieved"
         elif days_remaining <= 0:
             recommendation = "Deadline passed - goal not achieved. Analyze what went wrong."
             status_emoji = "\u274c"  # X
-            goal.status = "failed"
+            new_status = "failed"
         elif on_track:
             recommendation = "On track. Continue current strategy."
             status_emoji = "\U0001f7e2"  # green circle
@@ -352,6 +358,11 @@ class GoalManager:
         else:
             recommendation = "Slightly behind - consider strategy adjustment."
             status_emoji = "\U0001f7e1"  # yellow circle
+
+        # Update goal status atomically - set and persist together
+        if new_status:
+            goal.status = new_status
+            self.update_goal_status(goal.goal_id, new_status)
 
         return GoalProgress(
             goal_id=goal.goal_id,
@@ -423,7 +434,7 @@ class GoalManager:
         """
         now = int(time.time())
         goal = Goal(
-            goal_id=f"{target_metric}_{now}",
+            goal_id=f"{target_metric}_{now}_{_unique_suffix()}",
             goal_type=goal_type,
             target_metric=target_metric,
             current_value=current_value,

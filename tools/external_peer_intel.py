@@ -219,6 +219,7 @@ class ExternalPeerIntelligence:
     # Cache TTL in seconds
     GRAPH_CACHE_TTL = 300  # 5 minutes
     EXTERNAL_CACHE_TTL = 3600  # 1 hour
+    MAX_CACHE_SIZE = 500  # Max entries per cache
 
     def __init__(self, rpc, enable_external_apis: bool = False):
         """
@@ -344,7 +345,10 @@ class ExternalPeerIntelligence:
 
                 data.is_well_connected = data.channel_count >= self.MIN_CHANNELS_WELL_CONNECTED
 
-            # Cache result
+            # Cache result (evict oldest if at capacity)
+            if len(self._graph_cache) >= self.MAX_CACHE_SIZE:
+                oldest_key = min(self._graph_cache, key=lambda k: self._graph_cache[k][1])
+                del self._graph_cache[oldest_key]
             self._graph_cache[pubkey] = (data, now)
 
             return data
@@ -369,6 +373,9 @@ class ExternalPeerIntelligence:
         try:
             data = self._fetch_1ml_data(pubkey)
             if data.source == "1ml":
+                if len(self._external_cache) >= self.MAX_CACHE_SIZE:
+                    oldest_key = min(self._external_cache, key=lambda k: self._external_cache[k][1])
+                    del self._external_cache[oldest_key]
                 self._external_cache[pubkey] = (data, now)
                 return data
         except Exception as e:
@@ -382,6 +389,9 @@ class ExternalPeerIntelligence:
 
         data.source = "none"
         data.fetch_error = "No external data available"
+        if len(self._external_cache) >= self.MAX_CACHE_SIZE:
+            oldest_key = min(self._external_cache, key=lambda k: self._external_cache[k][1])
+            del self._external_cache[oldest_key]
         self._external_cache[pubkey] = (data, now)
 
         return data

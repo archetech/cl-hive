@@ -6,10 +6,29 @@ set -euo pipefail
 
 NODES_CONFIG="${HIVE_NODES_CONFIG:-/home/sat/bin/cl-hive/production/nodes.production.json}"
 LOG_FILE="/tmp/hive-watchdog.log"
+MAX_LOG_SIZE=$((1024 * 1024))  # 1MB
 TIMEOUT=10
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+# Rotate log if it exceeds max size
+if [[ -f "$LOG_FILE" ]] && [[ $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) -gt $MAX_LOG_SIZE ]]; then
+    mv "$LOG_FILE" "${LOG_FILE}.1"
+fi
+
+_curl_with_rune() {
+    # Pass rune via curl config file to avoid exposing it in /proc/cmdline
+    local rune="$1"; shift
+    local config_file
+    config_file=$(mktemp)
+    chmod 600 "$config_file"
+    printf 'header = "Rune: %s"\n' "$rune" > "$config_file"
+    curl -sK "$config_file" "$@"
+    local rc=$?
+    rm -f "$config_file"
+    return $rc
 }
 
 check_and_restart_plugin() {
@@ -17,33 +36,33 @@ check_and_restart_plugin() {
     local rest_url="$2"
     local rune="$3"
     local plugin_path="$4"
-    
+
     # Test hive-status with timeout
-    response=$(timeout "$TIMEOUT" curl -sk -X POST \
-        -H "Rune: $rune" \
+    response=$(timeout "$TIMEOUT" _curl_with_rune "$rune" \
+        -k -X POST \
         -H "Content-Type: application/json" \
         -d '{}' \
         "${rest_url}/v1/hive-status" 2>&1) || response="TIMEOUT"
-    
+
     if [[ "$response" == "TIMEOUT" ]] || [[ "$response" == *"error"* && "$response" != *"governance_mode"* ]]; then
         log "WARNING: $node_name hive-status failed, restarting plugin..."
-        
+
         # Stop plugin
-        timeout 15 curl -sk -X POST \
-            -H "Rune: $rune" \
+        timeout 15 _curl_with_rune "$rune" \
+            -k -X POST \
             -H "Content-Type: application/json" \
             -d "{\"subcommand\": \"stop\", \"plugin\": \"$plugin_path\"}" \
             "${rest_url}/v1/plugin" 2>/dev/null || true
-        
+
         sleep 2
-        
+
         # Start plugin
-        restart_result=$(timeout 15 curl -sk -X POST \
-            -H "Rune: $rune" \
+        restart_result=$(timeout 15 _curl_with_rune "$rune" \
+            -k -X POST \
             -H "Content-Type: application/json" \
             -d "{\"subcommand\": \"start\", \"plugin\": \"$plugin_path\"}" \
             "${rest_url}/v1/plugin" 2>&1) || restart_result="FAILED"
-        
+
         if [[ "$restart_result" == *"active\":true"* ]]; then
             log "OK: $node_name plugin restarted successfully"
         else
@@ -71,7 +90,7 @@ jq -r '.nodes[] | "\(.name)|\(.rest_url)|\(.rune)"' "$NODES_CONFIG" | while IFS=
     else
         plugin_path="/opt/cl-hive/cl-hive.py"
     fi
-    
+
     check_and_restart_plugin "$name" "$url" "$rune" "$plugin_path"
 done
 

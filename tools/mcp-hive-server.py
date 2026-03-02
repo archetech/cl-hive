@@ -56,7 +56,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -6484,7 +6484,7 @@ async def handle_hive_did_revoke(args: Dict) -> Dict:
         return {"error": f"Unknown node: {args.get('node')}"}
     return await node.call("hive-did-revoke", {
         "credential_id": args["credential_id"],
-        "reason": args["reason"],
+        "reason": args.get("reason", ""),
     })
 
 
@@ -6595,16 +6595,9 @@ async def handle_hive_poll_status(args: Dict) -> Dict:
 
 async def handle_hive_poll_vote(args: Dict) -> Dict:
     """Vote in an Archon poll."""
-    node = fleet.get_node(args.get("node", ""))
-    if not node:
-        return {"error": f"Unknown node: {args.get('node')}"}
-    params = {
-        "poll_id": args["poll_id"],
-        "choice": args["choice"],
-    }
-    if args.get("reason"):
-        params["reason"] = args["reason"]
-    return await node.call("hive-vote", params)
+    # Note: hive-poll-vote RPC is not yet implemented in the plugin.
+    # hive-vote-promotion and hive-vote-ban exist but serve different purposes.
+    return {"error": "Poll voting RPC (hive-poll-vote) is not yet implemented in the plugin"}
 
 
 async def handle_hive_my_votes(args: Dict) -> Dict:
@@ -7257,9 +7250,6 @@ async def _node_fleet_snapshot(node: NodeConnection) -> Dict[str, Any]:
     if isinstance(profitability, Exception):
         profitability = None
 
-    forward_count = 0
-    total_volume_msat = 0
-    total_revenue_msat = 0
     stats_24h = _forward_stats(forwards.get("forwards", []), since_24h, now)
     forward_count = stats_24h["forward_count"]
     total_volume_msat = stats_24h["total_volume_msat"]
@@ -7396,17 +7386,16 @@ async def handle_fleet_snapshot(args: Dict) -> Dict:
             return {"error": f"Unknown node: {node_name}"}
         return await _node_fleet_snapshot(node)
 
-    tasks = []
-    for node in fleet.nodes.values():
-        tasks.append(_node_fleet_snapshot(node))
+    node_list = list(fleet.nodes.values())
+    tasks = [_node_fleet_snapshot(n) for n in node_list]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     snapshots = {}
     for idx, result in enumerate(results):
-        node = list(fleet.nodes.values())[idx]
+        n = node_list[idx]
         if isinstance(result, Exception):
-            snapshots[node.name] = {"error": str(result)}
+            snapshots[n.name] = {"error": str(result)}
         else:
-            snapshots[node.name] = result
+            snapshots[n.name] = result
     return snapshots
 
 
@@ -8654,11 +8643,11 @@ async def handle_node_info(args: Dict) -> Dict:
     return {
         "info": info,
         "funds_summary": {
-            "onchain_sats": sum(o.get("amount_msat", 0) // 1000
+            "onchain_sats": sum(_extract_msat(o.get("amount_msat", 0)) // 1000
                                for o in funds.get("outputs", [])
                                if o.get("status") == "confirmed"),
             "channel_count": len(funds.get("channels", [])),
-            "total_channel_sats": sum(c.get("amount_msat", 0) // 1000
+            "total_channel_sats": sum(_extract_msat(c.get("amount_msat", 0)) // 1000
                                       for c in funds.get("channels", []))
         }
     }
@@ -8768,7 +8757,7 @@ async def handle_set_fees(args: Dict) -> Dict:
         return {"error": f"base_fee_msat must be an integer (got {base_fee_msat!r})"}
 
     # Guard: check if the target channel peer is a hive member (zero-fee policy)
-    if fee_ppm > 0 and not force:
+    if (fee_ppm > 0 or base_fee_msat > 0) and not force:
         try:
             # Gather both checks in parallel (was 2 sequential RPCs)
             members_result, channels = await asyncio.gather(
@@ -9145,6 +9134,10 @@ async def handle_splice(args: Dict) -> Dict:
         )
     elif result.get("error"):
         result["ai_note"] = f"Splice failed: {result.get('message', result.get('error'))}"
+        if budget_gate:
+            await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
+    else:
+        # Ambiguous response (neither success nor error): release reservation to avoid permanent budget hold
         if budget_gate:
             await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
 
@@ -10517,7 +10510,7 @@ async def _verify_rebalance_outcome(
       - no_route / failed (confirmed no execution)
       - in_progress / accepted (command accepted but no confirmed movement yet)
     """
-    deadline = time.time() + max(0.0, timeout_sec)
+    deadline = time.monotonic() + max(0.0, timeout_sec)
     attempt = 0
     last_after: Optional[Dict[str, Any]] = None
     last_sling_parsed: Optional[Dict[str, Any]] = None
@@ -10606,7 +10599,7 @@ async def _verify_rebalance_outcome(
                 "sling_status": last_sling_parsed,
             }
 
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             break
 
     final_status = "in_progress" if seen_in_progress else "accepted"
@@ -10702,7 +10695,7 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
     def _update_rebalance_decision_status(status: str, execution_result: Dict[str, Any]) -> None:
         if decision_id is None:
             return
-        with db._get_conn() as conn:
+        with db.get_conn() as conn:
             conn.execute(
                 "UPDATE ai_decisions SET status=?, executed_at=?, execution_result=? WHERE id=?",
                 (status, int(datetime.now().timestamp()), json.dumps(execution_result), decision_id),
@@ -10711,7 +10704,7 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
     def _insert_rebalance_outcome(success: int) -> None:
         if decision_id is None:
             return
-        with db._get_conn() as conn:
+        with db.get_conn() as conn:
             conn.execute(
                 """
                 INSERT INTO action_outcomes (
@@ -10800,7 +10793,7 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
         lower = err.lower()
         if "already a job" in lower and "scid" in lower:
             failure_type = "job_locked"
-        elif "no route" in lower or "route" in lower and "fail" in lower:
+        elif "no route" in lower or ("route" in lower and "fail" in lower):
             failure_type = "no_route"
         elif "budget" in lower:
             failure_type = "budget"
@@ -10823,13 +10816,13 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
 
         if decision_id is not None:
             try:
-                with db._get_conn() as conn:
+                with db.get_conn() as conn:
                     conn.execute(
                         "UPDATE ai_decisions SET status='failed', executed_at=?, execution_result=? WHERE id=?",
                         (int(datetime.now().timestamp()), json.dumps({"status": "error", "failure_type": failure_type, "error": err}), decision_id),
                     )
                 # Record outcome failure immediately
-                with db._get_conn() as conn:
+                with db.get_conn() as conn:
                     conn.execute(
                         """
                         INSERT INTO action_outcomes (
@@ -10855,7 +10848,12 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
             except Exception as ee:
                 logger.warning(f"Failed to mark rebalance decision failed in advisor_db: {ee}")
 
-        raise
+        return {
+            "error": err,
+            "failure_type": failure_type,
+            "decision_id": decision_id,
+            "retried": retry_result is not None,
+        }
 
 
 async def handle_revenue_boltz_quote(args: Dict) -> Dict:
@@ -11691,11 +11689,25 @@ async def handle_config_measure_outcomes(args: Dict) -> Dict:
                 context_metrics = json.loads(adj["context_metrics"])
             except (json.JSONDecodeError, TypeError):
                 pass
-        
+
         # Determine success based on improvement
         success = False
         notes = []
-        
+
+        if not context_metrics:
+            notes.append("No baseline metrics available - cannot determine outcome")
+            outcome = {
+                "adjustment_id": adj["id"],
+                "config_key": config_key,
+                "old_value": adj.get("old_value"),
+                "new_value": adj.get("new_value"),
+                "success": None,
+                "notes": notes,
+                "days_since_change": (int(datetime.now(timezone.utc).timestamp()) - adj.get("timestamp", 0)) / 86400
+            }
+            results.append(outcome)
+            continue
+
         if config_key in ["min_fee_ppm", "max_fee_ppm"]:
             # Success if revenue or volume improved
             old_rev = context_metrics.get("revenue_sats", 0)
@@ -12215,8 +12227,8 @@ async def handle_revenue_ops_health(args: Dict) -> Dict:
     elif "error" in dashboard:
         checks["dashboard"] = {"status": "error", "detail": dashboard["error"]}
     else:
-        has_revenue = dashboard.get("total_revenue_sats", 0) is not None
-        has_channels = dashboard.get("active_channels", 0) is not None
+        has_revenue = dashboard.get("total_revenue_sats") is not None
+        has_channels = dashboard.get("active_channels") is not None
         if has_revenue and has_channels:
             checks["dashboard"] = {"status": "pass", "active_channels": dashboard.get("active_channels"), "total_revenue_sats": dashboard.get("total_revenue_sats")}
         else:
@@ -12292,7 +12304,7 @@ async def handle_advisor_validate_data(args: Dict) -> Dict:
     channel_records = []
     try:
         db = ensure_advisor_db()
-        with db._get_conn() as conn:
+        with db.get_conn() as conn:
             rows = conn.execute("""
                 SELECT channel_id, peer_id, capacity_sats, local_sats, remote_sats, balance_ratio
                 FROM channel_history
@@ -12869,12 +12881,12 @@ async def handle_advisor_record_decision(args: Dict) -> Dict:
 
 async def handle_advisor_get_recent_decisions(args: Dict) -> Dict:
     """Get recent AI decisions from the audit trail."""
-    limit = args.get("limit", 20)
+    limit = min(args.get("limit", 20), 1000)
 
     db = ensure_advisor_db()
 
     # Get recent decisions
-    with db._get_conn() as conn:
+    with db.get_conn() as conn:
         rows = conn.execute("""
             SELECT id, timestamp, decision_type, node_name, channel_id, peer_id,
                    recommendation, reasoning, confidence, status,
@@ -13275,7 +13287,7 @@ def _get_proactive_advisor():
                         # Fallback: try explicit mapping for non-standard names
                         handler_name = self.TOOL_TO_HANDLER.get(tool_name)
                         if handler_name:
-                            handler = globals().get(handler_name)
+                            handler = TOOL_HANDLERS.get(handler_name)
                     if handler:
                         return await handler(params)
                     return {"error": f"Unknown tool: {tool_name}"}
@@ -13502,13 +13514,13 @@ async def handle_advisor_get_cycle_history(args: Dict) -> Dict:
 
 _revenue_predictor = None
 
-def ensure_revenue_predictor():
+async def ensure_revenue_predictor():
     """Get or create the revenue predictor singleton."""
     global _revenue_predictor
     if _revenue_predictor is None:
         from revenue_predictor import RevenuePredictor
         _revenue_predictor = RevenuePredictor(ADVISOR_DB_PATH)
-        stats = _revenue_predictor.train()
+        stats = await asyncio.to_thread(_revenue_predictor.train)
         logger.info(f"Revenue predictor trained: {stats}")
     return _revenue_predictor
 
@@ -13521,7 +13533,7 @@ async def handle_revenue_predict_optimal_fee(args: Dict) -> Dict:
         return {"error": "node and channel_id required"}
 
     try:
-        predictor = ensure_revenue_predictor()
+        predictor = await ensure_revenue_predictor()
         rec = predictor.predict_optimal_fee(channel_id, node_name)
     except Exception as e:
         logger.warning(f"Revenue predictor failed for {channel_id}: {e}")
@@ -13591,7 +13603,7 @@ async def handle_rebalance_cost_benefit(args: Dict) -> Dict:
         return {"error": "node and channel_id required"}
 
     try:
-        predictor = ensure_revenue_predictor()
+        predictor = await ensure_revenue_predictor()
         result = predictor.estimate_rebalance_benefit(channel_id, node_name, target_ratio)
     except Exception as e:
         logger.warning(f"Rebalance cost-benefit analysis failed for {channel_id}: {e}")
@@ -13632,7 +13644,7 @@ async def handle_channel_cluster_analysis(args: Dict) -> Dict:
     node_name = args.get("node")  # Optional filter
 
     try:
-        predictor = ensure_revenue_predictor()
+        predictor = await ensure_revenue_predictor()
         clusters = predictor.get_clusters()
     except Exception as e:
         logger.warning(f"Channel cluster analysis failed: {e}")
@@ -13675,7 +13687,7 @@ async def handle_temporal_routing_patterns(args: Dict) -> Dict:
         return {"error": "node and channel_id required"}
 
     try:
-        predictor = ensure_revenue_predictor()
+        predictor = await ensure_revenue_predictor()
         pattern = predictor.get_temporal_patterns(channel_id, node_name, days=days)
     except Exception as e:
         logger.warning(f"Temporal routing patterns failed for {channel_id}: {e}")
@@ -13706,7 +13718,7 @@ async def handle_learning_engine_insights(args: Dict) -> Dict:
 
     # Revenue predictor insights
     try:
-        predictor = ensure_revenue_predictor()
+        predictor = await ensure_revenue_predictor()
         result["revenue_predictor"] = predictor.get_insights()
     except Exception as e:
         logger.warning(f"Revenue predictor insights failed: {e}")
@@ -13998,6 +14010,7 @@ async def handle_auto_evaluate_proposal(args: Dict, _action_data: Dict = None) -
 async def handle_process_all_pending(args: Dict) -> Dict:
     """Batch process all pending actions across the fleet."""
     dry_run = args.get("dry_run", True)
+    max_actions = min(int(args.get("max_actions", 50)), 50)  # Hard cap at 50
 
     # Get pending actions from all nodes (already parallel via call_all)
     all_pending = await fleet.call_all("hive-pending-actions")
@@ -14007,8 +14020,9 @@ async def handle_process_all_pending(args: Dict) -> Dict:
     escalated = []
     errors = []
     by_node = {}
+    total_action_count = 0
 
-    async def _process_node(node_name, pending_result):
+    async def _process_node(node_name, pending_result, remaining_budget):
         """Process all pending actions for a single node in parallel.
 
         Returns (node_name, approved, rejected, escalated, top_errors, by_node_errors)
@@ -14033,7 +14047,7 @@ async def handle_process_all_pending(args: Dict) -> Dict:
         # redundant hive-pending-actions re-fetch per action
         eval_tasks = []
         action_ids = []
-        for action in actions:
+        for action in actions[:remaining_budget]:
             action_id = action.get("action_id") or action.get("id")
             if action_id is None:
                 continue
@@ -14081,11 +14095,31 @@ async def handle_process_all_pending(args: Dict) -> Dict:
 
         return node_name, node_approved, node_rejected, node_escalated, top_errors, bynode_errors
 
-    # Process all nodes in parallel
+    # Count total actions across all nodes and compute per-node budgets
     node_names_list = list(all_pending.keys())
+    node_action_counts = []
+    for nname in node_names_list:
+        pr = all_pending[nname]
+        cnt = len(pr.get("actions", [])) if "error" not in pr else 0
+        node_action_counts.append(cnt)
+    total_available = sum(node_action_counts)
+
+    # Distribute budget proportionally across nodes
+    node_budgets = []
+    budget_remaining = max_actions
+    for cnt in node_action_counts:
+        if total_available > 0:
+            share = max(1, int(max_actions * cnt / total_available)) if cnt > 0 else 0
+        else:
+            share = 0
+        alloc = min(share, budget_remaining)
+        node_budgets.append(alloc)
+        budget_remaining -= alloc
+
+    # Process all nodes in parallel
     node_tasks = [
-        _process_node(node_name, all_pending[node_name])
-        for node_name in node_names_list
+        _process_node(node_name, all_pending[node_name], node_budgets[i])
+        for i, node_name in enumerate(node_names_list)
     ]
     node_results = await asyncio.gather(*node_tasks, return_exceptions=True)
 
@@ -14108,10 +14142,16 @@ async def handle_process_all_pending(args: Dict) -> Dict:
             "errors": bynode_errors
         }
 
+    total_processed = len(approved) + len(rejected) + len(escalated)
+    truncated = total_available > max_actions
+
     return {
         "dry_run": dry_run,
+        "max_actions": max_actions,
+        "truncated": truncated,
+        "total_available": total_available,
         "summary": {
-            "total_processed": len(approved) + len(rejected) + len(escalated),
+            "total_processed": total_processed,
             "approved_count": len(approved),
             "rejected_count": len(rejected),
             "escalated_count": len(escalated),
@@ -14535,6 +14575,8 @@ async def handle_execute_safe_opportunities(args: Dict) -> Dict:
     db = ensure_advisor_db()
     executed = []
     skipped = []
+    aggregate_rebalance_sats = 0
+    max_aggregate_rebalance_sats = int(args.get("max_rebalance_sats", 2_000_000))
 
     for opp in opportunities:
         # Check if marked as auto-safe
@@ -14619,7 +14661,13 @@ async def handle_execute_safe_opportunities(args: Dict) -> Dict:
 
                 elif action_type == "rebalance" or opp_type in ("rebalance", "circular_rebalance", "preemptive_rebalance"):
                     amount = opp.get("amount_sats", 0)
-                    if amount <= 500_000:  # Only execute small rebalances
+                    if amount > 500_000:
+                        action_detail["action"] = "skipped_large_rebalance"
+                        action_result = {"skipped": True, "reason": f"Amount {amount} > 500k per-op limit"}
+                    elif aggregate_rebalance_sats + amount > max_aggregate_rebalance_sats:
+                        action_detail["action"] = "skipped_aggregate_cap"
+                        action_result = {"skipped": True, "reason": f"Aggregate rebalance cap reached ({aggregate_rebalance_sats}/{max_aggregate_rebalance_sats})"}
+                    else:
                         source = opp.get("source_channel")
                         dest = opp.get("dest_channel")
                         if source and dest:
@@ -14631,9 +14679,8 @@ async def handle_execute_safe_opportunities(args: Dict) -> Dict:
                                 "dry_run": False
                             })
                             action_detail["action"] = "circular_rebalance"
-                    else:
-                        action_detail["action"] = "skipped_large_rebalance"
-                        action_result = {"skipped": True, "reason": f"Amount {amount} > 500k limit"}
+                            if action_result and "error" not in action_result:
+                                aggregate_rebalance_sats += amount
 
                 else:
                     action_detail["action"] = "no_handler"
@@ -16618,7 +16665,7 @@ async def handle_settlement_readiness(args: Dict) -> Dict:
 async def handle_run_settlement_cycle(args: Dict) -> Dict:
     """Execute a full settlement cycle."""
     import time
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     node_name = args.get("node")
     dry_run = args.get("dry_run", True)
@@ -16628,7 +16675,7 @@ async def handle_run_settlement_cycle(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     # Determine current period
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     period = f"{now.year}-W{now.isocalendar()[1]:02d}"
 
     # Steps 1 & 2: Record contribution snapshot and calculate distribution in parallel
@@ -17210,181 +17257,6 @@ async def handle_connectivity_recommendations(args: Dict) -> Dict:
 # Automation Tools (Phase 2 - Hex Enhancement)
 # =============================================================================
 
-async def handle_stagnant_channels(args: Dict) -> Dict:
-    """List channels with ≥95% local balance with enriched context."""
-    import time
-    
-    node_name = args.get("node")
-    min_local_pct = args.get("min_local_pct", 95)
-    min_age_days = args.get("min_age_days", 14)
-    
-    node = fleet.get_node(node_name)
-    if not node:
-        return {"error": f"Unknown node: {node_name}"}
-    
-    # Gather initial data in parallel (was 3 sequential RPCs)
-    info, channels_result, forwards = await asyncio.gather(
-        node.call("hive-getinfo"),
-        node.call("hive-listpeerchannels"),
-        node.call("hive-listforwards", {"status": "settled"}),
-        return_exceptions=True,
-    )
-
-    if isinstance(info, Exception) or (isinstance(info, dict) and "error" in info):
-        return {"error": f"Failed to get node info: {info}"}
-    current_blockheight = info.get("blockheight", 0)
-
-    if isinstance(channels_result, Exception) or (isinstance(channels_result, dict) and "error" in channels_result):
-        return {"error": f"Failed to get channels: {channels_result}"}
-
-    if isinstance(forwards, Exception):
-        forwards_list = []
-    else:
-        forwards_list = forwards.get("forwards", []) if not forwards.get("error") else []
-
-    # Build map of channel -> last forward timestamp
-    channel_last_forward: Dict[str, int] = {}
-    for fwd in forwards_list:
-        for ch_key in ["in_channel", "out_channel"]:
-            ch_id = fwd.get(ch_key)
-            if ch_id:
-                ts = _coerce_ts(fwd.get("resolved_time") or fwd.get("resolved_at") or 0)
-                if ch_id not in channel_last_forward or ts > channel_last_forward[ch_id]:
-                    channel_last_forward[ch_id] = ts
-
-    # Get peer intel if available
-    try:
-        db = ensure_advisor_db()
-    except Exception:
-        db = None
-
-    now = int(time.time())
-
-    # First pass: identify stagnant candidates and collect unique peer_ids
-    stagnant_candidates = []
-    unique_peer_ids = set()
-
-    for ch in channels_result.get("channels", []):
-        totals = _channel_totals(ch)
-        total_msat = totals["total_msat"]
-        local_msat = totals["local_msat"]
-
-        if total_msat == 0:
-            continue
-
-        local_pct = round((local_msat / total_msat) * 100, 2)
-
-        if local_pct < min_local_pct:
-            continue
-
-        channel_id = ch.get("short_channel_id", "")
-        peer_id = ch.get("peer_id", "")
-
-        # Calculate channel age
-        channel_age_days = _scid_to_age_days(channel_id, current_blockheight) if channel_id else None
-
-        if channel_age_days is not None and channel_age_days < min_age_days:
-            continue
-
-        stagnant_candidates.append((ch, channel_id, peer_id, total_msat, local_msat, local_pct, channel_age_days))
-        if peer_id:
-            unique_peer_ids.add(peer_id)
-
-    # Batch-fetch all peer aliases in one RPC call (was N per-channel calls)
-    alias_map: Dict[str, str] = {}
-    if unique_peer_ids:
-        try:
-            all_nodes_result = await node.call("hive-listnodes")
-            if not isinstance(all_nodes_result, Exception) and "nodes" in all_nodes_result:
-                for n in all_nodes_result.get("nodes", []):
-                    nid = n.get("nodeid")
-                    alias = n.get("alias")
-                    if nid and alias:
-                        alias_map[nid] = alias
-        except Exception:
-            pass
-
-    stagnant_channels = []
-
-    for ch, channel_id, peer_id, total_msat, local_msat, local_pct, channel_age_days in stagnant_candidates:
-        peer_alias = alias_map.get(peer_id, "")
-        
-        # Get current fee
-        local_updates = ch.get("updates", {}).get("local", {})
-        current_fee_ppm = local_updates.get("fee_proportional_millionths", 0)
-        
-        # Calculate days since last forward
-        last_forward_ts = channel_last_forward.get(channel_id, 0)
-        days_since_forward = None
-        if last_forward_ts > 0:
-            days_since_forward = (now - last_forward_ts) // 86400
-        
-        # Get peer quality from advisor if available
-        peer_quality = None
-        peer_recommendation = None
-        if db and peer_id:
-            try:
-                intel = db.get_peer_intel(peer_id)
-                if intel:
-                    peer_quality = intel.get("quality_score")
-                    peer_recommendation = intel.get("recommendation")
-            except Exception:
-                pass
-        
-        # Generate recommendation
-        recommendation = "wait"
-        reasoning = ""
-        
-        if peer_recommendation == "avoid":
-            recommendation = "close"
-            reasoning = "Peer marked as 'avoid' - consider closing channel"
-        elif channel_age_days is not None and channel_age_days > 90:
-            if days_since_forward is not None and days_since_forward > 30:
-                recommendation = "close"
-                reasoning = f"Channel >90 days old with no forwards in {days_since_forward} days"
-            elif current_fee_ppm > 100:
-                recommendation = "fee_reduction"
-                reasoning = f"Channel >90 days old, try reducing fee from {current_fee_ppm} ppm"
-            else:
-                recommendation = "static_policy"
-                reasoning = "Channel >90 days old with low fee already - apply static policy"
-        elif channel_age_days is not None and channel_age_days > 30:
-            if current_fee_ppm > 200:
-                recommendation = "fee_reduction"
-                reasoning = f"Consider reducing fee from {current_fee_ppm} ppm to attract flow"
-            else:
-                recommendation = "wait"
-                reasoning = "Channel 30-90 days old - give more time to attract flow"
-        else:
-            recommendation = "wait"
-            reasoning = "Channel too young for intervention"
-        
-        stagnant_channels.append({
-            "channel_id": channel_id,
-            "peer_id": peer_id,
-            "peer_alias": peer_alias,
-            "capacity_sats": total_msat // 1000,
-            "local_pct": local_pct,
-            "channel_age_days": channel_age_days,
-            "days_since_last_forward": days_since_forward,
-            "peer_quality": peer_quality,
-            "current_fee_ppm": current_fee_ppm,
-            "recommendation": recommendation,
-            "reasoning": reasoning
-        })
-    
-    # Sort by recommendation priority: close > fee_reduction > static_policy > wait
-    priority = {"close": 0, "fee_reduction": 1, "static_policy": 2, "wait": 3}
-    stagnant_channels.sort(key=lambda x: (priority.get(x["recommendation"], 99), -(x.get("channel_age_days") or 0)))
-    
-    return {
-        "node": node_name,
-        "stagnant_count": len(stagnant_channels),
-        "channels": stagnant_channels,
-        "ai_note": f"Found {len(stagnant_channels)} stagnant channels (≥{min_local_pct}% local, ≥{min_age_days} days old)"
-    }
-
-
 async def handle_bulk_policy(args: Dict) -> Dict:
     """Apply policies to multiple channels matching criteria."""
     node_name = args.get("node")
@@ -17487,7 +17359,19 @@ async def handle_bulk_policy(args: Dict) -> Dict:
                 })
     else:
         return {"error": f"Unknown filter_type: {filter_type}"}
-    
+
+    # Safety: filter out hive member channels (zero-fee policy)
+    hive_filtered = 0
+    if fee_ppm is not None and fee_ppm > 0:
+        try:
+            members_result = await node.call("hive-members")
+            hive_member_ids = {m.get("peer_id") for m in members_result.get("members", [])}
+            before_count = len(matched_channels)
+            matched_channels = [ch for ch in matched_channels if ch.get("peer_id") not in hive_member_ids]
+            hive_filtered = before_count - len(matched_channels)
+        except Exception:
+            pass
+
     # Apply policies
     applied = []
     errors = []
@@ -17535,6 +17419,7 @@ async def handle_bulk_policy(args: Dict) -> Dict:
         "dry_run": dry_run,
         "applied": applied,
         "errors": errors if errors else None,
+        "hive_channels_excluded": hive_filtered,
         "ai_note": f"{'Would apply' if dry_run else 'Applied'} policies to {len(applied)} channels matching '{filter_type}' filter"
     }
 
@@ -17548,9 +17433,10 @@ async def handle_enrich_peer(args: Dict) -> Dict:
         return {"error": "peer_id is required"}
     
     # Validate peer_id format (should be 66 hex chars)
-    if not isinstance(peer_id, str) or len(peer_id) != 66:
+    import re as _re
+    if not isinstance(peer_id, str) or not _re.match(r'^[0-9a-fA-F]{66}$', peer_id):
         return {"error": "peer_id must be a 66-character hex pubkey"}
-    
+
     MEMPOOL_API = "https://mempool.space/api"
     
     result = {
@@ -17612,10 +17498,10 @@ async def handle_enrich_proposal(args: Dict) -> Dict:
     # Find the specific action
     target_action = None
     for action in pending.get("actions", []):
-        if action.get("id") == action_id:
+        if action.get("id") == action_id or action.get("action_id") == action_id:
             target_action = action
             break
-    
+
     if not target_action:
         return {"error": f"Action {action_id} not found in pending actions"}
     
@@ -17637,7 +17523,7 @@ async def handle_enrich_proposal(args: Dict) -> Dict:
     try:
         db = ensure_advisor_db()
         if db:
-            internal_intel = db.get_peer_intel(peer_id)
+            internal_intel = db.get_peer_intelligence(peer_id)
     except Exception:
         pass
     

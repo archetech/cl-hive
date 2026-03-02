@@ -652,7 +652,7 @@ class LearningEngine:
         # Get outcomes in window
         outcomes = []
         try:
-            with self.db._get_conn() as conn:
+            with self.db.get_conn() as conn:
                 rows = conn.execute("""
                     SELECT action_type, actual_benefit, predicted_benefit,
                            success, measured_at
@@ -747,7 +747,7 @@ class LearningEngine:
         # 1. Query recent outcomes (last 7 days) grouped by action type
         try:
             cutoff_7d = int(time.time()) - 7 * 86400
-            with self.db._get_conn() as conn:
+            with self.db.get_conn() as conn:
                 # Get recent outcomes by action type
                 rows = conn.execute("""
                     SELECT action_type, opportunity_type, channel_id,
@@ -907,7 +907,7 @@ class LearningEngine:
         cutoff = int(time.time()) - days * 86400
 
         try:
-            with self.db._get_conn() as conn:
+            with self.db.get_conn() as conn:
                 # Get all decisions of this type in window
                 decisions = conn.execute("""
                     SELECT channel_id, node_name, timestamp, confidence,
@@ -1050,7 +1050,7 @@ class LearningEngine:
         Returns suggested direction and step size.
         """
         try:
-            with self.db._get_conn() as conn:
+            with self.db.get_conn() as conn:
                 query = """
                     SELECT config_key, old_value, new_value, trigger_reason,
                            confidence, context_metrics, timestamp,
@@ -1191,7 +1191,7 @@ class LearningEngine:
         cumulative_trials = 0
         per_fee_data = []
         try:
-            with self.db._get_conn() as conn:
+            with self.db.get_conn() as conn:
                 for fee in exploration_fees:
                     low = int(fee * 0.7)
                     high = int(fee * 1.3)

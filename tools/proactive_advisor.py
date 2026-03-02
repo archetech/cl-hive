@@ -936,8 +936,8 @@ class ProactiveAdvisor:
         scored = []
 
         for opp in opportunities:
-            # Base score from opportunity scanner
-            base_score = opp.priority_score
+            # Use EV-based final_score from scanner if available, else fall back to priority_score
+            base_score = opp.final_score if opp.final_score > 0 else opp.priority_score
 
             # Apply learning adjustments
             adjusted_confidence = self.learning_engine.get_adjusted_confidence(
@@ -949,7 +949,7 @@ class ProactiveAdvisor:
             # Goal alignment bonus
             goal_bonus = self._calculate_goal_alignment(opp, state)
 
-            # Final score
+            # Compose with EV score: adjust by confidence and goal alignment
             final_score = base_score * (0.5 + adjusted_confidence * 0.5) * (1 + goal_bonus)
 
             opp.final_score = final_score

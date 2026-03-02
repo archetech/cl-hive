@@ -62,6 +62,8 @@ def msat_to_sats_ceil(msat: int) -> int:
 
 def rest_post(url: str, rune: str, payload: dict) -> dict:
     """POST to CLN REST API. Rune never touches shell or process argv."""
+    # SSL verification disabled: CLN c-lightning-REST uses self-signed certs
+    # on the local VPN (10.8.0.x). Rune-based auth provides request-level security.
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -77,7 +79,7 @@ def rest_post(url: str, rune: str, payload: dict) -> dict:
 def listforwards_last24h_n2() -> dict:
     return json.loads(
         sh([
-            "/snap/bin/docker", "exec", "be6a3d32b6a6",
+            "/snap/bin/docker", "exec", os.environ.get("PNL_CONTAINER_N2", "hive-nexus-02"),
             "lightning-cli", "--rpc-file=/data/lightning/bitcoin/bitcoin/lightning-rpc",
             "listforwards",
         ])
@@ -121,7 +123,7 @@ def sling_stats_n2() -> list:
     # list-style output when called with json=true and no scid
     return json.loads(
         sh([
-            "/snap/bin/docker", "exec", "be6a3d32b6a6",
+            "/snap/bin/docker", "exec", os.environ.get("PNL_CONTAINER_N2", "hive-nexus-02"),
             "lightning-cli", "--rpc-file=/data/lightning/bitcoin/bitcoin/lightning-rpc",
             "sling-stats", "json=true",
         ])
@@ -165,7 +167,7 @@ def sling_spent_total_for_active_jobs(stats_list: list, get_one_fn) -> int:
 def sling_stats_one_n2(scid: str) -> dict:
     return json.loads(
         sh([
-            "/snap/bin/docker", "exec", "be6a3d32b6a6",
+            "/snap/bin/docker", "exec", os.environ.get("PNL_CONTAINER_N2", "hive-nexus-02"),
             "lightning-cli", "--rpc-file=/data/lightning/bitcoin/bitcoin/lightning-rpc",
             "sling-stats", f"scid={scid}", "json=true",
         ])
@@ -181,7 +183,8 @@ def main():
     date_key = now.strftime("%Y-%m-%d")
 
     # Load runes from the production nodes file (avoid printing secrets)
-    nodes_cfg = json.loads(open(os.path.expanduser("~/bin/cl-hive/production/nodes.production.json")).read())
+    with open(os.path.expanduser("~/bin/cl-hive/production/nodes.production.json")) as f:
+        nodes_cfg = json.load(f)
     rune_n1 = None
     has_n2 = False
     for n in nodes_cfg.get("nodes", []):
@@ -189,6 +192,10 @@ def main():
             rune_n1 = n.get("rune")
         elif n.get("name") != "hive-nexus-01":
             has_n2 = True
+
+    if not rune_n1:
+        print("ERROR: hive-nexus-01 not found in nodes config or missing rune")
+        return
 
     # Ground truth: routing fees from listforwards (last 24h)
     n1_fwd = forwards_pnl_from_listforwards(listforwards_last24h_n1(rune_n1))

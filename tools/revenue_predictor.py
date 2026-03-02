@@ -910,9 +910,10 @@ class RevenuePredictor:
     def _kmeans(self, items: List[Dict], k: int, max_iter: int = 20) -> List[List[Dict]]:
         """Simple k-means clustering."""
         import random
-        
-        # Initialize centroids randomly
-        centroids = [items[i]["vec"][:] for i in random.sample(range(len(items)), k)]
+        rng = random.Random(42)
+
+        # Initialize centroids deterministically
+        centroids = [items[i]["vec"][:] for i in rng.sample(range(len(items)), k)]
         
         clusters = [[] for _ in range(k)]
         
