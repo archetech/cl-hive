@@ -594,10 +594,6 @@ class OpportunityScanner:
                     "boltz_budget_remaining_sats": boltz_only_remaining,
                     "strategic_corridor_score": round(corridor_score, 4),
                     "hive_internal_backbone_imbalanced": hive_internal_blocked,
-                    "market_rebalance_alternative_present": (
-                        (direction == "loop_in" and channel_id in market_targets) or
-                        (direction == "loop_out" and channel_id in market_sources)
-                    ),
                 }
             )
             opportunities.append(opp)
@@ -730,7 +726,20 @@ class OpportunityScanner:
         opportunities = []
 
         velocities = state.get("velocities", {})
-        critical_channels = velocities.get("channels", [])
+        critical_vel = state.get("critical_velocity", {})
+        # Merge channels from both sources, critical_velocity taking precedence
+        seen_ids = set()
+        critical_channels = []
+        for ch in (critical_vel.get("channels", []) or []):
+            cid = ch.get("channel_id")
+            critical_channels.append(ch)
+            if cid:
+                seen_ids.add(cid)
+        for ch in (velocities.get("channels", []) or []):
+            cid = ch.get("channel_id")
+            if cid and cid not in seen_ids:
+                critical_channels.append(ch)
+                seen_ids.add(cid)
 
         for ch in critical_channels:
             channel_id = ch.get("channel_id")
@@ -755,7 +764,7 @@ class OpportunityScanner:
                     priority_score=priority,
                     confidence_score=ch.get("confidence", 0.7),
                     roi_estimate=0.8,  # High ROI - prevents lost routing
-                    description=f"Channel {channel_id} depleting in {hours_until:.0f}h",
+                    description=f"Channel {channel_id} depleting in {float(hours_until):.0f}h",
                     reasoning=f"Velocity {ch.get('velocity_pct_per_hour', 0):.2f}%/h, "
                               f"current balance {ch.get('current_balance_ratio', 0):.0%}",
                     recommended_action="Rebalance to restore outbound liquidity",
@@ -779,7 +788,7 @@ class OpportunityScanner:
                     priority_score=priority,
                     confidence_score=ch.get("confidence", 0.7),
                     roi_estimate=0.6,
-                    description=f"Channel {channel_id} saturating in {hours_until:.0f}h",
+                    description=f"Channel {channel_id} saturating in {float(hours_until):.0f}h",
                     reasoning=f"Inbound velocity {abs(ch.get('velocity_pct_per_hour', 0)):.2f}%/h",
                     recommended_action="Reduce fees to encourage outbound flow",
                     predicted_benefit=2000,
@@ -845,9 +854,27 @@ class OpportunityScanner:
 
         # Stagnant channels (100% local, no flow)
         # Use channels data for balance info, merge with profitability
+        hive_members_stag = state.get("hive_members", {}) or {}
+        stag_member_pks = {
+            (m.get("pubkey") or m.get("peer_id"))
+            for m in (hive_members_stag.get("members", []) or [])
+            if (m.get("pubkey") or m.get("peer_id"))
+        }
         for ch in channels:
+            # Skip hive member channels (zero-fee policy)
+            if ch.get("peer_id") in stag_member_pks:
+                continue
             channel_id = ch.get("channel_id") or ch.get("scid")
-            balance_ratio = ch.get("balance_ratio", 0)
+            # Compute balance_ratio from to_us_msat / total_msat (field may not exist)
+            balance_ratio = ch.get("balance_ratio")
+            if balance_ratio is None:
+                to_us = ch.get("to_us_msat", 0)
+                total = ch.get("total_msat", 0)
+                if isinstance(to_us, str):
+                    to_us = int(to_us.replace("msat", ""))
+                if isinstance(total, str):
+                    total = int(total.replace("msat", ""))
+                balance_ratio = (to_us / total) if total > 0 else 0
             forward_count = ch.get("forward_count", 0)
 
             if balance_ratio > 0.95 and forward_count == 0:
@@ -890,9 +917,19 @@ class OpportunityScanner:
 
         channels = state.get("channels", [])
 
+        # Skip hive member channels (zero-fee policy)
+        hive_members_tbf = state.get("hive_members", {}) or {}
+        tbf_member_pks = {
+            (m.get("pubkey") or m.get("peer_id"))
+            for m in (hive_members_tbf.get("members", []) or [])
+            if (m.get("pubkey") or m.get("peer_id"))
+        }
+
         for ch in channels:
             channel_id = ch.get("short_channel_id") or ch.get("channel_id")
             if not channel_id:
+                continue
+            if ch.get("peer_id") in tbf_member_pks:
                 continue
 
             # Get channel history to detect patterns
@@ -1407,6 +1444,15 @@ class OpportunityScanner:
                 opportunities.append(opp)
 
             elif action == "stimulate":
+                # Skip hive member channels (zero-fee policy)
+                stim_hive = state.get("hive_members", {}) or {}
+                stim_pks = {
+                    (m.get("pubkey") or m.get("peer_id"))
+                    for m in (stim_hive.get("members", []) or [])
+                    if (m.get("pubkey") or m.get("peer_id"))
+                }
+                if rec.get("peer_id") in stim_pks:
+                    continue
                 opp = Opportunity(
                     opportunity_type=OpportunityType.STAGNANT_CHANNEL,
                     action_type=ActionType.FEE_CHANGE,
@@ -2072,8 +2118,8 @@ class OpportunityScanner:
         for proposal in fleet_close_proposals:
             target_member = proposal.get("target_member", "")
             target_peer = proposal.get("target_peer", "")
-            our_share = proposal.get("their_routing_share", 0)  # Our share in their perspective
-            their_share = proposal.get("our_routing_share", 0)  # Owner's share
+            our_share = proposal.get("our_routing_share", 0)
+            their_share = proposal.get("peer_routing_share", 0)
             reporters = proposal.get("reporters", [])
 
             # Only care about proposals targeting us
@@ -2100,8 +2146,8 @@ class OpportunityScanner:
                     total_msat = int(total_msat.replace("msat", ""))
                 capacity = total_msat // 1000
 
-            # Only auto-execute for small channels (<3M sats) with strong consensus
-            auto_safe = is_consensus and is_clear_underperformer and capacity < 3_000_000
+            # Channel closes NEVER auto-execute (safety constraint)
+            auto_safe = False
 
             confidence = 0.6 + (0.1 * reporter_count)  # Boost confidence with consensus
             if is_clear_underperformer:
@@ -2137,11 +2183,22 @@ class OpportunityScanner:
         # === Fleet Defensive Warnings ===
         # When fleet warns about a peer we have a channel with, raise fees defensively
         warnings = defense_status.get("warnings", [])
+        # Build hive member set to skip fee changes on member channels
+        hive_members_fc = state.get("hive_members", {}) or {}
+        member_pubkeys = {
+            (m.get("pubkey") or m.get("peer_id"))
+            for m in (hive_members_fc.get("members", []) or [])
+            if (m.get("pubkey") or m.get("peer_id"))
+        }
         for warning in warnings:
             peer_id = warning.get("peer_id", "")
             severity = warning.get("severity", "info")
             warning_type = warning.get("type", "")
             sources = warning.get("sources", [])
+
+            # Skip hive member channels (zero-fee policy)
+            if peer_id in member_pubkeys:
+                continue
 
             ch = peer_to_channel.get(peer_id)
             if not ch:

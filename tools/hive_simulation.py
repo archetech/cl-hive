@@ -174,13 +174,13 @@ class HiveSimulation:
         forwards = result.get("forwards", [])
         settled = [f for f in forwards if f.get("status") == "settled"]
 
-        total_msat = sum(f.get("out_msat", 0) for f in settled)
-        if isinstance(total_msat, str):
-            total_msat = int(total_msat.replace("msat", ""))
+        def _parse_msat(val):
+            if isinstance(val, str):
+                return int(val.replace("msat", ""))
+            return int(val) if val else 0
 
-        fees_msat = sum(f.get("fee_msat", 0) for f in settled)
-        if isinstance(fees_msat, str):
-            fees_msat = int(fees_msat.replace("msat", ""))
+        total_msat = sum(_parse_msat(f.get("out_msat", 0)) for f in settled)
+        fees_msat = sum(_parse_msat(f.get("fee_msat", 0)) for f in settled)
 
         return {
             "count": len(settled),
@@ -329,8 +329,8 @@ class HiveSimulation:
         try:
             proc = subprocess.Popen(
                 monitor_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 start_new_session=True
             )
             self.daemon_pids["hive-monitor"] = proc.pid
@@ -344,8 +344,8 @@ class HiveSimulation:
         try:
             proc = subprocess.Popen(
                 advisor_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 start_new_session=True
             )
             self.daemon_pids["ai_advisor"] = proc.pid

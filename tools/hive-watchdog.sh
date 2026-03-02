@@ -44,7 +44,7 @@ check_and_restart_plugin() {
         -d '{}' \
         "${rest_url}/v1/hive-status" 2>&1) || response="TIMEOUT"
 
-    if [[ "$response" == "TIMEOUT" ]] || [[ "$response" == *"error"* && "$response" != *"governance_mode"* ]]; then
+    if [[ "$response" == "TIMEOUT" ]] || echo "$response" | jq -e '.error' >/dev/null 2>&1; then
         log "WARNING: $node_name hive-status failed, restarting plugin..."
 
         # Stop plugin

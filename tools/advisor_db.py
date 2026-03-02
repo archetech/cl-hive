@@ -330,17 +330,17 @@ class ChannelVelocity:
     @property
     def is_critical(self) -> bool:
         """True if channel will deplete/fill within 24 hours."""
-        if self.hours_until_depleted and self.hours_until_depleted < 24:
+        if self.hours_until_depleted is not None and self.hours_until_depleted < 24:
             return True
-        if self.hours_until_full and self.hours_until_full < 24:
+        if self.hours_until_full is not None and self.hours_until_full < 24:
             return True
         return False
 
     @property
     def urgency(self) -> str:
         """Return urgency level."""
-        hours = self.hours_until_depleted or self.hours_until_full
-        if not hours:
+        hours = self.hours_until_depleted if self.hours_until_depleted is not None else self.hours_until_full
+        if hours is None:
             return "none"
         if hours < 4:
             return "critical"
@@ -496,7 +496,8 @@ class AdvisorDB:
                 current_version = 0
 
             if current_version < SCHEMA_VERSION:
-                # Apply schema
+                # Apply schema (executescript auto-commits, so version insert
+                # must be in a separate explicit transaction)
                 conn.executescript(SCHEMA)
                 # Migrations for existing databases
                 try:
@@ -507,6 +508,8 @@ class AdvisorDB:
                     "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
                     (SCHEMA_VERSION, int(datetime.now().timestamp()))
                 )
+                # Explicit commit needed: executescript auto-committed the
+                # DDL, so the INSERT above starts a new implicit transaction
                 conn.commit()
 
     # =========================================================================
@@ -860,7 +863,7 @@ class AdvisorDB:
                         predicted_benefit: int = None,
                         snapshot_metrics: str = None) -> int:
         """Record an AI decision/recommendation. Deduplicates against recent pending decisions."""
-        node_name_normalized = node_name.lower() if node_name else node_name
+        node_name_normalized = node_name
         now_ts = int(datetime.now().timestamp())
         dedup_window = now_ts - 86400  # 24h
 
@@ -869,14 +872,14 @@ class AdvisorDB:
             if channel_id:
                 existing = conn.execute("""
                     SELECT id FROM ai_decisions
-                    WHERE decision_type = ? AND LOWER(node_name) = ? AND channel_id = ?
+                    WHERE decision_type = ? AND node_name = ? AND channel_id = ?
                     AND status = 'recommended' AND timestamp > ?
                     ORDER BY timestamp DESC LIMIT 1
                 """, (decision_type, node_name_normalized, channel_id, dedup_window)).fetchone()
             else:
                 existing = conn.execute("""
                     SELECT id FROM ai_decisions
-                    WHERE decision_type = ? AND LOWER(node_name) = ? AND channel_id IS NULL
+                    WHERE decision_type = ? AND node_name = ? AND channel_id IS NULL
                     AND status = 'recommended' AND timestamp > ?
                     ORDER BY timestamp DESC LIMIT 1
                 """, (decision_type, node_name_normalized, dedup_window)).fetchone()
@@ -944,6 +947,12 @@ class AdvisorDB:
             conn.execute("""
                 DELETE FROM action_outcomes
                 WHERE measured_at < ?
+            """, (cutoff,))
+
+            # Clean up stale channel velocity entries
+            conn.execute("""
+                DELETE FROM channel_velocity
+                WHERE updated_at < ?
             """, (cutoff,))
 
             conn.commit()
@@ -1236,7 +1245,7 @@ class AdvisorDB:
         with self._get_conn() as conn:
             rows = conn.execute("""
                 SELECT * FROM alert_history
-                WHERE resolved = 0 AND first_flagged > ?
+                WHERE resolved = 0 AND last_flagged > ?
                 ORDER BY last_flagged DESC
             """, (cutoff,)).fetchall()
 
@@ -1349,21 +1358,26 @@ class AdvisorDB:
             reliability = max(0, 1.0 - (force_ratio * 2))  # Force closes hurt 2x
 
         # Calculate profitability score (net profit per channel opened)
-        channels_opened = row['channels_opened'] or 1
+        channels_opened = row['channels_opened'] or 0
         net_profit = (row['total_revenue_sats'] or 0) - (row['total_costs_sats'] or 0)
-        profitability = net_profit / channels_opened
-
-        # Determine recommendation
-        if reliability >= 0.9 and profitability > 1000:
-            recommendation = 'excellent'
-        elif reliability >= 0.7 and profitability > 0:
-            recommendation = 'good'
-        elif reliability >= 0.5 and profitability >= -500:
-            recommendation = 'neutral'
-        elif reliability < 0.5 or (row['force_closes'] or 0) >= 2:
-            recommendation = 'avoid'
+        if channels_opened == 0:
+            profitability = 0
+            recommendation = 'unknown'
         else:
-            recommendation = 'caution'
+            profitability = net_profit / channels_opened
+
+        # Determine recommendation (skip if already set from edge case above)
+        if channels_opened > 0:
+            if reliability >= 0.9 and profitability > 1000:
+                recommendation = 'excellent'
+            elif reliability >= 0.7 and profitability > 0:
+                recommendation = 'good'
+            elif reliability >= 0.5 and profitability >= -500:
+                recommendation = 'neutral'
+            elif reliability < 0.5 or (row['force_closes'] or 0) >= 2:
+                recommendation = 'avoid'
+            else:
+                recommendation = 'caution'
 
         conn.execute("""
             UPDATE peer_intelligence
@@ -1458,7 +1472,11 @@ class AdvisorDB:
                 ORDER BY timestamp DESC LIMIT 1
             """, (prev_cutoff, cutoff)).fetchone()
 
-            # Calculate changes
+            # Calculate changes (guard against empty DB)
+            if not current:
+                current = {"capacity": 0, "channels": 0, "revenue": 0}
+            if not previous:
+                previous = {"capacity": 0, "channels": 0, "revenue": 0}
             curr_capacity = current['capacity'] or 0
             prev_capacity = previous['capacity'] or 0
             capacity_change = ((curr_capacity - prev_capacity) / prev_capacity * 100) if prev_capacity > 0 else 0
@@ -2020,7 +2038,7 @@ class AdvisorDB:
         """Record an action outcome for learning."""
         with self._get_conn() as conn:
             cursor = conn.execute("""
-                INSERT INTO action_outcomes (
+                INSERT OR IGNORE INTO action_outcomes (
                     decision_id, action_type, opportunity_type, channel_id, node_name,
                     decision_confidence, predicted_benefit, actual_benefit,
                     success, prediction_error, measured_at
@@ -2225,7 +2243,7 @@ class AdvisorDB:
         Args:
             member_pubkey: Member's public key
         """
-        key = f"onboarded_{member_pubkey[:16]}"
+        key = f"onboarded_{member_pubkey[:32]}"
         self.set_metadata(key, {
             "pubkey": member_pubkey,
             "onboarded_at": int(datetime.now().timestamp())
@@ -2241,7 +2259,7 @@ class AdvisorDB:
         Returns:
             True if member was previously onboarded
         """
-        key = f"onboarded_{member_pubkey[:16]}"
+        key = f"onboarded_{member_pubkey[:32]}"
         return self.get_metadata(key) is not None
 
     # =========================================================================
@@ -2249,7 +2267,9 @@ class AdvisorDB:
     # =========================================================================
 
     def _ensure_config_tables(self) -> None:
-        """Ensure config adjustment tables exist."""
+        """Ensure config adjustment tables exist (cached after first call)."""
+        if getattr(self, '_config_tables_ensured', False):
+            return
         with self._get_conn() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS config_adjustments (
@@ -2291,7 +2311,8 @@ class AdvisorDB:
                     PRIMARY KEY (node_name, config_key)
                 );
             """)
-            conn.commit()
+            # executescript auto-commits; no need for explicit commit
+        self._config_tables_ensured = True
 
     def record_config_adjustment(
         self,
@@ -2373,87 +2394,94 @@ class AdvisorDB:
                 notes,
                 adjustment_id
             ))
-            conn.commit()
-
-            # Update learned ranges
+            # Update learned ranges in the same transaction
             row = conn.execute(
                 "SELECT node_name, config_key, new_value FROM config_adjustments WHERE id = ?",
                 (adjustment_id,)
             ).fetchone()
             if row:
                 self._update_learned_range(
-                    row["node_name"], row["config_key"], 
-                    json.loads(row["new_value"]), success
+                    row["node_name"], row["config_key"],
+                    json.loads(row["new_value"]), success, conn=conn
                 )
 
     def _update_learned_range(
-        self, node_name: str, config_key: str, value: Any, success: bool
+        self, node_name: str, config_key: str, value: Any, success: bool,
+        conn=None
     ) -> None:
         """Update learned optimal range for a config key."""
-        with self._get_conn() as conn:
-            row = conn.execute("""
-                SELECT * FROM config_learned_ranges 
-                WHERE node_name = ? AND config_key = ?
-            """, (node_name, config_key)).fetchone()
+        if conn is not None:
+            self._update_learned_range_impl(conn, node_name, config_key, value, success)
+        else:
+            with self._get_conn() as new_conn:
+                self._update_learned_range_impl(new_conn, node_name, config_key, value, success)
 
-            now = int(datetime.now().timestamp())
-            
-            if row:
-                adjustments = row["adjustments_count"] + 1
-                successful = row["successful_adjustments"] + (1 if success else 0)
-                
-                # Update optimal range based on success
-                try:
-                    val = float(value) if isinstance(value, (int, float, str)) else None
-                except (ValueError, TypeError):
-                    val = None
+    def _update_learned_range_impl(
+        self, conn, node_name: str, config_key: str, value: Any, success: bool
+    ) -> None:
+        """Internal implementation for updating learned ranges."""
+        row = conn.execute("""
+            SELECT * FROM config_learned_ranges
+            WHERE node_name = ? AND config_key = ?
+        """, (node_name, config_key)).fetchone()
 
-                if val is not None and success:
-                    opt_min = row["optimal_min"]
-                    opt_max = row["optimal_max"]
-                    if opt_min is None or val < opt_min:
-                        opt_min = val
-                    if opt_max is None or val > opt_max:
-                        opt_max = val
-                    
-                    conn.execute("""
-                        UPDATE config_learned_ranges 
-                        SET adjustments_count = ?,
-                            successful_adjustments = ?,
-                            last_success_value = ?,
-                            optimal_min = ?,
-                            optimal_max = ?,
-                            updated_at = ?
-                        WHERE node_name = ? AND config_key = ?
-                    """, (adjustments, successful, val, opt_min, opt_max, now, node_name, config_key))
-                else:
-                    conn.execute("""
-                        UPDATE config_learned_ranges 
-                        SET adjustments_count = ?,
-                            successful_adjustments = ?,
-                            updated_at = ?
-                        WHERE node_name = ? AND config_key = ?
-                    """, (adjustments, successful, now, node_name, config_key))
-            else:
-                try:
-                    val = float(value) if isinstance(value, (int, float, str)) else None
-                except (ValueError, TypeError):
-                    val = None
-                    
+        now = int(datetime.now().timestamp())
+
+        if row:
+            adjustments = row["adjustments_count"] + 1
+            successful = row["successful_adjustments"] + (1 if success else 0)
+
+            # Update optimal range based on success
+            try:
+                val = float(value) if isinstance(value, (int, float, str)) else None
+            except (ValueError, TypeError):
+                val = None
+
+            if val is not None and success:
+                opt_min = row["optimal_min"]
+                opt_max = row["optimal_max"]
+                if opt_min is None or val < opt_min:
+                    opt_min = val
+                if opt_max is None or val > opt_max:
+                    opt_max = val
+
                 conn.execute("""
-                    INSERT INTO config_learned_ranges 
-                    (node_name, config_key, adjustments_count, successful_adjustments,
-                     last_success_value, optimal_min, optimal_max, updated_at)
-                    VALUES (?, ?, 1, ?, ?, ?, ?, ?)
-                """, (
-                    node_name, config_key, 
-                    1 if success else 0,
-                    val if success else None,
-                    val if success else None,
-                    val if success else None,
-                    now
-                ))
-            conn.commit()
+                    UPDATE config_learned_ranges
+                    SET adjustments_count = ?,
+                        successful_adjustments = ?,
+                        last_success_value = ?,
+                        optimal_min = ?,
+                        optimal_max = ?,
+                        updated_at = ?
+                    WHERE node_name = ? AND config_key = ?
+                """, (adjustments, successful, val, opt_min, opt_max, now, node_name, config_key))
+            else:
+                conn.execute("""
+                    UPDATE config_learned_ranges
+                    SET adjustments_count = ?,
+                        successful_adjustments = ?,
+                        updated_at = ?
+                    WHERE node_name = ? AND config_key = ?
+                """, (adjustments, successful, now, node_name, config_key))
+        else:
+            try:
+                val = float(value) if isinstance(value, (int, float, str)) else None
+            except (ValueError, TypeError):
+                val = None
+
+            conn.execute("""
+                INSERT INTO config_learned_ranges
+                (node_name, config_key, adjustments_count, successful_adjustments,
+                 last_success_value, optimal_min, optimal_max, updated_at)
+                VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+            """, (
+                node_name, config_key,
+                1 if success else 0,
+                val if success else None,
+                val if success else None,
+                val if success else None,
+                now
+            ))
 
     def get_config_adjustment_history(
         self,

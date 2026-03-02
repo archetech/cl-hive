@@ -995,7 +995,7 @@ class RevenuePredictor:
                 daily_avg[d] = sum(vals) / len(vals) if vals else 0
             
             # Find peaks and lows
-            overall_avg = sum(hourly_avg.values()) / max(1, sum(1 for v in hourly_avg.values() if v > 0))
+            overall_avg = sum(v for v in hourly_avg.values() if v > 0) / max(1, sum(1 for v in hourly_avg.values() if v > 0))
             
             peak_hours = [h for h, v in hourly_avg.items() if v > overall_avg * 1.3 and v > 0]
             low_hours = [h for h, v in hourly_avg.items() if v < overall_avg * 0.5 or v == 0]

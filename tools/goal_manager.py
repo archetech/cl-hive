@@ -330,7 +330,7 @@ class GoalManager:
             progress_pct = 100.0
 
         # Expected progress based on time
-        time_progress_pct = (days_elapsed / goal.deadline_days) * 100
+        time_progress_pct = (days_elapsed / goal.deadline_days) * 100 if goal.deadline_days > 0 else 100.0
 
         # On track if actual progress is at least 80% of expected
         on_track = progress_pct >= time_progress_pct * 0.8
@@ -529,7 +529,8 @@ class GoalManager:
             summary["by_type"][goal.goal_type] += 1
 
             # Count by priority
-            summary["by_priority"][goal.priority] += 1
+            if goal.priority in summary["by_priority"]:
+                summary["by_priority"][goal.priority] += 1
 
             # Add goal details
             summary["goals"].append({

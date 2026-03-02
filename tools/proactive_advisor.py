@@ -742,7 +742,7 @@ class ProactiveAdvisor:
         prof_summary = prof_data.get("summary", {})
         underwater_count = prof_summary.get("underwater_count", 0)
         profitable_count = prof_summary.get("profitable_count", 0)
-        total_prof = prof_summary.get("total_channels", 1)
+        total_prof = prof_summary.get("total_channels", 1) or 1
         underwater_pct = underwater_count / total_prof * 100
         profitable_pct = profitable_count / total_prof * 100
 
@@ -783,7 +783,7 @@ class ProactiveAdvisor:
             fleet_close_proposals.append({
                 "target_member": our_pubkey,
                 "target_peer": rec.get("peer_id", ""),
-                "their_routing_share": rec.get("peer_routing_share", 0),
+                "peer_routing_share": rec.get("peer_routing_share", 0),
                 "our_routing_share": rec.get("our_routing_share", 0),
                 "reporters": [our_pubkey],  # Single reporter - needs fleet consensus
                 "channel_id": rec.get("channel_id", ""),
@@ -1095,9 +1095,26 @@ class ProactiveAdvisor:
         if not opp.channel_id:
             return False
 
+        # Safety: never set non-zero fees on hive member channels
+        if opp.peer_id:
+            try:
+                members_result = await self.mcp.call(
+                    "hive_members", {"node": node_name}
+                )
+                member_ids = {
+                    m.get("pubkey") or m.get("peer_id")
+                    for m in members_result.get("members", [])
+                }
+                if opp.peer_id in member_ids:
+                    logger.info(f"Skipping fee change on hive member channel {opp.channel_id}")
+                    return False
+            except Exception:
+                # Fail closed: if we can't verify, don't change fees
+                return False
+
         # Get current fee from current_state or fetch it
         current_state = opp.current_state or {}
-        current_fee = current_state.get("fee_ppm", 0)
+        current_fee = current_state.get("fee_ppm") or current_state.get("current_fee") or current_state.get("fee_per_millionth", 0)
 
         # If fee not in current_state, fetch from revenue-ops
         if current_fee == 0:

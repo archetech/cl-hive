@@ -19,9 +19,9 @@ def sh(cmd: list) -> str:
 
 
 def mcp(tool: str, **kwargs):
-    args = " ".join([f"{k}={v}" for k, v in kwargs.items()])
+    args = [f"{k}={v}" for k, v in kwargs.items()]
     p = subprocess.run(
-        ["mcporter", "call", f"hive.{tool}"] + args.split(),
+        ["mcporter", "call", f"hive.{tool}"] + args,
         capture_output=True, text=True,
     )
     if p.returncode != 0:
@@ -190,7 +190,7 @@ def main():
     for n in nodes_cfg.get("nodes", []):
         if n.get("name") == "hive-nexus-01":
             rune_n1 = n.get("rune")
-        elif n.get("name") != "hive-nexus-01":
+        elif n.get("name") == "hive-nexus-02":
             has_n2 = True
 
     if not rune_n1:

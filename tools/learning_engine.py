@@ -16,11 +16,14 @@ Usage:
 """
 
 import json
+import logging
 import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -318,7 +321,7 @@ class LearningEngine:
             actual_benefit = revenue_delta
         elif revenue_delta == 0 and flow_delta > 0:
             success = True
-            actual_benefit = flow_delta * after_fee // 1_000_000  # estimate from count
+            actual_benefit = flow_delta * after_fee / 1_000_000  # estimate from count
         elif revenue_delta == 0 and flow_delta == 0:
             # No data yet — neutral (don't penalize for no activity)
             success = True
@@ -661,9 +664,9 @@ class LearningEngine:
                     ORDER BY measured_at
                 """, (cutoff,)).fetchall()
                 outcomes = [dict(r) for r in rows]
-        except Exception:
-            pass
-        
+        except Exception as e:
+            logger.warning(f"Error measuring improvement gradient: {e}")
+
         if not outcomes:
             return {"status": "no_data", "window_hours": hours_window}
         
@@ -1099,8 +1102,15 @@ class LearningEngine:
                 raw_new = adj.get('new_value')
                 if raw_old is None or raw_new is None:
                     continue  # Skip adjustments with missing values
-                old_val = float(raw_old)
-                new_val = float(raw_new)
+                # Values are stored as json.dumps() — deserialize first
+                try:
+                    old_val = float(json.loads(raw_old))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    old_val = float(raw_old)
+                try:
+                    new_val = float(json.loads(raw_new))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    new_val = float(raw_new)
             except (ValueError, TypeError):
                 continue
 

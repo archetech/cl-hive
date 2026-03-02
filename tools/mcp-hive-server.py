@@ -113,8 +113,9 @@ def _check_method_allowed(method: str) -> bool:
         try:
             with open(HIVE_ALLOWED_METHODS_FILE) as f:
                 _allowed_methods = set(json.load(f))
-        except Exception:
+        except Exception as e:
             # Parse error: deny all and stop retrying on every call
+            logger.warning(f"Failed to parse RPC method allowlist {HIVE_ALLOWED_METHODS_FILE}: {e}. Denying all methods.")
             _allowed_methods = set()
             return False
     return method in _allowed_methods
@@ -200,7 +201,7 @@ def _validate_node_config(node_config: Dict, node_mode: str) -> Optional[str]:
 
 def _normalize_response(result: Any) -> Dict[str, Any]:
     if isinstance(result, dict) and "error" in result:
-        error_msg = result.get("error") or result.get("message") or "Unknown error"
+        error_msg = str(result.get("error") or result.get("message") or "Unknown error")
         return {"ok": False, "error": error_msg, "details": result}
     return {"ok": True, "data": result}
 
@@ -7944,7 +7945,7 @@ async def _node_peer_search(node: NodeConnection, query: str) -> Dict[str, Any]:
     for peer in peers.get("peers", []):
         peer_id = peer.get("id")
         alias = alias_map.get(peer_id) or peer.get("alias") or peer.get("alias_or_local") or ""
-        if query_lower not in alias.lower():
+        if query_lower not in alias.lower() and query_lower not in (peer_id or "").lower():
             continue
 
         # Use first channel if multiple
@@ -8138,13 +8139,17 @@ async def handle_open_channel(args: Dict) -> Dict:
         if isinstance(result, dict) and result.get("error"):
             await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
         elif budget_gate and budget_gate.get("reserved"):
-            # Settle reservation immediately to avoid temporary double-counting with canonical open costs.
-            await _settle_total_cost_budget(
-                node,
-                budget_gate.get("reservation_id"),
-                source="mcp_hive_open_channel",
-                record_event=False,
-            )
+            if isinstance(result, dict):
+                # Settle reservation immediately to avoid temporary double-counting with canonical open costs.
+                await _settle_total_cost_budget(
+                    node,
+                    budget_gate.get("reservation_id"),
+                    source="mcp_hive_open_channel",
+                    record_event=False,
+                )
+            else:
+                # Unexpected non-dict result — release reservation to avoid budget leak
+                await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
         if isinstance(result, dict):
             result["budget_gate"] = {
                 "reservation_id": budget_gate.get("reservation_id"),
@@ -8710,8 +8715,8 @@ async def handle_channels(args: Dict) -> Dict:
             channel["inbound_outbound_ratio"] = inbound_outbound_ratio if inbound_outbound_ratio != float('inf') else 999.99
             channel["inbound_payments"] = in_fulfilled
             channel["outbound_payments"] = out_fulfilled
-            channel["inbound_volume_sats"] = in_msat // 1000 if isinstance(in_msat, int) else 0
-            channel["outbound_volume_sats"] = out_msat // 1000 if isinstance(out_msat, int) else 0
+            channel["inbound_volume_sats"] = _extract_msat(in_msat) // 1000
+            channel["outbound_volume_sats"] = _extract_msat(out_msat) // 1000
 
             # Add profitability data if available
             if profitability and "channels_by_class" in profitability:
@@ -9124,7 +9129,7 @@ async def handle_splice(args: Dict) -> Dict:
     # Add context about the result
     if result.get("dry_run"):
         result["ai_note"] = (
-            f"Dry run preview: {result.get('splice_type')} of {result.get('amount_sats'):,} sats "
+            f"Dry run preview: {result.get('splice_type')} of {result.get('amount_sats', 0):,} sats "
             f"on channel {channel_id}. Remove dry_run=true to execute."
         )
     elif result.get("success"):
@@ -9706,8 +9711,9 @@ async def read_resource(uri: str) -> str:
             elif resource_type == "pending-actions":
                 # Get all pending actions in parallel (was sequential per-node loop)
                 async def _get_node_pending(name: str, node: NodeConnection):
-                    pending = await node.call("hive-pending-actions")
-                    if isinstance(pending, Exception):
+                    try:
+                        pending = await node.call("hive-pending-actions")
+                    except Exception:
                         pending = {"actions": []}
                     actions = pending.get("actions", [])
                     return name, {"count": len(actions), "actions": actions}
@@ -10323,6 +10329,29 @@ async def handle_revenue_set_fee(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
+    # Guard: check if the target channel peer is a hive member (zero-fee policy)
+    if fee_ppm and int(fee_ppm) > 0 and not force:
+        try:
+            members_result, channels = await asyncio.gather(
+                node.call("hive-members"),
+                node.call("hive-listpeerchannels"),
+            )
+            member_ids = {m.get("peer_id") for m in members_result.get("members", [])}
+            for ch in channels.get("channels", []):
+                scid = ch.get("short_channel_id", "")
+                peer_id = ch.get("peer_id", "")
+                if scid == channel_id or peer_id == channel_id:
+                    if peer_id in member_ids:
+                        return {
+                            "error": "Cannot set non-zero fees on hive member channel",
+                            "channel_id": channel_id,
+                            "peer_id": peer_id,
+                            "hint": "Hive channels must have 0 fees. Use force=true to override."
+                        }
+                    break
+        except Exception as e:
+            return {"error": f"Cannot verify hive membership for fee guard: {e}. Use force=true to override."}
+
     params = {
         "channel_id": channel_id,
         "fee_ppm": fee_ppm
@@ -10800,8 +10829,10 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
 
         # Upgrade: if we hit a stale job lock, try clearing sling job registry ONCE and retry.
         retry_result = None
+        retry_attempted = False
         if failure_type == "job_locked":
             try:
+                retry_attempted = True
                 await node.call("hive-sling-deletejob", {"job": "all"})
                 retry_result = await node.call("revenue-rebalance", params)
                 if isinstance(retry_result, dict):
@@ -10852,7 +10883,7 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
             "error": err,
             "failure_type": failure_type,
             "decision_id": decision_id,
-            "retried": retry_result is not None,
+            "retried": retry_attempted,
         }
 
 
@@ -11841,9 +11872,9 @@ async def handle_config_recommend(args: Dict) -> Dict:
          "Revenue very low - lower fee floor to attract more routing"),
         ("low_revenue", lambda c: c["revenue_24h"] < 100, "max_fee_ppm", "decrease",
          "Revenue very low - lower fee ceiling to be more competitive"),
-        ("high_rebalance_cost", lambda c: c["rebalance_cost_24h"] > c["net_profit_24h"] * 2,
+        ("high_rebalance_cost", lambda c: c["rebalance_cost_24h"] > 0 and c["rebalance_cost_24h"] > max(0, c["net_profit_24h"]) * 2,
          "daily_budget_sats", "decrease", "Rebalance costs exceed profit - reduce budget"),
-        ("high_rebalance_cost", lambda c: c["rebalance_cost_24h"] > c["net_profit_24h"] * 2,
+        ("high_rebalance_cost", lambda c: c["rebalance_cost_24h"] > 0 and c["rebalance_cost_24h"] > max(0, c["net_profit_24h"]) * 2,
          "rebalance_min_profit_ppm", "increase", "Rebalance costs high - require higher profit margin"),
         ("negative_margin", lambda c: c["operating_margin_pct"] < 0,
          "daily_budget_sats", "decrease", "Negative margin - reduce rebalance spending"),
@@ -12629,8 +12660,6 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
 
         # Process channel details for history
         channels_by_class = profitability.get("channels_by_class", {})
-        if not channels_by_class and "error" in profitability:
-            logger.warning(f"Profitability returned error for {node_name}: {profitability.get('error')}")
         prof_data = []
         for class_name, class_channels in channels_by_class.items():
             if isinstance(class_channels, list):
@@ -13268,26 +13297,9 @@ def _get_proactive_advisor():
 
             # Create a simple MCP client wrapper
             class MCPClientWrapper:
-                # Map tool names to handler names (some handlers drop the prefix)
-                TOOL_TO_HANDLER = {
-                    "hive_node_info": "handle_node_info",
-                    "hive_channels": "handle_channels",
-                    "hive_status": "handle_hive_status",
-                    "hive_pending_actions": "handle_pending_actions",
-                    "hive_set_fees": "handle_set_fees",
-                    "hive_routing_intelligence_status": "handle_routing_intelligence_status",
-                    "hive_backfill_routing_intelligence": "handle_backfill_routing_intelligence",
-                    "hive_members": "handle_members",
-                }
-
                 async def call(self, tool_name, params):
                     # Route to internal handlers via TOOL_HANDLERS registry
                     handler = TOOL_HANDLERS.get(tool_name)
-                    if not handler:
-                        # Fallback: try explicit mapping for non-standard names
-                        handler_name = self.TOOL_TO_HANDLER.get(tool_name)
-                        if handler_name:
-                            handler = TOOL_HANDLERS.get(handler_name)
                     if handler:
                         return await handler(params)
                     return {"error": f"Unknown tool: {tool_name}"}
@@ -13518,10 +13530,14 @@ async def ensure_revenue_predictor():
     """Get or create the revenue predictor singleton."""
     global _revenue_predictor
     if _revenue_predictor is None:
-        from revenue_predictor import RevenuePredictor
-        _revenue_predictor = RevenuePredictor(ADVISOR_DB_PATH)
-        stats = await asyncio.to_thread(_revenue_predictor.train)
-        logger.info(f"Revenue predictor trained: {stats}")
+        if not hasattr(ensure_revenue_predictor, '_lock'):
+            ensure_revenue_predictor._lock = asyncio.Lock()
+        async with ensure_revenue_predictor._lock:
+            if _revenue_predictor is None:  # Double-check after acquiring lock
+                from revenue_predictor import RevenuePredictor
+                _revenue_predictor = RevenuePredictor(ADVISOR_DB_PATH)
+                stats = await asyncio.to_thread(_revenue_predictor.train)
+                logger.info(f"Revenue predictor trained: {stats}")
     return _revenue_predictor
 
 
@@ -13784,7 +13800,8 @@ async def handle_advisor_scan_opportunities(args: Dict) -> Dict:
             "queue_for_review": len(queue),
             "require_approval": len(require),
             "focus_recommendation": focus,
-            "opportunities": [opp.to_dict() for opp in scored[:20]],  # Top 20
+            "opportunities": [opp.to_dict() for opp in scored[:20]]
+                             + [opp.to_dict() for opp in scored[20:] if opp.auto_execute_safe],
             "state_summary": state.get("summary", {})
         }
     except Exception as e:
@@ -13906,15 +13923,11 @@ async def handle_auto_evaluate_proposal(args: Dict, _action_data: Dict = None) -
             decision = "reject"
             reasoning.append(f"Capacity {capacity_sats:,} sats exceeds budget of {budget_limit:,} sats")
         elif channel_count >= 15 and recommendation not in ("avoid", "caution"):
-            # Good peer with enough connectivity
-            if within_budget:
-                decision = "approve"
-                reasoning.append(f"Peer has {channel_count} channels (≥15)")
-                reasoning.append(f"Peer recommendation: {recommendation}")
-                reasoning.append(f"Capacity {capacity_sats:,} sats within budget")
-            else:
-                decision = "escalate"
-                reasoning.append(f"Good peer but capacity {capacity_sats:,} sats needs review")
+            # Good peer with enough connectivity (within_budget guaranteed True here)
+            decision = "approve"
+            reasoning.append(f"Peer has {channel_count} channels (≥15)")
+            reasoning.append(f"Peer recommendation: {recommendation}")
+            reasoning.append(f"Capacity {capacity_sats:,} sats within budget")
         else:
             decision = "escalate"
             reasoning.append(f"Peer has {channel_count} channels (10-15 range, needs review)")
@@ -14224,9 +14237,12 @@ async def handle_stagnant_channels(args: Dict) -> Dict:
                 forward_by_channel[out_ch] = resolved_time
 
     # Get nodes list for alias lookup
-    nodes_result = await node.call("hive-listnodes")
+    try:
+        nodes_result = await node.call("hive-listnodes")
+    except Exception:
+        nodes_result = {}
     alias_map = {}
-    if not isinstance(nodes_result, Exception) and "nodes" in nodes_result:
+    if "nodes" in nodes_result:
         for n in nodes_result.get("nodes", []):
             nid = n.get("nodeid")
             alias = n.get("alias")
@@ -14673,8 +14689,8 @@ async def handle_execute_safe_opportunities(args: Dict) -> Dict:
                         if source and dest:
                             action_result = await handle_execute_hive_circular_rebalance({
                                 "node": node_name,
-                                "source_channel": source,
-                                "dest_channel": dest,
+                                "from_channel": source,
+                                "to_channel": dest,
                                 "amount_sats": amount,
                                 "dry_run": False
                             })
@@ -16477,6 +16493,15 @@ async def handle_check_neophytes(args: Dict) -> Dict:
         if target:
             pending_pubkeys.add(target)
 
+    # Get our pubkey once (only needed for non-dry-run proposals)
+    proposer_id = None
+    if not dry_run:
+        try:
+            info = await node.call("hive-getinfo")
+            proposer_id = info.get("id")
+        except Exception:
+            pass
+
     # Process each neophyte
     proposed_count = 0
     already_pending_count = 0
@@ -16515,10 +16540,6 @@ async def handle_check_neophytes(args: Dict) -> Dict:
             proposed_count += 1
         else:
             try:
-                # Get our pubkey as proposer
-                info = await node.call("hive-getinfo")
-                proposer_id = info.get("id")
-
                 result = await node.call("hive-propose-promotion", {
                     "target_peer_id": peer_id,
                     "proposer_peer_id": proposer_id
@@ -17296,7 +17317,7 @@ async def handle_bulk_policy(args: Dict) -> Dict:
         channels_by_class = prof.get("channels_by_class", {})
         for ch in channels_by_class.get("zombie", []):
             matched_channels.append({
-                "channel_id": ch.get("short_channel_id"),
+                "channel_id": ch.get("channel_id") or ch.get("short_channel_id"),
                 "peer_id": ch.get("peer_id"),
                 "peer_alias": ch.get("peer_alias", ""),
                 "classification": "zombie"
@@ -17309,7 +17330,7 @@ async def handle_bulk_policy(args: Dict) -> Dict:
         channels_by_class = prof.get("channels_by_class", {})
         for ch in channels_by_class.get("bleeder", []):
             matched_channels.append({
-                "channel_id": ch.get("short_channel_id"),
+                "channel_id": ch.get("channel_id") or ch.get("short_channel_id"),
                 "peer_id": ch.get("peer_id"),
                 "peer_alias": ch.get("peer_alias", ""),
                 "classification": "bleeder"
@@ -17369,8 +17390,8 @@ async def handle_bulk_policy(args: Dict) -> Dict:
             before_count = len(matched_channels)
             matched_channels = [ch for ch in matched_channels if ch.get("peer_id") not in hive_member_ids]
             hive_filtered = before_count - len(matched_channels)
-        except Exception:
-            pass
+        except Exception as e:
+            return {"error": f"Cannot verify hive membership for zero-fee guard: {e}. Refusing to apply bulk policy."}
 
     # Apply policies
     applied = []

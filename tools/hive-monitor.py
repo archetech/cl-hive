@@ -164,6 +164,15 @@ class Alert:
         return d
 
 
+def _parse_msat(val) -> int:
+    """Parse an msat value that may be an int or a string like '1000000msat'."""
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        return int(val.replace("msat", ""))
+    return 0
+
+
 class FleetMonitor:
     """Monitors a fleet of Hive nodes."""
 
@@ -274,11 +283,11 @@ class FleetMonitor:
             channels = funds.get("channels", [])
             state.channel_count = len(channels)
             state.total_capacity_sats = sum(
-                c.get("amount_msat", 0) // 1000 for c in channels
+                _parse_msat(c.get("amount_msat", 0)) // 1000 for c in channels
             )
             outputs = funds.get("outputs", [])
             state.onchain_sats = sum(
-                o.get("amount_msat", 0) // 1000
+                _parse_msat(o.get("amount_msat", 0)) // 1000
                 for o in outputs if o.get("status") == "confirmed"
             )
             result["funds"] = {
@@ -369,8 +378,8 @@ class FleetMonitor:
                 "remote_sats": total_sats - our_sats,
                 "balance_ratio": round(balance_ratio, 3),
                 # Fee info
-                "fee_base_msat": ch.get("updates", {}).get("local", {}).get("fee_base_msat", 0),
-                "fee_ppm": ch.get("updates", {}).get("local", {}).get("fee_proportional_millionths", 0),
+                "fee_base_msat": (ch.get("updates") or {}).get("local", {}).get("fee_base_msat", 0),
+                "fee_ppm": (ch.get("updates") or {}).get("local", {}).get("fee_proportional_millionths", 0),
                 # Flow state from revenue-ops
                 "flow_state": flow.get("state", "unknown"),
                 "flow_ratio": round(flow.get("flow_ratio", 0), 3),
