@@ -13822,7 +13822,7 @@ async def handle_advisor_scan_opportunities(args: Dict) -> Dict:
             "require_approval": len(require),
             "focus_recommendation": focus,
             "opportunities": [opp.to_dict() for opp in scored[:20]]
-                             + [opp.to_dict() for opp in scored[20:] if opp.auto_execute_safe],
+                             + [opp.to_dict() for opp in scored[20:100] if opp.auto_execute_safe],
             "state_summary": state.get("summary", {})
         }
     except Exception as e:
