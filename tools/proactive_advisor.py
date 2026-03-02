@@ -1183,7 +1183,7 @@ class ProactiveAdvisor:
                     "fee_ppm": new_fee
                 }
             )
-            return result.get("success", False)
+            return isinstance(result, dict) and "error" not in result
         except Exception:
             return False
 

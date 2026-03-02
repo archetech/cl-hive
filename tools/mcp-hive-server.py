@@ -9112,7 +9112,10 @@ async def handle_splice(args: Dict) -> Dict:
         if budget_gate:
             await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
         return {"error": str(e)}
-    if budget_gate and isinstance(result, dict):
+    if budget_gate and not isinstance(result, dict):
+        # Non-dict response: release reservation to avoid permanent budget hold
+        await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
+    elif budget_gate and isinstance(result, dict):
         if result.get("success"):
             # Settle reservation immediately to avoid temporary double-counting with canonical splice costs.
             await _settle_total_cost_budget(
