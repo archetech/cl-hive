@@ -725,6 +725,14 @@ class OpportunityScanner:
         """Scan for critical velocity (depletion/saturation) issues."""
         opportunities = []
 
+        # Build hive member set for zero-fee guard
+        hive_members_vel = state.get("hive_members", {}) or {}
+        vel_member_pks = {
+            (m.get("pubkey") or m.get("peer_id"))
+            for m in (hive_members_vel.get("members", []) or [])
+            if (m.get("pubkey") or m.get("peer_id"))
+        }
+
         velocities = state.get("velocities", {})
         critical_vel = state.get("critical_velocity", {})
         # Merge channels from both sources, critical_velocity taking precedence
@@ -748,8 +756,13 @@ class OpportunityScanner:
             h_full = ch.get("hours_until_full")
             hours_until = h_depleted if h_depleted is not None else (h_full if h_full is not None else None)
             urgency = ch.get("urgency", "low")
+            ch_peer_id = ch.get("peer_id")
 
             if hours_until is None or hours_until > 48:
+                continue
+
+            # Skip hive member channels for FEE_CHANGE actions (zero-fee policy)
+            if ch_peer_id and ch_peer_id in vel_member_pks and trend == "filling":
                 continue
 
             # Critical depletion
@@ -759,7 +772,7 @@ class OpportunityScanner:
                     opportunity_type=OpportunityType.CRITICAL_DEPLETION,
                     action_type=ActionType.REBALANCE,
                     channel_id=channel_id,
-                    peer_id=None,
+                    peer_id=ch_peer_id,
                     node_name=node_name,
                     priority_score=priority,
                     confidence_score=ch.get("confidence", 0.7),
@@ -783,7 +796,7 @@ class OpportunityScanner:
                     opportunity_type=OpportunityType.CRITICAL_SATURATION,
                     action_type=ActionType.FEE_CHANGE,
                     channel_id=channel_id,
-                    peer_id=None,
+                    peer_id=ch_peer_id,
                     node_name=node_name,
                     priority_score=priority,
                     confidence_score=ch.get("confidence", 0.7),
@@ -1845,6 +1858,14 @@ class OpportunityScanner:
         """
         opportunities = []
 
+        # Build hive member set for zero-fee guard
+        hive_members_ri = state.get("hive_members", {}) or {}
+        ri_member_pks = {
+            (m.get("pubkey") or m.get("peer_id"))
+            for m in (hive_members_ri.get("members", []) or [])
+            if (m.get("pubkey") or m.get("peer_id"))
+        }
+
         pheromones = state.get("pheromone_levels", {})
         markers = state.get("stigmergic_markers", {})
         routing_intel = state.get("routing_intelligence", {})
@@ -1969,6 +1990,10 @@ class OpportunityScanner:
 
         for dest_peer, peer_mk_list in peer_markers.items():
             if not peer_mk_list:
+                continue
+
+            # Skip hive member peers (zero-fee policy)
+            if dest_peer in ri_member_pks:
                 continue
 
             # Find the channel to this peer

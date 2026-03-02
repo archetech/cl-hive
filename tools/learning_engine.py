@@ -600,7 +600,7 @@ class LearningEngine:
 
         # Skip if adjusted confidence is very low
         if adjusted < 0.3:
-            opp_rate = self._params.opportunity_success_rates.get(opportunity_type, 0.5)
+            opp_rate = self._params.opportunity_success_rates.get(opportunity_type, self.DEFAULT_SUCCESS_RATE)
             return True, f"Low success rate for {opportunity_type} ({opp_rate:.0%})"
 
         # Skip if action type has been very unsuccessful

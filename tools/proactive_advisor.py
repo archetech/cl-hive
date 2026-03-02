@@ -1096,21 +1096,30 @@ class ProactiveAdvisor:
             return False
 
         # Safety: never set non-zero fees on hive member channels
-        if opp.peer_id:
-            try:
-                members_result = await self.mcp.call(
-                    "hive_members", {"node": node_name}
+        try:
+            members_result = await self.mcp.call(
+                "hive_members", {"node": node_name}
+            )
+            member_ids = {
+                m.get("pubkey") or m.get("peer_id")
+                for m in members_result.get("members", [])
+            }
+            # Resolve peer_id from channel data if not on the opportunity
+            peer_id_to_check = opp.peer_id
+            if not peer_id_to_check:
+                channels_result = await self.mcp.call(
+                    "hive_channels", {"node": node_name}
                 )
-                member_ids = {
-                    m.get("pubkey") or m.get("peer_id")
-                    for m in members_result.get("members", [])
-                }
-                if opp.peer_id in member_ids:
-                    logger.info(f"Skipping fee change on hive member channel {opp.channel_id}")
-                    return False
-            except Exception:
-                # Fail closed: if we can't verify, don't change fees
+                for ch in channels_result.get("channels", []):
+                    if ch.get("channel_id") == opp.channel_id or ch.get("scid") == opp.channel_id:
+                        peer_id_to_check = ch.get("peer_id")
+                        break
+            if peer_id_to_check and peer_id_to_check in member_ids:
+                logger.info(f"Skipping fee change on hive member channel {opp.channel_id}")
                 return False
+        except Exception:
+            # Fail closed: if we can't verify, don't change fees
+            return False
 
         # Get current fee from current_state or fetch it
         current_state = opp.current_state or {}
@@ -1146,6 +1155,13 @@ class ProactiveAdvisor:
         elif opp.opportunity_type == OpportunityType.CRITICAL_SATURATION:
             # Decrease to push flow out
             new_fee = max(50, int(current_fee * 0.8))
+        elif opp.opportunity_type == OpportunityType.FLEET_DEFENSIVE_ACTION:
+            # Use suggested_fee from current_state if available
+            suggested = current_state.get("suggested_fee")
+            if suggested and isinstance(suggested, (int, float)):
+                new_fee = int(suggested)
+            else:
+                return False
         else:
             return False
 

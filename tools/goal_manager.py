@@ -321,9 +321,6 @@ class GoalManager:
         total_change_needed = goal.target_value - goal.current_value
         change_so_far = current_value - goal.current_value
 
-        # For metrics where lower is better (underwater_pct, bleeder_count)
-        is_inverse = goal.target_metric in ["underwater_pct", "bleeder_count"]
-
         if total_change_needed != 0:
             progress_pct = (change_so_far / total_change_needed) * 100
         else:

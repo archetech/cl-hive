@@ -67,6 +67,17 @@ BITCOIN_NODE = "backend1"
 # Hive members (have cl-hive plugin)
 HIVE_NODES = ["alice", "bob", "carol"]
 
+
+def _parse_msat(val) -> int:
+    """Parse CLN msat values (int, 'Xmsat' string, or None) to int."""
+    if val is None:
+        return 0
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        return int(val.replace("msat", ""))
+    return int(val)
+
 # Target topology: sparse clusters with hive as bridges
 # Available nodes: alice, bob, carol (hive), dave, erin, oscar, pat (CLN), lnd1, lnd2 (LND)
 #
@@ -291,7 +302,7 @@ class TopologyManager:
         elif node1 in LND_NODES:
             parts = addr.split("@")
             if len(parts) == 2:
-                success, result = self._lnd_rpc(node1, "connect", [parts[0], parts[1]])
+                success, result = self._lnd_rpc(node1, "connect", [addr])
                 if success:
                     return True
                 if "already" in str(result).lower():
@@ -430,11 +441,8 @@ class TopologyManager:
             success, funds = self._cln_rpc(node, "listfunds")
             if success and isinstance(funds, dict):
                 outputs = funds.get("outputs", [])
-                total = sum(o.get("amount_msat", 0) for o in outputs)
-                if isinstance(total, int):
-                    total_sats = total // 1000
-                else:
-                    total_sats = 0
+                total = sum(_parse_msat(o.get("amount_msat", 0)) for o in outputs)
+                total_sats = total // 1000
                 print(f"  {node}: {total_sats:,} sats available")
 
                 if total_sats < 10_000_000:

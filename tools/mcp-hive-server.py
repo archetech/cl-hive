@@ -7788,10 +7788,10 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
         })
     elif local_pct < 20:
         issues.append({"type": "critical_low_balance", "severity": "critical", "details": {"local_pct": local_pct}})
-    if profitability.get("classification") in {"bleeder", "zombie"}:
+    if profitability.get("classification") in {"underwater", "zombie"}:
         issues.append({
             "type": profitability.get("classification"),
-            "severity": "warning" if profitability.get("classification") == "bleeder" else "info"
+            "severity": "warning" if profitability.get("classification") == "underwater" else "info"
         })
 
     return {
@@ -8769,6 +8769,11 @@ async def handle_set_fees(args: Dict) -> Dict:
                 node.call("hive-members"),
                 node.call("hive-listpeerchannels"),
             )
+            # Fail closed on RPC error dicts
+            if isinstance(members_result, dict) and "error" in members_result:
+                return {"error": f"Cannot verify hive membership: {members_result.get('error')}. Use force=true to override."}
+            if isinstance(channels, dict) and "error" in channels:
+                return {"error": f"Cannot verify hive membership: {channels.get('error')}. Use force=true to override."}
             member_ids = {m.get("peer_id") for m in members_result.get("members", [])}
             for ch in channels.get("channels", []):
                 scid = ch.get("short_channel_id", "")
@@ -9139,11 +9144,11 @@ async def handle_splice(args: Dict) -> Dict:
         )
     elif result.get("error"):
         result["ai_note"] = f"Splice failed: {result.get('message', result.get('error'))}"
-        if budget_gate:
+        if budget_gate and not result.get("success"):
             await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
     else:
         # Ambiguous response (neither success nor error): release reservation to avoid permanent budget hold
-        if budget_gate:
+        if budget_gate and not result.get("success"):
             await _release_total_cost_budget(node, budget_gate.get("reservation_id"))
 
     return result
@@ -10300,6 +10305,21 @@ async def handle_revenue_policy(args: Dict) -> Dict:
     elif action == "set":
         if not peer_id:
             return {"error": "peer_id required for set action"}
+        # Guard: check if the target peer is a hive member (zero-fee policy)
+        if fee_ppm is not None and int(fee_ppm) > 0:
+            try:
+                members_result = await node.call("hive-members")
+                if isinstance(members_result, dict) and "error" in members_result:
+                    return {"error": f"Cannot verify hive membership for zero-fee guard: {members_result.get('error')}. Refusing to set policy."}
+                hive_member_ids = {m.get("peer_id") for m in members_result.get("members", [])}
+                if peer_id in hive_member_ids:
+                    return {
+                        "error": "Cannot set non-zero fee_ppm policy on hive member channel",
+                        "peer_id": peer_id,
+                        "hint": "Hive channels must have 0 fees."
+                    }
+            except Exception as e:
+                return {"error": f"Cannot verify hive membership for zero-fee guard: {e}. Refusing to set policy."}
         params = {"action": "set", "peer_id": peer_id}
         if strategy:
             params["strategy"] = strategy
@@ -10336,6 +10356,11 @@ async def handle_revenue_set_fee(args: Dict) -> Dict:
                 node.call("hive-members"),
                 node.call("hive-listpeerchannels"),
             )
+            # Fail closed on RPC error dicts
+            if isinstance(members_result, dict) and "error" in members_result:
+                return {"error": f"Cannot verify hive membership: {members_result.get('error')}. Use force=true to override."}
+            if isinstance(channels, dict) and "error" in channels:
+                return {"error": f"Cannot verify hive membership: {channels.get('error')}. Use force=true to override."}
             member_ids = {m.get("peer_id") for m in members_result.get("members", [])}
             for ch in channels.get("channels", []):
                 scid = ch.get("short_channel_id", "")
@@ -11324,7 +11349,7 @@ async def handle_askrene_constraints_summary(args: Dict) -> Dict:
     for c in constraints:
         scid_dir = c.get("short_channel_id_dir")
         ts = int(c.get("timestamp") or 0)
-        max_msat = int(c.get("maximum_msat") or 0)
+        max_msat = _extract_msat(c.get("maximum_msat"))
         if not scid_dir or max_msat <= 0:
             continue
         if ts and (now - ts) > max_age_sec:
@@ -12680,12 +12705,8 @@ async def handle_advisor_record_snapshot(args: Dict) -> Dict:
                 continue
             prof_ch = prof_by_id.get(scid, {})
 
-            local_msat = ch.get("to_us_msat", 0)
-            if isinstance(local_msat, str):
-                local_msat = int(local_msat.replace("msat", ""))
-            capacity_msat = ch.get("total_msat", 0)
-            if isinstance(capacity_msat, str):
-                capacity_msat = int(capacity_msat.replace("msat", ""))
+            local_msat = _extract_msat(ch.get("to_us_msat"))
+            capacity_msat = _extract_msat(ch.get("total_msat"))
 
             local_sats = local_msat // 1000
             capacity_sats = capacity_msat // 1000
@@ -13934,7 +13955,7 @@ async def handle_auto_evaluate_proposal(args: Dict, _action_data: Dict = None) -
 
     elif action_type in ("fee_change", "set_fee"):
         current_fee = action.get("current_fee_ppm", 0)
-        new_fee = action.get("new_fee_ppm") or action.get("fee_ppm", 0)
+        new_fee = action.get("new_fee_ppm") if action.get("new_fee_ppm") is not None else action.get("fee_ppm", 0)
 
         # Calculate percentage change
         if current_fee > 0:
@@ -14033,7 +14054,6 @@ async def handle_process_all_pending(args: Dict) -> Dict:
     escalated = []
     errors = []
     by_node = {}
-    total_action_count = 0
 
     async def _process_node(node_name, pending_result, remaining_budget):
         """Process all pending actions for a single node in parallel.
@@ -14635,7 +14655,7 @@ async def handle_execute_safe_opportunities(args: Dict) -> Dict:
                     new_fee = rec_fee if rec_fee is not None else opp.get("new_fee_ppm")
 
                     # Calculate fee from current state if not explicitly set
-                    if not new_fee and channel_id:
+                    if new_fee is None and channel_id:
                         current_state = opp.get("current_state", {})
                         fee_ppm_val = current_state.get("fee_ppm")
                         current_fee = fee_ppm_val if fee_ppm_val is not None else current_state.get("fee_per_millionth", 0)
@@ -14656,7 +14676,7 @@ async def handle_execute_safe_opportunities(args: Dict) -> Dict:
                             # Generic fee change: reduce by 15%
                             new_fee = max(25, int(current_fee * 0.85))
 
-                    if new_fee and channel_id:
+                    if new_fee is not None and channel_id:
                         # Enforce hard bounds (safety constraints)
                         new_fee = max(25, min(5000, int(new_fee)))
                         action_result = await handle_revenue_set_fee({
@@ -17328,12 +17348,12 @@ async def handle_bulk_policy(args: Dict) -> Dict:
         if "error" in prof:
             return prof
         channels_by_class = prof.get("channels_by_class", {})
-        for ch in channels_by_class.get("bleeder", []):
+        for ch in channels_by_class.get("underwater", []):
             matched_channels.append({
                 "channel_id": ch.get("channel_id") or ch.get("short_channel_id"),
                 "peer_id": ch.get("peer_id"),
                 "peer_alias": ch.get("peer_alias", ""),
-                "classification": "bleeder"
+                "classification": "underwater"
             })
             
     elif filter_type == "depleted":

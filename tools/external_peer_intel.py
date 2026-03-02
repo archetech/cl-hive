@@ -367,7 +367,7 @@ class ExternalPeerIntelligence:
             if now - cached_at < self.EXTERNAL_CACHE_TTL:
                 return cached
 
-        data = ExternalReputationData(pubkey=pubkey, fetched_at=now)
+        fallback = ExternalReputationData(pubkey=pubkey, fetched_at=now)
 
         # Try 1ML first
         try:
@@ -387,14 +387,14 @@ class ExternalPeerIntelligence:
         # except Exception as e:
         #     logger.debug(f"Amboss fetch failed: {e}")
 
-        data.source = "none"
-        data.fetch_error = "No external data available"
+        fallback.source = "none"
+        fallback.fetch_error = "No external data available"
         if len(self._external_cache) >= self.MAX_CACHE_SIZE:
             oldest_key = min(self._external_cache, key=lambda k: self._external_cache[k][1])
             del self._external_cache[oldest_key]
-        self._external_cache[pubkey] = (data, now)
+        self._external_cache[pubkey] = (fallback, now)
 
-        return data
+        return fallback
 
     def _fetch_1ml_data(self, pubkey: str) -> ExternalReputationData:
         """Fetch data from 1ML API."""
