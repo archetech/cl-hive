@@ -1381,6 +1381,13 @@ plugin.add_option(
     dynamic=True
 )
 
+plugin.add_option(
+    name='hive-planner-max-active-channels',
+    default='50',
+    description='Maximum total channels before expansion auto-approval is gated (default: 50). Above this, channel opens escalate for human review.',
+    dynamic=True
+)
+
 # Budget Options (Phase 7 - Governance)
 plugin.add_option(
     name='hive-failsafe-budget-per-day',
@@ -1495,6 +1502,7 @@ OPTION_TO_CONFIG_MAP: Dict[str, tuple] = {
     'hive-planner-min-channel-sats': ('planner_min_channel_sats', int),
     'hive-planner-max-channel-sats': ('planner_max_channel_sats', int),
     'hive-planner-default-channel-sats': ('planner_default_channel_sats', int),
+    'hive-planner-max-active-channels': ('planner_max_active_channels', int),
     # Budget options (failsafe mode)
     'hive-failsafe-budget-per-day': ('failsafe_budget_per_day', int),
     'hive-budget-reserve-pct': ('budget_reserve_pct', float),
@@ -1775,6 +1783,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         planner_min_channel_sats=int(options.get('hive-planner-min-channel-sats', '1000000')),
         planner_max_channel_sats=int(options.get('hive-planner-max-channel-sats', '50000000')),
         planner_default_channel_sats=int(options.get('hive-planner-default-channel-sats', '5000000')),
+        planner_max_active_channels=int(options.get('hive-planner-max-active-channels', '50')),
         # Budget options (failsafe mode)
         failsafe_budget_per_day=int(options.get('hive-failsafe-budget-per-day', '10000000')),
         budget_reserve_pct=float(options.get('hive-budget-reserve-pct', '0.20')),
@@ -1870,12 +1879,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return False
 
     def _relay_get_members() -> list:
-        """Get list of member pubkeys for relay."""
+        """Get list of member pubkeys for relay (excludes banned)."""
         if not database:
             return []
         return [
             m["peer_id"] for m in database.get_all_members()
             if m.get("tier") == MembershipTier.MEMBER.value
+            and not database.is_banned(m["peer_id"])
         ]
 
     relay_mgr = RelayManager(
@@ -3688,6 +3698,9 @@ def _create_membership_payload() -> list:
     members = database.get_all_members()
     result = []
     for m in members:
+        # SECURITY: Exclude banned peers from membership list
+        if database.is_banned(m["peer_id"]):
+            continue
         member_dict = {
             "peer_id": m["peer_id"],
             "tier": m.get("tier", "neophyte"),
@@ -3907,8 +3920,8 @@ def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
         plugin.log(f"cl-hive: _broadcast_full_sync_to_members: missing deps", level='debug')
         return
 
-    members = database.get_all_members()
-    plugin.log(f"cl-hive: Broadcasting membership to {len(members)} known members")
+    targets = _get_broadcast_targets()
+    plugin.log(f"cl-hive: Broadcasting membership to {len(targets)} eligible members")
 
     # Create signed FULL_SYNC payload with membership
     full_sync_msg = _create_signed_full_sync_msg()
@@ -3917,11 +3930,8 @@ def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
         return
 
     sent_count = 0
-    for member in members:
+    for member in targets:
         member_id = member["peer_id"]
-        if member_id == our_pubkey:
-            continue
-
         try:
             plugin.rpc.call("sendcustommsg", {
                 "node_id": member_id,
@@ -3949,6 +3959,9 @@ def on_peer_connected(**kwargs):
     # Quick DB check is fine on IO thread; offload RPC-heavy work
     member = database.get_member(peer_id)
     if not member:
+        return
+    # SECURITY: Do not exchange state with banned peers
+    if database.is_banned(peer_id):
         return
     if _msg_executor is not None:
         _msg_executor.submit(_handle_peer_connected, peer_id, member)
@@ -4243,15 +4256,10 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
             rebalance_costs_sats=rebalance_costs
         )
 
-        # Get hive members
-        members = database.get_all_members()
-
-        # Broadcast to all members
+        # Broadcast to eligible members (excludes banned)
         broadcast_count = 0
-        for member in members:
-            member_id = member.get("peer_id")
-            if not member_id or member_id == our_pubkey:
-                continue
+        for member in _get_broadcast_targets():
+            member_id = member["peer_id"]
 
             try:
                 plugin.rpc.call("sendcustommsg", {
@@ -4625,10 +4633,8 @@ def broadcast_intent_abort(target: str, intent_type: str) -> None:
 
     abort_msg = serialize(HiveMessageType.INTENT_ABORT, abort_payload)
 
-    for member in members:
+    for member in _get_broadcast_targets():
         member_id = member['peer_id']
-        if member_id == intent_mgr.our_pubkey:
-            continue  # Skip self
 
         try:
             plugin.rpc.call("sendcustommsg", {
@@ -4644,25 +4650,37 @@ def broadcast_intent_abort(target: str, intent_type: str) -> None:
 # PHASE 5: PROMOTION PROTOCOL HANDLERS
 # =============================================================================
 
+def _get_broadcast_targets() -> List[Dict[str, Any]]:
+    """
+    Get the list of members eligible to receive broadcasts.
+
+    Excludes ourselves and banned peers. This is the single source of truth
+    for all outbound member broadcasts — never iterate get_all_members()
+    directly for sending messages.
+    """
+    if not database:
+        return []
+    return [
+        m for m in database.get_all_members()
+        if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value)
+        and m["peer_id"] != our_pubkey
+        and not database.is_banned(m["peer_id"])
+    ]
+
+
 def _broadcast_to_members(message_bytes: bytes) -> int:
     """
-    Broadcast a message to all hive members (excluding ourselves).
+    Broadcast a message to all hive members (excluding ourselves and banned).
 
     Returns:
         Number of members the message was successfully sent to.
     """
-    if not database :
+    if not database:
         return 0
 
     sent_count = 0
-    for member in database.get_all_members():
-        tier = member.get("tier")
-        # Broadcast to all tiers (member, neophyte)
-        if tier not in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value):
-            continue
+    for member in _get_broadcast_targets():
         member_id = member["peer_id"]
-        if member_id == our_pubkey:
-            continue
         try:
             plugin.rpc.call("sendcustommsg", {
                 "node_id": member_id,
@@ -4695,12 +4713,13 @@ def _outbox_send_fn(peer_id: str, msg_bytes: bytes) -> bool:
 
 
 def _outbox_get_member_ids() -> List[str]:
-    """Get list of member peer_ids for OutboxManager broadcasts."""
+    """Get list of member peer_ids for OutboxManager broadcasts (excludes banned)."""
     if not database:
         return []
     return [
         m["peer_id"] for m in database.get_all_members()
         if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value)
+        and not database.is_banned(m["peer_id"])
     ]
 
 
@@ -6181,6 +6200,14 @@ def _sync_member_policies(plugin: Plugin) -> None:
         if peer_id == our_pubkey:
             continue
 
+        # SECURITY: Banned peers always get dynamic strategy
+        if database.is_banned(peer_id):
+            try:
+                bridge.set_hive_policy(peer_id, is_member=False, bypass_rate_limit=True)
+            except Exception:
+                pass
+            continue
+
         # Determine if this peer should have HIVE strategy
         # P5-M-1 fix: Only full member tier gets HIVE strategy (0-fee)
         # Neophytes should NOT get hive fees — they use dynamic strategy
@@ -6243,9 +6270,9 @@ def _sync_membership_on_startup(plugin: Plugin) -> None:
     if not database or not gossip_mgr :
         return
 
-    members = database.get_all_members()
-    if len(members) <= 1:
-        return  # Just us, nothing to sync
+    targets = _get_broadcast_targets()
+    if not targets:
+        return  # No eligible targets to sync
 
     # Create signed FULL_SYNC with membership
     full_sync_msg = _create_signed_full_sync_msg()
@@ -6254,10 +6281,8 @@ def _sync_membership_on_startup(plugin: Plugin) -> None:
         return
 
     sent_count = 0
-    for member in members:
+    for member in targets:
         member_id = member["peer_id"]
-        if member_id == our_pubkey:
-            continue
 
         try:
             plugin.rpc.call("sendcustommsg", {
@@ -7022,7 +7047,9 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
         database.update_ban_proposal_status(proposal_id, "approved")
         proposer_id = proposal.get("proposer_peer_id", "quorum_vote")
         database.add_ban(target_peer_id, proposal.get("reason", "quorum_ban"), proposer_id)
-        database.remove_member(target_peer_id)
+
+        # Full removal: DB, state manager, bridge policy, and forced gossip
+        _execute_member_removal(target_peer_id, reason="banned")
 
         # Clear any intent locks held by the banned member
         if intent_mgr:
@@ -7032,13 +7059,6 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
                     plugin.log(f"cl-hive: Cleared {cleared} intent locks for banned member {target_peer_id[:16]}...")
             except Exception as e:
                 plugin.log(f"cl-hive: Failed to clear intents for banned member: {e}", level='warn')
-
-        # Revert fee policy
-        if bridge and bridge.status == BridgeStatus.ENABLED:
-            try:
-                bridge.set_hive_policy(target_peer_id, is_member=False)
-            except Exception:
-                pass
 
         vote_info = f"reject={reject_count}" if proposal_type == "settlement_gaming" else f"approve={approve_count}"
         plugin.log(f"cl-hive: Ban executed for {target_peer_id[:16]}... ({vote_info}/{eligible_count} votes)")
@@ -11162,6 +11182,9 @@ def _auto_connect_to_all_members() -> int:
         member_peer_id = member.get("peer_id")
         if not member_peer_id or member_peer_id == our_pubkey:
             continue
+        # SECURITY: Do not auto-connect to banned peers
+        if database.is_banned(member_peer_id):
+            continue
 
         # Skip if already connected
         if _is_peer_connected(member_peer_id):
@@ -11596,7 +11619,7 @@ def fee_intelligence_loop():
                     violations = []
                     for member in members:
                         peer_id = member.get('peer_id')
-                        if peer_id and peer_id != our_pubkey:
+                        if peer_id and peer_id != our_pubkey and not database.is_banned(peer_id):
                             is_valid, reason = bridge.verify_hive_channel_zero_fees(peer_id)
                             if not is_valid and reason not in ('no_channel', 'our_direction_not_found'):
                                 violations.append((peer_id[:16], reason))
@@ -12406,12 +12429,10 @@ def gossip_loop():
                 )
 
                 if gossip_msg:
-                    # Step 6: Broadcast to all hive members
+                    # Step 6: Broadcast to eligible members (excludes banned)
                     broadcast_count = 0
-                    for member in members:
-                        member_id = member.get("peer_id")
-                        if not member_id or member_id == our_pubkey:
-                            continue
+                    for member in _get_broadcast_targets():
+                        member_id = member["peer_id"]
 
                         try:
                             plugin.rpc.call("sendcustommsg", {
@@ -12529,14 +12550,11 @@ def _broadcast_mcf_solution(solution):
             plugin.log("cl-hive: Failed to create MCF solution message", level='warn')
             return
 
-        # Broadcast to all members
-        members = database.get_all_members()
+        # Broadcast to eligible members (excludes banned)
         broadcast_count = 0
 
-        for member in members:
-            peer_id = member.get("peer_id")
-            if not peer_id or peer_id == our_pubkey:
-                continue
+        for member in _get_broadcast_targets():
+            peer_id = member["peer_id"]
 
             try:
                 plugin.rpc.sendcustommsg(
@@ -12847,12 +12865,10 @@ def _broadcast_our_fee_intelligence():
             )
 
             if msg:
-                # Broadcast single snapshot to all hive members
+                # Broadcast single snapshot to eligible members (excludes banned)
                 broadcast_count = 0
-                for member in members:
-                    member_id = member.get("peer_id")
-                    if not member_id or member_id == our_pubkey:
-                        continue
+                for member in _get_broadcast_targets():
+                    member_id = member["peer_id"]
                     try:
                         plugin.rpc.call("sendcustommsg", {
                             "node_id": member_id,
@@ -12939,14 +12955,11 @@ def _broadcast_our_stigmergic_markers():
         if not msg:
             return
 
-        # Get hive members to broadcast to
-        members = database.get_all_members()
+        # Broadcast to eligible members (excludes banned)
         broadcast_count = 0
 
-        for member in members:
-            member_id = member.get("peer_id")
-            if not member_id or member_id == our_pubkey:
-                continue
+        for member in _get_broadcast_targets():
+            member_id = member["peer_id"]
 
             try:
                 plugin.rpc.call("sendcustommsg", {
@@ -13028,13 +13041,11 @@ def _broadcast_our_pheromones():
         if not msg:
             return
 
-        # Broadcast to all hive members
+        # Broadcast to eligible members (excludes banned)
         broadcast_count = 0
 
-        for member in members:
-            member_id = member.get("peer_id")
-            if not member_id or member_id == our_pubkey:
-                continue
+        for member in _get_broadcast_targets():
+            member_id = member["peer_id"]
 
             try:
                 plugin.rpc.call("sendcustommsg", {
@@ -13096,13 +13107,11 @@ def _broadcast_our_yield_metrics():
         if not msg:
             return
 
-        # Broadcast to all hive members
+        # Broadcast to eligible members (excludes banned)
         broadcast_count = 0
 
-        for member in members:
-            member_id = member.get("peer_id")
-            if not member_id or member_id == our_pubkey:
-                continue
+        for member in _get_broadcast_targets():
+            member_id = member["peer_id"]
 
             try:
                 plugin.rpc.call("sendcustommsg", {
@@ -13173,10 +13182,8 @@ def _broadcast_circular_flow_alerts():
             if not msg:
                 continue
 
-            for member in members:
-                member_id = member.get("peer_id")
-                if not member_id or member_id == our_pubkey:
-                    continue
+            for member in _get_broadcast_targets():
+                member_id = member["peer_id"]
 
                 try:
                     plugin.rpc.call("sendcustommsg", {
@@ -13242,13 +13249,11 @@ def _broadcast_our_temporal_patterns():
         if not msg:
             return
 
-        # Broadcast to all hive members
+        # Broadcast to eligible members (excludes banned)
         broadcast_count = 0
 
-        for member in members:
-            member_id = member.get("peer_id")
-            if not member_id or member_id == our_pubkey:
-                continue
+        for member in _get_broadcast_targets():
+            member_id = member["peer_id"]
 
             try:
                 plugin.rpc.call("sendcustommsg", {
@@ -13313,14 +13318,11 @@ def _broadcast_our_corridor_values():
         if not msg:
             return
 
-        # Broadcast to all hive members
-        members = database.get_all_members()
+        # Broadcast to eligible members (excludes banned)
         broadcast_count = 0
 
-        for member in members:
-            member_id = member.get("peer_id")
-            if not member_id or member_id == our_pubkey:
-                continue
+        for member in _get_broadcast_targets():
+            member_id = member["peer_id"]
 
             try:
                 plugin.rpc.call("sendcustommsg", {
@@ -13384,10 +13386,8 @@ def _broadcast_our_positioning_proposals():
             if not msg:
                 continue
 
-            for member in members:
-                member_id = member.get("peer_id")
-                if not member_id or member_id == our_pubkey:
-                    continue
+            for member in _get_broadcast_targets():
+                member_id = member["peer_id"]
 
                 try:
                     plugin.rpc.call("sendcustommsg", {
@@ -13456,10 +13456,8 @@ def _broadcast_our_physarum_recommendations():
             if not msg:
                 continue
 
-            for member in members:
-                member_id = member.get("peer_id")
-                if not member_id or member_id == our_pubkey:
-                    continue
+            for member in _get_broadcast_targets():
+                member_id = member["peer_id"]
 
                 try:
                     plugin.rpc.call("sendcustommsg", {
@@ -13519,14 +13517,11 @@ def _broadcast_our_coverage_analysis():
         if not msg:
             return
 
-        # Broadcast to all hive members
-        members = database.get_all_members()
+        # Broadcast to eligible members (excludes banned)
         broadcast_count = 0
 
-        for member in members:
-            member_id = member.get("peer_id")
-            if not member_id or member_id == our_pubkey:
-                continue
+        for member in _get_broadcast_targets():
+            member_id = member["peer_id"]
 
             try:
                 plugin.rpc.call("sendcustommsg", {
@@ -13591,10 +13586,8 @@ def _broadcast_our_close_proposals():
             if not msg:
                 continue
 
-            for member in members:
-                member_id = member.get("peer_id")
-                if not member_id or member_id == our_pubkey:
-                    continue
+            for member in _get_broadcast_targets():
+                member_id = member["peer_id"]
 
                 try:
                     plugin.rpc.call("sendcustommsg", {
@@ -13706,12 +13699,9 @@ def _broadcast_health_report():
         )
 
         if msg:
-            members = database.get_all_members()
             broadcast_count = 0
-            for member in members:
-                member_id = member.get("peer_id")
-                if not member_id or member_id == our_pubkey:
-                    continue
+            for member in _get_broadcast_targets():
+                member_id = member["peer_id"]
                 try:
                     plugin.rpc.call("sendcustommsg", {
                         "node_id": member_id,
@@ -13777,10 +13767,8 @@ def _broadcast_liquidity_needs():
             )
 
             if msg:
-                for member in members:
-                    member_id = member.get("peer_id")
-                    if not member_id or member_id == our_pubkey:
-                        continue
+                for member in _get_broadcast_targets():
+                    member_id = member["peer_id"]
                     try:
                         plugin.rpc.call("sendcustommsg", {
                             "node_id": member_id,
