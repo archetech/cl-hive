@@ -2543,6 +2543,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     peer_available_limiter = RateLimiter(max_per_minute=10, window_seconds=60)
     plugin.log("cl-hive: Rate limiter initialized (10 msg/min per peer)")
 
+    # Remove ghost members (gone from gossip graph) BEFORE syncing policies,
+    # so stale members don't get hive strategy re-applied on startup.
+    ghost_removed = _cleanup_ghost_members()
+    if ghost_removed > 0:
+        plugin.log(f"cl-hive: Removed {ghost_removed} ghost member(s) on startup")
+
     # Sync fee policies for existing members (Phase 4 integration)
     if bridge and bridge.status == BridgeStatus.ENABLED:
         _sync_member_policies(plugin)
@@ -6071,6 +6077,55 @@ def _check_timestamp_freshness(payload: Dict[str, Any], max_age: int,
             )
         return False
     return True
+
+
+def _cleanup_ghost_members() -> int:
+    """
+    Remove members whose node is no longer in the gossip graph.
+
+    The gossip graph retains node announcements for ~2 weeks, so absence
+    from the graph is a strong signal the node is permanently gone.
+
+    Returns:
+        Number of members removed.
+    """
+    if not database or not plugin:
+        return 0
+
+    removed = 0
+    try:
+        all_members = database.get_all_members() or []
+        for m in all_members:
+            pid = m.get("peer_id")
+            if not pid or pid == our_pubkey:
+                continue
+            try:
+                nodes = plugin.rpc.listnodes(pid).get("nodes", [])
+                if nodes:
+                    continue  # Still in graph
+            except Exception:
+                continue  # RPC error — be conservative, skip
+
+            # Node gone from gossip graph → auto-remove
+            database.remove_member(pid)
+            if bridge and bridge.status == BridgeStatus.ENABLED:
+                try:
+                    bridge.set_hive_policy(pid, is_member=False)
+                except Exception:
+                    pass
+            last_seen = m.get("last_seen") or 0
+            age_days = (int(time.time()) - last_seen) // 86400 if last_seen else "?"
+            plugin.log(
+                f"cl-hive: Auto-removed ghost member {pid[:16]}... "
+                f"(last_seen {age_days}d ago, not in gossip graph)",
+                level='info'
+            )
+            removed += 1
+    except Exception as e:
+        if plugin:
+            plugin.log(f"cl-hive: Ghost member cleanup error: {e}", level='debug')
+
+    return removed
 
 
 def _sync_member_policies(plugin: Plugin) -> None:
@@ -11195,43 +11250,12 @@ def membership_maintenance_loop():
                 if reconnected > 0 and plugin:
                     plugin.log(f"Auto-connected to {reconnected} hive member(s)", level='info')
 
-                # Auto-remove members not seen for 14+ days whose node is no
-                # longer in the gossip graph.  This prevents ghost members from
+                # Auto-remove members whose node is no longer in the gossip
+                # graph.  The gossip graph retains node announcements for ~2
+                # weeks, so absence from the graph is a strong signal the node
+                # is permanently gone.  This prevents ghost members from
                 # polluting settlement calculations and hive policies.
-                STALE_MEMBER_DAYS = 14
-                stale_cutoff = int(time.time()) - (STALE_MEMBER_DAYS * 86400)
-                try:
-                    all_members = database.get_all_members() or []
-                    for m in all_members:
-                        pid = m.get("peer_id")
-                        if not pid or pid == our_pubkey:
-                            continue
-                        last_seen = m.get("last_seen") or 0
-                        if last_seen > stale_cutoff:
-                            continue
-                        # Confirm the node is truly gone from the network graph
-                        try:
-                            nodes = plugin.rpc.listnodes(pid).get("nodes", [])
-                            if nodes:
-                                continue  # Still in graph, just not communicating with us
-                        except Exception:
-                            continue  # RPC error — be conservative, skip
-                        # Node gone from graph + not seen in 14 days → auto-remove
-                        database.remove_member(pid)
-                        if bridge and bridge.status == BridgeStatus.ENABLED:
-                            try:
-                                bridge.set_hive_policy(pid, is_member=False)
-                            except Exception:
-                                pass
-                        plugin.log(
-                            f"cl-hive: Auto-removed stale member {pid[:16]}... "
-                            f"(last_seen {(int(time.time()) - last_seen) // 86400}d ago, "
-                            f"not in gossip graph)",
-                            level='info'
-                        )
-                except Exception as stale_err:
-                    if plugin:
-                        plugin.log(f"cl-hive: Stale member cleanup error: {stale_err}", level='debug')
+                _cleanup_ghost_members()
 
                 # Sweep expired settlement_gaming ban proposals that may need quorum check.
                 # These use reversed voting (non-participation = approve) so bans only
