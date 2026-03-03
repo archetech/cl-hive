@@ -6123,6 +6123,31 @@ def _sync_member_policies(plugin: Plugin) -> None:
     if synced > 0:
         plugin.log(f"cl-hive: Synced fee policies for {synced} member(s)")
 
+    # Cleanup stale hive policies: peers with hive strategy in cl-revenue-ops
+    # that are no longer hive members (e.g. removal bridge call failed).
+    member_peer_ids = {m["peer_id"] for m in members}
+    try:
+        result = bridge.safe_call("revenue-policy", {"action": "list"})
+        policies = result.get("policies", [])
+        reverted = 0
+        for pol in policies:
+            pid = pol.get("peer_id", "")
+            strategy = pol.get("strategy", "")
+            if strategy == "hive" and pid and pid not in member_peer_ids and pid != our_pubkey:
+                try:
+                    bridge.set_hive_policy(pid, is_member=False, bypass_rate_limit=True)
+                    reverted += 1
+                    plugin.log(
+                        f"cl-hive: Reverted stale hive policy for non-member {pid[:16]}...",
+                        level='info'
+                    )
+                except Exception:
+                    pass
+        if reverted > 0:
+            plugin.log(f"cl-hive: Cleaned up {reverted} stale hive policy(s)")
+    except Exception as e:
+        plugin.log(f"cl-hive: Could not check for stale hive policies: {e}", level='debug')
+
 
 def _sync_membership_on_startup(plugin: Plugin) -> None:
     """
@@ -17126,6 +17151,14 @@ def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"
     success = database.remove_member(peer_id)
     if not success:
         return {"error": "removal_failed", "peer_id": peer_id}
+
+    # Revert fee policy to dynamic (was missing — caused stale hive policies
+    # in cl-revenue-ops after member removal)
+    if bridge and bridge.status == BridgeStatus.ENABLED:
+        try:
+            bridge.set_hive_policy(peer_id, is_member=False)
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to revert policy for removed member {peer_id[:16]}...: {e}", level='warn')
 
     plugin.log(
         f"cl-hive: Removed member {peer_id[:16]}... ({target_tier})"
