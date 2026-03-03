@@ -6079,6 +6079,38 @@ def _check_timestamp_freshness(payload: Dict[str, Any], max_age: int,
     return True
 
 
+def _execute_member_removal(peer_id: str, reason: str = "removed") -> None:
+    """
+    Full member removal: DB, state manager, bridge policy, and broadcast.
+
+    Shared by hive-remove-member, _cleanup_ghost_members, and ban execution.
+    """
+    # 1. Remove from database
+    database.remove_member(peer_id)
+
+    # 2. Remove from in-memory state
+    if state_manager:
+        try:
+            state_manager.remove_peer_state(peer_id)
+        except Exception:
+            pass
+
+    # 3. Revert fee policy to dynamic
+    if bridge and bridge.status == BridgeStatus.ENABLED:
+        try:
+            bridge.set_hive_policy(peer_id, is_member=False)
+        except Exception:
+            pass
+
+    # 4. Force the next gossip cycle to broadcast immediately so remaining
+    #    members see the updated member list without the removed peer.
+    if gossip_mgr:
+        try:
+            gossip_mgr.force_next_broadcast()
+        except Exception:
+            pass
+
+
 def _cleanup_ghost_members() -> int:
     """
     Remove members whose node is no longer in the gossip graph.
@@ -6106,15 +6138,10 @@ def _cleanup_ghost_members() -> int:
             except Exception:
                 continue  # RPC error — be conservative, skip
 
-            # Node gone from gossip graph → auto-remove
-            database.remove_member(pid)
-            if bridge and bridge.status == BridgeStatus.ENABLED:
-                try:
-                    bridge.set_hive_policy(pid, is_member=False)
-                except Exception:
-                    pass
+            # Node gone from gossip graph → full removal
             last_seen = m.get("last_seen") or 0
             age_days = (int(time.time()) - last_seen) // 86400 if last_seen else "?"
+            _execute_member_removal(pid, reason="ghost_cleanup")
             plugin.log(
                 f"cl-hive: Auto-removed ghost member {pid[:16]}... "
                 f"(last_seen {age_days}d ago, not in gossip graph)",
@@ -17209,18 +17236,8 @@ def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"
             )
         }
 
-    # Remove the member
-    success = database.remove_member(peer_id)
-    if not success:
-        return {"error": "removal_failed", "peer_id": peer_id}
-
-    # Revert fee policy to dynamic (was missing — caused stale hive policies
-    # in cl-revenue-ops after member removal)
-    if bridge and bridge.status == BridgeStatus.ENABLED:
-        try:
-            bridge.set_hive_policy(peer_id, is_member=False)
-        except Exception as e:
-            plugin.log(f"cl-hive: Failed to revert policy for removed member {peer_id[:16]}...: {e}", level='warn')
+    # Full removal: DB, state manager, bridge policy, and broadcast
+    _execute_member_removal(peer_id, reason)
 
     plugin.log(
         f"cl-hive: Removed member {peer_id[:16]}... ({target_tier})"

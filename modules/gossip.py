@@ -578,6 +578,11 @@ class GossipManager:
     # STATISTICS
     # =========================================================================
     
+    def force_next_broadcast(self) -> None:
+        """Force the next gossip cycle to broadcast by resetting the heartbeat timer."""
+        with self._lock:
+            self._last_broadcast_state.last_broadcast = 0
+
     def get_gossip_stats(self) -> Dict[str, Any]:
         """
         Get gossip statistics.
