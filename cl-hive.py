@@ -11195,6 +11195,44 @@ def membership_maintenance_loop():
                 if reconnected > 0 and plugin:
                     plugin.log(f"Auto-connected to {reconnected} hive member(s)", level='info')
 
+                # Auto-remove members not seen for 14+ days whose node is no
+                # longer in the gossip graph.  This prevents ghost members from
+                # polluting settlement calculations and hive policies.
+                STALE_MEMBER_DAYS = 14
+                stale_cutoff = int(time.time()) - (STALE_MEMBER_DAYS * 86400)
+                try:
+                    all_members = database.get_all_members() or []
+                    for m in all_members:
+                        pid = m.get("peer_id")
+                        if not pid or pid == our_pubkey:
+                            continue
+                        last_seen = m.get("last_seen") or 0
+                        if last_seen > stale_cutoff:
+                            continue
+                        # Confirm the node is truly gone from the network graph
+                        try:
+                            nodes = plugin.rpc.listnodes(pid).get("nodes", [])
+                            if nodes:
+                                continue  # Still in graph, just not communicating with us
+                        except Exception:
+                            continue  # RPC error — be conservative, skip
+                        # Node gone from graph + not seen in 14 days → auto-remove
+                        database.remove_member(pid)
+                        if bridge and bridge.status == BridgeStatus.ENABLED:
+                            try:
+                                bridge.set_hive_policy(pid, is_member=False)
+                            except Exception:
+                                pass
+                        plugin.log(
+                            f"cl-hive: Auto-removed stale member {pid[:16]}... "
+                            f"(last_seen {(int(time.time()) - last_seen) // 86400}d ago, "
+                            f"not in gossip graph)",
+                            level='info'
+                        )
+                except Exception as stale_err:
+                    if plugin:
+                        plugin.log(f"cl-hive: Stale member cleanup error: {stale_err}", level='debug')
+
                 # Sweep expired settlement_gaming ban proposals that may need quorum check.
                 # These use reversed voting (non-participation = approve) so bans only
                 # execute after the voting window expires, but nothing re-checks quorum
