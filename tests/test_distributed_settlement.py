@@ -82,6 +82,15 @@ def mock_database():
         {'peer_id': '02' + 'c' * 64, 'tier': 'member', 'uptime_pct': 95.0},
     ]
 
+    # Fee report methods - provide persisted fee data so old-period tests
+    # don't depend on state_manager fallback (which is now blocked for
+    # historical periods to prevent state contamination).
+    db.get_fee_reports_for_period.return_value = [
+        {'peer_id': '02' + 'a' * 64, 'fees_earned_sats': 10000, 'forward_count': 50, 'rebalance_costs_sats': 0},
+        {'peer_id': '02' + 'b' * 64, 'fees_earned_sats': 5000, 'forward_count': 25, 'rebalance_costs_sats': 0},
+        {'peer_id': '02' + 'c' * 64, 'fees_earned_sats': 3000, 'forward_count': 15, 'rebalance_costs_sats': 0},
+    ]
+
     return db
 
 
@@ -1033,14 +1042,14 @@ class TestSettlementRebroadcast:
         """Verify proposals store contributions_json for rebroadcast."""
         settlement_manager = SettlementManager(mock_database, mock_plugin, mock_rpc)
 
-        # Set up mock state manager
-        mock_state_manager.get_peer_fees.return_value = {
-            'fees_earned_sats': 1000,
-            'forward_count': 10,
-            'rebalance_costs_sats': 100
-        }
+        # Set up mock - provide persisted fee reports so old periods don't
+        # fall through to state_manager (blocked for historical periods).
         mock_state_manager.get_peer_state.return_value = MagicMock(capacity_sats=10_000_000)
-        mock_database.get_fee_reports_for_period.return_value = []
+        mock_database.get_fee_reports_for_period.return_value = [
+            {'peer_id': '02' + 'a' * 64, 'fees_earned_sats': 1000, 'forward_count': 10, 'rebalance_costs_sats': 100},
+            {'peer_id': '02' + 'b' * 64, 'fees_earned_sats': 1000, 'forward_count': 10, 'rebalance_costs_sats': 100},
+            {'peer_id': '02' + 'c' * 64, 'fees_earned_sats': 1000, 'forward_count': 10, 'rebalance_costs_sats': 100},
+        ]
 
         proposal = settlement_manager.create_proposal(
             period="2025-01",

@@ -6700,7 +6700,7 @@ class HiveDatabase:
         import datetime
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         cutoff_date = now - datetime.timedelta(weeks=keep_periods)
-        cutoff_period = f"{cutoff_date.isocalendar()[0]}-W{cutoff_date.isocalendar()[1]:02d}"
+        cutoff_period = f"{cutoff_date.isocalendar()[0]}-{cutoff_date.isocalendar()[1]:02d}"
 
         result = conn.execute("""
             DELETE FROM fee_reports WHERE period < ?
@@ -6841,6 +6841,15 @@ class HiveDatabase:
             (period,)
         ).fetchone()
         return dict(row) if row else None
+
+    def delete_settlement_proposal(self, proposal_id: str) -> bool:
+        """Delete a settlement proposal (e.g. expired) to allow re-creation."""
+        conn = self._get_connection()
+        result = conn.execute(
+            "DELETE FROM settlement_proposals WHERE proposal_id = ?",
+            (proposal_id,)
+        )
+        return result.rowcount > 0
 
     def get_pending_settlement_proposals(self) -> List[Dict[str, Any]]:
         """Get all pending settlement proposals."""

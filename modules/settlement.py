@@ -1085,18 +1085,29 @@ class SettlementManager:
         for member in all_members:
             peer_id = member['peer_id']
 
-            # First try database (persisted), then fall back to state manager (in-memory)
+            # First try database (persisted), then fall back to state manager
+            # for current/previous period only.  For older backlog periods,
+            # state_manager holds CURRENT fees which would contaminate
+            # historical settlement data — default to 0 instead.
             if peer_id in db_fees_by_peer:
                 db_report = db_fees_by_peer[peer_id]
                 fees_earned = db_report.get('fees_earned_sats', 0)
                 forward_count = db_report.get('forward_count', 0)
                 rebalance_costs = db_report.get('rebalance_costs_sats', 0)
             else:
-                # Fall back to in-memory state (may be from current session)
-                fee_data = state_manager.get_peer_fees(peer_id)
-                fees_earned = fee_data.get('fees_earned_sats', 0)
-                forward_count = fee_data.get('forward_count', 0)
-                rebalance_costs = fee_data.get('rebalance_costs_sats', 0)
+                current_period = self.get_period_string()
+                previous_period = self.get_previous_period()
+                if period in (current_period, previous_period):
+                    # Safe to use in-memory state for recent periods
+                    fee_data = state_manager.get_peer_fees(peer_id)
+                    fees_earned = fee_data.get('fees_earned_sats', 0)
+                    forward_count = fee_data.get('forward_count', 0)
+                    rebalance_costs = fee_data.get('rebalance_costs_sats', 0)
+                else:
+                    # Old period with no DB record — no data to attribute
+                    fees_earned = 0
+                    forward_count = 0
+                    rebalance_costs = 0
 
             # Get capacity from state
             peer_state = state_manager.get_peer_state(peer_id)
@@ -1162,12 +1173,31 @@ class SettlementManager:
         # Check if period already has a proposal
         existing = self.db.get_settlement_proposal_by_period(period)
         if existing:
-            self.last_create_proposal_skip_reason = "proposal_exists"
-            self.plugin.log(
-                f"Settlement proposal already exists for {period}",
-                level='debug'
-            )
-            return None
+            status = (existing.get("status") or "").lower()
+            if status == "expired":
+                # Expired proposals can be replaced - delete and proceed
+                try:
+                    proposal_id = existing.get("proposal_id")
+                    if proposal_id:
+                        self.db.delete_settlement_proposal(proposal_id)
+                        self.plugin.log(
+                            f"Deleted expired settlement proposal for {period} to allow re-creation",
+                            level='info'
+                        )
+                except Exception as e:
+                    self.plugin.log(
+                        f"Failed to delete expired proposal for {period}: {e}",
+                        level='warn'
+                    )
+                    self.last_create_proposal_skip_reason = "expired_proposal_cleanup_failed"
+                    return None
+            else:
+                self.last_create_proposal_skip_reason = "proposal_exists"
+                self.plugin.log(
+                    f"Settlement proposal already exists for {period} (status={status})",
+                    level='debug'
+                )
+                return None
 
         # Check if period is already settled
         if self.db.is_period_settled(period):
