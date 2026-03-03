@@ -412,8 +412,8 @@ class TestPeriodHandling:
 
         # Previous should be different from current
         # (unless at week boundary, but unlikely in tests)
-        current_week = int(current[6:])
-        previous_week = int(previous[6:])
+        current_week = int(current.split('-')[1])
+        previous_week = int(previous.split('-')[1])
 
         # Previous week should be 1 less (or 52/53 if current is week 1)
         if current_week > 1:

@@ -11787,8 +11787,29 @@ def settlement_loop():
                         if proposal:
                             break
 
+                        skip_reason = getattr(settlement_mgr, "last_create_proposal_skip_reason", None)
+
+                        # Zero-fee periods have nothing to settle. Mark them as settled
+                        # so the backlog scan doesn't retry them every cycle.
+                        if skip_reason == "zero_total_fees":
+                            try:
+                                database.mark_period_settled(
+                                    attempt_period,
+                                    proposal_id=f"zero-fee-auto-{attempt_period}",
+                                    total_distributed_sats=0,
+                                )
+                                plugin.log(
+                                    f"SETTLEMENT: Marked {attempt_period} as settled (zero fees, nothing to distribute)",
+                                    level='info'
+                                )
+                            except Exception as e:
+                                plugin.log(
+                                    f"SETTLEMENT: Failed to auto-settle zero-fee period {attempt_period}: {e}",
+                                    level='warn'
+                                )
+                            continue
+
                         if attempt_idx + 1 < len(attempted_periods):
-                            skip_reason = getattr(settlement_mgr, "last_create_proposal_skip_reason", None)
                             plugin.log(
                                 f"SETTLEMENT: Could not create proposal for {attempt_period}; "
                                 f"reason={skip_reason or 'unknown'}; trying next eligible unsettled period",
