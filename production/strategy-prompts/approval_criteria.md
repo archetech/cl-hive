@@ -149,6 +149,37 @@ The channel between fleet nodes is exempt from normal tier limits when >70/30 im
 
 ---
 
+## Boltz Swap Actions (Advisor-Evaluated)
+
+Boltz swaps are the **last resort** for liquidity management. Always prefer hive internal rebalances (free) and market/Sling routes before Boltz.
+
+### APPROVE if ALL conditions met:
+- Channel is profitable and has routing activity (not underwater/bleeder)
+- Estimated swap fee < remaining daily Boltz budget
+- Expected net benefit > 1.5x estimated swap fee (clear profit margin)
+- No pending Boltz swap already active on same channel
+- Hive internal and market rebalance options exhausted (check `fleet_rebalance_path` first)
+- Channel balance is outside acceptable range (<20% or >80% local)
+- Direction matches channel need (loop-in for depleting, loop-out for saturating)
+
+### REJECT if ANY condition applies:
+- Channel is underwater/bleeder (fix the channel first, don't feed it)
+- Would exceed daily Boltz budget
+- Hive internal rebalance available for same direction (use free route instead)
+- Market/Sling rebalance available at lower cost
+- Channel balance is acceptable (20-80% range — leave it alone)
+- Swap fee > 1000 ppm of amount (too expensive)
+- Channel is being considered for closing
+
+### DEFER (reject with reason "needs_review") if:
+- Expected net benefit is marginal (1.0-1.5x fee — borderline profitability)
+- Channel is < 14 days old (let optimizer learn naturally)
+- Treasury expansion cycle already running on this node
+- Any uncertainty about whether the swap is needed
+- Multiple Boltz swaps already executed today (budget discipline)
+
+---
+
 ## General Principles
 
 **Every decision must answer: "Does this increase fleet profitability or routing volume?"**
