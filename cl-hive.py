@@ -3863,7 +3863,8 @@ def _try_auto_connect(peer_id: str, addresses: List[str]) -> bool:
 
 def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
                                fee_policy: Dict, topology: list,
-                               addresses: List[str] = None) -> Optional[bytes]:
+                               addresses: List[str] = None,
+                               boltz_activity: Dict = None) -> Optional[bytes]:
     """
     Create a signed GOSSIP message for broadcast.
 
@@ -3877,6 +3878,7 @@ def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
         fee_policy: Current fee policy dict
         topology: List of external peer connections
         addresses: List of our connection addresses for auto-connect
+        boltz_activity: Boltz swap activity summary for fleet coordination
 
     Returns:
         Serialized and signed GOSSIP message, or None if signing fails
@@ -3891,7 +3893,8 @@ def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
         available_sats=available_sats,
         fee_policy=fee_policy,
         topology=topology,
-        addresses=addresses or []
+        addresses=addresses or [],
+        boltz_activity=boltz_activity
     )
 
     # Add sender identification for signature verification
@@ -12420,12 +12423,14 @@ def gossip_loop():
             if should_broadcast:
                 # Step 5: Create signed GOSSIP message (with addresses for auto-connect)
                 our_addresses = _get_our_addresses()
+                boltz_activity = bridge.get_boltz_activity() if bridge else None
                 gossip_msg = _create_signed_gossip_msg(
                     capacity_sats=hive_capacity_sats,
                     available_sats=hive_available_sats,
                     fee_policy=fee_policy,
                     topology=external_peers,
-                    addresses=our_addresses
+                    addresses=our_addresses,
+                    boltz_activity=boltz_activity
                 )
 
                 if gossip_msg:

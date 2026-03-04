@@ -235,7 +235,8 @@ class GossipManager:
                                budget_available_sats: int = 0,
                                budget_reserved_until: int = 0,
                                addresses: List[str] = None,
-                               capabilities: List[str] = None) -> Dict[str, Any]:
+                               capabilities: List[str] = None,
+                               boltz_activity: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Create a gossip payload for broadcast.
 
@@ -305,6 +306,8 @@ class GossipManager:
             "addresses": addresses or [],
             # Capabilities for version-aware feature negotiation (Phase 15)
             "capabilities": capabilities,
+            # Boltz swap activity for fleet coordination (F1)
+            "boltz_activity": boltz_activity or {},
         }
     
     # =========================================================================
