@@ -1147,7 +1147,7 @@ class Planner:
         Returns:
             Total capacity in satoshis (0 if not found)
         """
-        channels = self._network_cache.get(target, [])
+        channels = self.get_unique_channels_for(target)
         return sum(ch.capacity_sats for ch in channels if ch.active)
 
     # =========================================================================
@@ -1223,6 +1223,32 @@ class Planner:
             'underwater_count': underwater_count,
             'underwater_pct': underwater_pct,
         }
+
+    # =========================================================================
+    # CHANNEL DEDUP ACCESSOR
+    # =========================================================================
+
+    def get_unique_channels_for(self, target: str) -> List['ChannelInfo']:
+        """
+        Get deduplicated channels for a target from the network cache.
+
+        The cache indexes each channel under both endpoints (source and dest).
+        This method deduplicates by short_channel_id to prevent double-counting.
+
+        Args:
+            target: Target node pubkey
+
+        Returns:
+            List of unique ChannelInfo objects for this target
+        """
+        channels = self._network_cache.get(target, [])
+        seen_scids: set = set()
+        unique: list = []
+        for ch in channels:
+            if ch.short_channel_id not in seen_scids:
+                seen_scids.add(ch.short_channel_id)
+                unique.append(ch)
+        return unique
 
     # =========================================================================
     # SATURATION LOGIC
@@ -1999,7 +2025,10 @@ class Planner:
             # Calculate backoff: after threshold, wait exponentially longer
             # 3 rejections = 1 hour, 6 = 2 hours, 9 = 4 hours, etc.
             backoff_hours = 2 ** ((consecutive_rejections - pause_threshold) // 3)
-            max_backoff_hours = 24  # Cap at 24 hours
+            # Use the rejection lookback window as natural ceiling.
+            # Previous 24h cap caused permanent stalls because hourly planner
+            # cycles kept adding rejections within the capped window.
+            max_backoff_hours = getattr(self.db, 'REJECTION_LOOKBACK_HOURS', 168)
 
             backoff_hours = min(backoff_hours, max_backoff_hours)
 
@@ -2273,6 +2302,9 @@ class Planner:
                 'hive_share_pct': selected_target.hive_share_pct
             })
 
+            # Pre-compute node summary for accurate channel counts in proposals
+            node_summary = self.compute_node_summary()
+
             # Use DecisionEngine for governance decision if available
             if self.decision_engine:
                 # Calculate proposed channel size using intelligent sizing algorithm
@@ -2324,6 +2356,7 @@ class Planner:
                     'quality_score': round(selected_target.quality_score, 3),
                     'quality_confidence': round(selected_target.quality_confidence, 3),
                     'quality_recommendation': selected_target.quality_recommendation,
+                    'node_summary': node_summary,
                 }
 
                 # Define executor for channel_open (broadcasts intent)
@@ -2374,6 +2407,10 @@ class Planner:
                             'public_capacity_sats': selected_target.public_capacity_sats,
                             'hive_share_pct': round(selected_target.hive_share_pct, 4),
                             'onchain_balance': onchain_balance,
+                            'target_channel_count': self._get_target_channel_count(selected_target.target),
+                            'quality_score': round(selected_target.quality_score, 3),
+                            'quality_recommendation': selected_target.quality_recommendation,
+                            'node_summary': node_summary,
                         },
                         expires_hours=24
                     )

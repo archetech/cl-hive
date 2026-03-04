@@ -1834,5 +1834,239 @@ class TestComputeNodeSummary:
         assert result is None
 
 
+class TestRejectionBackoffStall:
+    """Tests for the rejection backoff stall fix (Task 4).
+
+    The bug: max_backoff_hours was capped at 24, but the planner runs hourly
+    and creates a new rejection each cycle.  With 18+ consecutive rejections
+    the backoff saturated at 24h, yet new rejections kept landing inside that
+    window, so get_recent_expansion_rejections(hours=24) always returned >= 3
+    items and expansions were permanently paused.
+
+    The fix: use REJECTION_LOOKBACK_HOURS (168h / 7 days) as the natural
+    ceiling so the backoff window eventually exceeds the rate at which
+    rejections accumulate, allowing it to escape.
+    """
+
+    def test_backoff_escapes_when_rejections_age_out(
+        self, mock_plugin, mock_database, mock_state_manager,
+        mock_bridge, mock_clboss_bridge
+    ):
+        """18 consecutive rejections but all are old -- should NOT pause."""
+        planner = Planner(
+            plugin=mock_plugin,
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=mock_bridge,
+            clboss_bridge=mock_clboss_bridge,
+        )
+        mock_database.count_consecutive_expansion_rejections.return_value = 18
+        # The backoff window (32h for 18 rejections) finds no recent items
+        mock_database.get_recent_expansion_rejections.return_value = []
+        mock_database.REJECTION_LOOKBACK_HOURS = 168
+
+        cfg = MagicMock()
+        cfg.expansion_pause_threshold = 3
+
+        should_pause, reason = planner._should_pause_expansions_globally(cfg)
+
+        assert should_pause is False, (
+            "Expansions should resume once all rejections age out of the backoff window"
+        )
+
+    def test_backoff_pauses_with_fresh_rejections(
+        self, mock_plugin, mock_database, mock_state_manager,
+        mock_bridge, mock_clboss_bridge
+    ):
+        """6 consecutive rejections with 3 fresh ones -- should pause."""
+        planner = Planner(
+            plugin=mock_plugin,
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=mock_bridge,
+            clboss_bridge=mock_clboss_bridge,
+        )
+        mock_database.count_consecutive_expansion_rejections.return_value = 6
+        # backoff_hours for 6 rejections = 2^((6-3)//3) = 2^1 = 2
+        mock_database.get_recent_expansion_rejections.return_value = [
+            {"id": 1}, {"id": 2}, {"id": 3}
+        ]
+        mock_database.REJECTION_LOOKBACK_HOURS = 168
+
+        cfg = MagicMock()
+        cfg.expansion_pause_threshold = 3
+
+        should_pause, reason = planner._should_pause_expansions_globally(cfg)
+
+        assert should_pause is True
+        assert "global_constraint_backoff" in reason
+
+    def test_hard_cap_still_blocks_at_50(
+        self, mock_plugin, mock_database, mock_state_manager,
+        mock_bridge, mock_clboss_bridge
+    ):
+        """50 consecutive rejections should always pause with manual intervention."""
+        planner = Planner(
+            plugin=mock_plugin,
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=mock_bridge,
+            clboss_bridge=mock_clboss_bridge,
+        )
+        mock_database.count_consecutive_expansion_rejections.return_value = 50
+        mock_database.REJECTION_LOOKBACK_HOURS = 168
+
+        cfg = MagicMock()
+        cfg.expansion_pause_threshold = 3
+
+        should_pause, reason = planner._should_pause_expansions_globally(cfg)
+
+        assert should_pause is True
+        assert "manual intervention" in reason
+
+    def test_backoff_hours_grows_past_24(
+        self, mock_plugin, mock_database, mock_state_manager,
+        mock_bridge, mock_clboss_bridge
+    ):
+        """18 rejections should produce backoff_hours=32, not capped at 24."""
+        planner = Planner(
+            plugin=mock_plugin,
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=mock_bridge,
+            clboss_bridge=mock_clboss_bridge,
+        )
+        mock_database.count_consecutive_expansion_rejections.return_value = 18
+        mock_database.get_recent_expansion_rejections.return_value = []
+        mock_database.REJECTION_LOOKBACK_HOURS = 168
+
+        cfg = MagicMock()
+        cfg.expansion_pause_threshold = 3
+
+        planner._should_pause_expansions_globally(cfg)
+
+        # backoff_hours = 2^((18-3)//3) = 2^5 = 32
+        # With the old 24h cap this would have been 24; now it should be 32
+        call_args = mock_database.get_recent_expansion_rejections.call_args
+        assert call_args is not None, "get_recent_expansion_rejections should have been called"
+        assert call_args[1]["hours"] == 32 or call_args[0][0] == 32, (
+            f"Expected backoff_hours=32 but got call_args={call_args}"
+        )
+
+
+# =============================================================================
+# GET UNIQUE CHANNELS FOR TESTS (Dedup Accessor)
+# =============================================================================
+
+class TestGetUniqueChannelsFor:
+    """Test get_unique_channels_for() deduplicating accessor."""
+
+    @staticmethod
+    def _make_planner(mock_plugin, mock_state_manager, mock_database,
+                      mock_bridge, mock_clboss_bridge):
+        return Planner(
+            plugin=mock_plugin,
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=mock_bridge,
+            clboss_bridge=mock_clboss_bridge,
+        )
+
+    def test_dedup_bidirectional_entries(self, mock_plugin, mock_state_manager,
+                                         mock_database, mock_bridge,
+                                         mock_clboss_bridge):
+        """Same ChannelInfo indexed under both endpoints returns 1 per query."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+
+        ch = ChannelInfo(
+            short_channel_id='123x1x0',
+            source='A',
+            destination='B',
+            capacity_sats=1_000_000,
+            active=True,
+        )
+        planner._network_cache = {
+            'A': [ch],
+            'B': [ch],
+        }
+
+        result_a = planner.get_unique_channels_for('A')
+        assert len(result_a) == 1
+        assert result_a[0].short_channel_id == '123x1x0'
+
+        result_b = planner.get_unique_channels_for('B')
+        assert len(result_b) == 1
+        assert result_b[0].short_channel_id == '123x1x0'
+
+    def test_multiple_unique_channels(self, mock_plugin, mock_state_manager,
+                                       mock_database, mock_bridge,
+                                       mock_clboss_bridge):
+        """Two distinct channels under same target returns both."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+
+        ch1 = ChannelInfo(
+            short_channel_id='100x1x0',
+            source='T',
+            destination='X',
+            capacity_sats=500_000,
+            active=True,
+        )
+        ch2 = ChannelInfo(
+            short_channel_id='200x2x0',
+            source='Y',
+            destination='T',
+            capacity_sats=750_000,
+            active=True,
+        )
+        planner._network_cache = {
+            'T': [ch1, ch2],
+        }
+
+        result = planner.get_unique_channels_for('T')
+        assert len(result) == 2
+        scids = {ch.short_channel_id for ch in result}
+        assert scids == {'100x1x0', '200x2x0'}
+
+    def test_empty_target(self, mock_plugin, mock_state_manager,
+                           mock_database, mock_bridge, mock_clboss_bridge):
+        """Unknown target returns empty list."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+
+        planner._network_cache = {}
+
+        result = planner.get_unique_channels_for('UNKNOWN')
+        assert result == []
+
+    def test_get_public_capacity_uses_dedup(self, mock_plugin, mock_state_manager,
+                                             mock_database, mock_bridge,
+                                             mock_clboss_bridge):
+        """_get_public_capacity_to_target counts capacity only once per channel."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+
+        ch = ChannelInfo(
+            short_channel_id='123x1x0',
+            source='A',
+            destination='B',
+            capacity_sats=1_000_000,
+            active=True,
+        )
+        # Same channel object indexed under both endpoints
+        planner._network_cache = {
+            'A': [ch],
+            'B': [ch],
+        }
+
+        # Capacity should be counted once, not doubled
+        cap_a = planner._get_public_capacity_to_target('A')
+        assert cap_a == 1_000_000
+
+        cap_b = planner._get_public_capacity_to_target('B')
+        assert cap_b == 1_000_000
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
