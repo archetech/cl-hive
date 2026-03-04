@@ -19232,6 +19232,46 @@ def hive_fleet_rebalance_path(
     )
 
 
+@plugin.method("hive-fleet-boltz-status")
+def hive_fleet_boltz_status(plugin: Plugin):
+    """
+    Aggregate Boltz swap activity across all fleet members from gossip state.
+
+    Returns per-member breakdown of pending swaps, daily spend, and
+    fleet totals for coordination.
+    """
+    ctx = _get_hive_context()
+    if ctx.state_manager is None:
+        return {"error": "state_manager not initialized"}
+
+    members = {}
+    fleet_pending = 0
+    fleet_daily_spend = 0
+
+    for state in ctx.state_manager.get_all_peer_states():
+        peer_id = state.peer_id
+        boltz = getattr(state, 'boltz_activity', None) or {}
+        if not isinstance(boltz, dict):
+            boltz = {}
+        pending = int(boltz.get("pending_swaps", 0) or 0)
+        spend = int(boltz.get("daily_spend_sats", 0) or 0)
+        last_ts = int(boltz.get("last_swap_ts", 0) or 0)
+        members[peer_id] = {
+            "pending_swaps": pending,
+            "daily_spend_sats": spend,
+            "last_swap_ts": last_ts,
+        }
+        fleet_pending += pending
+        fleet_daily_spend += spend
+
+    return {
+        "fleet_pending_swaps": fleet_pending,
+        "fleet_daily_spend_sats": fleet_daily_spend,
+        "member_count": len(members),
+        "members": members,
+    }
+
+
 @plugin.method("hive-report-rebalance-outcome")
 def hive_report_rebalance_outcome(
     plugin: Plugin,

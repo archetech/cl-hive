@@ -11342,43 +11342,7 @@ async def handle_fleet_boltz_status(args: Dict) -> Dict:
     if not node:
         return {"error": f"Unknown node: {node_name}"}
 
-    # Get all member states from gossip via the node's hive-members RPC
-    try:
-        members_resp = await node.call("hive-members")
-    except Exception as e:
-        return {"error": f"Failed to get members: {e}"}
-
-    members = {}
-    fleet_pending = 0
-    fleet_daily_spend = 0
-
-    if isinstance(members_resp, dict):
-        for member in (members_resp.get("members") or []):
-            if not isinstance(member, dict):
-                continue
-            member_id = member.get("peer_id") or member.get("pubkey") or ""
-            alias = member.get("alias", "")
-            boltz = member.get("boltz_activity", {})
-            if not isinstance(boltz, dict):
-                boltz = {}
-            pending = int(boltz.get("pending_swaps", 0) or 0)
-            spend = int(boltz.get("daily_spend_sats", 0) or 0)
-            last_ts = int(boltz.get("last_swap_ts", 0) or 0)
-            members[member_id] = {
-                "alias": alias,
-                "pending_swaps": pending,
-                "daily_spend_sats": spend,
-                "last_swap_ts": last_ts,
-            }
-            fleet_pending += pending
-            fleet_daily_spend += spend
-
-    return {
-        "fleet_pending_swaps": fleet_pending,
-        "fleet_daily_spend_sats": fleet_daily_spend,
-        "member_count": len(members),
-        "members": members,
-    }
+    return await node.call("hive-fleet-boltz-status")
 
 
 async def handle_askrene_constraints_summary(args: Dict) -> Dict:

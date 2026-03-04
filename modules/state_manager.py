@@ -86,6 +86,8 @@ class HivePeerState:
     fees_costs_sats: int = 0  # Rebalance costs in period (for net profit settlement)
     # Capabilities for version-aware feature negotiation (e.g., ["mcf"])
     capabilities: List[str] = field(default_factory=list)
+    # Boltz swap activity for fleet coordination (F1)
+    boltz_activity: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -365,6 +367,8 @@ class StateManager:
                 fees_costs_sats=existing.fees_costs_sats if existing else 0,
                 # Capabilities (MCF support, etc. - backward compatible, defaults to empty)
                 capabilities=list(gossip_data.get('capabilities', [])),  # defensive copy
+                # Boltz activity for fleet coordination (F1 - backward compatible, defaults to empty)
+                boltz_activity=dict(gossip_data.get('boltz_activity', {})),  # defensive copy
             )
 
             # Update in-memory cache
