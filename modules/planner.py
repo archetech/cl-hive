@@ -1270,7 +1270,7 @@ class Planner:
         members = self.db.get_all_members()
         return [m['peer_id'] for m in members if m.get('tier') == 'member']
 
-    def _has_existing_or_pending_channel(self, target: str) -> Tuple[bool, Optional[str], Optional[int]]:
+    def _has_existing_or_pending_channel(self, target: str) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
         """
         Check if we already have an existing or pending channel to this target.
 
@@ -1281,13 +1281,14 @@ class Planner:
             target: Target node pubkey
 
         Returns:
-            Tuple of (has_channel, state, capacity_sats)
+            Tuple of (has_channel, state, capacity_sats, opener)
             - has_channel: True if we have an active or pending channel
             - state: Channel state if found (e.g., 'CHANNELD_NORMAL', 'CHANNELD_AWAITING_LOCKIN')
             - capacity_sats: Channel capacity if found
+            - opener: 'local' or 'remote' indicating who opened the channel
         """
         if not self.plugin:
-            return (False, None, None)
+            return (False, None, None, None)
 
         try:
             peer_channels = self.plugin.rpc.listpeerchannels(id=target)
@@ -1298,12 +1299,13 @@ class Planner:
                 if state in ('CHANNELD_AWAITING_LOCKIN', 'CHANNELD_NORMAL',
                              'DUALOPEND_AWAITING_LOCKIN', 'DUALOPEND_OPEN_INIT'):
                     capacity_sats = ch.get('total_msat', 0) // 1000
-                    return (True, state, capacity_sats)
+                    opener = ch.get('opener', 'local')
+                    return (True, state, capacity_sats, opener)
         except Exception:
             # If RPC fails, assume channel exists to prevent duplicate opens.
-            return (True, None, None)
+            return (True, None, None, None)
 
-        return (False, None, None)
+        return (False, None, None, None)
 
     def _get_hive_capacity_to_target(self, target: str, hive_members: List[str]) -> int:
         """
@@ -1674,9 +1676,12 @@ class Planner:
                     state = ch.get('state', '')
                     if state in ('CHANNELD_NORMAL', 'CHANNELD_AWAITING_LOCKIN',
                                  'DUALOPEND_AWAITING_LOCKIN', 'DUALOPEND_OPEN_INIT'):
-                        peer_id = ch.get('peer_id', '')
-                        if peer_id:
-                            existing_channel_peers.add(peer_id)
+                        # Only skip peers where WE opened the channel.
+                        # Remote-opened channels don't prevent expansion proposals.
+                        if ch.get('opener', 'local') == 'local':
+                            peer_id = ch.get('peer_id', '')
+                            if peer_id:
+                                existing_channel_peers.add(peer_id)
             except Exception as e:
                 self._log(f"Batch listpeerchannels failed, falling back to empty set: {e}", level='debug')
 

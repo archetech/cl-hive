@@ -188,6 +188,12 @@ class PeerQualityScorer:
             self.WEIGHT_CONSISTENCY * consistency
         )
 
+        # Bonus: peers who opened channels to us chose us as a routing partner
+        remote_open_count = summary.get('remote_open_count', 0)
+        if remote_open_count > 0:
+            opener_bonus = min(0.1, remote_open_count * 0.05)  # +0.05 per open, cap +0.10
+            overall = min(1.0, overall + opener_bonus)
+
         # Determine recommendation
         recommendation = self._get_recommendation(overall, confidence)
 

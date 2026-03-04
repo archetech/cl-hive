@@ -3762,6 +3762,7 @@ class HiveDatabase:
                 "peer_id": peer_id,
                 "event_count": 0,
                 "open_count": 0,
+                "remote_open_count": 0,
                 "close_count": 0,
                 "remote_close_count": 0,
                 "local_close_count": 0,
@@ -3778,6 +3779,7 @@ class HiveDatabase:
 
         # Aggregate statistics
         open_events = [e for e in events if e['event_type'] == 'channel_open']
+        remote_opens = [e for e in open_events if e.get('opener') == 'remote']
         close_events = [e for e in events if e['event_type'].endswith('_close')]
         remote_closes = [e for e in close_events if e.get('closer') == 'remote']
         local_closes = [e for e in close_events if e.get('closer') == 'local']
@@ -3810,6 +3812,7 @@ class HiveDatabase:
             "peer_id": peer_id,
             "event_count": len(events),
             "open_count": len(open_events),
+            "remote_open_count": len(remote_opens),
             "close_count": len(close_events),
             "remote_close_count": len(remote_closes),
             "local_close_count": len(local_closes),

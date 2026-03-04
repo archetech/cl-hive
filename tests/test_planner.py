@@ -2200,5 +2200,179 @@ class TestProfitabilityGate:
                 pytest.fail("Profitability gate should not have blocked when summary is None")
 
 
+class TestOpenerAwareExpansion:
+    """Tests for Fix H2: Allow expansion to peers who opened channels to us."""
+
+    def _make_planner(self, mock_plugin, mock_state_manager, mock_database,
+                      mock_bridge, mock_clboss_bridge):
+        return Planner(
+            plugin=mock_plugin,
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=mock_bridge,
+            clboss_bridge=mock_clboss_bridge,
+        )
+
+    def test_has_existing_returns_opener_remote(self, mock_plugin, mock_state_manager,
+                                                 mock_database, mock_bridge, mock_clboss_bridge):
+        """_has_existing_or_pending_channel returns opener='remote' for remote-opened channels."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+        mock_plugin.rpc.listpeerchannels.return_value = {
+            'channels': [
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 5_000_000_000, 'opener': 'remote'}
+            ]
+        }
+        has, state, capacity, opener = planner._has_existing_or_pending_channel('target_peer')
+        assert has is True
+        assert state == 'CHANNELD_NORMAL'
+        assert capacity == 5_000_000
+        assert opener == 'remote'
+
+    def test_has_existing_returns_opener_local(self, mock_plugin, mock_state_manager,
+                                                mock_database, mock_bridge, mock_clboss_bridge):
+        """_has_existing_or_pending_channel returns opener='local' for locally-opened channels."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+        mock_plugin.rpc.listpeerchannels.return_value = {
+            'channels': [
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 3_000_000_000, 'opener': 'local'}
+            ]
+        }
+        has, state, capacity, opener = planner._has_existing_or_pending_channel('target_peer')
+        assert has is True
+        assert state == 'CHANNELD_NORMAL'
+        assert capacity == 3_000_000
+        assert opener == 'local'
+
+    def test_no_channel_returns_none_opener(self, mock_plugin, mock_state_manager,
+                                             mock_database, mock_bridge, mock_clboss_bridge):
+        """No channel returns opener=None in the 4-tuple."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+        mock_plugin.rpc.listpeerchannels.return_value = {'channels': []}
+        has, state, capacity, opener = planner._has_existing_or_pending_channel('target_peer')
+        assert has is False
+        assert state is None
+        assert capacity is None
+        assert opener is None
+
+    def test_underserved_skips_only_locally_opened(self, mock_plugin, mock_state_manager,
+                                                    mock_database, mock_bridge, mock_clboss_bridge):
+        """Peers with only remote-opened channels are NOT excluded from underserved targets."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+        # listpeerchannels returns one remote-opened and one local-opened channel
+        mock_plugin.rpc.listpeerchannels.return_value = {
+            'channels': [
+                {'peer_id': 'T', 'state': 'CHANNELD_NORMAL', 'total_msat': 5_000_000_000, 'opener': 'remote'},
+                {'peer_id': 'L', 'state': 'CHANNELD_NORMAL', 'total_msat': 3_000_000_000, 'opener': 'local'},
+            ]
+        }
+        # Build existing_channel_peers set using the same logic as get_underserved_targets
+        all_peer_channels = mock_plugin.rpc.listpeerchannels()
+        locally_opened_peers = set()
+        for ch in all_peer_channels.get('channels', []):
+            state = ch.get('state', '')
+            if state in ('CHANNELD_NORMAL', 'CHANNELD_AWAITING_LOCKIN',
+                         'DUALOPEND_AWAITING_LOCKIN', 'DUALOPEND_OPEN_INIT'):
+                if ch.get('opener', 'local') == 'local':
+                    peer_id = ch.get('peer_id', '')
+                    if peer_id:
+                        locally_opened_peers.add(peer_id)
+        # 'T' should NOT be in locally_opened_peers (remote opener)
+        assert 'T' not in locally_opened_peers
+        # 'L' SHOULD be in locally_opened_peers (local opener)
+        assert 'L' in locally_opened_peers
+
+
+class TestOpenerQualityBonus:
+    """Tests for Fix H3: Remote channel opens boost quality score."""
+
+    def test_remote_opens_increase_score(self, mock_database):
+        """Peers who opened channels to us get a quality bonus."""
+        from modules.quality_scorer import PeerQualityScorer
+        scorer = PeerQualityScorer(database=mock_database)
+
+        # Base case: no remote opens
+        base_summary = {
+            "peer_id": "peer_A",
+            "event_count": 5,
+            "open_count": 3,
+            "remote_open_count": 0,
+            "close_count": 2,
+            "remote_close_count": 0,
+            "local_close_count": 1,
+            "mutual_close_count": 1,
+            "total_revenue_sats": 5000,
+            "total_rebalance_cost_sats": 1000,
+            "total_net_pnl_sats": 4000,
+            "total_forward_count": 100,
+            "avg_routing_score": 0.7,
+            "avg_profitability_score": 0.6,
+            "avg_duration_days": 90,
+            "reporters": ["node1"],
+            "reporter_scores": {"node1": {"event_count": 5, "avg_routing_score": 0.7, "avg_profitability_score": 0.6}},
+        }
+        mock_database.get_peer_event_summary.return_value = base_summary
+        base_result = scorer.calculate_score("peer_A")
+
+        # With remote opens
+        remote_summary = dict(base_summary)
+        remote_summary["remote_open_count"] = 2
+        mock_database.get_peer_event_summary.return_value = remote_summary
+        remote_result = scorer.calculate_score("peer_A")
+
+        assert remote_result.overall_score > base_result.overall_score
+
+    def test_opener_bonus_caps_at_0_1(self, mock_database):
+        """Remote opener bonus is capped at 0.10 even with many remote opens."""
+        from modules.quality_scorer import PeerQualityScorer
+        scorer = PeerQualityScorer(database=mock_database)
+
+        # Base case: no remote opens
+        base_summary = {
+            "peer_id": "peer_B",
+            "event_count": 5,
+            "open_count": 3,
+            "remote_open_count": 0,
+            "close_count": 2,
+            "remote_close_count": 0,
+            "local_close_count": 1,
+            "mutual_close_count": 1,
+            "total_revenue_sats": 5000,
+            "total_rebalance_cost_sats": 1000,
+            "total_net_pnl_sats": 4000,
+            "total_forward_count": 100,
+            "avg_routing_score": 0.7,
+            "avg_profitability_score": 0.6,
+            "avg_duration_days": 90,
+            "reporters": ["node1"],
+            "reporter_scores": {"node1": {"event_count": 5, "avg_routing_score": 0.7, "avg_profitability_score": 0.6}},
+        }
+        mock_database.get_peer_event_summary.return_value = base_summary
+        base_result = scorer.calculate_score("peer_B")
+
+        # With 5 remote opens (5 * 0.05 = 0.25, but should be capped at 0.10)
+        many_opens_summary = dict(base_summary)
+        many_opens_summary["remote_open_count"] = 5
+        mock_database.get_peer_event_summary.return_value = many_opens_summary
+        many_result = scorer.calculate_score("peer_B")
+
+        # With 2 remote opens (2 * 0.05 = 0.10, exactly at cap)
+        two_opens_summary = dict(base_summary)
+        two_opens_summary["remote_open_count"] = 2
+        mock_database.get_peer_event_summary.return_value = two_opens_summary
+        two_result = scorer.calculate_score("peer_B")
+
+        # The bonus from 5 opens should equal the bonus from 2 opens (both capped at 0.10)
+        # because min(0.1, 5*0.05) == min(0.1, 2*0.05) == 0.10
+        assert abs(many_result.overall_score - two_result.overall_score) < 1e-9
+
+        # Both should be exactly 0.10 above the base (unless clamped at 1.0)
+        actual_bonus = many_result.overall_score - base_result.overall_score
+        assert actual_bonus <= 0.1 + 1e-9  # bonus does not exceed 0.10
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

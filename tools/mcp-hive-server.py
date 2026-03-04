@@ -7809,6 +7809,7 @@ async def handle_channel_deep_dive(args: Dict) -> Dict:
             "state": channel_state,
             "owner": channel_owner,
             "closer": channel_closer,
+            "opener": target_channel.get("opener", "unknown"),
             "status": channel_status,
         },
         "lifecycle": {
