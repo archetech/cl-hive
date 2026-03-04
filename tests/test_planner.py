@@ -1833,6 +1833,29 @@ class TestComputeNodeSummary:
 
         assert result is None
 
+    def test_opener_breakdown(self, mock_plugin, mock_state_manager,
+                               mock_database, mock_bridge, mock_clboss_bridge):
+        """Counts we_opened vs they_opened from opener field."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+        mock_plugin.rpc.listpeerchannels.return_value = {
+            'channels': [
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 5_000_000_000, 'opener': 'local'},
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 3_000_000_000, 'opener': 'local'},
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 2_000_000_000, 'opener': 'remote'},
+                {'state': 'CHANNELD_AWAITING_LOCKIN', 'total_msat': 1_000_000_000, 'opener': 'local'},
+                {'state': 'ONCHAIN', 'total_msat': 500_000_000, 'opener': 'remote'},
+            ]
+        }
+        mock_bridge.safe_call.return_value = {'channels': []}
+
+        result = planner.compute_node_summary()
+        assert result['we_opened'] == 2   # only active CHANNELD_NORMAL with opener=local
+        assert result['they_opened'] == 1  # only active CHANNELD_NORMAL with opener=remote
+        assert result['active_channels'] == 3
+        assert result['pending_channels'] == 1
+        assert result['closing_channels'] == 1
+
 
 class TestRejectionBackoffStall:
     """Tests for the rejection backoff stall fix (Task 4).

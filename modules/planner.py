@@ -1187,12 +1187,19 @@ class Planner:
         pending = 0
         closing = 0
         total_capacity_msat = 0
+        we_opened = 0
+        they_opened = 0
 
         for ch in channels:
             state = ch.get('state', '')
             if state == 'CHANNELD_NORMAL':
                 active += 1
                 total_capacity_msat += ch.get('total_msat', 0)
+                opener = ch.get('opener', 'local')
+                if opener == 'local':
+                    we_opened += 1
+                else:
+                    they_opened += 1
             elif state in pending_states:
                 pending += 1
             else:
@@ -1222,6 +1229,8 @@ class Planner:
             'total_capacity_sats': total_capacity_sats,
             'underwater_count': underwater_count,
             'underwater_pct': underwater_pct,
+            'we_opened': we_opened,
+            'they_opened': they_opened,
         }
 
     # =========================================================================
