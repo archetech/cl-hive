@@ -1151,6 +1151,80 @@ class Planner:
         return sum(ch.capacity_sats for ch in channels if ch.active)
 
     # =========================================================================
+    # NODE SUMMARY
+    # =========================================================================
+
+    def compute_node_summary(self) -> Optional[Dict[str, Any]]:
+        """
+        Compute a summary of this node's channel state.
+
+        Returns a dict with channel counts, capacity, and underwater metrics,
+        or None if the plugin is unavailable or RPC fails (fail-closed).
+
+        Returns:
+            Dict with keys: active_channels, pending_channels, closing_channels,
+            total_capacity_sats, underwater_count, underwater_pct
+            Or None on failure.
+        """
+        if self.plugin is None:
+            return None
+
+        # States considered "pending" (channel not yet usable)
+        pending_states = {
+            'CHANNELD_AWAITING_LOCKIN',
+            'DUALOPEND_AWAITING_LOCKIN',
+            'DUALOPEND_OPEN_INIT',
+        }
+
+        try:
+            peer_channels = self.plugin.rpc.listpeerchannels()
+            channels = peer_channels.get('channels', [])
+        except Exception as e:
+            self._log(f"compute_node_summary: listpeerchannels failed: {e}", level='warn')
+            return None
+
+        active = 0
+        pending = 0
+        closing = 0
+        total_capacity_msat = 0
+
+        for ch in channels:
+            state = ch.get('state', '')
+            if state == 'CHANNELD_NORMAL':
+                active += 1
+                total_capacity_msat += ch.get('total_msat', 0)
+            elif state in pending_states:
+                pending += 1
+            else:
+                closing += 1
+
+        total_capacity_sats = total_capacity_msat // 1000
+
+        # Get underwater count from bridge (revenue-profitability)
+        underwater_count = 0
+        try:
+            prof_result = self.bridge.safe_call('revenue-profitability', {})
+            if prof_result and isinstance(prof_result, dict):
+                prof_channels = prof_result.get('channels', [])
+                for pch in prof_channels:
+                    if pch.get('profitability_class') in ('underwater', 'bleeder'):
+                        underwater_count += 1
+        except Exception:
+            # Bridge failure is non-fatal; default to 0
+            pass
+
+        underwater_pct = round(underwater_count * 100.0 / active, 1) if active > 0 else 0.0
+
+        return {
+            'active_channels': active,
+            'pending_channels': pending,
+            'closing_channels': closing,
+            'total_capacity_sats': total_capacity_sats,
+            'underwater_count': underwater_count,
+            'underwater_pct': underwater_pct,
+        }
+
+    # =========================================================================
     # SATURATION LOGIC
     # =========================================================================
 

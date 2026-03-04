@@ -1703,5 +1703,136 @@ class TestQualityScoreVariation:
         assert len(results) == 1
 
 
+# =============================================================================
+# COMPUTE NODE SUMMARY TESTS
+# =============================================================================
+
+class TestComputeNodeSummary:
+    """Tests for Planner.compute_node_summary()."""
+
+    def _make_planner(self, mock_plugin, mock_state_manager, mock_database,
+                      mock_bridge, mock_clboss_bridge):
+        return Planner(
+            plugin=mock_plugin,
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=mock_bridge,
+            clboss_bridge=mock_clboss_bridge,
+        )
+
+    def test_counts_only_active_channels(self, mock_plugin, mock_state_manager,
+                                          mock_database, mock_bridge,
+                                          mock_clboss_bridge):
+        """Given mixed channel states, only CHANNELD_NORMAL counted as active.
+        Verify active_channels, pending_channels, closing_channels, total_capacity_sats."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+
+        mock_plugin.rpc.listpeerchannels.return_value = {
+            'channels': [
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 5_000_000_000},   # 5M sats active
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 3_000_000_000},   # 3M sats active
+                {'state': 'CHANNELD_AWAITING_LOCKIN', 'total_msat': 2_000_000_000},  # pending
+                {'state': 'ONCHAIN', 'total_msat': 1_000_000_000},            # closing
+                {'state': 'CLOSINGD_COMPLETE', 'total_msat': 500_000_000},    # closing
+            ]
+        }
+        # Bridge returns no profitability data (empty list)
+        mock_bridge.safe_call.return_value = {'channels': []}
+
+        result = planner.compute_node_summary()
+
+        assert result is not None
+        assert result['active_channels'] == 2
+        assert result['pending_channels'] == 1
+        assert result['closing_channels'] == 2
+        # total_capacity_sats = (5M + 3M) = 8M sats (only active channels)
+        assert result['total_capacity_sats'] == 8_000_000
+
+    def test_underwater_count_from_bridge(self, mock_plugin, mock_state_manager,
+                                           mock_database, mock_bridge,
+                                           mock_clboss_bridge):
+        """When bridge.safe_call('revenue-profitability') returns channel profitability
+        data, underwater_count and underwater_pct are computed correctly."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+
+        mock_plugin.rpc.listpeerchannels.return_value = {
+            'channels': [
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 1_000_000_000},
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 1_000_000_000},
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 1_000_000_000},
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 1_000_000_000},
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 1_000_000_000},
+            ]
+        }
+        mock_bridge.safe_call.return_value = {
+            'channels': [
+                {'short_channel_id': '1x1x1', 'profitability_class': 'underwater'},
+                {'short_channel_id': '1x1x2', 'profitability_class': 'bleeder'},
+                {'short_channel_id': '1x1x3', 'profitability_class': 'profitable'},
+                {'short_channel_id': '1x1x4', 'profitability_class': 'highly_profitable'},
+                {'short_channel_id': '1x1x5', 'profitability_class': 'neutral'},
+            ]
+        }
+
+        result = planner.compute_node_summary()
+
+        assert result is not None
+        assert result['underwater_count'] == 2  # underwater + bleeder
+        # underwater_pct = round(2 * 100.0 / 5, 1) = 40.0
+        assert result['underwater_pct'] == 40.0
+
+    def test_rpc_failure_returns_none(self, mock_plugin, mock_state_manager,
+                                       mock_database, mock_bridge,
+                                       mock_clboss_bridge):
+        """When listpeerchannels raises Exception, returns None."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+
+        mock_plugin.rpc.listpeerchannels.side_effect = Exception("RPC connection lost")
+
+        result = planner.compute_node_summary()
+
+        assert result is None
+
+    def test_bridge_failure_graceful(self, mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge,
+                                      mock_clboss_bridge):
+        """When bridge.safe_call raises, underwater_count defaults to 0 (no crash)."""
+        planner = self._make_planner(mock_plugin, mock_state_manager,
+                                      mock_database, mock_bridge, mock_clboss_bridge)
+
+        mock_plugin.rpc.listpeerchannels.return_value = {
+            'channels': [
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 2_000_000_000},
+                {'state': 'CHANNELD_NORMAL', 'total_msat': 3_000_000_000},
+            ]
+        }
+        mock_bridge.safe_call.side_effect = Exception("bridge unavailable")
+
+        result = planner.compute_node_summary()
+
+        assert result is not None
+        assert result['active_channels'] == 2
+        assert result['underwater_count'] == 0
+        assert result['underwater_pct'] == 0.0
+
+    def test_no_plugin_returns_none(self, mock_state_manager, mock_database,
+                                     mock_bridge, mock_clboss_bridge):
+        """When self.plugin is None, returns None."""
+        planner = Planner(
+            plugin=None,
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=mock_bridge,
+            clboss_bridge=mock_clboss_bridge,
+        )
+
+        result = planner.compute_node_summary()
+
+        assert result is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
