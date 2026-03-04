@@ -13916,16 +13916,22 @@ async def handle_auto_evaluate_proposal(args: Dict, _action_data: Dict = None) -
         # auto-approving opens. This keeps automation aligned with an
         # expansion-oriented strategy while still capping uncontrolled growth.
         max_active_channels_for_auto_expand = 50
+        # Prefer pre-computed node_summary from proposal payload (Fix 1)
+        node_summary = payload.get("node_summary") if isinstance(payload, dict) else None
         active_channels = None
-        try:
-            info_result = await node.call("hive-getinfo")
-            if isinstance(info_result, dict):
-                active_channels = (
-                    info_result.get("num_active_channels")
-                    or ((info_result.get("info") or {}).get("num_active_channels"))
-                )
-        except Exception:
-            active_channels = None
+        if node_summary and isinstance(node_summary, dict):
+            active_channels = node_summary.get("active_channels")
+        if active_channels is None:
+            # Fallback: fetch from RPC for legacy proposals without node_summary
+            try:
+                info_result = await node.call("hive-getinfo")
+                if isinstance(info_result, dict):
+                    active_channels = (
+                        info_result.get("num_active_channels")
+                        or ((info_result.get("info") or {}).get("num_active_channels"))
+                    )
+            except Exception:
+                active_channels = None
 
         # Evaluate criteria
         if recommendation == "avoid" or local_data.get("force_closes", 0) > 0:

@@ -2068,5 +2068,114 @@ class TestGetUniqueChannelsFor:
         assert cap_b == 1_000_000
 
 
+class TestProfitabilityGate:
+    """Tests for Fix 5: Profitability gate blocks expansion when too many underwater channels."""
+
+    def test_blocks_when_above_40pct_underwater(self, mock_plugin, mock_database,
+            mock_state_manager, mock_bridge, mock_clboss_bridge):
+        """Expansion blocked when >40% of channels are underwater."""
+        planner = Planner(
+            plugin=mock_plugin,
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=mock_bridge,
+            clboss_bridge=mock_clboss_bridge,
+        )
+        planner.compute_node_summary = MagicMock(return_value={
+            'active_channels': 10,
+            'pending_channels': 0,
+            'closing_channels': 0,
+            'total_capacity_sats': 50000000,
+            'underwater_count': 5,
+            'underwater_pct': 50.0,
+        })
+        cfg = MagicMock()
+        cfg.planner_enable_expansions = True
+        cfg.expansion_pause_threshold = 3
+        planner._expansions_this_cycle = 0
+        planner.intent_manager = MagicMock()
+
+        decisions = planner._propose_expansion(cfg, run_id='test-001')
+        # Should return empty decisions (blocked by profitability gate)
+        assert decisions == []
+        # Should log the profitability_gate reason
+        mock_database.log_planner_action.assert_called()
+        call_args = mock_database.log_planner_action.call_args
+        assert call_args[1]['details']['reason'] == 'profitability_gate'
+        assert call_args[1]['result'] == 'skipped'
+
+    def test_allows_when_at_or_below_40pct(self, mock_plugin, mock_database,
+            mock_state_manager, mock_bridge, mock_clboss_bridge):
+        """Expansion allowed when <=40% underwater (gate only blocks >40%)."""
+        planner = Planner(
+            plugin=mock_plugin,
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=mock_bridge,
+            clboss_bridge=mock_clboss_bridge,
+        )
+        planner.compute_node_summary = MagicMock(return_value={
+            'active_channels': 10,
+            'pending_channels': 0,
+            'closing_channels': 0,
+            'total_capacity_sats': 50000000,
+            'underwater_count': 4,
+            'underwater_pct': 40.0,
+        })
+        cfg = MagicMock()
+        cfg.planner_enable_expansions = True
+        cfg.expansion_pause_threshold = 3
+        cfg.max_expansion_feerate_perkb = 0  # Disable feerate gate to simplify test
+        cfg.planner_min_channel_sats = 1_000_000
+        cfg.planner_safety_reserve_sats = 500_000
+        cfg.planner_fee_buffer_sats = 100_000
+        planner._expansions_this_cycle = 0
+        planner.intent_manager = MagicMock()
+
+        # The method will proceed past the profitability gate and hit later checks.
+        # It may fail further along — we only care that the gate didn't block.
+        try:
+            planner._propose_expansion(cfg, run_id='test-002')
+        except Exception:
+            pass  # Later checks may fail; we only test the gate
+        planner.compute_node_summary.assert_called_once()
+        # Check that no profitability_gate skip was logged
+        for call in mock_database.log_planner_action.call_args_list:
+            if call[1].get('details', {}).get('reason') == 'profitability_gate':
+                pytest.fail("Profitability gate should not have blocked at 40%")
+
+    def test_skips_gate_when_summary_unavailable(self, mock_plugin, mock_database,
+            mock_state_manager, mock_bridge, mock_clboss_bridge):
+        """Gate skipped when compute_node_summary returns None (RPC failure)."""
+        planner = Planner(
+            plugin=mock_plugin,
+            state_manager=mock_state_manager,
+            database=mock_database,
+            bridge=mock_bridge,
+            clboss_bridge=mock_clboss_bridge,
+        )
+        planner.compute_node_summary = MagicMock(return_value=None)
+        cfg = MagicMock()
+        cfg.planner_enable_expansions = True
+        cfg.expansion_pause_threshold = 3
+        cfg.max_expansion_feerate_perkb = 0  # Disable feerate gate to simplify test
+        cfg.planner_min_channel_sats = 1_000_000
+        cfg.planner_safety_reserve_sats = 500_000
+        cfg.planner_fee_buffer_sats = 100_000
+        planner._expansions_this_cycle = 0
+        planner.intent_manager = MagicMock()
+
+        # The method should proceed past the gate (not block on None summary)
+        try:
+            planner._propose_expansion(cfg, run_id='test-003')
+        except Exception:
+            pass  # Later checks may fail; we only test the gate
+        planner.compute_node_summary.assert_called_once()
+        # Check that no profitability_gate skip was logged
+        for call in mock_database.log_planner_action.call_args_list:
+            if call[1].get('details', {}).get('reason') == 'profitability_gate':
+                pytest.fail("Profitability gate should not have blocked when summary is None")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

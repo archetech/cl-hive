@@ -2097,6 +2097,30 @@ class Planner:
             )
             return decisions
 
+        # Profitability gate: skip expansion when too many channels are underwater.
+        # Matches approval_criteria.md DEFER: >40% underwater.
+        node_summary = self.compute_node_summary()
+        if node_summary and node_summary.get('underwater_pct', 0) > 40:
+            self._log(
+                f"Profitability gate: skipping expansion, "
+                f"{node_summary['underwater_pct']}% underwater channels "
+                f"({node_summary['underwater_count']}/{node_summary['active_channels']}). "
+                f"Fix existing channels before expanding.",
+                level='info'
+            )
+            self.db.log_planner_action(
+                action_type='expansion',
+                result='skipped',
+                details={
+                    'reason': 'profitability_gate',
+                    'underwater_pct': node_summary['underwater_pct'],
+                    'underwater_count': node_summary['underwater_count'],
+                    'active_channels': node_summary['active_channels'],
+                    'run_id': run_id
+                }
+            )
+            return decisions
+
         # Feerate gate: block expansions when on-chain fees are too high
         max_feerate = getattr(cfg, 'max_expansion_feerate_perkb', 5000)
         if max_feerate != 0 and self.plugin:
@@ -2302,8 +2326,7 @@ class Planner:
                 'hive_share_pct': selected_target.hive_share_pct
             })
 
-            # Pre-compute node summary for accurate channel counts in proposals
-            node_summary = self.compute_node_summary()
+            # node_summary already computed above (profitability gate)
 
             # Use DecisionEngine for governance decision if available
             if self.decision_engine:
