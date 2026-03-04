@@ -1662,9 +1662,9 @@ class OpportunityScanner:
         if not members_list:
             return opportunities
 
-        # Get our node's pubkey
+        # Get our node's pubkey (node_info wraps getinfo in {"info": {...}})
         node_info = state.get("node_info", {})
-        our_pubkey = node_info.get("id", "")
+        our_pubkey = node_info.get("info", {}).get("id", "") or node_info.get("id", "")
 
         # Get existing channels to understand current topology
         channels = state.get("channels", [])

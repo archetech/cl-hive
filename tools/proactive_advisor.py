@@ -777,7 +777,7 @@ class ProactiveAdvisor:
         # Transform close_recommendations into fleet_close_proposals format
         # for opportunity_scanner._scan_fleet_consensus()
         close_recs = results.get("close_recommendations", {}).get("recommendations", [])
-        our_pubkey = results.get("node_info", {}).get("id", "")
+        our_pubkey = results.get("node_info", {}).get("info", {}).get("id", "") or results.get("node_info", {}).get("id", "")
         fleet_close_proposals = []
         for rec in close_recs:
             fleet_close_proposals.append({

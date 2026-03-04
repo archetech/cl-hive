@@ -16443,12 +16443,13 @@ async def handle_membership_dashboard(args: Dict) -> Dict:
 
     # Gather data from multiple sources in parallel
     try:
-        members_data, neophyte_rankings, nnlb_data, pending_promos, pending_bans = await asyncio.gather(
+        members_data, neophyte_rankings, nnlb_data, pending_promos, pending_bans, node_info = await asyncio.gather(
             node.call("hive-members"),
             node.call("hive-neophyte-rankings", {}),
             node.call("hive-nnlb-status", {}),
             node.call("hive-pending-promotions", {}),
             node.call("hive-pending-bans", {}),
+            node.call("hive-getinfo"),
             return_exceptions=True,
         )
     except Exception as e:
@@ -16485,10 +16486,13 @@ async def handle_membership_dashboard(args: Dict) -> Dict:
 
     # Check for onboarding needs (members without recent channel suggestions)
     db = ensure_advisor_db()
+    our_pubkey = node_info.get("id", "") if not isinstance(node_info, Exception) else ""
     onboarding_needed = []
     for member in members_list:
         pubkey = member.get("pubkey") or member.get("peer_id")
-        if pubkey and not db.is_member_onboarded(pubkey):
+        if not pubkey or pubkey == our_pubkey:
+            continue
+        if not db.is_member_onboarded(pubkey):
             onboarding_needed.append({
                 "pubkey": pubkey[:16] + "...",
                 "alias": member.get("alias", ""),
