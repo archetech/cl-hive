@@ -4026,7 +4026,7 @@ optimizations like small fee adjustments.
                     },
                     "period": {
                         "type": "string",
-                        "description": "Period to query (format: YYYY-WW, defaults to current week)"
+                        "description": "Period to query (format: YYYY-Www, defaults to current week)"
                     }
                 },
                 "required": ["node"]
@@ -4062,7 +4062,7 @@ optimizations like small fee adjustments.
                     },
                     "period": {
                         "type": "string",
-                        "description": "Period to calculate (format: YYYY-WW, defaults to current week)"
+                        "description": "Period to calculate (format: YYYY-Www, defaults to current week)"
                     }
                 },
                 "required": ["node"]
@@ -4080,7 +4080,7 @@ optimizations like small fee adjustments.
                     },
                     "period": {
                         "type": "string",
-                        "description": "Period to snapshot (format: YYYY-WW, defaults to current week)"
+                        "description": "Period to snapshot (format: YYYY-Www, defaults to current week)"
                     }
                 },
                 "required": ["node"]
@@ -4098,7 +4098,7 @@ optimizations like small fee adjustments.
                     },
                     "period": {
                         "type": "string",
-                        "description": "Period to settle (format: YYYY-WW, defaults to previous week)"
+                        "description": "Period to settle (format: YYYY-Www, defaults to previous week)"
                     },
                     "dry_run": {
                         "type": "boolean",
@@ -5421,7 +5421,7 @@ Validates that the hive is ready for settlement:
 3. If dry_run=false: calls settlement_execute to distribute funds
 
 **Returns:**
-- period: Settlement period (YYYY-WW format)
+- period: Settlement period (YYYY-Www format)
 - snapshot_recorded: Whether contribution snapshot was taken
 - total_distributed_sats: Total sats distributed (0 if dry_run)
 - per_member_breakdown: What each member received/would receive

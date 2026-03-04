@@ -393,11 +393,12 @@ class TestPeriodHandling:
 
         period = pool._current_period()
 
-        # Should be YYYY-WW format (e.g., "2026-06")
-        assert len(period) == 7
+        # Should be YYYY-Www format (e.g., "2026-W06")
+        assert len(period) == 8
         assert period[4] == "-"
+        assert period[5] == "W"
         year = int(period[:4])
-        week = int(period[5:])
+        week = int(period[6:])
         assert year >= 2024
         assert 1 <= week <= 53
 
@@ -412,8 +413,8 @@ class TestPeriodHandling:
 
         # Previous should be different from current
         # (unless at week boundary, but unlikely in tests)
-        current_week = int(current.split('-')[1])
-        previous_week = int(previous.split('-')[1])
+        current_week = int(current.split('-')[1][1:])  # strip "W" prefix
+        previous_week = int(previous.split('-')[1][1:])
 
         # Previous week should be 1 less (or 52/53 if current is week 1)
         if current_week > 1:

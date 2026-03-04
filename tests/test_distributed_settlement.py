@@ -213,23 +213,27 @@ class TestPeriodString:
     """Tests for period string generation."""
 
     def test_get_period_string_format(self):
-        """Period string should be in YYYY-WW format."""
+        """Period string should be in YYYY-Www format."""
         period = SettlementManager.get_period_string()
 
-        assert len(period) == 7 or len(period) == 8  # "2024-05" or "2024-52"
-        assert '-' in period
-        year, week = period.split('-')
+        assert len(period) == 8  # "2026-W10"
+        assert '-W' in period
+        year, week_part = period.split('-')
         assert len(year) == 4
-        assert int(week) >= 1 and int(week) <= 53
+        assert week_part.startswith("W")
+        week = int(week_part[1:])
+        assert week >= 1 and week <= 53
 
     def test_get_previous_period(self):
         """Previous period should be one week before current."""
         current = SettlementManager.get_period_string()
         previous = SettlementManager.get_previous_period()
 
-        # Parse week numbers
-        curr_year, curr_week = map(int, current.split('-'))
-        prev_year, prev_week = map(int, previous.split('-'))
+        # Parse week numbers from YYYY-Www format
+        curr_year, curr_week_part = current.split('-')
+        curr_year, curr_week = int(curr_year), int(curr_week_part[1:])
+        prev_year, prev_week_part = previous.split('-')
+        prev_year, prev_week = int(prev_year), int(prev_week_part[1:])
 
         # Previous week logic
         if curr_week == 1:

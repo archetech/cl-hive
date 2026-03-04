@@ -2076,7 +2076,7 @@ def pool_status(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
 
     Args:
         ctx: HiveContext
-        period: Optional period to query (format: YYYY-WW, defaults to current week)
+        period: Optional period to query (format: YYYY-Www, defaults to current week)
 
     Returns:
         Dict with pool status including revenue, contributions, and distributions.
@@ -2127,7 +2127,7 @@ def pool_snapshot(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
 
     Args:
         ctx: HiveContext
-        period: Optional period to snapshot (format: YYYY-WW, defaults to current week)
+        period: Optional period to snapshot (format: YYYY-Www, defaults to current week)
 
     Returns:
         Dict with snapshot results.
@@ -2148,7 +2148,7 @@ def pool_snapshot(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
         if period is None:
             now = datetime.datetime.now(tz=datetime.timezone.utc)
             year, week, _ = now.isocalendar()
-            period = f"{year}-{week:02d}"
+            period = f"{year}-W{week:02d}"
 
         # Sync uptime from presence data before snapshotting
         # This ensures uptime_pct in hive_members is current
@@ -2189,7 +2189,7 @@ def pool_distribution(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
 
     Args:
         ctx: HiveContext
-        period: Optional period to calculate (format: YYYY-WW, defaults to current week)
+        period: Optional period to calculate (format: YYYY-Www, defaults to current week)
 
     Returns:
         Dict with calculated distribution amounts for each member.
@@ -2204,7 +2204,7 @@ def pool_distribution(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
         if period is None:
             now = datetime.datetime.now(tz=datetime.timezone.utc)
             year, week, _ = now.isocalendar()
-            period = f"{year}-{week:02d}"
+            period = f"{year}-W{week:02d}"
 
         # Get revenue for the period
         revenue_info = ctx.routing_pool.db.get_pool_revenue(period=period)
@@ -2239,7 +2239,7 @@ def pool_settle(ctx: HiveContext, period: str = None, dry_run: bool = True) -> D
 
     Args:
         ctx: HiveContext
-        period: Period to settle (format: YYYY-WW, defaults to PREVIOUS week)
+        period: Period to settle (format: YYYY-Www, defaults to PREVIOUS week)
         dry_run: If True, calculate but don't actually record (default: True)
 
     Returns:
@@ -2263,7 +2263,7 @@ def pool_settle(ctx: HiveContext, period: str = None, dry_run: bool = True) -> D
             now = datetime.datetime.now(tz=datetime.timezone.utc)
             last_week = now - datetime.timedelta(days=7)
             year, week, _ = last_week.isocalendar()
-            period = f"{year}-{week:02d}"
+            period = f"{year}-W{week:02d}"
 
         if dry_run:
             # Just calculate

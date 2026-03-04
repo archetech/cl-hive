@@ -5807,9 +5807,9 @@ class HiveDatabase:
 
     def _normalize_pool_period(self, period: str) -> str:
         """
-        Normalize pool period to canonical weekly format YYYY-WW.
+        Normalize pool period to canonical weekly format YYYY-Www.
 
-        Accepts legacy weekly format YYYY-WWW and converts to YYYY-WW.
+        Accepts legacy format YYYY-Www (without W prefix) and converts to YYYY-Www.
         Non-weekly period strings are returned unchanged.
         """
         if not isinstance(period, str):
@@ -5823,19 +5823,19 @@ class HiveDatabase:
             if week_part.isdigit():
                 week_i = int(week_part)
                 if 1 <= week_i <= 53:
-                    return f"{year_part}-{week_i:02d}"
+                    return f"{year_part}-W{week_i:02d}"
         return text
 
     def _period_aliases(self, period: str) -> List[str]:
         """
         Return equivalent period spellings for weekly pool lookups.
 
-        Canonical format is YYYY-WW. Legacy format YYYY-WWW is still accepted.
+        Canonical format is YYYY-Www. Legacy format YYYY-Www (without W prefix) is still accepted.
         """
         normalized = self._normalize_pool_period(period)
         parts = normalized.split("-")
-        if len(parts) == 2 and len(parts[0]) == 4 and parts[1].isdigit():
-            legacy = f"{parts[0]}-W{parts[1]}"
+        if len(parts) == 2 and len(parts[0]) == 4 and parts[1].startswith("W") and parts[1][1:].isdigit():
+            legacy = f"{parts[0]}-{parts[1][1:]}"
             if legacy == normalized:
                 return [normalized]
             return [normalized, legacy]
@@ -5846,8 +5846,8 @@ class HiveDatabase:
         Convert period string to start/end timestamps.
 
         Supports formats:
-        - "2025-03" (ISO week, canonical)
-        - "2025-W03" (ISO week, legacy)
+        - "2025-W03" (ISO week, canonical)
+        - "2025-03" (ISO week, legacy)
         - "2025-01-15" (day)
 
         Returns:
@@ -5862,9 +5862,10 @@ class HiveDatabase:
                 tzinfo=datetime.timezone.utc
             )
             end = start + datetime.timedelta(days=1)
-        elif len(normalized) == 7:
-            # ISO week format: 2025-03
-            year, week = normalized.split("-")
+        elif len(normalized) == 8 and "-W" in normalized:
+            # ISO week format: 2025-W03
+            year, week_part = normalized.split("-")
+            week = week_part[1:]  # strip "W" prefix
             # Monday of that week (use ISO week format: %G=ISO year, %V=ISO week, %u=ISO weekday)
             start = datetime.datetime.strptime(f"{year}-W{week}-1", "%G-W%V-%u").replace(
                 tzinfo=datetime.timezone.utc
@@ -6593,7 +6594,7 @@ class HiveDatabase:
 
         Args:
             peer_id: Member's node public key
-            period: Settlement period (YYYY-WW format)
+            period: Settlement period (YYYY-Www format)
             fees_earned_sats: Fees earned in the period
             forward_count: Number of forwards in the period
             period_start: Period start timestamp
@@ -6630,7 +6631,7 @@ class HiveDatabase:
         Get all fee reports for a settlement period.
 
         Args:
-            period: Settlement period (YYYY-WW format)
+            period: Settlement period (YYYY-Www format)
 
         Returns:
             List of fee report dicts with peer_id, fees_earned_sats, rebalance_costs_sats, etc.
@@ -6649,11 +6650,11 @@ class HiveDatabase:
         """
         Get distinct fee-report periods up to and including max_period.
 
-        Periods are stored in YYYY-WW format, so lexicographic ordering matches
+        Periods are stored in YYYY-Www format, so lexicographic ordering matches
         chronological ordering.
 
         Args:
-            max_period: Inclusive upper bound (YYYY-WW)
+            max_period: Inclusive upper bound (YYYY-Www)
 
         Returns:
             Sorted list of distinct period strings.
@@ -6731,7 +6732,7 @@ class HiveDatabase:
 
         Args:
             proposal_id: Unique proposal identifier
-            period: Settlement period (YYYY-WW format)
+            period: Settlement period (YYYY-Www format)
             proposer_peer_id: Peer who proposed this settlement
             data_hash: Canonical hash of settlement data for verification
             total_fees_sats: Total fees to distribute
@@ -6837,7 +6838,7 @@ class HiveDatabase:
         return dict(row) if row else None
 
     def get_settlement_proposal_by_period(self, period: str) -> Optional[Dict[str, Any]]:
-        """Get a settlement proposal by period (YYYY-WW)."""
+        """Get a settlement proposal by period (YYYY-Www)."""
         conn = self._get_connection()
         row = conn.execute(
             "SELECT * FROM settlement_proposals WHERE period = ?",
@@ -7118,7 +7119,7 @@ class HiveDatabase:
         Mark a settlement period as complete.
 
         Args:
-            period: Period that was settled (YYYY-WW)
+            period: Period that was settled (YYYY-Www)
             proposal_id: Proposal that completed the settlement
             total_distributed_sats: Total sats distributed
 

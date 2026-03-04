@@ -995,20 +995,20 @@ class SettlementManager:
     @staticmethod
     def get_period_string(timestamp: Optional[int] = None) -> str:
         """
-        Get the YYYY-WW period string for a given timestamp.
+        Get the YYYY-Www period string for a given timestamp.
 
         Args:
             timestamp: Unix timestamp (defaults to now)
 
         Returns:
-            Period string in YYYY-WW format (ISO week)
+            Period string in YYYY-Www format (ISO week)
         """
         import datetime
         if timestamp is None:
             timestamp = int(time.time())
         dt = datetime.datetime.fromtimestamp(timestamp, tz=datetime.timezone.utc)
         iso_year, iso_week, _ = dt.isocalendar()
-        return f"{iso_year}-{iso_week:02d}"
+        return f"{iso_year}-W{iso_week:02d}"
 
     @staticmethod
     def get_previous_period() -> str:
@@ -1017,7 +1017,7 @@ class SettlementManager:
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         prev_week = now - datetime.timedelta(weeks=1)
         iso_year, iso_week, _ = prev_week.isocalendar()
-        return f"{iso_year}-{iso_week:02d}"
+        return f"{iso_year}-W{iso_week:02d}"
 
     @staticmethod
     def calculate_settlement_hash(
@@ -1031,7 +1031,7 @@ class SettlementManager:
         a deterministic hash of the contribution data.
 
         Args:
-            period: Settlement period (YYYY-WW)
+            period: Settlement period (YYYY-Www)
             contributions: List of contribution dicts with peer_id, fees_earned, capacity, costs
 
         Returns:
@@ -1159,7 +1159,7 @@ class SettlementManager:
         calculates the canonical hash, and creates the proposal.
 
         Args:
-            period: Settlement period (YYYY-WW)
+            period: Settlement period (YYYY-Www)
             our_peer_id: Our node's public key
             state_manager: HiveStateManager with gossiped fee data
             rpc: RPC proxy for signing

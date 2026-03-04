@@ -17511,7 +17511,7 @@ def hive_pool_status(plugin: Plugin, period: str = None):
     Get current routing pool status and statistics.
 
     Args:
-        period: Optional period to query (format: YYYY-WW, defaults to current week)
+        period: Optional period to query (format: YYYY-Www, defaults to current week)
 
     Returns:
         Dict with pool status including revenue, contributions, and distributions.
@@ -17541,7 +17541,7 @@ def hive_pool_snapshot(plugin: Plugin, period: str = None):
     Permission: Admin only
 
     Args:
-        period: Optional period (format: YYYY-WW, defaults to current week)
+        period: Optional period (format: YYYY-Www, defaults to current week)
 
     Returns:
         Dict with snapshot results.
@@ -17555,7 +17555,7 @@ def hive_pool_distribution(plugin: Plugin, period: str = None):
     Calculate distribution amounts for a period (dry run).
 
     Args:
-        period: Optional period (format: YYYY-WW, defaults to current week)
+        period: Optional period (format: YYYY-Www, defaults to current week)
 
     Returns:
         Dict with calculated distribution amounts.
@@ -17571,7 +17571,7 @@ def hive_pool_settle(plugin: Plugin, period: str = None, dry_run: bool = True):
     Permission: Admin only
 
     Args:
-        period: Period to settle (format: YYYY-WW, defaults to PREVIOUS week)
+        period: Period to settle (format: YYYY-Www, defaults to PREVIOUS week)
         dry_run: If True, calculate but don't record (default: True)
 
     Returns:
@@ -18400,7 +18400,7 @@ def hive_backfill_fees(plugin: Plugin, period: str = None, source: str = "revenu
     calculations even after node restarts.
 
     Args:
-        period: Optional specific period to backfill (YYYY-WW format).
+        period: Optional specific period to backfill (YYYY-Www format).
                 If not provided, backfills current period.
         source: Data source - "revenue-ops" (default) or "local"
 
@@ -18539,7 +18539,7 @@ def hive_fee_reports(plugin: Plugin, period: str = None):
     Get all fee reports stored in the database.
 
     Args:
-        period: Optional specific period (YYYY-WW format). If not provided,
+        period: Optional specific period (YYYY-Www format). If not provided,
                 returns the latest report for each peer.
 
     Returns:

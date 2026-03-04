@@ -563,7 +563,7 @@ class RoutingPool:
         Get current pool status for display/MCP.
 
         Args:
-            period: Optional period to query (format: YYYY-WW, defaults to current week)
+            period: Optional period to query (format: YYYY-Www, defaults to current week)
 
         Returns:
             Dict with period, revenue, contributions, projections
@@ -651,21 +651,21 @@ class RoutingPool:
     def _current_period(self) -> str:
         """Get current ISO week period string (UTC).
 
-        Format: YYYY-WW (e.g., "2026-06") to match SettlementManager.get_period_string().
+        Format: YYYY-Www (e.g., "2026-W06") to match SettlementManager.get_period_string().
         """
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         year, week, _ = now.isocalendar()
-        return f"{year}-{week:02d}"
+        return f"{year}-W{week:02d}"
 
     def _previous_period(self) -> str:
         """Get previous ISO week period string (UTC).
 
-        Format: YYYY-WW (e.g., "2026-05") to match SettlementManager.get_previous_period().
+        Format: YYYY-Www (e.g., "2026-W05") to match SettlementManager.get_previous_period().
         """
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         last_week = now - datetime.timedelta(days=7)
         year, week, _ = last_week.isocalendar()
-        return f"{year}-{week:02d}"
+        return f"{year}-W{week:02d}"
 
     def _get_member_capacity(self, member_id: str) -> int:
         """Get total channel capacity for a member."""

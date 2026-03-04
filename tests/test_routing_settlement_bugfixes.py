@@ -3,7 +3,7 @@ Tests for routing pool and settlement bug fixes.
 
 Covers:
 - Bug 1: calculate_our_balance forwards formula alignment with compute_settlement_plan
-- Bug 2: Period format consistency (YYYY-WW not YYYY-WWW)
+- Bug 2: Period format consistency (YYYY-Www not YYYY-WwwW)
 - Bug 3: settle_period atomicity check (falsy vs False)
 - Bug 4: generate_payments deterministic sort (peer_id tie-breaker)
 - Bug 5: capital_score reflects weighted_capacity not uptime_pct
@@ -188,24 +188,25 @@ class TestCalculateOurBalanceAlignment:
 # =============================================================================
 
 class TestPeriodFormat:
-    """Bug 2: Period format must be YYYY-WW consistently (no W prefix)."""
+    """Bug 2: Period format must be YYYY-Www consistently (with W prefix)."""
 
     def test_routing_pool_current_period_format(self, database, mock_plugin):
-        """RoutingPool._current_period() should return YYYY-WW format."""
+        """RoutingPool._current_period() should return YYYY-Www format."""
         pool = RoutingPool(database=database, plugin=mock_plugin)
         period = pool._current_period()
-        # Format should be YYYY-WW (e.g., "2026-06"), NOT "2026-W06"
-        assert "-W" not in period
+        # Format should be YYYY-Www (e.g., "2026-W06")
+        assert "-W" in period
         parts = period.split("-")
         assert len(parts) == 2
         assert len(parts[0]) == 4  # Year
-        assert len(parts[1]) == 2  # Week number (zero-padded)
+        assert parts[1].startswith("W")
+        assert len(parts[1]) == 3  # "W" + two-digit week number
 
     def test_routing_pool_previous_period_format(self, database, mock_plugin):
-        """RoutingPool._previous_period() should return YYYY-WW format."""
+        """RoutingPool._previous_period() should return YYYY-Www format."""
         pool = RoutingPool(database=database, plugin=mock_plugin)
         period = pool._previous_period()
-        assert "-W" not in period
+        assert "-W" in period
         parts = period.split("-")
         assert len(parts) == 2
 
@@ -417,7 +418,7 @@ class TestReadOnlyPaths:
 # =============================================================================
 
 class TestPoolPeriodCompatibility:
-    """Bug 10: YYYY-WW periods must map to ISO week (not month)."""
+    """Bug 10: YYYY-Www periods must map to ISO week (not month)."""
 
     def test_get_pool_revenue_uses_iso_week_for_yyyy_dash_ww(self, database):
         """2026-08 should mean ISO week 8, not August 2026."""
@@ -434,7 +435,7 @@ class TestPoolPeriodCompatibility:
         assert rev["transaction_count"] == 1
 
     def test_legacy_w_period_rows_are_visible_via_canonical_period(self, database):
-        """Rows written as YYYY-WWW must be returned for YYYY-WW lookups."""
+        """Rows written as YYYY-WwwW must be returned for YYYY-Www lookups."""
         database.record_pool_contribution(
             member_id=PEER_A,
             period="2026-W08",

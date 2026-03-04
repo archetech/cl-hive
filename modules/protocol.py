@@ -4302,7 +4302,7 @@ def create_settlement_propose(
 
     Args:
         proposal_id: Unique identifier for this proposal
-        period: Settlement period (YYYY-WW format)
+        period: Settlement period (YYYY-Www format)
         proposer_peer_id: Node proposing the settlement
         data_hash: Canonical hash of contribution data for verification
         total_fees_sats: Total fees to distribute
