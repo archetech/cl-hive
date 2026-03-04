@@ -2541,6 +2541,20 @@ Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
             }
         ),
         Tool(
+            name="fleet_boltz_status",
+            description="Aggregate Boltz swap activity across all fleet members. Shows pending swaps, daily spend, and per-member breakdown from gossip state.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to query fleet from"
+                    }
+                },
+                "required": ["node"]
+            },
+        ),
+        Tool(
             name="askrene_constraints_summary",
             description="Summarize AskRene liquidity constraints for a given layer (default: xpay). Useful routing intelligence for why rebalances fail.",
             inputSchema={
@@ -11320,6 +11334,53 @@ async def handle_revenue_boltz_backup_verify(args: Dict) -> Dict:
     return await node.call("revenue-boltz-backup-verify", {"swap_mnemonic": swap_mnemonic})
 
 
+async def handle_fleet_boltz_status(args: Dict) -> Dict:
+    """Aggregate Boltz swap activity across all fleet members from gossip state."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    # Get all member states from gossip via the node's hive-members RPC
+    try:
+        members_resp = await node.call("hive-members")
+    except Exception as e:
+        return {"error": f"Failed to get members: {e}"}
+
+    members = {}
+    fleet_pending = 0
+    fleet_daily_spend = 0
+
+    if isinstance(members_resp, dict):
+        for member in (members_resp.get("members") or []):
+            if not isinstance(member, dict):
+                continue
+            member_id = member.get("peer_id") or member.get("pubkey") or ""
+            alias = member.get("alias", "")
+            boltz = member.get("boltz_activity", {})
+            if not isinstance(boltz, dict):
+                boltz = {}
+            pending = int(boltz.get("pending_swaps", 0) or 0)
+            spend = int(boltz.get("daily_spend_sats", 0) or 0)
+            last_ts = int(boltz.get("last_swap_ts", 0) or 0)
+            members[member_id] = {
+                "alias": alias,
+                "pending_swaps": pending,
+                "daily_spend_sats": spend,
+                "last_swap_ts": last_ts,
+            }
+            fleet_pending += pending
+            fleet_daily_spend += spend
+
+    return {
+        "fleet_pending_swaps": fleet_pending,
+        "fleet_daily_spend_sats": fleet_daily_spend,
+        "member_count": len(members),
+        "members": members,
+    }
+
+
 async def handle_askrene_constraints_summary(args: Dict) -> Dict:
     node_name = args.get("node")
     layer = args.get("layer", "xpay")
@@ -17766,6 +17827,7 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_boltz_deposit": handle_revenue_boltz_deposit,
     "revenue_boltz_backup": handle_revenue_boltz_backup,
     "revenue_boltz_backup_verify": handle_revenue_boltz_backup_verify,
+    "fleet_boltz_status": handle_fleet_boltz_status,
     "askrene_constraints_summary": handle_askrene_constraints_summary,
     "askrene_reservations": handle_askrene_reservations,
     "revenue_report": handle_revenue_report,
