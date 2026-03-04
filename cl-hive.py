@@ -14100,7 +14100,7 @@ def hive_status(plugin: Plugin):
 
 
 @plugin.method("hive-report-period-costs")
-def hive_report_period_costs(plugin: Plugin, rebalance_costs_sats: int = 0):
+def hive_report_period_costs(plugin: Plugin, rebalance_costs_sats: int = 0, boltz_costs_sats: int = 0):
     """
     Report rebalancing costs for the current settlement period.
 
@@ -14110,6 +14110,7 @@ def hive_report_period_costs(plugin: Plugin, rebalance_costs_sats: int = 0):
 
     Args:
         rebalance_costs_sats: Total rebalancing costs in sats for the current period
+        boltz_costs_sats: Boltz swap costs in sats for the current period
 
     Returns:
         Dict with status and accepted costs value
@@ -14119,17 +14120,21 @@ def hive_report_period_costs(plugin: Plugin, rebalance_costs_sats: int = 0):
     if not isinstance(rebalance_costs_sats, int) or rebalance_costs_sats < 0:
         return {"error": "rebalance_costs_sats must be a non-negative integer"}
 
+    total_costs = rebalance_costs_sats + max(0, int(boltz_costs_sats or 0))
+
     with _local_fees_lock:
-        _local_rebalance_costs_sats = rebalance_costs_sats
+        _local_rebalance_costs_sats = total_costs
 
     plugin.log(
-        f"[Settlement] Updated period costs: {rebalance_costs_sats} sats",
+        f"[Settlement] Updated period costs: {rebalance_costs_sats} sats rebalance + {boltz_costs_sats} sats boltz = {total_costs} sats total",
         level="info"
     )
 
     return {
         "status": "accepted",
-        "rebalance_costs_sats": rebalance_costs_sats
+        "rebalance_costs_sats": rebalance_costs_sats,
+        "boltz_costs_sats": int(boltz_costs_sats or 0),
+        "total_costs_sats": total_costs,
     }
 
 
