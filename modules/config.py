@@ -45,6 +45,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'planner_min_channel_sats': int,
     'planner_max_channel_sats': int,
     'planner_default_channel_sats': int,
+    'planner_max_active_channels': int,
     # Governance (Phase 7) - Failsafe mode limits
     'failsafe_budget_per_day': int,
     'failsafe_actions_per_hour': int,
@@ -72,6 +73,7 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'planner_min_channel_sats': (100_000, 100_000_000),  # 100k to 100M sats
     'planner_max_channel_sats': (1_000_000, 1_000_000_000),  # 1M to 1B sats (10 BTC)
     'planner_default_channel_sats': (100_000, 500_000_000),  # 100k to 500M sats (5 BTC)
+    'planner_max_active_channels': (10, 500),  # Max channels before auto-expansion is gated
     # Governance (Phase 7) - Failsafe mode limits (tighter than old autonomous)
     'failsafe_budget_per_day': (100_000, 10_000_000),  # 100k to 10M sats (reduced max)
     'failsafe_actions_per_hour': (1, 5),  # 1 to 5 actions per hour (reduced max)
@@ -142,6 +144,7 @@ class HiveConfig:
     planner_min_channel_sats: int = 1_000_000  # 1M sats minimum channel size
     planner_max_channel_sats: int = 50_000_000  # 50M sats maximum channel size
     planner_default_channel_sats: int = 5_000_000  # 5M sats default channel size
+    planner_max_active_channels: int = 50      # Gate expansion auto-approve above this channel count
 
     # Governance (Phase 7) - Failsafe mode limits
     failsafe_budget_per_day: int = 10_000_000    # 10M sats daily budget (5M per channel at 50%)
@@ -254,6 +257,7 @@ class HiveConfigSnapshot:
     planner_min_channel_sats: int
     planner_max_channel_sats: int
     planner_default_channel_sats: int
+    planner_max_active_channels: int
     # Governance (Phase 7) - Failsafe mode limits
     failsafe_budget_per_day: int
     failsafe_actions_per_hour: int
@@ -291,6 +295,7 @@ class HiveConfigSnapshot:
             planner_min_channel_sats=config.planner_min_channel_sats,
             planner_max_channel_sats=config.planner_max_channel_sats,
             planner_default_channel_sats=config.planner_default_channel_sats,
+            planner_max_active_channels=config.planner_max_active_channels,
             failsafe_budget_per_day=config.failsafe_budget_per_day,
             failsafe_actions_per_hour=config.failsafe_actions_per_hour,
             budget_reserve_pct=config.budget_reserve_pct,
