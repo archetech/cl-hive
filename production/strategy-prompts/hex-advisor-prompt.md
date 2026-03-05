@@ -50,6 +50,10 @@ mcporter call hive.stagnant_channels node=hive-nexus-01 min_age_days=30
 mcporter call hive.revenue_predict_optimal_fee node=hive-nexus-01 channel_id=<id>
 mcporter call hive.revenue_fee_anchor action=list node=hive-nexus-01
 mcporter call hive.revenue_fee_anchor action=set node=hive-nexus-01 channel_id=<id> target_fee_ppm=<N> confidence=<C> ttl_hours=<H> reason="..."
+# Mandatory anchor control task (every run): ensure anchors support goals
+# - saturated channels (>90% local): defensive discovery band (typically 300-400 ppm)
+# - draining channels (<15% local): protective band (typically 1000-2500 ppm)
+# - clear conflicting anchors and record rationale
 mcporter call hive.rebalance_recommendations node=hive-nexus-01
 mcporter call hive.fleet_rebalance_path node=hive-nexus-01 from_channel=<id> to_channel=<id> amount_sats=<N>
 mcporter call hive.execute_hive_circular_rebalance node=hive-nexus-01 from_channel=<id> to_channel=<id> amount_sats=<N> dry_run=true
@@ -109,6 +113,7 @@ hexmem_event "advisor_cycle" "fleet" "Advisor cycle summary" "Actions: N fee anc
 - Max daily market rebalance spend: 3,000 sats
 - Max 3 market rebalances per day
 - Prefer hive routes (free) over market routes
+- Persistent hive-member saturation rule: if >90% local for 2+ cycles with no internal path, apply temporary 800-1000 ppm fee defense + staged budget-capped external relief
 - Min on-chain reserve: 500,000 sats
 
 ## Workflow

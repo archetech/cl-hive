@@ -136,6 +136,25 @@ The channel between fleet nodes is exempt from normal tier limits when >70/30 im
 - Fee limit for market fallback: up to 1000 ppm (same ceiling, but justified by unlock value)
 - This is the single highest-ROI rebalance possible
 
+### EXCEPTION: Persistent Hive Topology Saturation (single-path member link)
+Use this when a hive-member channel remains heavily imbalanced because topology lacks a viable internal return path.
+
+Trigger conditions (all):
+- Channel is with a hive member
+- Local balance stays >90% (or <10%) for ≥2 consecutive cycles
+- `fleet_rebalance_path` shows no viable internal path (or repeated no-route outcomes)
+
+Advisor actions (in order):
+1. **Directional fee defense:** set temporary elevated fee on the saturated direction (start 800-1000 ppm)
+2. **Budget-capped staged relief:** execute external liquidity in small tranches only (rebalance or Boltz), verifying budget before each tranche
+3. **Stop criteria:** stop on no-delta outcomes, route failures, or when remaining daily budget would be breached
+4. **Decay policy:** if channel improves below ~80% local (or above ~20% local), step fee back down gradually (e.g., 1000→700→500)
+
+Guardrails:
+- Never exceed daily unified budget cap
+- Never run unbounded retries when route quality is poor
+- Treat this as a recurring topology condition, not a one-off anomaly
+
 ### DO NOT rebalance if ANY condition applies:
 - Channel balance is acceptable (20-80% range — leave it alone)
 - Cost >1000 ppm (0.1%) of amount for market routes (too expensive)
