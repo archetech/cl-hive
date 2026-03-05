@@ -106,7 +106,7 @@ hexmem_event "advisor_cycle" "fleet" "Advisor cycle summary" "Actions: N fee anc
 - Fee anchor range: 25-5000 ppm
 - Max concurrent anchors: 10 per node
 - Market rebalance max fee: 1000 ppm
-- Max daily market rebalance spend: 10,000 sats
+- Max daily market rebalance spend: 3,000 sats
 - Max 3 market rebalances per day
 - Prefer hive routes (free) over market routes
 - Min on-chain reserve: 500,000 sats

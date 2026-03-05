@@ -125,7 +125,7 @@ Unlike hard fee overrides, they preserve the algorithm's learning state.
 - Source channel is not underwater/bleeder
 - Destination channel is not underwater/bleeder
 - `rebalance_diagnostic` shows sling available and budget has room
-- Daily market rebalance fee spend still under 10,000 sats total
+- Daily market rebalance fee spend still under 3,000 sats total
 - Max 3 market-routed rebalances per day
 
 ### EXCEPTION: Hive Internal Channel
@@ -143,7 +143,7 @@ The channel between fleet nodes is exempt from normal tier limits when >70/30 im
 - Destination channel has poor routing history
 - Market route expected incremental fee capture is not at least 3x the routing cost (use `rebalance_cost_benefit`)
 - Rebalancing into a channel we're considering closing
-- Daily market rebalance fee spend already ≥10,000 sats
+- Daily market rebalance fee spend already ≥3,000 sats
 - Sling not installed or budget exhausted (check `rebalance_diagnostic`)
 - Stale channel + no hive route (don't spend market fees on unproven channels)
 
