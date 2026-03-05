@@ -2,8 +2,11 @@
 # =============================================================================
 # cl-hive Hot Upgrade Script
 # =============================================================================
-# Upgrades plugins by pulling latest code on HOST and restarting in container.
-# Requires plugins to be mounted from host (default in docker-compose.yml).
+# Upgrades plugins by pulling latest code and restarting in container.
+# Supports three deployment modes:
+#   1. Full repo mounted from host (.git visible in container)
+#   2. Partial bind mount from host (individual files/dirs, no .git in container)
+#   3. Git repo cloned inside container only (no host mount)
 #
 # Usage:
 #   ./hot-upgrade.sh              # Upgrade both plugins
@@ -11,11 +14,6 @@
 #   ./hot-upgrade.sh revenue      # Upgrade only cl-revenue-ops
 #   ./hot-upgrade.sh --check      # Check for updates without applying
 #   ./hot-upgrade.sh --restart    # Just restart plugins (no git pull)
-#
-# Required directory structure:
-#   parent/
-#     cl-hive/           <- this repo (mounted to /opt/cl-hive)
-#     cl_revenue_ops/    <- revenue ops repo (mounted to /opt/cl-revenue-ops)
 # =============================================================================
 
 set -e
@@ -63,74 +61,116 @@ check_mount() {
     local host_path="$2"
     local container_path="$3"
 
-    # Check host repo exists
-    if [ ! -d "$host_path/.git" ]; then
+    # Determine where the git repo and mounts are
+    local has_host_git=false
+    local has_container_git=false
+    local has_bind_mount=false
+
+    [ -d "$host_path/.git" ] && has_host_git=true
+    docker exec "$CONTAINER_NAME" test -d "$container_path/.git" 2>/dev/null && has_container_git=true
+
+    # Detect partial bind mounts (individual files/dirs mounted, not the whole repo)
+    if docker inspect "$CONTAINER_NAME" --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null \
+        | grep -q "^${container_path}/"; then
+        has_bind_mount=true
+    fi
+
+    # Case 1: Full repo mounted from host (.git visible in container)
+    if [ "$has_host_git" == "true" ] && [ "$has_container_git" == "true" ]; then
+        return 0
+    fi
+
+    # Case 2: Partial mount from host (files bind-mounted, no .git in container)
+    if [ "$has_host_git" == "true" ] && [ "$has_bind_mount" == "true" ]; then
+        return 0
+    fi
+
+    # Case 3: Git repo inside container only (not mounted from host)
+    if [ "$has_container_git" == "true" ]; then
+        return 0
+    fi
+
+    # Nothing found — provide guidance
+    if [ "$has_host_git" != "true" ]; then
         log_error "$name not found at: $host_path"
-        echo ""
-        echo "Please clone the repo:"
-        echo "  git clone https://github.com/lightning-goats/$name.git $host_path"
-        return 1
+        echo "  Clone it: git clone https://github.com/lightning-goats/$name.git $host_path"
     fi
-
-    # Check if mounted by comparing a file
-    local host_version=$(get_git_version "$host_path")
-    local container_version=$(docker exec "$CONTAINER_NAME" cat "$container_path/.git/HEAD" 2>/dev/null | head -1 || echo "not-mounted")
-
-    if [[ "$container_version" == "not-mounted" ]] || [[ "$container_version" != *"ref:"* && "$container_version" != "$host_version"* ]]; then
-        log_error "$name is not mounted from host"
-        echo ""
-        echo "Add to docker-compose.yml or docker-compose.override.yml:"
-        echo "  volumes:"
-        echo "    - $host_path:$container_path:ro"
-        echo ""
-        echo "Then run: docker-compose up -d"
-        return 1
-    fi
-
-    return 0
+    log_error "$name is not accessible in container at $container_path"
+    echo ""
+    echo "Add to docker-compose.yml volumes:"
+    echo "  - $host_path:$container_path:ro"
+    echo ""
+    echo "Then run: docker compose up -d"
+    return 1
 }
 
 upgrade_repo() {
     local name="$1"
-    local repo_path="$2"
+    local host_path="$2"
+    local container_path="$3"
 
     log_step "Checking $name for updates..."
 
-    if [ ! -d "$repo_path/.git" ]; then
-        log_warn "$name repo not found at $repo_path"
+    # Prefer host git repo (works for full mounts and partial bind mounts)
+    if [ -d "$host_path/.git" ]; then
+        cd "$host_path"
+
+        local current=$(get_git_version .)
+        local remote=$(get_remote_version .)
+
+        echo "  Current: $current"
+        echo "  Remote:  $remote"
+
+        if [ "$current" == "$remote" ]; then
+            log_info "$name is up to date"
+            return 0
+        fi
+
+        if [ "$CHECK_ONLY" == "true" ]; then
+            log_warn "Update available: $current -> $remote"
+            return 1
+        fi
+
+        log_info "Pulling latest $name on host..."
+
+        if ! git diff --quiet 2>/dev/null; then
+            log_warn "Stashing local changes..."
+            git stash
+        fi
+
+        git pull origin main
+
+        log_info "$name upgraded: $current -> $(get_git_version .)"
+        return 1  # Signal upgrade was performed
+
+    # Fall back to container git repo
+    elif docker exec "$CONTAINER_NAME" test -d "$container_path/.git" 2>/dev/null; then
+        local current=$(docker exec "$CONTAINER_NAME" git -C "$container_path" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        docker exec "$CONTAINER_NAME" git -C "$container_path" fetch --quiet 2>/dev/null || true
+        local remote=$(docker exec "$CONTAINER_NAME" git -C "$container_path" rev-parse --short origin/main 2>/dev/null || echo "unknown")
+
+        echo "  Current: $current"
+        echo "  Remote:  $remote"
+
+        if [ "$current" == "$remote" ]; then
+            log_info "$name is up to date"
+            return 0
+        fi
+
+        if [ "$CHECK_ONLY" == "true" ]; then
+            log_warn "Update available: $current -> $remote"
+            return 1
+        fi
+
+        log_info "Pulling latest $name in container..."
+        docker exec "$CONTAINER_NAME" git -C "$container_path" pull origin main
+
+        log_info "$name upgraded: $current -> $(docker exec "$CONTAINER_NAME" git -C "$container_path" rev-parse --short HEAD)"
+        return 1  # Signal upgrade was performed
+    else
+        log_warn "$name: no git repo found (baked into image)"
         return 0
     fi
-
-    cd "$repo_path"
-
-    local current=$(get_git_version .)
-    local remote=$(get_remote_version .)
-
-    echo "  Current: $current"
-    echo "  Remote:  $remote"
-
-    if [ "$current" == "$remote" ]; then
-        log_info "$name is up to date"
-        return 0
-    fi
-
-    if [ "$CHECK_ONLY" == "true" ]; then
-        log_warn "Update available: $current -> $remote"
-        return 1
-    fi
-
-    log_info "Pulling latest $name..."
-
-    # Stash local changes if any
-    if ! git diff --quiet 2>/dev/null; then
-        log_warn "Stashing local changes..."
-        git stash
-    fi
-
-    git pull origin main
-
-    log_info "$name upgraded: $current -> $(get_git_version .)"
-    return 1  # Signal upgrade was performed
 }
 
 restart_plugin() {
@@ -166,11 +206,19 @@ restart_plugin() {
 
 show_versions() {
     echo ""
-    echo "Current versions (on host):"
+    echo "Current versions:"
     echo -n "  cl-hive:        "
-    get_git_version "$PROJECT_ROOT"
+    if [ -d "$PROJECT_ROOT/.git" ]; then
+        get_git_version "$PROJECT_ROOT"
+    else
+        docker exec "$CONTAINER_NAME" git -C /opt/cl-hive rev-parse --short HEAD 2>/dev/null || echo "unknown"
+    fi
     echo -n "  cl-revenue-ops: "
-    get_git_version "$REVENUE_OPS_ROOT"
+    if [ -d "$REVENUE_OPS_ROOT/.git" ]; then
+        get_git_version "$REVENUE_OPS_ROOT"
+    else
+        docker exec "$CONTAINER_NAME" git -C /opt/cl-revenue-ops rev-parse --short HEAD 2>/dev/null || echo "unknown"
+    fi
 }
 
 print_usage() {
@@ -196,9 +244,10 @@ Examples:
     ./hot-upgrade.sh hive         # Upgrade and restart cl-hive only
     ./hot-upgrade.sh --restart    # Just restart plugins (no git)
 
-Required setup:
-    Both repos must be cloned on host and mounted into container.
-    See docker-compose.yml for the default configuration.
+Supported setups:
+    - Host mount: repos cloned on host and mounted into container (recommended)
+    - Partial mount: individual plugin files bind-mounted from host repo
+    - Container git: repos cloned inside container (pulls inside container)
 EOF
 }
 
@@ -280,13 +329,13 @@ main() {
     # In restart-only mode, skip git operations
     if [ "$RESTART_ONLY" != "true" ]; then
         if [ "$upgrade_hive" == "true" ]; then
-            if ! upgrade_repo "cl-hive" "$PROJECT_ROOT"; then
+            if ! upgrade_repo "cl-hive" "$PROJECT_ROOT" "/opt/cl-hive"; then
                 hive_upgraded=true
             fi
         fi
 
         if [ "$upgrade_revenue" == "true" ]; then
-            if ! upgrade_repo "cl_revenue_ops" "$REVENUE_OPS_ROOT"; then
+            if ! upgrade_repo "cl-revenue-ops" "$REVENUE_OPS_ROOT" "/opt/cl-revenue-ops"; then
                 revenue_upgraded=true
             fi
         fi
