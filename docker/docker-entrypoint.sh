@@ -290,7 +290,53 @@ EOF
         chown -R debian-tor:debian-tor /var/lib/tor /var/log/tor
         chmod 700 /var/lib/tor/cln-service
 
-        echo "Tor configured - hidden service will be created on first start"
+        # Add announce address if specified (e.g. manual override)
+        if [ -n "$ANNOUNCE_ADDR" ]; then
+            echo "announce-addr=$ANNOUNCE_ADDR" >> "$CONFIG_FILE"
+            echo "Manual announce address: $ANNOUNCE_ADDR"
+        fi
+
+        # Announce onion address so the node is discoverable via Tor
+        ONION_FILE="/var/lib/tor/cln-service/hostname"
+        if [ -f "$ONION_FILE" ]; then
+            ONION_ADDR=$(cat "$ONION_FILE" | tr -d '\n')
+            echo "announce-addr=${ONION_ADDR}:${LIGHTNING_PORT}" >> "$CONFIG_FILE"
+            echo "Tor address: ${ONION_ADDR}:${LIGHTNING_PORT}"
+        else
+            # First run - start Tor temporarily as debian-tor to generate hidden service
+            echo "Generating Tor hidden service (first run)..."
+            su -s /bin/sh -c "tor -f /etc/tor/torrc" debian-tor &
+            TOR_PID=$!
+
+            # Wait for hidden service hostname (max 30 seconds)
+            for i in $(seq 1 30); do
+                if [ -f "$ONION_FILE" ]; then
+                    ONION_ADDR=$(cat "$ONION_FILE" | tr -d '\n')
+                    echo "announce-addr=${ONION_ADDR}:${LIGHTNING_PORT}" >> "$CONFIG_FILE"
+                    echo "Tor address: ${ONION_ADDR}:${LIGHTNING_PORT}"
+                    break
+                fi
+                sleep 1
+            done
+
+            # Stop temporary Tor — kill su wrapper and the actual tor process
+            kill $TOR_PID 2>/dev/null || true
+            pkill -u debian-tor -x tor 2>/dev/null || true
+            wait $TOR_PID 2>/dev/null || true
+            # Ensure port 9050 is released before supervisor starts Tor
+            for i in $(seq 1 10); do
+                if ! ss -tlnp 2>/dev/null | grep -q ':9050 '; then
+                    break
+                fi
+                sleep 1
+            done
+
+            if [ -z "$ONION_ADDR" ]; then
+                echo "WARNING: Could not generate Tor hidden service"
+            fi
+        fi
+
+        echo "Tor configured"
         ;;
 
     clearnet)
@@ -358,9 +404,9 @@ EOF
             echo "announce-addr=${ONION_ADDR}:${LIGHTNING_PORT}" >> "$CONFIG_FILE"
             echo "Tor address: ${ONION_ADDR}:${LIGHTNING_PORT}"
         else
-            # First run - start Tor temporarily to generate hidden service
+            # First run - start Tor temporarily as debian-tor to generate hidden service
             echo "Generating Tor hidden service (first run)..."
-            tor -f /etc/tor/torrc &
+            su -s /bin/sh -c "tor -f /etc/tor/torrc" debian-tor &
             TOR_PID=$!
 
             # Wait for hidden service hostname (max 30 seconds)
@@ -374,9 +420,17 @@ EOF
                 sleep 1
             done
 
-            # Stop temporary Tor (supervisor will manage it)
+            # Stop temporary Tor — kill su wrapper and the actual tor process
             kill $TOR_PID 2>/dev/null || true
+            pkill -u debian-tor -x tor 2>/dev/null || true
             wait $TOR_PID 2>/dev/null || true
+            # Ensure port 9050 is released before supervisor starts Tor
+            for i in $(seq 1 10); do
+                if ! ss -tlnp 2>/dev/null | grep -q ':9050 '; then
+                    break
+                fi
+                sleep 1
+            done
 
             if [ -z "$ONION_ADDR" ]; then
                 echo "WARNING: Could not generate Tor hidden service"
