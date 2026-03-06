@@ -30,6 +30,9 @@ htmlcov/
 .idea/
 .DS_Store
 
+# Git worktrees
+.worktrees/
+
 # Local env files
 .env
 .env.*
