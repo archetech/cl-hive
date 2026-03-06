@@ -18,5 +18,11 @@ rgb=e33502
 # Logging
 log-level=info
 
+# Dual-Funding (set by DUAL_FUND_ENABLED, default: true)
+# experimental-dual-fund
+# funder-policy=match
+# funder-policy-mod=100
+# funder-lease-requests-only=false
+
 # Plugins
 plugin-dir=/root/.lightning/plugins

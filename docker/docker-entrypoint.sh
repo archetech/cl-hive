@@ -21,6 +21,10 @@ set -e
 #   HIVE_COMMS_ENABLED   - Enable optional cl-hive-comms plugin (default: false)
 #   HIVE_ARCHON_ENABLED  - Enable optional cl-hive-archon plugin (default: false; requires comms)
 #   CLBOSS_ENABLED       - Enable CLBOSS (default: true, optional - hive works without it)
+#   DUAL_FUND_ENABLED    - Enable dual-funded channels (default: true)
+#   FUNDER_POLICY        - Funder policy: match, fixed, available (default: match)
+#   FUNDER_POLICY_MOD    - Funder policy modifier percentage (default: 100)
+#   FUNDER_PER_CHANNEL_MAX - Max sats to contribute per channel (optional)
 #   LOG_LEVEL            - debug, info, unusual, broken (default: info)
 # =============================================================================
 
@@ -211,6 +215,20 @@ if [ "${EXPERIMENTAL_SPLICING:-false}" = "true" ]; then
     echo "# Experimental Features" >> "$CONFIG_FILE"
     echo "experimental-splicing" >> "$CONFIG_FILE"
     echo "Experimental splicing enabled"
+fi
+
+# Enable dual-funding support (default: enabled)
+if [ "${DUAL_FUND_ENABLED:-true}" = "true" ]; then
+    echo "" >> "$CONFIG_FILE"
+    echo "# Dual-Funding (accept dual-funded channel opens)" >> "$CONFIG_FILE"
+    echo "experimental-dual-fund" >> "$CONFIG_FILE"
+    echo "funder-policy=${FUNDER_POLICY:-match}" >> "$CONFIG_FILE"
+    echo "funder-policy-mod=${FUNDER_POLICY_MOD:-100}" >> "$CONFIG_FILE"
+    echo "funder-lease-requests-only=false" >> "$CONFIG_FILE"
+    if [ -n "${FUNDER_PER_CHANNEL_MAX:-}" ]; then
+        echo "funder-per-channel-max=${FUNDER_PER_CHANNEL_MAX}" >> "$CONFIG_FILE"
+    fi
+    echo "Dual-funding enabled (policy: ${FUNDER_POLICY:-match}, mod: ${FUNDER_POLICY_MOD:-100})"
 fi
 
 # Disable CLBOSS if requested
