@@ -534,6 +534,93 @@ class TestIntelligenceTransport:
         assert result == {"result": "continue"}
         cl_hive._should_process_message.assert_not_called()
 
+    def test_non_member_gossip_skips_signature_check_and_logs_debug(self):
+        """Direct GOSSIP from an ex-member should be ignored before checkmessage."""
+        cl_hive = _load_cl_hive_module()
+        peer_id = "02" + "a" * 64
+        plugin = MagicMock()
+        plugin.log = MagicMock()
+        plugin.rpc = MagicMock()
+        plugin.rpc.checkmessage.side_effect = Exception("pubkey not found in the graph")
+
+        cl_hive.gossip_mgr = MagicMock()
+        cl_hive.database = MagicMock()
+        cl_hive.database.get_member.return_value = None
+        cl_hive._should_process_message = MagicMock(return_value=True)
+
+        payload = {
+            "sender_id": peer_id,
+            "timestamp": int(time.time()),
+            "signature": "sig",
+            "version": 1,
+        }
+
+        with patch.object(cl_hive, "validate_gossip", return_value=True), patch.object(
+            cl_hive,
+            "get_gossip_signing_payload",
+            return_value="signed-payload",
+        ):
+            result = cl_hive.handle_gossip(
+                peer_id=peer_id,
+                payload=payload,
+                plugin=plugin,
+            )
+
+        assert result == {"result": "continue"}
+        plugin.rpc.checkmessage.assert_not_called()
+        plugin.log.assert_any_call(
+            f"cl-hive: GOSSIP from non-member {peer_id[:16]}..., ignoring",
+            level="debug",
+        )
+
+    def test_gossip_signature_verification_uses_claimed_sender_pubkey(self):
+        """GOSSIP signature verification should not depend on graph lookup."""
+        cl_hive = _load_cl_hive_module()
+        sender_id = "02" + "a" * 64
+        relay_peer_id = "02" + "b" * 64
+        plugin = MagicMock()
+        plugin.log = MagicMock()
+        plugin.rpc = MagicMock()
+        plugin.rpc.checkmessage.return_value = {"verified": True, "pubkey": sender_id}
+
+        cl_hive.gossip_mgr = MagicMock()
+        cl_hive.gossip_mgr.process_gossip.return_value = False
+        cl_hive.database = MagicMock()
+        cl_hive.database.get_member.side_effect = lambda requested_peer_id: {
+            sender_id: {"peer_id": sender_id, "tier": "member"},
+            relay_peer_id: {"peer_id": relay_peer_id, "tier": "member"},
+        }.get(requested_peer_id)
+        cl_hive.database.is_banned.return_value = False
+        cl_hive._should_process_message = MagicMock(return_value=True)
+
+        payload = {
+            "sender_id": sender_id,
+            "timestamp": int(time.time()),
+            "signature": "sig",
+            "version": 1,
+            "_relay": {
+                "origin": sender_id,
+                "relay_path": [sender_id, relay_peer_id],
+                "ttl": 2,
+                "msg_id": "fixed-relay-id",
+                "origin_ts": int(time.time()),
+            },
+        }
+
+        with patch.object(cl_hive, "validate_gossip", return_value=True), patch.object(
+            cl_hive,
+            "get_gossip_signing_payload",
+            return_value="signed-payload",
+        ):
+            result = cl_hive.handle_gossip(
+                peer_id=relay_peer_id,
+                payload=payload,
+                plugin=plugin,
+            )
+
+        assert result == {"result": "continue"}
+        plugin.rpc.checkmessage.assert_called_once_with("signed-payload", "sig", sender_id)
+
 
 # =============================================================================
 # MARKER DEPOSITOR SPOOFING TEST

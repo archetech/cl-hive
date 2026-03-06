@@ -17,22 +17,72 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
+_DUAL_FUND_BIT_EVEN = 1 << 28
+_DUAL_FUND_BIT_ODD = 1 << 29
+
+
+def _peer_supports_dual_fund(rpc, peer_id: str, log_fn=None) -> bool:
+    """Check if a peer advertises option_dual_fund (feature bits 28/29)."""
+    try:
+        res = rpc.call("listpeers", {"id": peer_id})
+        peers = res.get("peers") or []
+        if not peers:
+            return False
+        features_hex = peers[0].get("features")
+        if not features_hex:
+            return False
+        features = int(features_hex, 16)
+        supported = bool(features & (_DUAL_FUND_BIT_EVEN | _DUAL_FUND_BIT_ODD))
+        if log_fn and supported:
+            log_fn(f"cl-hive: Peer {peer_id[:16]}... supports dual-fund (v2)", "info")
+        return supported
+    except Exception:
+        return False
+
+
 def _open_channel(rpc, target: str, amount_sats: int,
                   feerate: str = "normal", announce: bool = True,
+                  request_amt: int = 0,
                   log_fn=None) -> Dict[str, Any]:
-    """Open a channel using fundchannel."""
+    """Open a channel using fundchannel.
+
+    When *request_amt* > 0 and the peer advertises ``option_dual_fund``,
+    the amount is passed as ``request_amt`` to ``fundchannel`` so the
+    remote funder plugin can contribute liquidity.  If the dual-funded
+    attempt fails, we retry without ``request_amt`` (graceful fallback).
+    """
     if log_fn:
         log_fn(f"cl-hive: Opening channel to {target[:16]}... for {amount_sats:,} sats", "info")
-    result = rpc.call("fundchannel", {
+
+    params = {
         "id": target,
         "amount": amount_sats,
         "feerate": feerate,
         "announce": announce,
-    })
+    }
+
+    dual_funded = False
+    if request_amt > 0 and _peer_supports_dual_fund(rpc, target, log_fn=log_fn):
+        params["request_amt"] = request_amt
+        dual_funded = True
+
+    try:
+        result = rpc.call("fundchannel", dict(params))
+    except Exception:
+        if dual_funded:
+            # Graceful fallback: retry without request_amt
+            if log_fn:
+                log_fn("cl-hive: Dual-fund attempt failed, retrying without request_amt", "info")
+            fallback_params = {k: v for k, v in params.items() if k != "request_amt"}
+            dual_funded = False
+            result = rpc.call("fundchannel", fallback_params)
+        else:
+            raise
 
     return {
         "channel_id": result.get("channel_id", "unknown"),
         "txid": result.get("txid", "unknown"),
+        "dual_funded": dual_funded,
     }
 
 
@@ -43,7 +93,12 @@ def _batch_open_channels(
     announce: bool = True,
     log_fn=None,
 ) -> Dict[str, Any]:
-    """Batch-open multiple channels in a single on-chain transaction."""
+    """Batch-open multiple channels in a single on-chain transaction.
+
+    Note: ``multifundchannel`` negotiates v2 transparently but does not
+    support per-destination ``request_amt``.  Use single ``_open_channel``
+    calls when dual-fund contributions are needed.
+    """
     if log_fn:
         log_fn(
             f"cl-hive: Batch opening {len(targets)} channels via multifundchannel",

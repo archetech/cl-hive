@@ -3349,13 +3349,22 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _check_timestamp_freshness(payload, MAX_GOSSIP_AGE_SECONDS, "GOSSIP"):
         return {"result": "continue"}
 
-    # SECURITY: Verify cryptographic signature
     sender_id = payload.get("sender_id")
+
+    # SECURITY: Fast-reject ex-members before signature verification to avoid
+    # graph-dependent checkmessage failures after a peer has left the hive.
+    if database:
+        member = database.get_member(sender_id)
+        if not member:
+            plugin.log(f"cl-hive: GOSSIP from non-member {sender_id[:16]}..., ignoring", level='debug')
+            return {"result": "continue"}
+
+    # SECURITY: Verify cryptographic signature
     signature = payload.get("signature")
     signing_payload = get_gossip_signing_payload(payload)
 
     try:
-        result = plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature, sender_id)
         if not result.get("verified") or result.get("pubkey") != sender_id:
             plugin.log(
                 f"cl-hive: GOSSIP signature invalid from {peer_id[:16]}...",
@@ -14010,8 +14019,11 @@ def hive_connect(plugin: Plugin, peer_id: str):
 
 
 @plugin.method("hive-open-channel")
-def hive_open_channel(plugin: Plugin, peer_id: str, amount_sats: int, feerate: str = "normal", announce: bool = True):
-    """Open a channel via plugin (native RPC)."""
+def hive_open_channel(plugin: Plugin, peer_id: str, amount_sats: int, feerate: str = "normal", announce: bool = True, request_amt: int = 0):
+    """Open a channel via plugin (native RPC).
+
+    When *request_amt* > 0, dual-fund (v2) is attempted if the peer supports it.
+    """
     rpc, err = _require_rpc(plugin)
     if err:
         return err
@@ -14030,6 +14042,7 @@ def hive_open_channel(plugin: Plugin, peer_id: str, amount_sats: int, feerate: s
         amount_sats=amount_sats,
         feerate=feerate,
         announce=announce,
+        request_amt=request_amt,
         log_fn=lambda msg, lvl="info": plugin.log(msg, level=lvl),
     )
 
