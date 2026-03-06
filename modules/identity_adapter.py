@@ -1,9 +1,8 @@
 """
-Identity adapter for Phase 6 handover.
+Identity adapter for Phase 6.
 
-Supports two modes:
-1. LocalIdentity: Signs via CLN HSM directly (default, supported)
-2. RemoteArchonIdentity: Delegates signing to cl-hive-archon via RPC (optional)
+cl-hive delegates all signing to cl-hive-archon via RPC.
+RemoteArchonIdentity is the only supported mode.
 """
 
 from typing import Any, Dict
@@ -25,41 +24,6 @@ class IdentityInterface:
     def get_info(self) -> Dict[str, Any]:
         """Return identity info (pubkey, mode, etc.)."""
         raise NotImplementedError
-
-
-class LocalIdentity(IdentityInterface):
-    """Signs via CLN HSM directly (default supported mode)."""
-
-    def __init__(self, rpc):
-        self._rpc = rpc
-
-    def set_rpc(self, rpc) -> None:
-        """Rebind RPC backend (used after cl-hive installs the RpcPoolProxy)."""
-        self._rpc = rpc
-
-    def sign_message(self, message: str) -> str:
-        try:
-            result = self._rpc.signmessage(message)
-            if isinstance(result, dict):
-                return str(result.get("zbase", ""))
-            return ""
-        except Exception:
-            return ""
-
-    def check_message(self, message: str, signature: str, pubkey: str = "") -> bool:
-        try:
-            if pubkey:
-                result = self._rpc.checkmessage(message, signature, pubkey)
-            else:
-                result = self._rpc.checkmessage(message, signature)
-            if isinstance(result, dict):
-                return bool(result.get("verified", False))
-            return False
-        except Exception:
-            return False
-
-    def get_info(self) -> Dict[str, Any]:
-        return {"mode": "local", "backend": "cln-hsm"}
 
 
 class RemoteArchonIdentity(IdentityInterface):

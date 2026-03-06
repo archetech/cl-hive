@@ -18,7 +18,6 @@ import pytest
 
 from modules.identity_adapter import (
     IdentityInterface,
-    LocalIdentity,
     RemoteArchonIdentity,
 )
 from modules.bridge import CircuitState
@@ -27,23 +26,6 @@ from modules.bridge import CircuitState
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-class _FakeRpc:
-    """Minimal RPC mock for LocalIdentity."""
-
-    def __init__(self, sign_result=None, check_result=None, raise_on_check=False):
-        self._sign_result = sign_result or {"zbase": "mock_zbase_sig"}
-        self._check_result = check_result or {"verified": True}
-        self._raise_on_check = raise_on_check
-
-    def signmessage(self, message):
-        return self._sign_result
-
-    def checkmessage(self, message, signature, pubkey=None):
-        if self._raise_on_check:
-            raise RuntimeError("rpc error")
-        return self._check_result
-
 
 class _FakePlugin:
     """Minimal plugin mock for RemoteArchonIdentity."""
@@ -92,54 +74,6 @@ class TestIdentityInterface:
     def test_get_info_raises_not_implemented(self):
         with pytest.raises(NotImplementedError):
             IdentityInterface().get_info()
-
-
-# ---------------------------------------------------------------------------
-# LocalIdentity
-# ---------------------------------------------------------------------------
-
-class TestLocalIdentity:
-    def test_sign_message_returns_zbase(self):
-        rpc = _FakeRpc(sign_result={"zbase": "abc123"})
-        li = LocalIdentity(rpc)
-        assert li.sign_message("test") == "abc123"
-
-    def test_sign_message_empty_on_missing_key(self):
-        rpc = _FakeRpc(sign_result={"other": "value"})
-        li = LocalIdentity(rpc)
-        assert li.sign_message("test") == ""
-
-    def test_sign_message_handles_non_dict(self):
-        rpc = _FakeRpc(sign_result="not_a_dict")
-        li = LocalIdentity(rpc)
-        assert li.sign_message("test") == ""
-
-    def test_check_message_returns_true(self):
-        rpc = _FakeRpc(check_result={"verified": True})
-        li = LocalIdentity(rpc)
-        assert li.check_message("msg", "sig") is True
-
-    def test_check_message_returns_false(self):
-        rpc = _FakeRpc(check_result={"verified": False})
-        li = LocalIdentity(rpc)
-        assert li.check_message("msg", "sig") is False
-
-    def test_check_message_with_pubkey(self):
-        rpc = _FakeRpc(check_result={"verified": True})
-        li = LocalIdentity(rpc)
-        assert li.check_message("msg", "sig", pubkey="02aabb") is True
-
-    def test_check_message_exception_returns_false(self):
-        rpc = _FakeRpc(raise_on_check=True)
-        li = LocalIdentity(rpc)
-        assert li.check_message("msg", "sig") is False
-
-    def test_get_info(self):
-        rpc = _FakeRpc()
-        li = LocalIdentity(rpc)
-        info = li.get_info()
-        assert info["mode"] == "local"
-        assert info["backend"] == "cln-hsm"
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,7 @@ if "pyln.client" not in sys.modules:
     sys.modules["pyln.client"] = client_module
     pyln_module.client = client_module
 
-from modules.nostr_transport import ExternalCommsTransport, NostrTransport
+from modules.nostr_transport import ExternalCommsTransport
 
 
 @pytest.fixture
@@ -27,11 +27,6 @@ def mock_plugin():
     plugin.log = MagicMock()
     plugin.rpc = MagicMock()
     return plugin
-
-
-def test_legacy_nostr_transport_alias_raises(mock_plugin):
-    with pytest.raises(RuntimeError, match="removed from cl-hive"):
-        NostrTransport(mock_plugin, MagicMock())
 
 
 def test_external_transport_identity_uses_rpc(mock_plugin):

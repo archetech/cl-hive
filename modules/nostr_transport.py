@@ -1,12 +1,8 @@
 """
-Nostr transport abstraction for Phase 6.
+Nostr transport for Phase 6.
 
-Supported mode:
-1. ExternalCommsTransport: delegates transport to cl-hive-comms via RPC
-
-Legacy note:
-- InternalNostrTransport has been removed from cl-hive runtime. A fail-fast
-  compatibility stub remains so callers get a clear migration error.
+cl-hive delegates all Nostr transport to cl-hive-comms via RPC.
+ExternalCommsTransport is the only supported mode.
 """
 
 import json
@@ -203,16 +199,3 @@ class ExternalCommsTransport(TransportInterface):
         }
 
 
-class InternalNostrTransport(TransportInterface):
-    """Legacy stub kept for import compatibility after internal transport removal."""
-
-    def __init__(self, *args, **kwargs):
-        raise RuntimeError(
-            "InternalNostrTransport has been removed from cl-hive. "
-            "Use cl-hive-comms with ExternalCommsTransport."
-        )
-
-
-# Alias kept for backward compatibility with older imports. Instantiation fails
-# fast with migration guidance via the legacy stub above.
-NostrTransport = InternalNostrTransport

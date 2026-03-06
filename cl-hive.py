@@ -116,7 +116,7 @@ from modules.did_credentials import DIDCredentialManager
 from modules.management_schemas import ManagementSchemaRegistry
 from modules.cashu_escrow import CashuEscrowManager
 from modules.nostr_transport import ExternalCommsTransport, TransportInterface
-from modules.identity_adapter import IdentityInterface, LocalIdentity, RemoteArchonIdentity
+from modules.identity_adapter import IdentityInterface, RemoteArchonIdentity
 from modules.phase6_ingest import parse_injected_hive_packet
 from modules.marketplace import MarketplaceManager
 from modules.liquidity_marketplace import LiquidityMarketplaceManager
@@ -1178,8 +1178,8 @@ def _get_hive_context() -> HiveContext:
     _signing_backend = "unknown"
     if isinstance(_identity_adapter, RemoteArchonIdentity):
         _signing_backend = "cl-hive-archon"
-    elif isinstance(_identity_adapter, LocalIdentity):
-        _signing_backend = "cln-hsm"
+    elif _identity_adapter is None:
+        _signing_backend = "none"
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -2471,14 +2471,14 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             identity_adapter = RemoteArchonIdentity(plugin=plugin)
             plugin.log("cl-hive: Using Remote Identity (cl-hive-archon)")
         else:
-            identity_adapter = LocalIdentity(rpc=plugin.rpc)
+            identity_adapter = None
             plugin.log(
-                "cl-hive: Using Local Identity (CLN HSM); "
-                "cl-hive-archon is optional for delegated signing"
+                "cl-hive: Identity adapter not available; "
+                "install cl-hive-archon for delegated signing"
             )
     except Exception as e:
-        identity_adapter = LocalIdentity(rpc=plugin.rpc)
-        plugin.log(f"cl-hive: Identity adapter fell back to local CLN HSM signing: {e}", level='warn')
+        identity_adapter = None
+        plugin.log(f"cl-hive: Identity adapter disabled (init error): {e}", level='warn')
 
     # Phase 5B/5C marketplace features (only with companion stack)
     global marketplace_mgr
@@ -2643,10 +2643,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         management_schema_registry.rpc = plugin.rpc
     if cashu_escrow_mgr:
         cashu_escrow_mgr.rpc = plugin.rpc
-    # LocalIdentity is created before RPC proxy install and otherwise keeps the
-    # raw pyln RPC handle (no pool timeout/restart protection).
-    if isinstance(identity_adapter, LocalIdentity):
-        identity_adapter.set_rpc(plugin.rpc)
 
     plugin.log("cl-hive: Initialization complete. Swarm Intelligence ready.")
 
