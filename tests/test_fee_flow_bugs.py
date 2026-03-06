@@ -11,6 +11,10 @@ Covers:
 import pytest
 import time
 import math
+import os
+import sys
+import importlib.util
+import types
 from unittest.mock import MagicMock, patch
 
 from modules.fee_coordination import (
@@ -33,6 +37,53 @@ from modules.fee_intelligence import (
     HEALTH_STRUGGLING,
 )
 from modules.rpc_commands import pheromone_levels as rpc_pheromone_levels
+
+
+def _load_cl_hive_module():
+    """Import cl-hive.py under a lightweight pyln.client stub for ingestion tests."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+    class DummyPlugin:
+        def __init__(self, *args, **kwargs):
+            self.rpc = None
+            self.log = lambda *a, **k: None
+            self.write_lock = None
+            self.stdout = None
+
+        def method(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+            return decorator
+
+        hook = method
+        subscribe = method
+        init = method
+
+        def add_option(self, *args, **kwargs):
+            return None
+
+        def run(self):
+            return None
+
+        def __getattr__(self, name):
+            def no_op(*args, **kwargs):
+                return None
+            return no_op
+
+    mock_pyln_client = types.SimpleNamespace(Plugin=DummyPlugin, RpcError=Exception)
+    sys.modules["pyln"] = types.SimpleNamespace(client=mock_pyln_client)
+    sys.modules["pyln.client"] = mock_pyln_client
+
+    module_path = os.path.join(repo_root, "cl-hive.py")
+    spec = importlib.util.spec_from_file_location(
+        f"cl_hive_test_{time.time_ns()}",
+        module_path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class MockDatabase:
@@ -328,6 +379,109 @@ class TestBug4RecordRoutingOutcome:
         # Marker should be created
         markers = self.manager.stigmergic_coord.get_all_markers()
         assert len(markers) > 0
+
+    def test_record_outcome_uses_forwarded_volume_for_marker_strength(self):
+        """Marker strength should track forwarded volume, not earned fee."""
+        self.manager.record_routing_outcome(
+            channel_id="123x1x0",
+            peer_id="02" + "a" * 64,
+            fee_ppm=500,
+            success=True,
+            revenue_sats=50,
+            volume_sats=80000,
+            source="peer1",
+            destination="peer2"
+        )
+
+        markers = self.manager.stigmergic_coord.read_markers("peer1", "peer2")
+        assert len(markers) == 1
+        assert markers[0].strength >= 0.75
+
+
+class TestTransportMsatParsing:
+    """Regression tests for msat parsing in cl-hive fee-intelligence ingestion."""
+
+    def test_forward_event_ingestion_parses_string_msat_values(self):
+        """Forward-event ingestion should accept CLN string msat values."""
+        cl_hive = _load_cl_hive_module()
+
+        plugin = MagicMock()
+        plugin.log = MagicMock()
+        plugin.rpc = MagicMock()
+        plugin.rpc.listfunds.return_value = {
+            "channels": [
+                {"short_channel_id": "123x1x0", "peer_id": "02" + "a" * 64},
+            ]
+        }
+
+        cl_hive.plugin = plugin
+        cl_hive.fee_coordination_mgr = MagicMock()
+        cl_hive.fee_coordination_mgr.adaptive_controller._channel_peer_map = {}
+
+        cl_hive._record_forward_for_fee_coordination(
+            {
+                "out_channel": "123x1x0",
+                "fee_msat": "1500msat",
+                "out_msat": "3000000msat",
+            },
+            "settled",
+        )
+
+        cl_hive.fee_coordination_mgr.record_routing_outcome.assert_called_once_with(
+            channel_id="123x1x0",
+            peer_id="02" + "a" * 64,
+            fee_ppm=500,
+            success=True,
+            revenue_sats=1,
+            volume_sats=3000,
+            source=None,
+            destination="02" + "a" * 64,
+        )
+
+    def test_backfill_ingestion_parses_nested_msat_values(self):
+        """Backfill should accept CLN nested msat objects when computing outcomes."""
+        cl_hive = _load_cl_hive_module()
+
+        plugin = MagicMock()
+        plugin.log = MagicMock()
+        plugin.rpc = MagicMock()
+        plugin.rpc.listforwards.return_value = {
+            "forwards": [
+                {
+                    "received_time": int(time.time()),
+                    "in_channel": "111x1x0",
+                    "out_channel": "123x1x0",
+                    "fee_msat": {"msat": "2500msat"},
+                    "out_msat": {"msat": "5000000msat"},
+                    "status": "settled",
+                }
+            ]
+        }
+        plugin.rpc.listfunds.return_value = {
+            "channels": [
+                {"short_channel_id": "111x1x0", "peer_id": "02" + "b" * 64},
+                {"short_channel_id": "123x1x0", "peer_id": "02" + "a" * 64},
+            ]
+        }
+
+        cl_hive.fee_coordination_mgr = MagicMock()
+        cl_hive.fee_coordination_mgr.adaptive_controller.get_all_pheromone_levels.return_value = {}
+        cl_hive.fee_coordination_mgr.stigmergic_coord.get_all_markers.return_value = []
+
+        result = cl_hive.hive_backfill_routing_intelligence(plugin, days=1, status_filter="settled")
+
+        assert result["processed"] == 1
+        assert result["errors"] == 0
+        cl_hive.fee_coordination_mgr.record_routing_outcome.assert_called_once_with(
+            channel_id="123x1x0",
+            peer_id="02" + "a" * 64,
+            fee_ppm=500,
+            success=True,
+            revenue_sats=2,
+            volume_sats=5000,
+            source="02" + "b" * 64,
+            destination="02" + "a" * 64,
+        )
 
 
 class TestSalienceFunction:

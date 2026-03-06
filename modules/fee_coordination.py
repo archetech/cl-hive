@@ -615,6 +615,11 @@ class FlowCorridorManager:
 
         Returns (fee_ppm, is_primary)
         """
+        now = time.time()
+        assignments, ts = self._assignments_snapshot
+        if (not assignments) or (now - ts >= self._assignments_ttl):
+            self.get_assignments(force_refresh=True)
+
         key = (source, destination)
         assignments, _ = self._assignments_snapshot
         assignment = assignments.get(key)
@@ -851,9 +856,13 @@ class AdaptiveFeeController:
         """
         with self._lock:
             pheromone = self._pheromone.get(channel_id, 0)
+            learned_fee = self._pheromone_fee.get(channel_id)
 
         if pheromone > PHEROMONE_EXPLOIT_THRESHOLD:
             # Strong signal - exploit current fee
+            if learned_fee is not None:
+                bounded_fee = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, learned_fee))
+                return bounded_fee, "exploit_learned_pheromone_fee"
             return current_fee, "exploit_strong_pheromone"
         else:
             # Weak signal - explore
@@ -1003,6 +1012,7 @@ class AdaptiveFeeController:
         # Bound values to prevent manipulation via gossip
         fee_ppm = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, fee_ppm))
         level = max(0.0, min(100.0, level))
+        weighting_factor = max(0.0, min(1.0, weighting_factor))
 
         # Store remote pheromone, keyed by the external peer
         entry = {
@@ -1014,6 +1024,14 @@ class AdaptiveFeeController:
         }
 
         with self._lock:
+            self._remote_pheromones[peer_id] = [
+                r for r in self._remote_pheromones[peer_id]
+                if not (
+                    r.get("reporter_id") == reporter_id and
+                    r.get("fee_ppm") == fee_ppm and
+                    r.get("level") == level
+                )
+            ]
             # Keep only recent reports per peer (last 10)
             self._remote_pheromones[peer_id].append(entry)
             if len(self._remote_pheromones[peer_id]) > 10:
@@ -1361,6 +1379,19 @@ class StigmergicCoordinator:
 
             key = (marker.source_peer_id, marker.destination_peer_id)
             with self._lock:
+                existing = next(
+                    (
+                        m for m in self._markers[key]
+                        if m.depositor == marker.depositor and
+                        m.fee_ppm == marker.fee_ppm and
+                        m.success == marker.success and
+                        m.volume_sats == marker.volume_sats and
+                        int(m.timestamp) == int(marker.timestamp)
+                    ),
+                    None
+                )
+                if existing:
+                    return existing
                 self._markers[key].append(marker)
                 self._prune_markers(key)
 
@@ -2499,6 +2530,7 @@ class FeeCoordinationManager:
         ceiling_applied = False
         stigmergic_influence = 0.0
         defensive_multiplier = 1.0
+        defended_floor_fee: Optional[int] = None
         centrality_adjustment_pct = 0.0
         our_hive_centrality = 0.0
         reasons = []
@@ -2571,6 +2603,7 @@ class FeeCoordinationManager:
         if defensive_multiplier > 1.0:
             recommended_fee = int(recommended_fee * defensive_multiplier)
             recommended_fee = min(recommended_fee, FLEET_FEE_CEILING_PPM)
+            defended_floor_fee = recommended_fee
             reasons.append(f"defensive_{defensive_multiplier:.2f}x")
 
         # 5. Apply time-based adjustment (Phase 7.4)
@@ -2594,6 +2627,11 @@ class FeeCoordinationManager:
                     reasons.append(f"centrality_premium_{centrality_adjustment_pct*100:.1f}%")
                 else:
                     reasons.append(f"centrality_discount_{abs(centrality_adjustment_pct)*100:.1f}%")
+
+        # Defense must remain a hard floor through later adjustments.
+        if defended_floor_fee is not None and recommended_fee < defended_floor_fee:
+            recommended_fee = defended_floor_fee
+            reasons.append("defense_floor_applied")
 
         # 7. Apply floor and ceiling
         if recommended_fee < FLEET_FEE_FLOOR_PPM:
@@ -2626,8 +2664,15 @@ class FeeCoordinationManager:
 
         # If not salient, recommend keeping current fee
         if not is_salient:
-            recommended_fee = current_fee
-            reasons.append(f"not_salient:{salience_reason}")
+            if defended_floor_fee is not None and defended_floor_fee > current_fee:
+                recommended_fee = max(recommended_fee, defended_floor_fee)
+                is_salient = True
+                salience_reason = "defense_bypass"
+                reasons.append("defense_salience_bypass")
+                self.record_fee_change(channel_id)
+            else:
+                recommended_fee = current_fee
+                reasons.append(f"not_salient:{salience_reason}")
         elif recommended_fee != current_fee:
             # Salient change — record so cooldown activates for next check
             self.record_fee_change(channel_id)
@@ -2660,6 +2705,7 @@ class FeeCoordinationManager:
         fee_ppm: int,
         success: bool,
         revenue_sats: int,
+        volume_sats: int = 0,
         source: str = None,
         destination: str = None
     ) -> None:
@@ -2676,8 +2722,9 @@ class FeeCoordinationManager:
 
         # Deposit stigmergic marker
         if source and destination:
+            marker_volume_sats = volume_sats if volume_sats > 0 else revenue_sats
             self.stigmergic_coord.deposit_marker(
-                source, destination, fee_ppm, success, revenue_sats if success else 0
+                source, destination, fee_ppm, success, marker_volume_sats if success else 0
             )
 
     def save_state_to_database(self) -> Dict[str, int]:

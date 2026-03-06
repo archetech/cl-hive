@@ -3932,19 +3932,19 @@ def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
         plugin.log("cl-hive: Failed to create signed FULL_SYNC", level='error')
         return
 
-    sent_count = 0
-    for member in targets:
-        member_id = member["peer_id"]
-        try:
-            plugin.rpc.call("sendcustommsg", {
-                "node_id": member_id,
-                "msg": full_sync_msg.hex()
-            })
-            sent_count += 1
-            shutdown_event.wait(0.02)  # Yield for incoming RPC
-            plugin.log(f"cl-hive: Sent FULL_SYNC to {member_id[:16]}...", level='debug')
-        except Exception as e:
-            plugin.log(f"cl-hive: Failed to send FULL_SYNC to {member_id[:16]}...: {e}", level='info')
+    result = _broadcast_member_message(
+        message_bytes=full_sync_msg,
+        reliability="reliable",
+        failure_policy="fail_closed",
+        log_label="full_sync",
+    )
+    sent_count = result["queued"] or result["sent"]
+    if not result["ok"]:
+        plugin.log(
+            f"cl-hive: Membership broadcast incomplete: {sent_count}/{result['attempted']} delivered",
+            level='warning',
+        )
+        return
 
     plugin.log(f"cl-hive: Membership broadcast complete: {sent_count} messages sent")
 
@@ -4259,20 +4259,13 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
             rebalance_costs_sats=rebalance_costs
         )
 
-        # Broadcast to eligible members (excludes banned)
-        broadcast_count = 0
-        for member in _get_broadcast_targets():
-            member_id = member["peer_id"]
-
-            try:
-                plugin.rpc.call("sendcustommsg", {
-                    "node_id": member_id,
-                    "msg": fee_report_msg.hex()
-                })
-                broadcast_count += 1
-                shutdown_event.wait(0.02)  # Yield for incoming RPC
-            except Exception:
-                pass  # Peer may be offline
+        result = _broadcast_member_message(
+            message_bytes=fee_report_msg,
+            reliability="reliable",
+            failure_policy="best_effort",
+            log_label="fee_report",
+        )
+        broadcast_count = result["queued"] or result["sent"]
 
         if broadcast_count > 0:
             plugin.log(
@@ -4282,7 +4275,7 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
             )
         else:
             plugin.log(
-                f"[FeeReport] No members to broadcast to (found {len(members)} total)",
+                f"[FeeReport] No members to broadcast to (eligible={result['attempted']})",
                 level="warn"
             )
 
@@ -4402,8 +4395,12 @@ def _record_forward_for_fee_coordination(forward_event: Dict, status: str):
     try:
         in_channel = forward_event.get("in_channel", "")
         out_channel = forward_event.get("out_channel", "")
-        fee_msat = forward_event.get("fee_msat", 0)
-        out_msat = forward_event.get("out_msat", 0)
+        fee_msat = _parse_msat_value(
+            forward_event.get("fee_msat", forward_event.get("fee_msatoshi", 0))
+        )
+        out_msat = _parse_msat_value(
+            forward_event.get("out_msat", forward_event.get("out_msatoshi", 0))
+        )
 
         if not out_channel:
             return
@@ -4445,6 +4442,7 @@ def _record_forward_for_fee_coordination(forward_event: Dict, status: str):
             fee_ppm=fee_ppm,
             success=success,
             revenue_sats=fee_sats if success else 0,
+            volume_sats=volume_sats if success else 0,
             source=in_peer if in_peer else None,
             destination=out_peer
         )
@@ -4634,19 +4632,13 @@ def broadcast_intent_abort(target: str, intent_type: str) -> None:
         plugin.log(f"cl-hive: Failed to sign INTENT_ABORT: {e}", level='error')
         return
 
-    abort_msg = serialize(HiveMessageType.INTENT_ABORT, abort_payload)
-
-    for member in _get_broadcast_targets():
-        member_id = member['peer_id']
-
-        try:
-            plugin.rpc.call("sendcustommsg", {
-                "node_id": member_id,
-                "msg": abort_msg.hex()
-            })
-        except Exception as e:
-            plugin.log(f"Failed to send INTENT_ABORT to {member_id[:16]}...: {e}", level='debug')
-        shutdown_event.wait(0.02)  # Yield for incoming RPC
+    _broadcast_member_message(
+        msg_type=HiveMessageType.INTENT_ABORT,
+        payload=abort_payload,
+        reliability="reliable",
+        failure_policy="best_effort",
+        log_label="intent_abort",
+    )
 
 
 # =============================================================================
@@ -4671,6 +4663,178 @@ def _get_broadcast_targets() -> List[Dict[str, Any]]:
     ]
 
 
+def _normalize_member_broadcast_bytes(
+    msg_type: Optional[HiveMessageType] = None,
+    payload: Optional[Dict[str, Any]] = None,
+    message_bytes: Optional[bytes] = None,
+    relay_ttl: int = 3,
+):
+    """
+    Normalize payload/bytes input into a relay-aware payload and serialized bytes.
+
+    Returns:
+        Tuple of (normalized_type, normalized_payload, normalized_bytes)
+    """
+    if (payload is None) == (message_bytes is None):
+        raise ValueError("exactly one of payload or message_bytes is required")
+
+    if payload is not None:
+        if msg_type is None:
+            raise ValueError("msg_type is required when payload is provided")
+        normalized_type = msg_type
+        normalized_payload = _prepare_broadcast_payload(dict(payload), ttl=relay_ttl)
+    else:
+        normalized_type, decoded_payload = deserialize(message_bytes)
+        if normalized_type is None or decoded_payload is None:
+            raise ValueError("message_bytes could not be deserialized")
+        normalized_payload = dict(decoded_payload)
+        if "_relay" not in normalized_payload:
+            normalized_payload = _prepare_broadcast_payload(normalized_payload, ttl=relay_ttl)
+
+    normalized_bytes = serialize(normalized_type, normalized_payload)
+    if normalized_bytes is None:
+        raise ValueError("normalized broadcast message could not be serialized")
+
+    return normalized_type, normalized_payload, normalized_bytes
+
+
+def _normalize_member_broadcast_targets(targets: Optional[List[str]] = None) -> List[str]:
+    """Normalize explicit broadcast targets using the same safety filters as default broadcasts."""
+    eligible_targets = [member["peer_id"] for member in _get_broadcast_targets()]
+    if targets is None:
+        return eligible_targets
+    eligible_set = set(eligible_targets)
+
+    normalized_targets: List[str] = []
+    seen: Set[str] = set()
+    for peer_id in targets:
+        if not peer_id or peer_id == our_pubkey or peer_id in seen:
+            continue
+        if peer_id not in eligible_set:
+            continue
+        seen.add(peer_id)
+        normalized_targets.append(peer_id)
+    return normalized_targets
+
+
+def _send_member_message_direct(
+    target_ids: List[str],
+    normalized_bytes: bytes,
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Send a member broadcast directly over sendcustommsg."""
+    result["mode"] = "direct"
+    if not plugin:
+        result["ok"] = False
+        result["failed"] = len(target_ids)
+        return result
+
+    for peer_id in target_ids:
+        try:
+            plugin.rpc.call("sendcustommsg", {
+                "node_id": peer_id,
+                "msg": normalized_bytes.hex(),
+            })
+            result["sent"] += 1
+            shutdown_event.wait(0.02)
+        except Exception:
+            result["failed"] += 1
+
+    result["ok"] = result["failed"] == 0 if result["policy"] == "fail_closed" else True
+    return result
+
+
+def _broadcast_member_message(
+    msg_type: Optional[HiveMessageType] = None,
+    payload: Optional[Dict[str, Any]] = None,
+    message_bytes: Optional[bytes] = None,
+    *,
+    msg_id: Optional[str] = None,
+    reliability: str = "direct",
+    failure_policy: str = "best_effort",
+    targets: Optional[List[str]] = None,
+    relay_ttl: int = 3,
+    log_label: str = "member_broadcast",
+) -> Dict[str, Any]:
+    """
+    Broadcast a message to hive members with explicit transport policy.
+
+    Returns a result dict with:
+    - ok: Whether the broadcast satisfied the requested policy
+    - attempted: Target count
+    - queued: Reliable enqueue count
+    - sent: Direct send count
+    - failed: Failures or unsatisfied targets
+    - mode: direct or reliable
+    - policy: best_effort or fail_closed
+    """
+    if reliability not in {"direct", "reliable"}:
+        raise ValueError(f"unsupported reliability: {reliability}")
+    if failure_policy not in {"best_effort", "fail_closed"}:
+        raise ValueError(f"unsupported failure_policy: {failure_policy}")
+    if failure_policy == "fail_closed" and reliability != "reliable":
+        raise ValueError("fail_closed broadcasts must use reliable delivery")
+
+    target_ids = _normalize_member_broadcast_targets(targets)
+
+    result = {
+        "ok": True,
+        "attempted": len(target_ids),
+        "queued": 0,
+        "sent": 0,
+        "failed": 0,
+        "mode": reliability,
+        "policy": failure_policy,
+    }
+
+    if not target_ids:
+        return result
+
+    try:
+        normalized_type, normalized_payload, normalized_bytes = _normalize_member_broadcast_bytes(
+            msg_type=msg_type,
+            payload=payload,
+            message_bytes=message_bytes,
+            relay_ttl=relay_ttl,
+        )
+    except Exception as e:
+        if plugin:
+            plugin.log(f"cl-hive: {log_label} normalization failed: {e}", level="debug")
+        result["ok"] = False
+        result["failed"] = len(target_ids)
+        return result
+
+    if reliability == "reliable":
+        if not outbox_mgr:
+            if failure_policy == "best_effort":
+                return _send_member_message_direct(target_ids, normalized_bytes, result)
+            result["ok"] = False
+            result["failed"] = len(target_ids)
+            return result
+
+        try:
+            result["queued"] = outbox_mgr.enqueue(
+                msg_id or generate_event_id(normalized_type.name, normalized_payload) or secrets.token_hex(16),
+                normalized_type,
+                normalized_payload,
+                peer_ids=target_ids,
+            )
+        except Exception as e:
+            if plugin:
+                plugin.log(f"cl-hive: {log_label} outbox enqueue failed: {e}", level="debug")
+            result["queued"] = 0
+            if failure_policy == "best_effort":
+                return _send_member_message_direct(target_ids, normalized_bytes, result)
+
+        if result["queued"] == 0 and failure_policy == "best_effort":
+            return _send_member_message_direct(target_ids, normalized_bytes, result)
+        result["failed"] = max(0, len(target_ids) - result["queued"])
+        result["ok"] = result["failed"] == 0 if failure_policy == "fail_closed" else True
+        return result
+
+    return _send_member_message_direct(target_ids, normalized_bytes, result)
+
+
 def _broadcast_to_members(message_bytes: bytes) -> int:
     """
     Broadcast a message to all hive members (excluding ourselves and banned).
@@ -4678,23 +4842,18 @@ def _broadcast_to_members(message_bytes: bytes) -> int:
     Returns:
         Number of members the message was successfully sent to.
     """
-    if not database:
-        return 0
-
-    sent_count = 0
-    for member in _get_broadcast_targets():
-        member_id = member["peer_id"]
-        try:
-            plugin.rpc.call("sendcustommsg", {
-                "node_id": member_id,
-                "msg": message_bytes.hex()
-            })
-            sent_count += 1
-            shutdown_event.wait(0.02)  # Yield for incoming RPC
-        except Exception as e:
-            plugin.log(f"Failed to send message to {member_id[:16]}...: {e}", level='debug')
-
-    return sent_count
+    result = _broadcast_member_message(
+        message_bytes=message_bytes,
+        reliability="direct",
+        failure_policy="best_effort",
+        log_label="broadcast_to_members",
+    )
+    if plugin and result.get("failed", 0) > 0:
+        plugin.log(
+            f"cl-hive: broadcast_to_members incomplete: {result['sent']}/{result['attempted']} delivered",
+            level="warn",
+        )
+    return result["sent"]
 
 
 # =============================================================================
@@ -4733,13 +4892,19 @@ def _reliable_broadcast(msg_type: HiveMessageType, payload: Dict,
 
     Falls back to fire-and-forget broadcast if outbox is unavailable.
     """
-    if not msg_id:
-        msg_id = generate_event_id(msg_type.name, payload) or secrets.token_hex(16)
-
-    if outbox_mgr:
-        outbox_mgr.enqueue(msg_id, msg_type, payload)
-    else:
-        _broadcast_to_members(serialize(msg_type, payload))
+    result = _broadcast_member_message(
+        msg_type=msg_type,
+        payload=payload,
+        msg_id=msg_id,
+        reliability="reliable",
+        failure_policy="best_effort",
+        log_label="reliable_broadcast",
+    )
+    if plugin and result.get("failed", 0) > 0:
+        plugin.log(
+            f"cl-hive: reliable_broadcast incomplete: {result['queued'] + result['sent']}/{result['attempted']} delivered",
+            level="warn",
+        )
 
 
 def _reliable_send(msg_type: HiveMessageType, payload: Dict,
@@ -5867,7 +6032,6 @@ def _broadcast_promotion_vote(target_peer_id: str, voter_peer_id: str) -> bool:
     if not has_request:
         database.add_promotion_request(target_peer_id, request_id, status="pending")
 
-    # Broadcast VOUCH message
     vouch_payload = {
         "target_pubkey": target_peer_id,
         "request_id": request_id,
@@ -5875,14 +6039,20 @@ def _broadcast_promotion_vote(target_peer_id: str, voter_peer_id: str) -> bool:
         "voucher_pubkey": voter_peer_id,
         "sig": sig
     }
-    vouch_msg = serialize(HiveMessageType.VOUCH, vouch_payload)
-    sent = _broadcast_to_members(vouch_msg)
+    result = _broadcast_member_message(
+        msg_type=HiveMessageType.VOUCH,
+        payload=vouch_payload,
+        reliability="reliable",
+        failure_policy="fail_closed",
+        log_label="promotion_vote",
+    )
+    sent = result["queued"] or result["sent"]
 
     plugin.log(
         f"Broadcast promotion vote for {target_peer_id[:16]}... to {sent} members",
         level='debug'
     )
-    return sent > 0
+    return result["ok"]
 
 
 # R5-M-5 fix: Per-relay-peer rate limiter for credential messages
@@ -8695,10 +8865,6 @@ def handle_stigmergic_marker_batch(peer_id: str, payload: Dict, plugin: Plugin) 
     if not fee_coordination_mgr or not database:
         return {"result": "continue"}
 
-    # Deduplication check
-    if not _should_process_message(payload):
-        return {"result": "continue"}
-
     # SECURITY: Timestamp freshness check
     if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "STIGMERGIC_MARKER_BATCH"):
         return {"result": "continue"}
@@ -8744,6 +8910,10 @@ def handle_stigmergic_marker_batch(peer_id: str, payload: Dict, plugin: Plugin) 
             return {"result": "continue"}
     except Exception as e:
         plugin.log(f"cl-hive: STIGMERGIC_MARKER_BATCH signature check error: {e}", level='debug')
+        return {"result": "continue"}
+
+    # Deduplicate only after sender, payload, and signature are validated.
+    if not _should_process_message(payload):
         return {"result": "continue"}
 
     # Process each marker
@@ -8795,10 +8965,6 @@ def handle_pheromone_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not fee_coordination_mgr or not database:
         return {"result": "continue"}
 
-    # Deduplication check
-    if not _should_process_message(payload):
-        return {"result": "continue"}
-
     # SECURITY: Timestamp freshness check
     if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "PHEROMONE_BATCH"):
         return {"result": "continue"}
@@ -8844,6 +9010,10 @@ def handle_pheromone_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             return {"result": "continue"}
     except Exception as e:
         plugin.log(f"cl-hive: PHEROMONE_BATCH signature check error: {e}", level='debug')
+        return {"result": "continue"}
+
+    # Deduplicate only after sender, payload, and signature are validated.
+    if not _should_process_message(payload):
         return {"result": "continue"}
 
     # Process each pheromone entry
@@ -12434,20 +12604,13 @@ def gossip_loop():
                 )
 
                 if gossip_msg:
-                    # Step 6: Broadcast to eligible members (excludes banned)
-                    broadcast_count = 0
-                    for member in _get_broadcast_targets():
-                        member_id = member["peer_id"]
-
-                        try:
-                            plugin.rpc.call("sendcustommsg", {
-                                "node_id": member_id,
-                                "msg": gossip_msg.hex()
-                            })
-                            broadcast_count += 1
-                            shutdown_event.wait(0.02)  # Yield for incoming RPC
-                        except Exception:
-                            pass  # Peer may be offline
+                    result = _broadcast_member_message(
+                        message_bytes=gossip_msg,
+                        reliability="direct",
+                        failure_policy="best_effort",
+                        log_label="gossip",
+                    )
+                    broadcast_count = result["sent"]
 
                     if broadcast_count > 0:
                         plugin.log(
@@ -12555,24 +12718,20 @@ def _broadcast_mcf_solution(solution):
             plugin.log("cl-hive: Failed to create MCF solution message", level='warn')
             return
 
-        # Broadcast to eligible members (excludes banned)
-        broadcast_count = 0
+        result = _broadcast_member_message(
+            message_bytes=msg,
+            reliability="reliable",
+            failure_policy="fail_closed",
+            log_label="mcf_solution",
+        )
+        broadcast_count = result["queued"] or result["sent"]
 
-        for member in _get_broadcast_targets():
-            peer_id = member["peer_id"]
-
-            try:
-                plugin.rpc.sendcustommsg(
-                    node_id=peer_id,
-                    msg=msg.hex()
-                )
-                broadcast_count += 1
-                shutdown_event.wait(0.02)  # Yield for incoming RPC
-            except Exception as e:
-                plugin.log(
-                    f"cl-hive: Failed to send MCF solution to {peer_id[:16]}...: {e}",
-                    level='debug'
-                )
+        if not result["ok"]:
+            plugin.log(
+                f"cl-hive: MCF solution broadcast incomplete: {broadcast_count}/{result['attempted']} delivered",
+                level='warn'
+            )
+            return
 
         if broadcast_count > 0:
             plugin.log(
@@ -12870,19 +13029,13 @@ def _broadcast_our_fee_intelligence():
             )
 
             if msg:
-                # Broadcast single snapshot to eligible members (excludes banned)
-                broadcast_count = 0
-                for member in _get_broadcast_targets():
-                    member_id = member["peer_id"]
-                    try:
-                        plugin.rpc.call("sendcustommsg", {
-                            "node_id": member_id,
-                            "msg": msg.hex()
-                        })
-                        broadcast_count += 1
-                        shutdown_event.wait(0.02)  # Yield for incoming RPC
-                    except Exception:
-                        pass  # Peer might be offline
+                result = _broadcast_member_message(
+                    message_bytes=msg,
+                    reliability="direct",
+                    failure_policy="best_effort",
+                    log_label="fee_intelligence",
+                )
+                broadcast_count = result["sent"]
 
                 if broadcast_count > 0:
                     plugin.log(
@@ -12915,7 +13068,6 @@ def _broadcast_our_stigmergic_markers():
 
     try:
         from modules.protocol import (
-            create_stigmergic_marker_batch,
             get_stigmergic_marker_batch_signing_payload,
             MIN_MARKER_STRENGTH,
             MAX_MARKER_AGE_HOURS,
@@ -12949,32 +13101,20 @@ def _broadcast_our_stigmergic_markers():
             plugin.log(f"cl-hive: Failed to sign stigmergic marker batch: {e}", level='warn')
             return
 
-        # Create signed batch message
-        msg = create_stigmergic_marker_batch(
-            reporter_id=our_pubkey,
-            timestamp=timestamp,
-            signature=signature,
-            markers=shareable_markers
-        )
+        payload["signature"] = signature
+        broadcast_payload = _prepare_broadcast_payload(dict(payload))
+        msg = serialize(HiveMessageType.STIGMERGIC_MARKER_BATCH, broadcast_payload)
 
         if not msg:
             return
 
-        # Broadcast to eligible members (excludes banned)
-        broadcast_count = 0
-
-        for member in _get_broadcast_targets():
-            member_id = member["peer_id"]
-
-            try:
-                plugin.rpc.call("sendcustommsg", {
-                    "node_id": member_id,
-                    "msg": msg.hex()
-                })
-                broadcast_count += 1
-                shutdown_event.wait(0.02)  # Yield for incoming RPC
-            except Exception:
-                pass  # Peer might be offline
+        result = _broadcast_member_message(
+            message_bytes=msg,
+            reliability="direct",
+            failure_policy="best_effort",
+            log_label="stigmergic_markers",
+        )
+        broadcast_count = result["sent"]
 
         if broadcast_count > 0:
             plugin.log(
@@ -13001,7 +13141,7 @@ def _broadcast_our_pheromones():
 
     try:
         from modules.protocol import (
-            create_pheromone_batch,
+            get_pheromone_batch_signing_payload,
             MIN_PHEROMONE_LEVEL,
             MAX_PHEROMONES_IN_BATCH
         )
@@ -13036,31 +13176,35 @@ def _broadcast_our_pheromones():
         if not shareable_pheromones:
             return
 
-        # Create signed batch message
-        msg = create_pheromone_batch(
-            pheromones=shareable_pheromones,
-            rpc=plugin.rpc,
-            our_pubkey=our_pubkey
-        )
+        timestamp = int(time.time())
+        payload = {
+            "reporter_id": our_pubkey,
+            "timestamp": timestamp,
+            "signature": "",
+            "pheromones": shareable_pheromones,
+        }
+
+        try:
+            signing_payload = get_pheromone_batch_signing_payload(payload)
+            sig_result = plugin.rpc.signmessage(signing_payload)
+            payload["signature"] = sig_result.get("signature", sig_result.get("zbase", ""))
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to sign pheromone batch: {e}", level='warn')
+            return
+
+        broadcast_payload = _prepare_broadcast_payload(dict(payload))
+        msg = serialize(HiveMessageType.PHEROMONE_BATCH, broadcast_payload)
 
         if not msg:
             return
 
-        # Broadcast to eligible members (excludes banned)
-        broadcast_count = 0
-
-        for member in _get_broadcast_targets():
-            member_id = member["peer_id"]
-
-            try:
-                plugin.rpc.call("sendcustommsg", {
-                    "node_id": member_id,
-                    "msg": msg.hex()
-                })
-                broadcast_count += 1
-                shutdown_event.wait(0.02)  # Yield for incoming RPC
-            except Exception:
-                pass  # Peer might be offline
+        result = _broadcast_member_message(
+            message_bytes=msg,
+            reliability="direct",
+            failure_policy="best_effort",
+            log_label="pheromones",
+        )
+        broadcast_count = result["sent"]
 
         if broadcast_count > 0:
             plugin.log(
@@ -13112,21 +13256,13 @@ def _broadcast_our_yield_metrics():
         if not msg:
             return
 
-        # Broadcast to eligible members (excludes banned)
-        broadcast_count = 0
-
-        for member in _get_broadcast_targets():
-            member_id = member["peer_id"]
-
-            try:
-                plugin.rpc.call("sendcustommsg", {
-                    "node_id": member_id,
-                    "msg": msg.hex()
-                })
-                broadcast_count += 1
-                shutdown_event.wait(0.02)  # Yield for incoming RPC
-            except Exception:
-                pass  # Peer might be offline
+        result = _broadcast_member_message(
+            message_bytes=msg,
+            reliability="direct",
+            failure_policy="best_effort",
+            log_label="yield_metrics",
+        )
+        broadcast_count = result["sent"]
 
         if broadcast_count > 0:
             plugin.log(
@@ -13167,8 +13303,6 @@ def _broadcast_circular_flow_alerts():
         if not shareable_flows:
             return
 
-        members = database.get_all_members()
-
         # Broadcast each flow as a separate alert (event-driven)
         total_broadcast = 0
 
@@ -13187,18 +13321,13 @@ def _broadcast_circular_flow_alerts():
             if not msg:
                 continue
 
-            for member in _get_broadcast_targets():
-                member_id = member["peer_id"]
-
-                try:
-                    plugin.rpc.call("sendcustommsg", {
-                        "node_id": member_id,
-                        "msg": msg.hex()
-                    })
-                    total_broadcast += 1
-                    shutdown_event.wait(0.02)  # Yield for incoming RPC
-                except Exception:
-                    pass
+            result = _broadcast_member_message(
+                message_bytes=msg,
+                reliability="reliable",
+                failure_policy="best_effort",
+                log_label="circular_flow_alert",
+            )
+            total_broadcast += result["queued"] or result["sent"]
 
         if total_broadcast > 0:
             plugin.log(
@@ -13254,21 +13383,13 @@ def _broadcast_our_temporal_patterns():
         if not msg:
             return
 
-        # Broadcast to eligible members (excludes banned)
-        broadcast_count = 0
-
-        for member in _get_broadcast_targets():
-            member_id = member["peer_id"]
-
-            try:
-                plugin.rpc.call("sendcustommsg", {
-                    "node_id": member_id,
-                    "msg": msg.hex()
-                })
-                broadcast_count += 1
-                shutdown_event.wait(0.02)  # Yield for incoming RPC
-            except Exception:
-                pass  # Peer might be offline
+        result = _broadcast_member_message(
+            message_bytes=msg,
+            reliability="direct",
+            failure_policy="best_effort",
+            log_label="temporal_patterns",
+        )
+        broadcast_count = result["sent"]
 
         if broadcast_count > 0:
             plugin.log(
@@ -13323,21 +13444,13 @@ def _broadcast_our_corridor_values():
         if not msg:
             return
 
-        # Broadcast to eligible members (excludes banned)
-        broadcast_count = 0
-
-        for member in _get_broadcast_targets():
-            member_id = member["peer_id"]
-
-            try:
-                plugin.rpc.call("sendcustommsg", {
-                    "node_id": member_id,
-                    "msg": msg.hex()
-                })
-                broadcast_count += 1
-                shutdown_event.wait(0.02)  # Yield for incoming RPC
-            except Exception:
-                pass
+        result = _broadcast_member_message(
+            message_bytes=msg,
+            reliability="direct",
+            failure_policy="best_effort",
+            log_label="corridor_values",
+        )
+        broadcast_count = result["sent"]
 
         if broadcast_count > 0:
             plugin.log(
@@ -13372,7 +13485,6 @@ def _broadcast_our_positioning_proposals():
         if not shareable_proposals:
             return
 
-        members = database.get_all_members()
         total_broadcast = 0
 
         # Broadcast each proposal separately (they're targeted recommendations)
@@ -13391,18 +13503,13 @@ def _broadcast_our_positioning_proposals():
             if not msg:
                 continue
 
-            for member in _get_broadcast_targets():
-                member_id = member["peer_id"]
-
-                try:
-                    plugin.rpc.call("sendcustommsg", {
-                        "node_id": member_id,
-                        "msg": msg.hex()
-                    })
-                    total_broadcast += 1
-                    shutdown_event.wait(0.02)  # Yield for incoming RPC
-                except Exception:
-                    pass
+            result = _broadcast_member_message(
+                message_bytes=msg,
+                reliability="reliable",
+                failure_policy="best_effort",
+                log_label="positioning_proposal",
+            )
+            total_broadcast += result["queued"] or result["sent"]
 
         if total_broadcast > 0:
             plugin.log(
@@ -13441,7 +13548,6 @@ def _broadcast_our_physarum_recommendations():
         # Limit to max per cycle
         shareable_recommendations = shareable_recommendations[:MAX_PHYSARUM_RECOMMENDATIONS_PER_CYCLE]
 
-        members = database.get_all_members()
         total_broadcast = 0
 
         # Broadcast each recommendation separately
@@ -13461,18 +13567,13 @@ def _broadcast_our_physarum_recommendations():
             if not msg:
                 continue
 
-            for member in _get_broadcast_targets():
-                member_id = member["peer_id"]
-
-                try:
-                    plugin.rpc.call("sendcustommsg", {
-                        "node_id": member_id,
-                        "msg": msg.hex()
-                    })
-                    total_broadcast += 1
-                    shutdown_event.wait(0.02)  # Yield for incoming RPC
-                except Exception:
-                    pass
+            result = _broadcast_member_message(
+                message_bytes=msg,
+                reliability="direct",
+                failure_policy="best_effort",
+                log_label="physarum_recommendation",
+            )
+            total_broadcast += result["sent"]
 
         if total_broadcast > 0:
             plugin.log(
@@ -13522,21 +13623,13 @@ def _broadcast_our_coverage_analysis():
         if not msg:
             return
 
-        # Broadcast to eligible members (excludes banned)
-        broadcast_count = 0
-
-        for member in _get_broadcast_targets():
-            member_id = member["peer_id"]
-
-            try:
-                plugin.rpc.call("sendcustommsg", {
-                    "node_id": member_id,
-                    "msg": msg.hex()
-                })
-                broadcast_count += 1
-                shutdown_event.wait(0.02)  # Yield for incoming RPC
-            except Exception:
-                pass
+        result = _broadcast_member_message(
+            message_bytes=msg,
+            reliability="direct",
+            failure_policy="best_effort",
+            log_label="coverage_analysis",
+        )
+        broadcast_count = result["sent"]
 
         if broadcast_count > 0:
             plugin.log(
@@ -13572,7 +13665,6 @@ def _broadcast_our_close_proposals():
         if not shareable_proposals:
             return
 
-        members = database.get_all_members()
         total_broadcast = 0
 
         # Broadcast each proposal separately (targeted to specific member)
@@ -13591,18 +13683,13 @@ def _broadcast_our_close_proposals():
             if not msg:
                 continue
 
-            for member in _get_broadcast_targets():
-                member_id = member["peer_id"]
-
-                try:
-                    plugin.rpc.call("sendcustommsg", {
-                        "node_id": member_id,
-                        "msg": msg.hex()
-                    })
-                    total_broadcast += 1
-                    shutdown_event.wait(0.02)  # Yield for incoming RPC
-                except Exception:
-                    pass
+            result = _broadcast_member_message(
+                message_bytes=msg,
+                reliability="reliable",
+                failure_policy="best_effort",
+                log_label="close_proposal",
+            )
+            total_broadcast += result["queued"] or result["sent"]
 
         if total_broadcast > 0:
             plugin.log(
@@ -13704,18 +13791,13 @@ def _broadcast_health_report():
         )
 
         if msg:
-            broadcast_count = 0
-            for member in _get_broadcast_targets():
-                member_id = member["peer_id"]
-                try:
-                    plugin.rpc.call("sendcustommsg", {
-                        "node_id": member_id,
-                        "msg": msg.hex()
-                    })
-                    broadcast_count += 1
-                    shutdown_event.wait(0.02)  # Yield for incoming RPC
-                except Exception:
-                    pass
+            result = _broadcast_member_message(
+                message_bytes=msg,
+                reliability="direct",
+                failure_policy="best_effort",
+                log_label="health_report",
+            )
+            broadcast_count = result["sent"]
 
             if broadcast_count > 0:
                 plugin.log(
@@ -13749,9 +13831,6 @@ def _broadcast_liquidity_needs():
         if not needs:
             return
 
-        # Get hive members
-        members = database.get_all_members()
-
         # Note: Cooperative rebalancing removed - we don't transfer funds between nodes.
         # Set can_provide values to 0 since we're information-only.
         # Broadcasting liquidity needs is still useful for fee coordination.
@@ -13770,19 +13849,14 @@ def _broadcast_liquidity_needs():
                 can_provide_outbound=0,  # No cooperative rebalancing
                 rpc=plugin.rpc
             )
-
             if msg:
-                for member in _get_broadcast_targets():
-                    member_id = member["peer_id"]
-                    try:
-                        plugin.rpc.call("sendcustommsg", {
-                            "node_id": member_id,
-                            "msg": msg.hex()
-                        })
-                        broadcast_count += 1
-                        shutdown_event.wait(0.02)  # Yield for incoming RPC
-                    except Exception:
-                        pass
+                result = _broadcast_member_message(
+                    message_bytes=msg,
+                    reliability="direct",
+                    failure_policy="best_effort",
+                    log_label="liquidity_need",
+                )
+                broadcast_count += result["sent"]
 
         if broadcast_count > 0:
             plugin.log(
@@ -18987,7 +19061,7 @@ def hive_record_routing_outcome(
         peer_id: Peer on this channel
         fee_ppm: Fee charged in ppm
         success: Whether routing succeeded
-        amount_sats: Amount routed in satoshis
+        amount_sats: Forwarded amount in satoshis
         source: Source peer (optional, for stigmergic marker)
         destination: Destination peer (optional, for stigmergic marker)
 
@@ -18999,12 +19073,14 @@ def hive_record_routing_outcome(
         return {"error": "Fee coordination not initialized"}
 
     try:
+        revenue_sats = int((amount_sats * fee_ppm) / 1_000_000) if success and amount_sats > 0 else 0
         ctx.fee_coordination_mgr.record_routing_outcome(
             channel_id=channel_id,
             peer_id=peer_id,
             fee_ppm=fee_ppm,
             success=success,
-            revenue_sats=amount_sats,
+            revenue_sats=revenue_sats,
+            volume_sats=amount_sats if success else 0,
             source=source,
             destination=destination
         )
@@ -20253,8 +20329,12 @@ def hive_backfill_routing_intelligence(
 
                 out_channel = fwd.get("out_channel", "")
                 in_channel = fwd.get("in_channel", "")
-                fee_msat = fwd.get("fee_msat", 0)
-                out_msat = fwd.get("out_msat", 0)
+                fee_msat = _parse_msat_value(
+                    fwd.get("fee_msat", fwd.get("fee_msatoshi", 0))
+                )
+                out_msat = _parse_msat_value(
+                    fwd.get("out_msat", fwd.get("out_msatoshi", 0))
+                )
                 status = fwd.get("status", "unknown")
 
                 if not out_channel:
@@ -20282,6 +20362,7 @@ def hive_backfill_routing_intelligence(
                     fee_ppm=fee_ppm,
                     success=success,
                     revenue_sats=fee_sats if success else 0,
+                    volume_sats=volume_sats if success else 0,
                     source=in_peer if in_peer else None,
                     destination=out_peer
                 )

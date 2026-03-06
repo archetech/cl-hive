@@ -671,6 +671,61 @@ class TestFeeCoordinationManager:
         # Should not exceed ceiling
         assert rec.recommended_fee_ppm <= FLEET_FEE_CEILING_PPM
 
+    def test_defense_floor_preserved_after_later_adjustments(self):
+        """Active defense should remain a hard floor after time/centrality adjustments."""
+        peer_id = "02" + "a" * 64
+        warning = PeerWarning(
+            peer_id=peer_id,
+            threat_type="drain",
+            severity=0.8,
+            reporter="02" + "0" * 64,  # self-detected -> immediate defense
+            timestamp=time.time(),
+            ttl=24 * 3600
+        )
+        self.manager.defense_system.handle_warning(warning)
+
+        self.manager.time_adjuster.enabled = True
+        self.manager.time_adjuster.get_time_adjustment = MagicMock(return_value=MagicMock(
+            adjustment_type="low_decrease",
+            adjusted_fee_ppm=400,
+            adjustment_pct=-0.2,
+        ))
+        self.manager._get_centrality_fee_adjustment = MagicMock(return_value=(-0.1, 0.1))
+
+        rec = self.manager.get_fee_recommendation(
+            channel_id="123x1x0",
+            peer_id=peer_id,
+            current_fee=200,
+            local_balance_pct=0.5
+        )
+
+        # Defense severity 0.8 => multiplier 2.6, so 200 ppm must never fall below 520 ppm.
+        assert rec.recommended_fee_ppm >= 520
+
+    def test_defense_bypasses_salience_revert(self):
+        """Defense-critical fee increases should not be reverted by cooldown salience."""
+        peer_id = "02" + "b" * 64
+        warning = PeerWarning(
+            peer_id=peer_id,
+            threat_type="drain",
+            severity=0.8,
+            reporter="02" + "0" * 64,  # self-detected -> immediate defense
+            timestamp=time.time(),
+            ttl=24 * 3600
+        )
+        self.manager.defense_system.handle_warning(warning)
+        self.manager._fee_change_times["123x1x0"] = time.time()
+
+        rec = self.manager.get_fee_recommendation(
+            channel_id="123x1x0",
+            peer_id=peer_id,
+            current_fee=200,
+            local_balance_pct=0.5
+        )
+
+        assert rec.recommended_fee_ppm > 200
+        assert "defensive" in rec.reason
+
     def test_record_routing_outcome(self):
         """Test recording routing outcome."""
         # Should not raise
@@ -771,6 +826,16 @@ class TestAdaptiveFeeControllerLocks:
 
         fee, reason = self.controller.suggest_fee(channel_id, 500, 0.5)
         assert fee == 500
+        assert "exploit" in reason
+
+    def test_suggest_fee_uses_learned_fee_when_pheromone_strong(self):
+        """Strong pheromone should exploit the learned fee, not blindly keep current fee."""
+        for _ in range(5):
+            self.controller.update_pheromone("learned", 600, True, 10000)
+
+        fee, reason = self.controller.suggest_fee("learned", 300, 0.5)
+
+        assert fee > 300
         assert "exploit" in reason
 
     def test_get_pheromone_level_holds_lock(self):

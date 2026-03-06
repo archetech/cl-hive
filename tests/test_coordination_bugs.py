@@ -17,12 +17,59 @@ Covers:
 import pytest
 import time
 import threading
+import importlib.util
+import types
 from unittest.mock import Mock, MagicMock, patch, PropertyMock
 from collections import defaultdict
 
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _load_cl_hive_module():
+    """Import cl-hive.py under a lightweight pyln.client stub for handler tests."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    class DummyPlugin:
+        def __init__(self, *args, **kwargs):
+            self.rpc = None
+            self.log = lambda *a, **k: None
+            self.write_lock = None
+            self.stdout = None
+
+        def method(self, *args, **kwargs):
+            def decorator(fn):
+                return fn
+            return decorator
+
+        hook = method
+        subscribe = method
+        init = method
+
+        def add_option(self, *args, **kwargs):
+            return None
+
+        def run(self):
+            return None
+
+        def __getattr__(self, name):
+            def no_op(*args, **kwargs):
+                return None
+            return no_op
+
+    mock_pyln_client = types.SimpleNamespace(Plugin=DummyPlugin, RpcError=Exception)
+    sys.modules["pyln"] = types.SimpleNamespace(client=mock_pyln_client)
+    sys.modules["pyln.client"] = mock_pyln_client
+
+    module_path = os.path.join(repo_root, "cl-hive.py")
+    spec = importlib.util.spec_from_file_location(
+        f"cl_hive_test_{time.time_ns()}",
+        module_path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 # =============================================================================
@@ -298,6 +345,194 @@ class TestBanHandlerBugs:
         assert voter.get("tier") == "member"
         assert mock_db.is_banned("02" + "c" * 64) is True
         # The fix ensures this path results in returning without storing the vote
+
+
+# =============================================================================
+# INTELLIGENCE TRANSPORT TESTS
+# =============================================================================
+
+class TestIntelligenceTransport:
+    """Tests for relay metadata and handler dedupe ordering in cl-hive.py."""
+
+    def test_stigmergic_broadcast_attaches_relay_metadata(self):
+        """Marker broadcasts should originate with relay metadata on the wire."""
+        from modules.protocol import deserialize, HiveMessageType
+        from modules.relay import RelayManager
+
+        cl_hive = _load_cl_hive_module()
+        member_id = "02" + "b" * 64
+        sent_messages = []
+
+        plugin = MagicMock()
+        plugin.log = MagicMock()
+        plugin.rpc = MagicMock()
+        plugin.rpc.signmessage.return_value = {"zbase": "sig"}
+        plugin.rpc.call.side_effect = lambda method, params: (
+            sent_messages.append((method, params)) or {"result": "ok"}
+        )
+
+        cl_hive.plugin = plugin
+        cl_hive.our_pubkey = "02" + "a" * 64
+        cl_hive.database = MagicMock()
+        cl_hive.database.get_all_members.return_value = [
+            {"peer_id": member_id, "tier": "member"}
+        ]
+        cl_hive.database.is_banned.return_value = False
+        cl_hive.relay_mgr = RelayManager(
+            our_pubkey=cl_hive.our_pubkey,
+            send_message=lambda peer_id, msg: True,
+            get_members=lambda: [member_id],
+            log=lambda *args, **kwargs: None,
+        )
+        cl_hive.fee_coordination_mgr = MagicMock()
+        cl_hive.fee_coordination_mgr.stigmergic_coord.get_shareable_markers.return_value = [
+            {
+                "depositor": cl_hive.our_pubkey,
+                "source_peer_id": "02" + "c" * 64,
+                "destination_peer_id": "02" + "d" * 64,
+                "fee_ppm": 100,
+                "success": True,
+                "volume_sats": 50_000,
+                "timestamp": int(time.time()),
+                "strength": 0.5,
+            }
+        ]
+
+        cl_hive._broadcast_our_stigmergic_markers()
+
+        assert len(sent_messages) == 1
+        method, params = sent_messages[0]
+        assert method == "sendcustommsg"
+        msg_type, payload = deserialize(bytes.fromhex(params["msg"]))
+        assert msg_type == HiveMessageType.STIGMERGIC_MARKER_BATCH
+        assert payload["_relay"]["origin"] == cl_hive.our_pubkey
+        assert payload["_relay"]["relay_path"] == [cl_hive.our_pubkey]
+
+    def test_pheromone_broadcast_attaches_relay_metadata(self):
+        """Pheromone broadcasts should originate with relay metadata on the wire."""
+        from modules.protocol import deserialize, HiveMessageType
+        from modules.relay import RelayManager
+
+        cl_hive = _load_cl_hive_module()
+        member_id = "02" + "b" * 64
+        sent_messages = []
+
+        plugin = MagicMock()
+        plugin.log = MagicMock()
+        plugin.rpc = MagicMock()
+        plugin.rpc.signmessage.return_value = {"zbase": "sig"}
+        plugin.rpc.listfunds.return_value = {
+            "channels": [
+                {
+                    "short_channel_id": "123x1x0",
+                    "peer_id": "02" + "f" * 64,
+                    "state": "CHANNELD_NORMAL",
+                }
+            ]
+        }
+        plugin.rpc.call.side_effect = lambda method, params: (
+            sent_messages.append((method, params)) or {"result": "ok"}
+        )
+
+        cl_hive.plugin = plugin
+        cl_hive.our_pubkey = "02" + "a" * 64
+        cl_hive.database = MagicMock()
+        cl_hive.database.get_all_members.return_value = [
+            {"peer_id": member_id, "tier": "member"}
+        ]
+        cl_hive.database.is_banned.return_value = False
+        cl_hive.relay_mgr = RelayManager(
+            our_pubkey=cl_hive.our_pubkey,
+            send_message=lambda peer_id, msg: True,
+            get_members=lambda: [member_id],
+            log=lambda *args, **kwargs: None,
+        )
+        cl_hive.fee_coordination_mgr = MagicMock()
+        cl_hive.fee_coordination_mgr.adaptive_controller.get_shareable_pheromones.return_value = [
+            {
+                "peer_id": "02" + "f" * 64,
+                "level": 2.5,
+                "fee_ppm": 400,
+                "channel_id": "123x1x0",
+            }
+        ]
+        cl_hive.fee_coordination_mgr.adaptive_controller.update_channel_peer_mappings = MagicMock()
+        cl_hive.anticipatory_liquidity_mgr = None
+
+        cl_hive._broadcast_our_pheromones()
+
+        assert len(sent_messages) == 1
+        method, params = sent_messages[0]
+        assert method == "sendcustommsg"
+        msg_type, payload = deserialize(bytes.fromhex(params["msg"]))
+        assert msg_type == HiveMessageType.PHEROMONE_BATCH
+        assert payload["_relay"]["origin"] == cl_hive.our_pubkey
+        assert payload["_relay"]["relay_path"] == [cl_hive.our_pubkey]
+
+    def test_invalid_stigmergic_sender_does_not_consume_dedupe_state(self):
+        """Non-members should be rejected before handler dedupe is consulted."""
+        cl_hive = _load_cl_hive_module()
+        plugin = MagicMock()
+        plugin.log = MagicMock()
+
+        cl_hive.fee_coordination_mgr = MagicMock()
+        cl_hive.database = MagicMock()
+        cl_hive.database.get_member.return_value = None
+        cl_hive._should_process_message = MagicMock(return_value=True)
+
+        payload = {
+            "reporter_id": "02" + "a" * 64,
+            "timestamp": int(time.time()),
+            "signature": "sig",
+            "markers": [],
+        }
+
+        result = cl_hive.handle_stigmergic_marker_batch(
+            peer_id="02" + "b" * 64,
+            payload=payload,
+            plugin=plugin,
+        )
+
+        assert result == {"result": "continue"}
+        cl_hive._should_process_message.assert_not_called()
+
+    def test_invalid_pheromone_signature_does_not_consume_dedupe_state(self):
+        """Signature failures should happen before handler dedupe is consulted."""
+        cl_hive = _load_cl_hive_module()
+        peer_id = "02" + "a" * 64
+        plugin = MagicMock()
+        plugin.log = MagicMock()
+        plugin.rpc = MagicMock()
+        plugin.rpc.checkmessage.return_value = {"verified": False}
+
+        cl_hive.fee_coordination_mgr = MagicMock()
+        cl_hive.database = MagicMock()
+        cl_hive.database.get_member.side_effect = [
+            {"peer_id": peer_id, "tier": "member"},
+            {"peer_id": peer_id, "tier": "member"},
+        ]
+        cl_hive.database.is_banned.return_value = False
+        cl_hive._should_process_message = MagicMock(return_value=True)
+
+        payload = {
+            "reporter_id": peer_id,
+            "timestamp": int(time.time()),
+            "signature": "sig",
+            "pheromones": [],
+        }
+
+        with patch("modules.protocol.validate_pheromone_batch", return_value=True), patch(
+            "modules.protocol.get_pheromone_batch_signing_payload",
+            return_value="signed-payload",
+        ):
+            result = cl_hive.handle_pheromone_batch(
+                peer_id=peer_id,
+                payload=payload,
+                plugin=plugin,
+            )
+
+        assert result == {"result": "continue"}
+        cl_hive._should_process_message.assert_not_called()
 
 
 # =============================================================================

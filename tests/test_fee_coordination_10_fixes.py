@@ -289,6 +289,44 @@ class TestFleetHintsLock:
         # Should complete without RuntimeError
         assert len(errors) == 0, f"Got errors: {errors}"
 
+    def test_duplicate_remote_pheromone_not_stacked(self):
+        """Repeated gossip from the same reporter should not duplicate one signal."""
+        controller = AdaptiveFeeController()
+
+        pheromone_data = {
+            "peer_id": "03peer",
+            "level": 5.0,
+            "fee_ppm": 350,
+        }
+        controller.receive_pheromone_from_gossip("03reporter", pheromone_data)
+        controller.receive_pheromone_from_gossip("03reporter", pheromone_data)
+
+        assert len(controller._remote_pheromones["03peer"]) == 1
+
+
+class TestRemoteMarkerDeduplication:
+    """Repeated remote markers should not accumulate duplicate evidence."""
+
+    def test_duplicate_marker_not_stacked(self):
+        coord = StigmergicCoordinator(
+            database=MagicMock(), plugin=MagicMock()
+        )
+
+        marker_data = {
+            "depositor": "03reporter",
+            "source_peer_id": "src",
+            "destination_peer_id": "dst",
+            "fee_ppm": 500,
+            "success": True,
+            "volume_sats": 50000,
+            "timestamp": time.time(),
+            "strength": 0.5,
+        }
+        coord.receive_marker_from_gossip(marker_data)
+        coord.receive_marker_from_gossip(marker_data)
+
+        assert len(coord.read_markers("src", "dst")) == 1
+
 
 # =============================================================================
 # Bug 5: FlowCorridorManager._assignments atomic swap
@@ -347,6 +385,49 @@ class TestAssignmentsAtomicSwap:
         # With atomic swap, assignments should never be seen as empty
         # during the rebuild (the old dict stays until new one is ready)
         assert len(seen_empty) == 0
+
+    def test_get_fee_for_member_refreshes_stale_snapshot(self):
+        """TTL-expired corridor snapshots should refresh before serving a recommendation."""
+        mgr = FlowCorridorManager(
+            database=MagicMock(),
+            plugin=MagicMock(),
+            liquidity_coordinator=MagicMock(),
+        )
+        mgr.set_our_pubkey("03us")
+
+        from modules.fee_coordination import FlowCorridor, CorridorAssignment
+        stale_corridor = FlowCorridor(
+            source_peer_id="src",
+            destination_peer_id="dst",
+            capable_members=["03us", "03other"],
+            competition_level="low",
+        )
+        stale_assignment = CorridorAssignment(
+            corridor=stale_corridor,
+            primary_member="03other",
+            secondary_members=["03us"],
+            primary_fee_ppm=500,
+            secondary_fee_ppm=900,
+            assignment_reason="stale",
+            confidence=0.4,
+        )
+        mgr._assignments_snapshot = (
+            {("src", "dst"): stale_assignment},
+            time.time() - mgr._assignments_ttl - 1,
+        )
+
+        fresh_corridor = FlowCorridor(
+            source_peer_id="src",
+            destination_peer_id="dst",
+            capable_members=["03us"],
+            competition_level="none",
+        )
+        mgr.identify_corridors = MagicMock(return_value=[fresh_corridor])
+
+        fee, is_primary = mgr.get_fee_for_member("03us", "src", "dst")
+
+        assert is_primary is True
+        assert fee != 900
 
 
 # =============================================================================
