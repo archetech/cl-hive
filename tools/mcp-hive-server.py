@@ -1981,10 +1981,10 @@ Fee targets: stagnant=50ppm, depleted=150-250ppm, active underwater=100-600ppm, 
         ),
         Tool(
             name="revenue_fee_anchor",
-            description="""Manage advisor fee anchors — soft fee targets that blend into the optimizer with decaying weight.
+            description="""[DEPRECATED] Fee anchors are deprecated under the simplified fee path.
+Use revenue_policy with fee_multiplier_min/fee_multiplier_max instead.
 
-Unlike revenue_set_fee (which hard-overrides), anchors preserve Thompson Sampling / Hill Climbing state.
-Weight decays linearly to zero over the TTL. Applied AFTER hive coordination, BEFORE defense multiplier.
+Legacy: Manage advisor fee anchors — soft fee targets that blend into the optimizer with decaying weight.
 
 Actions: set, list, get, clear, clear-all.
 Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
@@ -2850,6 +2850,198 @@ Default weight=0.7 (strong anchor), default TTL=24h, max TTL=7 days.""",
                     "node": {
                         "type": "string",
                         "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_total_cost_budget",
+            description="Unified budget status across rebalances, Boltz, and on-chain liquidity costs.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "window_hours": {
+                        "type": "integer",
+                        "description": "Budget window in hours (optional, uses configured default)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_spend_ledger",
+            description="Summary of generic spend ledger events/reservations (opens, closes, splices, etc.).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "window_hours": {
+                        "type": "integer",
+                        "description": "Lookback window in hours (default: 24)"
+                    },
+                    "include_reservations": {
+                        "type": "boolean",
+                        "description": "Include active reservations in output (default: false)"
+                    },
+                    "reservation_limit": {
+                        "type": "integer",
+                        "description": "Max reservations to return (default: 50)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_spend_reserve",
+            description="Reserve spend in the generic ledger, enforcing the unified total-cost budget.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "reservation_id": {
+                        "type": "string",
+                        "description": "Unique reservation identifier"
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Spend category (e.g. open, close, splice, boltz)"
+                    },
+                    "amount_sats": {
+                        "type": "integer",
+                        "description": "Amount to reserve in satoshis"
+                    },
+                    "subcategory": {
+                        "type": "string",
+                        "description": "Optional subcategory"
+                    },
+                    "reference_id": {
+                        "type": "string",
+                        "description": "Optional external reference ID"
+                    },
+                    "channel_id": {
+                        "type": "string",
+                        "description": "Optional channel SCID"
+                    },
+                    "metadata_json": {
+                        "type": "string",
+                        "description": "Optional JSON metadata string"
+                    }
+                },
+                "required": ["node", "reservation_id", "category", "amount_sats"]
+            }
+        ),
+        Tool(
+            name="revenue_spend_release",
+            description="Release a specific spend reservation.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "reservation_id": {
+                        "type": "string",
+                        "description": "Reservation ID to release"
+                    }
+                },
+                "required": ["node", "reservation_id"]
+            }
+        ),
+        Tool(
+            name="revenue_spend_release_stale",
+            description="Release stale/orphaned spend reservations (safe recovery path).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "max_age_seconds": {
+                        "type": "integer",
+                        "description": "Max reservation age before considered stale (default: 3600)"
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Only release reservations in this category (optional)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max reservations to release (default: 100)"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_spend_settle",
+            description="Mark a spend reservation as spent, optionally recording a spend event.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "reservation_id": {
+                        "type": "string",
+                        "description": "Reservation ID to settle"
+                    },
+                    "actual_spent_sats": {
+                        "type": "integer",
+                        "description": "Actual amount spent (optional, uses reserved amount if omitted)"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Source identifier for the spend event (optional)"
+                    },
+                    "record_event": {
+                        "type": "boolean",
+                        "description": "Record a generic spend event (default: false)"
+                    }
+                },
+                "required": ["node", "reservation_id"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_auto_cycle_status",
+            description="Return scheduler status for the in-plugin Boltz auto-cycle.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    }
+                },
+                "required": ["node"]
+            }
+        ),
+        Tool(
+            name="revenue_boltz_auto_cycle_run_now",
+            description="Trigger one immediate Boltz auto-cycle run using scheduler settings.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Force run even if conditions aren't met (default: false)"
                     }
                 },
                 "required": ["node"]
@@ -10108,6 +10300,129 @@ async def handle_revenue_clear_reservations(args: Dict) -> Dict:
         return {"error": f"Unknown node: {node_name}"}
 
     return await node.call("revenue-clear-reservations")
+
+
+async def handle_revenue_total_cost_budget(args: Dict) -> Dict:
+    """Unified budget status across rebalances, Boltz, and on-chain costs."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if args.get("window_hours") is not None:
+        params["window_hours"] = int(args["window_hours"])
+    return await node.call("revenue-total-cost-budget", params)
+
+
+async def handle_revenue_spend_ledger(args: Dict) -> Dict:
+    """Summary of generic spend ledger events/reservations."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if args.get("window_hours") is not None:
+        params["window_hours"] = int(args["window_hours"])
+    if args.get("include_reservations") is not None:
+        params["include_reservations"] = bool(args["include_reservations"])
+    if args.get("reservation_limit") is not None:
+        params["reservation_limit"] = int(args["reservation_limit"])
+    return await node.call("revenue-spend-ledger", params)
+
+
+async def handle_revenue_spend_reserve(args: Dict) -> Dict:
+    """Reserve spend in the generic ledger, enforcing unified budget."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {
+        "reservation_id": str(args["reservation_id"]),
+        "category": str(args["category"]),
+        "amount_sats": int(args["amount_sats"]),
+    }
+    for key in ("subcategory", "reference_id", "channel_id", "metadata_json"):
+        if args.get(key) is not None:
+            params[key] = str(args[key])
+    return await node.call("revenue-spend-reserve", params)
+
+
+async def handle_revenue_spend_release(args: Dict) -> Dict:
+    """Release a specific spend reservation."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-spend-release", {"reservation_id": str(args["reservation_id"])})
+
+
+async def handle_revenue_spend_release_stale(args: Dict) -> Dict:
+    """Release stale/orphaned spend reservations."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if args.get("max_age_seconds") is not None:
+        params["max_age_seconds"] = int(args["max_age_seconds"])
+    if args.get("category") is not None:
+        params["category"] = str(args["category"])
+    if args.get("limit") is not None:
+        params["limit"] = int(args["limit"])
+    return await node.call("revenue-spend-release-stale", params)
+
+
+async def handle_revenue_spend_settle(args: Dict) -> Dict:
+    """Mark a spend reservation as spent."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {"reservation_id": str(args["reservation_id"])}
+    if args.get("actual_spent_sats") is not None:
+        params["actual_spent_sats"] = int(args["actual_spent_sats"])
+    if args.get("source") is not None:
+        params["source"] = str(args["source"])
+    if args.get("record_event") is not None:
+        params["record_event"] = bool(args["record_event"])
+    return await node.call("revenue-spend-settle", params)
+
+
+async def handle_revenue_boltz_auto_cycle_status(args: Dict) -> Dict:
+    """Return scheduler status for Boltz auto-cycle."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    return await node.call("revenue-boltz-auto-cycle-status")
+
+
+async def handle_revenue_boltz_auto_cycle_run_now(args: Dict) -> Dict:
+    """Trigger one immediate Boltz auto-cycle run."""
+    node_name = args.get("node")
+
+    node = fleet.get_node(node_name)
+    if not node:
+        return {"error": f"Unknown node: {node_name}"}
+
+    params = {}
+    if args.get("force") is not None:
+        params["force"] = bool(args["force"])
+    return await node.call("revenue-boltz-auto-cycle-run-now", params)
 
 
 async def handle_revenue_profitability(args: Dict) -> Dict:
@@ -17764,6 +18079,14 @@ TOOL_HANDLERS: Dict[str, Any] = {
     "revenue_list_ignored": handle_revenue_list_ignored,
     "revenue_cleanup_closed": handle_revenue_cleanup_closed,
     "revenue_clear_reservations": handle_revenue_clear_reservations,
+    "revenue_total_cost_budget": handle_revenue_total_cost_budget,
+    "revenue_spend_ledger": handle_revenue_spend_ledger,
+    "revenue_spend_reserve": handle_revenue_spend_reserve,
+    "revenue_spend_release": handle_revenue_spend_release,
+    "revenue_spend_release_stale": handle_revenue_spend_release_stale,
+    "revenue_spend_settle": handle_revenue_spend_settle,
+    "revenue_boltz_auto_cycle_status": handle_revenue_boltz_auto_cycle_status,
+    "revenue_boltz_auto_cycle_run_now": handle_revenue_boltz_auto_cycle_run_now,
     "revenue_profitability": handle_revenue_profitability,
     "revenue_dashboard": handle_revenue_dashboard,
     "revenue_portfolio": handle_revenue_portfolio,
