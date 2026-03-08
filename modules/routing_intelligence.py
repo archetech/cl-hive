@@ -10,6 +10,7 @@ Implements collective routing intelligence for the hive:
 Security: All route probes require cryptographic signatures.
 """
 
+import heapq
 import threading
 import time
 from dataclasses import dataclass, field
@@ -17,9 +18,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
 from .protocol import (
-    HiveMessageType,
-    serialize,
-    create_route_probe,
     create_route_probe_batch,
     validate_route_probe_payload,
     validate_route_probe_batch_payload,
@@ -27,7 +25,6 @@ from .protocol import (
     get_route_probe_batch_signing_payload,
     ROUTE_PROBE_RATE_LIMIT,
     ROUTE_PROBE_BATCH_RATE_LIMIT,
-    MAX_PATH_LENGTH,
     MAX_PROBES_IN_BATCH,
 )
 from . import network_metrics
@@ -43,7 +40,6 @@ PROBE_STALENESS_HOURS = 24  # Probes older than this are stale
 # Centrality-aware routing (Use Case 7)
 CENTRALITY_WEIGHT_IN_ROUTING = 0.15  # 15% weight for centrality in route score
 HIGH_CENTRALITY_ROUTING_BONUS = 1.2  # 20% bonus for paths with high-centrality members
-MIN_CENTRALITY_FOR_FALLBACK = 0.4    # Minimum centrality to consider for fallback paths
 
 
 @dataclass
@@ -145,62 +141,6 @@ class HiveRoutingMap:
     ):
         """Record a message for rate limiting."""
         rate_tracker[sender].append(time.time())
-
-    def create_route_probe_message(
-        self,
-        destination: str,
-        path: List[str],
-        success: bool,
-        latency_ms: int,
-        rpc: Any,
-        failure_reason: str = "",
-        failure_hop: int = -1,
-        estimated_capacity_sats: int = 0,
-        total_fee_ppm: int = 0,
-        per_hop_fees: List[int] = None,
-        amount_probed_sats: int = 0
-    ) -> Optional[bytes]:
-        """
-        Create a signed ROUTE_PROBE message.
-
-        Args:
-            destination: Final destination pubkey
-            path: List of intermediate hop pubkeys
-            success: Whether probe succeeded
-            latency_ms: Round-trip time
-            rpc: RPC interface for signing
-            failure_reason: Reason for failure
-            failure_hop: Index of failing hop
-            estimated_capacity_sats: Route capacity estimate
-            total_fee_ppm: Total route fees
-            per_hop_fees: Fee at each hop
-            amount_probed_sats: Amount probed
-
-        Returns:
-            Serialized message bytes, or None on error
-        """
-        try:
-            return create_route_probe(
-                reporter_id=self.our_pubkey,
-                destination=destination,
-                path=path,
-                success=success,
-                latency_ms=latency_ms,
-                rpc=rpc,
-                failure_reason=failure_reason,
-                failure_hop=failure_hop,
-                estimated_capacity_sats=estimated_capacity_sats,
-                total_fee_ppm=total_fee_ppm,
-                per_hop_fees=per_hop_fees,
-                amount_probed_sats=amount_probed_sats
-            )
-        except Exception as e:
-            if self.plugin:
-                self.plugin.log(
-                    f"cl-hive: Failed to create route probe message: {e}",
-                    level='warn'
-                )
-            return None
 
     def handle_route_probe(
         self,
@@ -564,11 +504,12 @@ class HiveRoutingMap:
         """Evict least-recently-probed entries. Must be called with self._lock held."""
         # Evict 10% of entries with oldest last-probe time
         evict_count = max(1, len(self._path_stats) // 10)
-        entries = sorted(
+        oldest = heapq.nsmallest(
+            evict_count,
             self._path_stats.items(),
             key=lambda kv: max(kv[1].last_success_time, kv[1].last_failure_time)
         )
-        for key, _ in entries[:evict_count]:
+        for key, _ in oldest:
             del self._path_stats[key]
 
     def get_path_success_rate(self, path: List[str]) -> float:
@@ -690,6 +631,7 @@ class HiveRoutingMap:
 
         # Collect all paths to this destination
         candidates = []
+        stale_cutoff = time.time() - (PROBE_STALENESS_HOURS * 3600)
 
         with self._lock:
             items = list(self._path_stats.items())
@@ -724,7 +666,6 @@ class HiveRoutingMap:
             hive_hop_count = sum(1 for hop in path if hop in hive_members)
 
             # Calculate confidence inline from stats (avoids O(n) re-search)
-            stale_cutoff = time.time() - (PROBE_STALENESS_HOURS * 3600)
             confidence = self._confidence_from_stats(stats, stale_cutoff)
 
             # Calculate path centrality (Use Case 7)
@@ -787,109 +728,6 @@ class HiveRoutingMap:
 
         return max(candidates, key=score_route)
 
-    def get_fallback_routes(
-        self,
-        destination: str,
-        failed_path: List[str],
-        amount_sats: int,
-        hive_members: set = None,
-        limit: int = 3
-    ) -> List[RouteSuggestion]:
-        """
-        Get fallback routes when a primary path fails.
-
-        Prioritizes paths through high-centrality hive members that
-        don't include the failed path's hops.
-
-        Args:
-            destination: Target node pubkey
-            failed_path: The path that failed
-            amount_sats: Amount to route
-            hive_members: Set of hive member pubkeys
-            limit: Maximum number of fallback routes to return
-
-        Returns:
-            List of alternative RouteSuggestion sorted by quality
-        """
-        if hive_members is None:
-            hive_members = set()
-
-        failed_set = set(failed_path)
-        candidates = []
-
-        with self._lock:
-            items = list(self._path_stats.items())
-
-        for (dest, path), stats in items:
-            if dest != destination:
-                continue
-
-            if stats.probe_count == 0:
-                continue
-
-            # Skip paths that overlap with failed path (except destination)
-            path_set = set(path)
-            if path_set & failed_set:  # Any overlap
-                continue
-
-            success_rate = stats.success_count / stats.probe_count
-
-            # For fallbacks, we might accept slightly lower success rates
-            if success_rate < LOW_SUCCESS_RATE * 0.8:  # 40% threshold for fallbacks
-                continue
-
-            if stats.avg_capacity_sats > 0 and stats.avg_capacity_sats < amount_sats:
-                continue
-
-            if stats.success_count > 0:
-                avg_latency = stats.total_latency_ms // stats.success_count
-                avg_fee = stats.total_fee_ppm // stats.success_count
-            else:
-                avg_latency = 0
-                avg_fee = 0
-
-            hive_hop_count = sum(1 for hop in path if hop in hive_members)
-            path_centrality, is_high_centrality = self._get_path_centrality_score(
-                list(path), hive_members
-            )
-
-            # For fallbacks, strongly prefer high-centrality paths
-            if path_centrality < MIN_CENTRALITY_FOR_FALLBACK and hive_hop_count > 0:
-                continue
-
-            stale_cutoff = time.time() - (PROBE_STALENESS_HOURS * 3600)
-            candidates.append(RouteSuggestion(
-                destination=destination,
-                path=list(path),
-                expected_fee_ppm=avg_fee,
-                expected_latency_ms=avg_latency,
-                success_rate=success_rate,
-                confidence=self._confidence_from_stats(stats, stale_cutoff),
-                last_successful_probe=stats.last_success_time,
-                hive_hop_count=hive_hop_count,
-                path_centrality_score=path_centrality,
-                is_high_centrality_path=is_high_centrality
-            ))
-
-        # Score with heavy emphasis on centrality for fallbacks
-        def score_fallback(route: RouteSuggestion) -> float:
-            success_score = route.success_rate
-            fee_score = 1.0 / (1 + route.expected_fee_ppm / 1000)
-
-            # Heavily weight centrality for fallback routes
-            centrality_score = route.path_centrality_score
-            if route.is_high_centrality_path:
-                centrality_score *= 1.5
-
-            return (
-                success_score * 0.3 +
-                fee_score * 0.2 +
-                centrality_score * 0.5  # 50% weight for centrality in fallbacks
-            )
-
-        candidates.sort(key=score_fallback, reverse=True)
-        return candidates[:limit]
-
     def get_routes_to(
         self,
         destination: str,
@@ -908,6 +746,7 @@ class HiveRoutingMap:
             List of route suggestions
         """
         candidates = []
+        stale_cutoff = time.time() - (PROBE_STALENESS_HOURS * 3600)
 
         with self._lock:
             items = list(self._path_stats.items())
@@ -933,7 +772,6 @@ class HiveRoutingMap:
                 avg_latency = 0
                 avg_fee = 0
 
-            stale_cutoff = time.time() - (PROBE_STALENESS_HOURS * 3600)
             candidates.append(RouteSuggestion(
                 destination=destination,
                 path=list(path),
@@ -959,14 +797,11 @@ class HiveRoutingMap:
         """
         with self._lock:
             stats_values = list(self._path_stats.values())
-            stats_keys = list(self._path_stats.keys())
+            destinations = {dest for dest, _ in self._path_stats}
 
         total_paths = len(stats_values)
         total_probes = sum(s.probe_count for s in stats_values)
         total_successes = sum(s.success_count for s in stats_values)
-
-        # Unique destinations
-        destinations = set(dest for dest, _ in stats_keys)
 
         # High quality paths (>90% success)
         high_quality = sum(
