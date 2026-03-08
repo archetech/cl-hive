@@ -6,16 +6,6 @@ Implements the "Gardner" algorithm for automated topology management:
 - Guard Mechanism: Prevent redundant channel opens to saturated targets
 - Expansion Proposals: Cooperative expansion with feerate gate
 
-CLBoss Integration (Optional):
-CLBoss is NOT required. If installed (ksedgwic/clboss fork):
-- Uses clboss-unmanage with 'open' tag to prevent CLBoss channel opens to saturated targets
-- Uses clboss-manage to re-enable opens when saturation drops
-- Fee/balance tags are managed by cl-revenue-ops (not this module)
-
-If CLBoss is NOT installed:
-- Saturation detection still runs for analytics
-- Hive uses native cooperative expansion instead
-
 Security Constraints (Red Team - PHASE6_THREAT_MODEL):
 - Gossip capacity is CLAMPED to public listchannels data
 - Max 5 new unmanages per cycle (abort if exceeded)
@@ -617,8 +607,8 @@ class Planner:
 
     Analyzes network topology to:
     1. Detect targets where Hive has excessive market share (saturation)
-    2. Issue clboss-ignore to prevent further capital accumulation
-    3. Release ignores when saturation drops below threshold
+    2. Record saturation events for analytics and native expansion control
+    3. Release saturation flags when share drops below threshold
 
     Thread Safety:
     - Uses config snapshot pattern (cfg passed to run_cycle)
@@ -626,7 +616,7 @@ class Planner:
     - No sleeping inside run_cycle
     """
 
-    def __init__(self, state_manager, database, bridge, clboss_bridge, plugin=None,
+    def __init__(self, state_manager, database, bridge, plugin=None,
                  intent_manager=None, decision_engine=None,
                  liquidity_coordinator=None, splice_coordinator=None,
                  health_aggregator=None, rationalization_mgr=None,
@@ -638,7 +628,6 @@ class Planner:
             state_manager: StateManager for accessing Hive peer states
             database: HiveDatabase for logging and membership data
             bridge: Integration Bridge for cl-revenue-ops
-            clboss_bridge: CLBossBridge for ignore/unignore operations
             plugin: Plugin reference for RPC and logging
             intent_manager: IntentManager for coordinated channel opens
             decision_engine: DecisionEngine for governance decisions (Phase 7)
@@ -651,7 +640,6 @@ class Planner:
         self.state_manager = state_manager
         self.db = database
         self.bridge = bridge
-        self.clboss = clboss_bridge
         self.plugin = plugin
         self.intent_manager = intent_manager
         self.decision_engine = decision_engine
@@ -1442,11 +1430,11 @@ class Planner:
 
     def _enforce_saturation(self, cfg, run_id: str) -> List[Dict[str, Any]]:
         """
-        Enforce saturation limits by issuing clboss-ignore.
+        Enforce saturation limits by recording saturated targets.
 
         SECURITY CONSTRAINTS:
-        - Max 5 new ignores per cycle (abort if exceeded)
-        - Idempotent: skip already-ignored peers
+        - Max 5 new saturation detections per cycle (abort if exceeded)
+        - Idempotent: skip already-flagged peers
         - Log all decisions to hive_planner_log
 
         Args:
@@ -1507,71 +1495,30 @@ class Planner:
             if ignores_issued >= MAX_IGNORES_PER_CYCLE:
                 break
 
-            # Check if CLBoss is available (optional integration)
-            if not self.clboss or not self.clboss._available:
-                # CLBoss not installed - this is fine, hive uses native expansion control
-                # Still log for saturation analytics
-                self.db.log_planner_action(
-                    action_type='saturation_detected',
-                    result='info',
-                    target=result.target,
-                    details={
-                        'note': 'clboss_not_installed',
-                        'hive_share_pct': round(result.hive_share_pct, 4),
-                        'run_id': run_id
-                    }
-                )
-                decisions.append({
-                    'action': 'saturation_detected',
-                    'target': result.target,
+            # Record saturation for analytics and native expansion control
+            self._ignored_peers.add(result.target)
+            ignores_issued += 1
+
+            self._log(
+                f"Saturated target {result.target[:16]}... "
+                f"(share={result.hive_share_pct:.1%})"
+            )
+            self.db.log_planner_action(
+                action_type='saturation_detected',
+                result='info',
+                target=result.target,
+                details={
                     'hive_share_pct': round(result.hive_share_pct, 4),
-                    'note': 'clboss_not_installed'
-                })
-                continue
-
-            # Issue clboss-unmanage for 'open' tag (prevent channel opens)
-            success = self.clboss.unmanage_open(result.target)
-            if success:
-                self._ignored_peers.add(result.target)
-                ignores_issued += 1
-
-                self._log(
-                    f"Ignored saturated target {result.target[:16]}... "
-                    f"(share={result.hive_share_pct:.1%})"
-                )
-                self.db.log_planner_action(
-                    action_type='ignore',
-                    result='success',
-                    target=result.target,
-                    details={
-                        'hive_share_pct': round(result.hive_share_pct, 4),
-                        'hive_capacity_sats': result.hive_capacity_sats,
-                        'public_capacity_sats': result.public_capacity_sats,
-                        'run_id': run_id
-                    }
-                )
-                decisions.append({
-                    'action': 'ignore',
-                    'target': result.target,
-                    'result': 'success',
-                    'hive_share_pct': result.hive_share_pct
-                })
-            else:
-                self._log(f"Failed to ignore {result.target[:16]}...", level='warn')
-                self.db.log_planner_action(
-                    action_type='ignore',
-                    result='failed',
-                    target=result.target,
-                    details={
-                        'hive_share_pct': round(result.hive_share_pct, 4),
-                        'run_id': run_id
-                    }
-                )
-                decisions.append({
-                    'action': 'ignore',
-                    'target': result.target,
-                    'result': 'failed'
-                })
+                    'hive_capacity_sats': result.hive_capacity_sats,
+                    'public_capacity_sats': result.public_capacity_sats,
+                    'run_id': run_id
+                }
+            )
+            decisions.append({
+                'action': 'saturation_detected',
+                'target': result.target,
+                'hive_share_pct': round(result.hive_share_pct, 4),
+            })
 
         # Log summary
         self.db.log_planner_action(
@@ -1608,33 +1555,28 @@ class Planner:
             if result.should_release:
                 peers_to_release.append((peer, result))
 
-        # Issue unignores
+        # Release saturation flags
         for peer, result in peers_to_release:
-            if not self.clboss or not self.clboss._available:
-                continue
+            self._ignored_peers.discard(peer)
 
-            success = self.clboss.manage_open(peer)
-            if success:
-                self._ignored_peers.discard(peer)
-
-                self._log(
-                    f"Released ignore on {peer[:16]}... "
-                    f"(share={result.hive_share_pct:.1%} < {SATURATION_RELEASE_THRESHOLD_PCT:.0%})"
-                )
-                self.db.log_planner_action(
-                    action_type='unignore',
-                    result='success',
-                    target=peer,
-                    details={
-                        'hive_share_pct': round(result.hive_share_pct, 4),
-                        'run_id': run_id
-                    }
-                )
-                decisions.append({
-                    'action': 'unignore',
-                    'target': peer,
-                    'result': 'success'
-                })
+            self._log(
+                f"Released saturation flag on {peer[:16]}... "
+                f"(share={result.hive_share_pct:.1%} < {SATURATION_RELEASE_THRESHOLD_PCT:.0%})"
+            )
+            self.db.log_planner_action(
+                action_type='saturation_released',
+                result='success',
+                target=peer,
+                details={
+                    'hive_share_pct': round(result.hive_share_pct, 4),
+                    'run_id': run_id
+                }
+            )
+            decisions.append({
+                'action': 'saturation_released',
+                'target': peer,
+                'result': 'success'
+            })
 
         return decisions
 

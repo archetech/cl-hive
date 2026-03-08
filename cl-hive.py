@@ -90,7 +90,6 @@ from modules.membership import MembershipManager, MembershipTier
 from modules.planner import Planner, ChannelSizer
 from modules.quality_scorer import PeerQualityScorer
 from modules.cooperative_expansion import CooperativeExpansionManager
-from modules.clboss_bridge import CLBossBridge
 from modules.governance import DecisionEngine
 from modules.vpn_transport import VPNTransportManager
 from modules.fee_intelligence import FeeIntelligenceManager
@@ -303,7 +302,6 @@ bridge: Optional[Bridge] = None
 membership_mgr: Optional[MembershipManager] = None
 contribution_mgr: Optional[ContributionManager] = None
 planner: Optional[Planner] = None
-clboss_bridge: Optional[CLBossBridge] = None
 decision_engine: Optional[DecisionEngine] = None
 vpn_transport: Optional[VPNTransportManager] = None
 coop_expansion: Optional[CooperativeExpansionManager] = None
@@ -976,10 +974,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     if bridge_status == BridgeStatus.ENABLED:
         plugin.log(f"cl-hive: Bridge ENABLED - cl-revenue-ops {bridge._revenue_ops_version}")
-        if bridge._clboss_available:
-            plugin.log("cl-hive: CLBoss detected - saturation control via Gateway Pattern")
-        else:
-            plugin.log("cl-hive: CLBoss not detected (optional) - using native expansion control")
     elif bridge_status == BridgeStatus.DEGRADED:
         plugin.log("cl-hive: Bridge DEGRADED - some features unavailable", level='warn')
     else:
@@ -1096,13 +1090,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin.log("cl-hive: VPN transport configured (mode=any, not enforcing)")
 
     # Initialize Planner (Phase 6)
-    global planner, clboss_bridge
-    clboss_bridge = CLBossBridge(plugin.rpc, plugin)
+    global planner
     planner = Planner(
         state_manager=state_manager,
         database=database,
         bridge=bridge,
-        clboss_bridge=clboss_bridge,
         plugin=plugin,
         intent_manager=intent_mgr,
         decision_engine=decision_engine
@@ -1788,8 +1780,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         contribution_mgr.rpc = plugin.rpc
     if settlement_mgr:
         settlement_mgr.rpc = plugin.rpc
-    if clboss_bridge:
-        clboss_bridge.rpc = plugin.rpc
     if did_credential_mgr:
         did_credential_mgr.rpc = plugin.rpc
     if management_schema_registry:

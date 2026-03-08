@@ -450,8 +450,8 @@ def planner_loop():
     Background thread that runs Planner cycles for topology optimization.
 
     Runs periodically to:
-    1. Detect saturated targets and issue clboss-ignore
-    2. Release ignores when saturation drops below threshold
+    1. Detect saturated targets and record for native expansion control
+    2. Release saturation flags when share drops below threshold
     3. (If enabled) Propose channel expansions to underserved targets
 
     Security:

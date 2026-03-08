@@ -2,7 +2,7 @@
 Integration Bridge Module for cl-hive.
 
 Implements the "Paranoid" Bridge pattern with Circuit Breaker for
-safe integration with external plugins (cl-revenue-ops, clboss).
+safe integration with external plugins (cl-revenue-ops).
 
 Circuit Breaker Pattern:
 - CLOSED: Normal operation, requests pass through
@@ -204,8 +204,7 @@ class Bridge:
     
     Provides "Paranoid" error handling for calls to:
     - cl-revenue-ops: Fee strategy and rebalancing
-    - clboss: Topology ignore/unignore
-    
+
     Thread Safety:
     - Uses the thread-safe RPC proxy from cl-hive.py
     - Circuit breaker state is simple integers (thread-safe for reads)
@@ -225,9 +224,6 @@ class Bridge:
         # Status tracking
         self._status = BridgeStatus.DISABLED
         self._revenue_ops_version: Optional[str] = None
-        self._clboss_available = False
-        self._clboss_unignore_supported = True
-
         self._rpc_socket_path = self._resolve_rpc_socket()
         self._use_subprocess = bool(
             self._rpc_socket_path and shutil.which("lightning-cli")
@@ -238,9 +234,8 @@ class Bridge:
                 level="warn"
             )
         
-        # Circuit breakers for each integration
+        # Circuit breaker for revenue-ops integration
         self._revenue_ops_cb = CircuitBreaker("revenue-ops")
-        self._clboss_cb = CircuitBreaker("clboss")
 
         # Security hardening: Rate limiting (Issue #27)
         self._policy_last_change: Dict[str, float] = {}  # peer_id -> timestamp
@@ -323,17 +318,12 @@ class Bridge:
                 )
                 time.sleep(delay)
 
-        clboss_ok = self._detect_clboss()
-
         if revenue_ops_ok:
             self._status = BridgeStatus.ENABLED
             self._log(f"Bridge enabled: cl-revenue-ops {self._revenue_ops_version}")
         else:
             self._status = BridgeStatus.DISABLED
             self._log("Bridge disabled: cl-revenue-ops not available", level='warn')
-
-        if clboss_ok:
-            self._log("CLBoss integration available")
 
         return self._status
 
@@ -395,29 +385,6 @@ class Bridge:
         except Exception as e:
             self._log(f"Failed to detect cl-revenue-ops: {e}", level='warn')
             self._revenue_ops_cb.record_failure()
-            return False
-    
-    def _detect_clboss(self) -> bool:
-        """
-        Detect clboss plugin.
-        
-        Returns:
-            True if clboss is available
-        """
-        try:
-            plugins = self.rpc.plugin("list")
-            
-            for p in plugins.get('plugins', []):
-                if 'clboss' in p.get('name', '').lower():
-                    self._clboss_available = p.get('active', False)
-                    if self._clboss_available:
-                        self._clboss_cb.record_success()
-                    return self._clboss_available
-            
-            return False
-            
-        except Exception as e:
-            self._log(f"Failed to detect clboss: {e}", level='debug')
             return False
     
     def _parse_version(self, version_str: str) -> Tuple[int, int, int]:
@@ -862,71 +829,6 @@ class Bridge:
             return None
     
     # =========================================================================
-    # CLBOSS INTEGRATION
-    # =========================================================================
-    
-    def ignore_peer(self, peer_id: str) -> bool:
-        """
-        Tell CLBoss to ignore a peer for channel management.
-        
-        Used to prevent CLBoss from opening redundant channels
-        to targets the Hive already covers.
-        
-        Args:
-            peer_id: Node public key to ignore
-            
-        Returns:
-            True if successful
-        """
-        if not self._clboss_available:
-            self._log(f"CLBoss not available, cannot ignore {peer_id[:16]}...")
-            return False
-        
-        try:
-            result = self.safe_call(
-                "clboss-ignore",
-                {"nodeid": peer_id},
-                self._clboss_cb
-            )
-            
-            self._log(f"CLBoss ignoring {peer_id[:16]}...")
-            return True
-            
-        except Exception as e:
-            self._log(f"Failed to ignore peer in CLBoss: {e}", level='warn')
-            return False
-    
-    def unignore_peer(self, peer_id: str) -> bool:
-        """
-        Tell CLBoss to stop ignoring a peer.
-        
-        Args:
-            peer_id: Node public key to unignore
-            
-        Returns:
-            True if successful
-        """
-        if not self._clboss_available or not self._clboss_unignore_supported:
-            return False
-        
-        try:
-            result = self.safe_call(
-                "clboss-unignore",
-                {"nodeid": peer_id},
-                self._clboss_cb
-            )
-            
-            self._log(f"CLBoss unignoring {peer_id[:16]}...")
-            return True
-            
-        except Exception as e:
-            msg = str(e).lower()
-            if "unknown command" in msg or "method not found" in msg:
-                self._clboss_unignore_supported = False
-            self._log(f"Failed to unignore peer in CLBoss: {e}", level='warn')
-            return False
-    
-    # =========================================================================
     # FEE CONFIGURATION
     # =========================================================================
 
@@ -990,10 +892,6 @@ class Bridge:
             "revenue_ops": {
                 "version": self._revenue_ops_version,
                 "circuit_breaker": self._revenue_ops_cb.get_stats()
-            },
-            "clboss": {
-                "available": self._clboss_available,
-                "circuit_breaker": self._clboss_cb.get_stats() if self._clboss_available else None
             },
             "security_limits": {
                 "policy_rate_limit_seconds": POLICY_RATE_LIMIT_SECONDS,

@@ -462,10 +462,6 @@
             "sha256": "3882986c40e93c3d079b1243d7806b40e64311e86a3d06cdbe9d70da5b1371dd"
         },
         {
-            "path": "./modules/clboss_bridge.py",
-            "sha256": "ca2daf9129f04cfc64b2c0a83fdfe4ec10dfab6cb01a08e692f9c8b5f8a0c127"
-        },
-        {
             "path": "./modules/config.py",
             "sha256": "c6af3af50d65e70418d87e2accaa129ebef0de621152419a1f22f0c252ae82aa"
         },

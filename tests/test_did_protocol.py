@@ -980,7 +980,6 @@ class TestPlannerReputationIntegration:
             state_manager=MagicMock(),
             database=MagicMock(),
             bridge=MagicMock(),
-            clboss_bridge=MagicMock(),
         )
         assert hasattr(planner, 'did_credential_mgr')
         assert planner.did_credential_mgr is None

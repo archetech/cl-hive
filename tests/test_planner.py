@@ -91,20 +91,6 @@ def mock_bridge():
 
 
 @pytest.fixture
-def mock_clboss_bridge():
-    """Create a mock CLBossBridge."""
-    clboss = MagicMock()
-    clboss._available = True
-    # Modern API methods
-    clboss.unmanage_open.return_value = True
-    clboss.manage_open.return_value = True
-    # Legacy aliases (deprecated but may still be used in tests)
-    clboss.ignore_peer.return_value = True
-    clboss.unignore_peer.return_value = True
-    return clboss
-
-
-@pytest.fixture
 def mock_plugin():
     """Create a mock plugin."""
     plugin = MagicMock()
@@ -135,13 +121,12 @@ def mock_config():
 
 
 @pytest.fixture
-def planner(mock_state_manager, mock_database, mock_bridge, mock_clboss_bridge, mock_plugin):
+def planner(mock_state_manager, mock_database, mock_bridge, mock_plugin):
     """Create a Planner instance with mocked dependencies."""
     return Planner(
         state_manager=mock_state_manager,
         database=mock_database,
         bridge=mock_bridge,
-        clboss_bridge=mock_clboss_bridge,
         plugin=mock_plugin
     )
 
@@ -368,10 +353,10 @@ class TestSaturationCalculation:
 # =============================================================================
 
 class TestGuardMechanism:
-    """Test saturation enforcement (clboss-ignore)."""
+    """Test saturation enforcement."""
 
-    def test_ignore_saturated_target(self, planner, mock_clboss_bridge, mock_database, mock_plugin, mock_config):
-        """Should issue clboss-ignore for saturated targets."""
+    def test_detect_saturated_target(self, planner, mock_database, mock_plugin, mock_config):
+        """Should record saturation for saturated targets."""
         target = '02' + 'x' * 64
 
         # Setup network cache with saturated target
@@ -403,12 +388,12 @@ class TestGuardMechanism:
 
             decisions = planner._enforce_saturation(mock_config, 'test-run-1')
 
-        # Should have called unmanage_open (modern API)
-        mock_clboss_bridge.unmanage_open.assert_called_once_with(target)
+        # Should have recorded saturation and added to ignored peers
         assert target in planner._ignored_peers
+        assert any(d.get('action') == 'saturation_detected' for d in decisions)
 
-    def test_max_ignores_per_cycle_limit(self, planner, mock_clboss_bridge, mock_database, mock_plugin, mock_config):
-        """Should abort if more than MAX_IGNORES_PER_CYCLE ignores needed."""
+    def test_max_ignores_per_cycle_limit(self, planner, mock_database, mock_plugin, mock_config):
+        """Should abort if more than MAX_IGNORES_PER_CYCLE saturation detections needed."""
         # Setup network cache
         mock_plugin.rpc.listchannels.return_value = {'channels': []}
         planner._refresh_network_cache(force=True)
@@ -435,9 +420,6 @@ class TestGuardMechanism:
         assert any(d.get('action') == 'abort' for d in decisions)
         assert any(d.get('reason') == 'mass_saturation_detected' for d in decisions)
 
-        # Should NOT have called ignore_peer
-        mock_clboss_bridge.ignore_peer.assert_not_called()
-
         # Should have logged the abort
         mock_database.log_planner_action.assert_any_call(
             action_type='saturation_check',
@@ -450,11 +432,11 @@ class TestGuardMechanism:
             }
         )
 
-    def test_idempotent_ignore(self, planner, mock_clboss_bridge, mock_database, mock_plugin, mock_config):
-        """Should not re-ignore already-ignored peers."""
+    def test_idempotent_saturation(self, planner, mock_database, mock_plugin, mock_config):
+        """Should not re-flag already-flagged peers."""
         target = '02' + 'y' * 64
 
-        # Mark as already ignored
+        # Mark as already flagged
         planner._ignored_peers.add(target)
 
         mock_plugin.rpc.listchannels.return_value = {'channels': []}
@@ -472,15 +454,14 @@ class TestGuardMechanism:
                 )
             ]
 
-            planner._enforce_saturation(mock_config, 'test-run-3')
+            decisions = planner._enforce_saturation(mock_config, 'test-run-3')
 
-        # Should NOT have called ignore_peer (already ignored)
-        mock_clboss_bridge.ignore_peer.assert_not_called()
+        # Should not have added any new saturation detections (already flagged)
+        assert len(decisions) == 0
 
-    def test_clboss_unavailable_records_saturation(self, planner, mock_clboss_bridge, mock_database, mock_plugin, mock_config):
-        """Should record saturation detection when CLBoss is unavailable (CLBoss is optional)."""
+    def test_saturation_recorded_for_analytics(self, planner, mock_database, mock_plugin, mock_config):
+        """Should record saturation detection for analytics."""
         target = '02' + 'z' * 64
-        mock_clboss_bridge._available = False
 
         mock_plugin.rpc.listchannels.return_value = {'channels': []}
         planner._refresh_network_cache(force=True)
@@ -499,7 +480,7 @@ class TestGuardMechanism:
 
             decisions = planner._enforce_saturation(mock_config, 'test-run-4')
 
-        # Should record saturation_detected (CLBoss is optional, so this is informational)
+        # Should record saturation_detected
         assert any(d.get('action') == 'saturation_detected' for d in decisions)
 
 
@@ -589,11 +570,11 @@ class TestRunCycle:
 class TestSaturationRelease:
     """Test release of ignores when saturation drops."""
 
-    def test_release_when_below_threshold(self, planner, mock_clboss_bridge, mock_config, mock_plugin, mock_database):
-        """Should unignore when share drops below release threshold."""
+    def test_release_when_below_threshold(self, planner, mock_config, mock_plugin, mock_database):
+        """Should release saturation flag when share drops below release threshold."""
         target = '02' + 'r' * 64
 
-        # Mark as ignored
+        # Mark as flagged
         planner._ignored_peers.add(target)
 
         mock_plugin.rpc.listchannels.return_value = {'channels': []}
@@ -612,9 +593,9 @@ class TestSaturationRelease:
 
             decisions = planner._release_saturation(mock_config, 'test-release')
 
-        # Should have called manage_open (modern API)
-        mock_clboss_bridge.manage_open.assert_called_once_with(target)
+        # Should have released the saturation flag
         assert target not in planner._ignored_peers
+        assert any(d.get('action') == 'saturation_released' for d in decisions)
 
 
 # =============================================================================
@@ -892,7 +873,7 @@ class TestExpansionLogic:
 class TestPlannerGovernanceIntegration:
     """Test Planner-Governance integration (Issue #14)."""
 
-    def test_expansion_with_decision_engine_advisor(self, mock_config, mock_plugin, mock_database, mock_state_manager, mock_clboss_bridge):
+    def test_expansion_with_decision_engine_advisor(self, mock_config, mock_plugin, mock_database, mock_state_manager):
         """Planner should use DecisionEngine for governance in advisor mode."""
         from modules.governance import DecisionEngine, DecisionResult
 
@@ -912,7 +893,7 @@ class TestPlannerGovernanceIntegration:
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=MagicMock(),
-            clboss_bridge=mock_clboss_bridge,
+
             plugin=mock_plugin,
             intent_manager=MagicMock(),
             decision_engine=mock_decision_engine
@@ -954,7 +935,7 @@ class TestPlannerGovernanceIntegration:
         # Verify DecisionEngine was called
         mock_decision_engine.propose_action.assert_called_once()
 
-    def test_expansion_with_decision_engine_queued(self, mock_config, mock_plugin, mock_database, mock_state_manager, mock_clboss_bridge):
+    def test_expansion_with_decision_engine_queued(self, mock_config, mock_plugin, mock_database, mock_state_manager):
         """Planner should handle QUEUED result from DecisionEngine."""
         from modules.governance import DecisionEngine, DecisionResult
 
@@ -974,7 +955,7 @@ class TestPlannerGovernanceIntegration:
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=MagicMock(),
-            clboss_bridge=mock_clboss_bridge,
+
             plugin=mock_plugin,
             intent_manager=MagicMock(),
             decision_engine=mock_decision_engine
@@ -1711,22 +1692,20 @@ class TestComputeNodeSummary:
     """Tests for Planner.compute_node_summary()."""
 
     def _make_planner(self, mock_plugin, mock_state_manager, mock_database,
-                      mock_bridge, mock_clboss_bridge):
+                      mock_bridge):
         return Planner(
             plugin=mock_plugin,
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
         )
 
     def test_counts_only_active_channels(self, mock_plugin, mock_state_manager,
-                                          mock_database, mock_bridge,
-                                          mock_clboss_bridge):
+                                          mock_database, mock_bridge):
         """Given mixed channel states, only CHANNELD_NORMAL counted as active.
         Verify active_channels, pending_channels, closing_channels, total_capacity_sats."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
 
         mock_plugin.rpc.listpeerchannels.return_value = {
             'channels': [
@@ -1751,11 +1730,11 @@ class TestComputeNodeSummary:
 
     def test_underwater_count_from_bridge(self, mock_plugin, mock_state_manager,
                                            mock_database, mock_bridge,
-                                           mock_clboss_bridge):
+ ):
         """When bridge.safe_call('revenue-profitability') returns channel profitability
         data, underwater_count and underwater_pct are computed correctly."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
 
         mock_plugin.rpc.listpeerchannels.return_value = {
             'channels': [
@@ -1784,11 +1763,10 @@ class TestComputeNodeSummary:
         assert result['underwater_pct'] == 40.0
 
     def test_rpc_failure_returns_none(self, mock_plugin, mock_state_manager,
-                                       mock_database, mock_bridge,
-                                       mock_clboss_bridge):
+                                       mock_database, mock_bridge):
         """When listpeerchannels raises Exception, returns None."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
 
         mock_plugin.rpc.listpeerchannels.side_effect = Exception("RPC connection lost")
 
@@ -1797,11 +1775,10 @@ class TestComputeNodeSummary:
         assert result is None
 
     def test_bridge_failure_graceful(self, mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge,
-                                      mock_clboss_bridge):
+                                      mock_database, mock_bridge):
         """When bridge.safe_call raises, underwater_count defaults to 0 (no crash)."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
 
         mock_plugin.rpc.listpeerchannels.return_value = {
             'channels': [
@@ -1819,14 +1796,13 @@ class TestComputeNodeSummary:
         assert result['underwater_pct'] == 0.0
 
     def test_no_plugin_returns_none(self, mock_state_manager, mock_database,
-                                     mock_bridge, mock_clboss_bridge):
+                                     mock_bridge):
         """When self.plugin is None, returns None."""
         planner = Planner(
             plugin=None,
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
         )
 
         result = planner.compute_node_summary()
@@ -1834,10 +1810,10 @@ class TestComputeNodeSummary:
         assert result is None
 
     def test_opener_breakdown(self, mock_plugin, mock_state_manager,
-                               mock_database, mock_bridge, mock_clboss_bridge):
+                               mock_database, mock_bridge):
         """Counts we_opened vs they_opened from opener field."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
         mock_plugin.rpc.listpeerchannels.return_value = {
             'channels': [
                 {'state': 'CHANNELD_NORMAL', 'total_msat': 5_000_000_000, 'opener': 'local'},
@@ -1873,7 +1849,7 @@ class TestRejectionBackoffStall:
 
     def test_backoff_escapes_when_rejections_age_out(
         self, mock_plugin, mock_database, mock_state_manager,
-        mock_bridge, mock_clboss_bridge
+        mock_bridge,
     ):
         """18 consecutive rejections but all are old -- should NOT pause."""
         planner = Planner(
@@ -1881,7 +1857,6 @@ class TestRejectionBackoffStall:
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
         )
         mock_database.count_consecutive_expansion_rejections.return_value = 18
         # The backoff window (32h for 18 rejections) finds no recent items
@@ -1899,7 +1874,7 @@ class TestRejectionBackoffStall:
 
     def test_backoff_pauses_with_fresh_rejections(
         self, mock_plugin, mock_database, mock_state_manager,
-        mock_bridge, mock_clboss_bridge
+        mock_bridge,
     ):
         """6 consecutive rejections with 3 fresh ones -- should pause."""
         planner = Planner(
@@ -1907,7 +1882,6 @@ class TestRejectionBackoffStall:
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
         )
         mock_database.count_consecutive_expansion_rejections.return_value = 6
         # backoff_hours for 6 rejections = 2^((6-3)//3) = 2^1 = 2
@@ -1926,7 +1900,7 @@ class TestRejectionBackoffStall:
 
     def test_hard_cap_still_blocks_at_50(
         self, mock_plugin, mock_database, mock_state_manager,
-        mock_bridge, mock_clboss_bridge
+        mock_bridge,
     ):
         """50 consecutive rejections should always pause with manual intervention."""
         planner = Planner(
@@ -1934,7 +1908,6 @@ class TestRejectionBackoffStall:
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
         )
         mock_database.count_consecutive_expansion_rejections.return_value = 50
         mock_database.REJECTION_LOOKBACK_HOURS = 168
@@ -1949,7 +1922,7 @@ class TestRejectionBackoffStall:
 
     def test_backoff_hours_grows_past_24(
         self, mock_plugin, mock_database, mock_state_manager,
-        mock_bridge, mock_clboss_bridge
+        mock_bridge,
     ):
         """18 rejections should produce backoff_hours=32, not capped at 24."""
         planner = Planner(
@@ -1957,7 +1930,6 @@ class TestRejectionBackoffStall:
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
         )
         mock_database.count_consecutive_expansion_rejections.return_value = 18
         mock_database.get_recent_expansion_rejections.return_value = []
@@ -1986,21 +1958,20 @@ class TestGetUniqueChannelsFor:
 
     @staticmethod
     def _make_planner(mock_plugin, mock_state_manager, mock_database,
-                      mock_bridge, mock_clboss_bridge):
+                      mock_bridge):
         return Planner(
             plugin=mock_plugin,
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
         )
 
     def test_dedup_bidirectional_entries(self, mock_plugin, mock_state_manager,
                                          mock_database, mock_bridge,
-                                         mock_clboss_bridge):
+  ):
         """Same ChannelInfo indexed under both endpoints returns 1 per query."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
 
         ch = ChannelInfo(
             short_channel_id='123x1x0',
@@ -2023,11 +1994,10 @@ class TestGetUniqueChannelsFor:
         assert result_b[0].short_channel_id == '123x1x0'
 
     def test_multiple_unique_channels(self, mock_plugin, mock_state_manager,
-                                       mock_database, mock_bridge,
-                                       mock_clboss_bridge):
+                                       mock_database, mock_bridge):
         """Two distinct channels under same target returns both."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
 
         ch1 = ChannelInfo(
             short_channel_id='100x1x0',
@@ -2053,10 +2023,10 @@ class TestGetUniqueChannelsFor:
         assert scids == {'100x1x0', '200x2x0'}
 
     def test_empty_target(self, mock_plugin, mock_state_manager,
-                           mock_database, mock_bridge, mock_clboss_bridge):
+                           mock_database, mock_bridge):
         """Unknown target returns empty list."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
 
         planner._network_cache = {}
 
@@ -2065,10 +2035,10 @@ class TestGetUniqueChannelsFor:
 
     def test_get_public_capacity_uses_dedup(self, mock_plugin, mock_state_manager,
                                              mock_database, mock_bridge,
-                                             mock_clboss_bridge):
+   ):
         """_get_public_capacity_to_target counts capacity only once per channel."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
 
         ch = ChannelInfo(
             short_channel_id='123x1x0',
@@ -2095,14 +2065,13 @@ class TestProfitabilityGate:
     """Tests for Fix 5: Profitability gate blocks expansion when too many underwater channels."""
 
     def test_blocks_when_above_40pct_underwater(self, mock_plugin, mock_database,
-            mock_state_manager, mock_bridge, mock_clboss_bridge):
+            mock_state_manager, mock_bridge):
         """Expansion blocked when >40% of channels are underwater."""
         planner = Planner(
             plugin=mock_plugin,
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
         )
         planner.compute_node_summary = MagicMock(return_value={
             'active_channels': 10,
@@ -2128,14 +2097,13 @@ class TestProfitabilityGate:
         assert call_args[1]['result'] == 'skipped'
 
     def test_allows_when_at_or_below_40pct(self, mock_plugin, mock_database,
-            mock_state_manager, mock_bridge, mock_clboss_bridge):
+            mock_state_manager, mock_bridge):
         """Expansion allowed when <=40% underwater (gate only blocks >40%)."""
         planner = Planner(
             plugin=mock_plugin,
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
         )
         planner.compute_node_summary = MagicMock(return_value={
             'active_channels': 10,
@@ -2168,14 +2136,13 @@ class TestProfitabilityGate:
                 pytest.fail("Profitability gate should not have blocked at 40%")
 
     def test_skips_gate_when_summary_unavailable(self, mock_plugin, mock_database,
-            mock_state_manager, mock_bridge, mock_clboss_bridge):
+            mock_state_manager, mock_bridge):
         """Gate skipped when compute_node_summary returns None (RPC failure)."""
         planner = Planner(
             plugin=mock_plugin,
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
         )
         planner.compute_node_summary = MagicMock(return_value=None)
         cfg = MagicMock()
@@ -2204,20 +2171,19 @@ class TestOpenerAwareExpansion:
     """Tests for Fix H2: Allow expansion to peers who opened channels to us."""
 
     def _make_planner(self, mock_plugin, mock_state_manager, mock_database,
-                      mock_bridge, mock_clboss_bridge):
+                      mock_bridge):
         return Planner(
             plugin=mock_plugin,
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
         )
 
     def test_has_existing_returns_opener_remote(self, mock_plugin, mock_state_manager,
-                                                 mock_database, mock_bridge, mock_clboss_bridge):
+                                                 mock_database, mock_bridge):
         """_has_existing_or_pending_channel returns opener='remote' for remote-opened channels."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
         mock_plugin.rpc.listpeerchannels.return_value = {
             'channels': [
                 {'state': 'CHANNELD_NORMAL', 'total_msat': 5_000_000_000, 'opener': 'remote'}
@@ -2230,10 +2196,10 @@ class TestOpenerAwareExpansion:
         assert opener == 'remote'
 
     def test_has_existing_returns_opener_local(self, mock_plugin, mock_state_manager,
-                                                mock_database, mock_bridge, mock_clboss_bridge):
+                                                mock_database, mock_bridge):
         """_has_existing_or_pending_channel returns opener='local' for locally-opened channels."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
         mock_plugin.rpc.listpeerchannels.return_value = {
             'channels': [
                 {'state': 'CHANNELD_NORMAL', 'total_msat': 3_000_000_000, 'opener': 'local'}
@@ -2246,10 +2212,10 @@ class TestOpenerAwareExpansion:
         assert opener == 'local'
 
     def test_no_channel_returns_none_opener(self, mock_plugin, mock_state_manager,
-                                             mock_database, mock_bridge, mock_clboss_bridge):
+                                             mock_database, mock_bridge):
         """No channel returns opener=None in the 4-tuple."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
         mock_plugin.rpc.listpeerchannels.return_value = {'channels': []}
         has, state, capacity, opener = planner._has_existing_or_pending_channel('target_peer')
         assert has is False
@@ -2258,10 +2224,10 @@ class TestOpenerAwareExpansion:
         assert opener is None
 
     def test_underserved_skips_only_locally_opened(self, mock_plugin, mock_state_manager,
-                                                    mock_database, mock_bridge, mock_clboss_bridge):
+                                                    mock_database, mock_bridge):
         """Peers with only remote-opened channels are NOT excluded from underserved targets."""
         planner = self._make_planner(mock_plugin, mock_state_manager,
-                                      mock_database, mock_bridge, mock_clboss_bridge)
+                                      mock_database, mock_bridge)
         # listpeerchannels returns one remote-opened and one local-opened channel
         mock_plugin.rpc.listpeerchannels.return_value = {
             'channels': [

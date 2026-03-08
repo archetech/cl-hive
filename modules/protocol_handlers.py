@@ -476,9 +476,6 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Phase 4: Apply Hive fee policy to this peer
     if bridge and bridge.status == BridgeStatus.ENABLED:
         bridge.set_hive_policy(peer_id, is_member=True)
-        # Also tell CLBoss about this peer (Gateway Pattern)
-        if bridge._clboss_available:
-            bridge.ignore_peer(peer_id)
 
     # Store Hive membership info for ourselves
     if database and our_pubkey:

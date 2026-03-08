@@ -102,7 +102,6 @@ See [Joining the Hive](docs/JOINING_THE_HIVE.md) for the complete guide.
 - `cl-revenue-ops` v1.4.0+ (Recommended for full functionality)
 
 ### Optional Integrations
-- **CLBoss**: Not required. If installed, cl-hive coordinates to prevent redundant channel opens.
 - **Sling**: Not required for cl-hive. Rebalancing is handled by cl-revenue-ops.
 - **cl-hive-comms**: Optional companion plugin for Nostr transport (Phase 6+). If absent, `cl-hive` runs without Nostr transport features.
 - **cl-hive-archon**: Optional Phase 6 Archon sibling plugin for delegated signing. Local CLN HSM signing remains supported.

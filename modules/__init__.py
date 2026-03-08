@@ -10,7 +10,6 @@ This package contains the core modules for the Hive swarm intelligence layer:
 - gossip: Threshold gossiping and anti-entropy sync (Phase 2)
 - intent_manager: Intent Lock conflict resolution (Phase 3)
 - bridge: cl-revenue-ops integration (Phase 4)
-- clboss_bridge: CLBoss conflict prevention (Phase 4)
 - membership: Two-tier membership system (Phase 5)
 - contribution: Contribution ratio tracking (Phase 5)
 - planner: Topology optimization (Phase 6)

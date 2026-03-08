@@ -369,13 +369,10 @@ class TestPlannerFeerateGate:
 
         mock_state_mgr = MagicMock(spec=StateManager)
         mock_bridge = MagicMock()
-        mock_clboss = MagicMock()
-
         planner = Planner(
             state_manager=mock_state_mgr,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss,
             plugin=mock_plugin,
             intent_manager=MagicMock(),
         )

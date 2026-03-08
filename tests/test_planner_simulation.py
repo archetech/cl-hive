@@ -110,16 +110,6 @@ def mock_bridge():
 
 
 @pytest.fixture
-def mock_clboss_bridge():
-    """Mock CLBoss bridge."""
-    cb = MagicMock()
-    cb._available = True
-    cb.ignore_peer.return_value = True
-    cb.unignore_peer.return_value = True
-    return cb
-
-
-@pytest.fixture
 def mock_config():
     """Mock config snapshot."""
     cfg = MagicMock()
@@ -221,7 +211,7 @@ class TestTheStalemate:
         assert we_win is False, "Bob (higher pubkey) should lose"
 
     def test_concurrent_intent_creation(self, mock_database, mock_plugin, mock_state_manager,
-                                         mock_bridge, mock_clboss_bridge):
+                                         mock_bridge):
         """
         Simulate two planners creating intents for the same target concurrently.
 
@@ -292,7 +282,7 @@ class TestTheStalemate:
         assert alice_wins is True  # Alice wins (lower pubkey)
 
     def test_stalemate_no_double_action(self, mock_database, mock_plugin, mock_state_manager,
-                                         mock_bridge, mock_clboss_bridge, mock_config):
+                                         mock_bridge, mock_config):
         """
         When two planners identify the same target, only one should proceed.
 
@@ -317,7 +307,6 @@ class TestTheStalemate:
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
             plugin=mock_plugin,
             intent_manager=alice_intent_mgr
         )
@@ -334,7 +323,6 @@ class TestTheStalemate:
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
             plugin=mock_plugin,
             intent_manager=bob_intent_mgr
         )
@@ -387,7 +375,7 @@ class TestTheFlap:
     """
 
     def test_hysteresis_prevents_flapping(self, mock_state_manager, mock_database,
-                                           mock_bridge, mock_clboss_bridge, mock_plugin,
+                                           mock_bridge, mock_plugin,
                                            mock_config):
         """
         Target at exactly 20% should be ignored, but once ignored,
@@ -399,7 +387,6 @@ class TestTheFlap:
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
             plugin=mock_plugin
         )
 
@@ -417,7 +404,7 @@ class TestTheFlap:
         }
         planner._refresh_network_cache(force=True)
 
-        # Cycle 1: Target at 21% - should be ignored
+        # Cycle 1: Target at 21% - should be flagged as saturated
         # Mock get_saturated_targets to return the saturated target
         with patch.object(planner, 'get_saturated_targets') as mock_saturated:
             mock_saturated.return_value = [
@@ -435,11 +422,8 @@ class TestTheFlap:
 
         # Should have issued ignore
         assert len(decisions_1) == 1
-        assert decisions_1[0]['action'] == 'ignore'
+        assert decisions_1[0]['action'] == 'saturation_detected'
         assert target in planner._ignored_peers
-
-        # Reset mock
-        mock_clboss_bridge.ignore_peer.reset_mock()
 
         # Cycle 2: Target drops to 18% - should NOT release (still above 15%)
         with patch.object(planner, '_calculate_hive_share') as mock_calc:
@@ -456,8 +440,7 @@ class TestTheFlap:
 
         # Should NOT have released (hysteresis)
         assert len(decisions_2) == 0
-        assert target in planner._ignored_peers  # Still ignored
-        mock_clboss_bridge.unignore_peer.assert_not_called()
+        assert target in planner._ignored_peers  # Still flagged
 
         # Cycle 3: Target drops to 14% - NOW should release
         with patch.object(planner, '_calculate_hive_share') as mock_calc:
@@ -474,11 +457,11 @@ class TestTheFlap:
 
         # Should have released
         assert len(decisions_3) == 1
-        assert decisions_3[0]['action'] == 'unignore'
+        assert decisions_3[0]['action'] == 'saturation_released'
         assert target not in planner._ignored_peers
 
     def test_hovering_at_threshold_no_flap(self, mock_state_manager, mock_database,
-                                            mock_bridge, mock_clboss_bridge, mock_plugin,
+                                            mock_bridge, mock_plugin,
                                             mock_config):
         """
         Target oscillating between 19% and 21% should not cause flapping.
@@ -491,7 +474,6 @@ class TestTheFlap:
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
             plugin=mock_plugin
         )
 
@@ -500,22 +482,8 @@ class TestTheFlap:
         planner._refresh_network_cache(force=True)
         planner._network_cache[target] = []
 
-        ignore_count = 0
-        unignore_count = 0
-
-        def count_ignore(*args, **kwargs):
-            nonlocal ignore_count
-            ignore_count += 1
-            return True
-
-        def count_unignore(*args, **kwargs):
-            nonlocal unignore_count
-            unignore_count += 1
-            return True
-
-        # Modern API methods (unmanage_open/manage_open)
-        mock_clboss_bridge.unmanage_open.side_effect = count_ignore
-        mock_clboss_bridge.manage_open.side_effect = count_unignore
+        saturation_count = 0
+        release_count = 0
 
         # Simulate 10 cycles oscillating between 19% and 21%
         for i in range(10):
@@ -537,7 +505,8 @@ class TestTheFlap:
                 else:
                     mock_saturated.return_value = []
 
-                planner._enforce_saturation(mock_config, f'cycle-{i}')
+                decisions = planner._enforce_saturation(mock_config, f'cycle-{i}')
+                saturation_count += sum(1 for d in decisions if d.get('action') == 'saturation_detected')
 
             # Mock _calculate_hive_share for release cycles
             with patch.object(planner, '_calculate_hive_share') as mock_calc:
@@ -550,15 +519,16 @@ class TestTheFlap:
                     should_release=share < SATURATION_RELEASE_THRESHOLD_PCT
                 )
 
-                planner._release_saturation(mock_config, f'cycle-{i}')
+                decisions = planner._release_saturation(mock_config, f'cycle-{i}')
+                release_count += sum(1 for d in decisions if d.get('action') == 'saturation_released')
 
-        # Should have only ONE ignore (on first 21% cycle)
-        # and ZERO unignores (never drops below 15%)
-        assert ignore_count == 1, f"Expected 1 ignore, got {ignore_count}"
-        assert unignore_count == 0, f"Expected 0 unignores, got {unignore_count}"
+        # Should have only ONE saturation detection (on first 21% cycle)
+        # and ZERO releases (never drops below 15%)
+        assert saturation_count == 1, f"Expected 1 saturation detection, got {saturation_count}"
+        assert release_count == 0, f"Expected 0 releases, got {release_count}"
 
     def test_exact_threshold_boundary(self, mock_state_manager, mock_database,
-                                       mock_bridge, mock_clboss_bridge, mock_plugin,
+                                       mock_bridge, mock_plugin,
                                        mock_config):
         """
         Test behavior at exact threshold boundaries (20% and 15%).
@@ -569,7 +539,6 @@ class TestTheFlap:
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
             plugin=mock_plugin
         )
 
@@ -603,7 +572,7 @@ class TestTheFlap:
             decisions = planner._enforce_saturation(mock_config, 'test-over')
 
         assert len(decisions) == 1
-        assert decisions[0]['action'] == 'ignore'
+        assert decisions[0]['action'] == 'saturation_detected'
 
 
 # =============================================================================
@@ -672,7 +641,7 @@ class TestGameTheory:
         assert bob_wins_vs_carol is True  # Bob wins against Carol
 
     def test_expansion_respects_max_per_cycle(self, mock_state_manager, mock_database,
-                                               mock_bridge, mock_clboss_bridge, mock_plugin,
+                                               mock_bridge, mock_plugin,
                                                mock_config):
         """
         Even with multiple underserved targets, only MAX_EXPANSIONS_PER_CYCLE should be proposed.
@@ -690,7 +659,6 @@ class TestGameTheory:
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=mock_bridge,
-            clboss_bridge=mock_clboss_bridge,
             plugin=mock_plugin,
             intent_manager=mock_intent_mgr
         )

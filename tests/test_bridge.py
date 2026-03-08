@@ -2,7 +2,7 @@
 Test Suite for cl-hive Integration Bridge.
 
 Tests the Circuit Breaker pattern, feature detection,
-and integration methods for cl-revenue-ops and CLBoss.
+and integration methods for cl-revenue-ops.
 
 Author: Lightning Goats Team
 """
@@ -185,11 +185,11 @@ class TestBridgeInitialization:
     def test_detect_revenue_ops_not_found(self, bridge, mock_rpc):
         """Detection fails if cl-revenue-ops not in plugin list."""
         mock_rpc.plugin.return_value = {"plugins": [
-            {"name": "clboss", "active": True}
+            {"name": "some-other-plugin", "active": True}
         ]}
-        
+
         status = bridge.initialize()
-        
+
         assert status == BridgeStatus.DISABLED
         assert bridge._revenue_ops_version is None
     
@@ -225,17 +225,6 @@ class TestBridgeInitialization:
         status = bridge.initialize()
         
         assert status == BridgeStatus.DISABLED
-    
-    def test_detect_clboss_success(self, bridge, mock_rpc):
-        """CLBoss detection works correctly."""
-        mock_rpc.plugin.return_value = {"plugins": [
-            {"name": "clboss", "active": True}
-        ]}
-        
-        result = bridge._detect_clboss()
-        
-        assert result is True
-        assert bridge._clboss_available is True
     
     def test_parse_version_with_v_prefix(self, bridge):
         """Version parsing handles 'v' prefix."""
@@ -452,52 +441,6 @@ class TestRevenueOpsIntegration:
 
 
 # =============================================================================
-# CLBOSS INTEGRATION TESTS
-# =============================================================================
-
-class TestClbossIntegration:
-    """Test suite for CLBoss integration methods."""
-    
-    def test_ignore_peer_clboss_unavailable(self, bridge):
-        """ignore_peer returns False when CLBoss unavailable."""
-        result = bridge.ignore_peer("peer123")
-        assert result is False
-    
-    def test_ignore_peer_success(self, bridge, mock_rpc):
-        """ignore_peer calls clboss-ignore correctly."""
-        bridge._status = BridgeStatus.ENABLED
-        bridge._clboss_available = True
-        mock_rpc.call.return_value = {}
-        
-        result = bridge.ignore_peer("peer123" * 5)
-        
-        assert result is True
-        mock_rpc.call.assert_called_with("clboss-ignore", {"nodeid": "peer123" * 5})
-    
-    def test_unignore_peer_success(self, bridge, mock_rpc):
-        """unignore_peer calls clboss-unignore correctly."""
-        bridge._status = BridgeStatus.ENABLED
-        bridge._clboss_available = True
-        mock_rpc.call.return_value = {}
-        
-        result = bridge.unignore_peer("peer123" * 5)
-        
-        assert result is True
-        mock_rpc.call.assert_called_with("clboss-unignore", {"nodeid": "peer123" * 5})
-    
-    def test_clboss_failure_records_failure(self, bridge, mock_rpc):
-        """CLBoss failures are recorded in circuit breaker."""
-        bridge._status = BridgeStatus.ENABLED
-        bridge._clboss_available = True
-        mock_rpc.call.side_effect = RpcError("clboss-ignore", {}, "CLBoss error")
-        
-        result = bridge.ignore_peer("peer123")
-        
-        assert result is False
-        assert bridge._clboss_cb._failure_count == 1
-
-
-# =============================================================================
 # STATISTICS TESTS
 # =============================================================================
 
@@ -507,23 +450,20 @@ class TestBridgeStats:
     def test_get_stats_disabled(self, bridge):
         """get_stats returns expected structure when disabled."""
         stats = bridge.get_stats()
-        
+
         assert stats["status"] == "disabled"
         assert stats["revenue_ops"]["version"] is None
-        assert stats["clboss"]["available"] is False
-    
+
     def test_get_stats_enabled(self, bridge, mock_rpc):
         """get_stats returns expected structure when enabled."""
         bridge._status = BridgeStatus.ENABLED
         bridge._revenue_ops_version = "v1.4.0"
-        bridge._clboss_available = True
-        
+
         stats = bridge.get_stats()
-        
+
         assert stats["status"] == "enabled"
         assert stats["revenue_ops"]["version"] == "v1.4.0"
         assert stats["revenue_ops"]["circuit_breaker"]["state"] == "closed"
-        assert stats["clboss"]["available"] is True
 
 
 # =============================================================================

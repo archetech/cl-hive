@@ -1817,7 +1817,6 @@ def reinit_bridge(ctx: HiveContext) -> Dict[str, Any]:
         "previous_status": previous_status,
         "new_status": new_status.value,
         "revenue_ops_version": ctx.bridge._revenue_ops_version,
-        "clboss_available": ctx.bridge._clboss_available,
         "message": (
             "Bridge enabled successfully" if new_status == BridgeStatus.ENABLED
             else "Bridge still disabled - check cl-revenue-ops installation"

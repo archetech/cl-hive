@@ -51,7 +51,6 @@ Core Lightning
 | `gossip.py` | Threshold-based gossip (10% capacity change) with 5-min heartbeat |
 | `intent_manager.py` | Intent Lock protocol - Announce-Wait-Commit with lexicographic tie-breaker |
 | `bridge.py` | Circuit Breaker pattern for cl-revenue-ops integration |
-| `clboss_bridge.py` | Optional CLBoss integration for saturation control |
 | `membership.py` | Three-tier system: Admin → Member → Neophyte with vouch-based promotion |
 | `contribution.py` | Forwarding stats and anti-leech detection |
 | `planner.py` | Topology optimization - saturation analysis, expansion election, feerate gate |
@@ -194,19 +193,6 @@ The Planner proposes topology changes but cannot open channels directly:
 
 ## Optional Integrations
 
-### CLBoss (Optional)
-CLBoss is **not required** for cl-hive to function. The hive provides its own:
-- **Channel opening**: Cooperative expansion with feerate gate
-- **Fee management**: Delegated to cl-revenue-ops
-- **Rebalancing**: Delegated to cl-revenue-ops + sling
-
-If CLBoss IS installed, cl-hive will:
-- Detect it automatically via plugin list
-- Use `clboss-unmanage` to prevent redundant channel opens to saturated targets
-- Coordinate via the "Gateway Pattern" to avoid conflicts
-
-To run without CLBoss: Simply don't install it. No configuration needed.
-
 ### Sling (Optional for cl-hive)
 Sling rebalancer is optional for cl-hive. cl-revenue-ops handles rebalancing coordination.
 Note: Sling IS required for cl-revenue-ops itself.
@@ -237,7 +223,6 @@ cl-hive/
 │   ├── gossip.py           # Gossip protocol
 │   ├── intent_manager.py   # Intent locks
 │   ├── bridge.py           # cl-revenue-ops bridge (Circuit Breaker)
-│   ├── clboss_bridge.py    # Optional CLBoss bridge
 │   ├── membership.py       # Member management
 │   ├── contribution.py     # Contribution tracking
 │   ├── planner.py          # Topology planner
