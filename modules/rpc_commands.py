@@ -13,7 +13,7 @@ Design Pattern:
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
@@ -3009,8 +3009,6 @@ def get_routing_intelligence(ctx: HiveContext, scid: str = None) -> Dict[str, An
             "timestamp": 1234567890
         }
     """
-    import time
-
     if not ctx.fee_coordination_mgr:
         return {"error": "Fee coordination not initialized"}
 
@@ -4943,6 +4941,14 @@ def get_channel_ages(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
         # Get all channels
         channels = ctx.safe_plugin.rpc.listpeerchannels()
 
+        # Fetch blockheight once (constant across iterations)
+        current_block = 0
+        try:
+            info = ctx.safe_plugin.rpc.getinfo()
+            current_block = info.get('blockheight', 0)
+        except Exception:
+            pass
+
         for ch in channels.get('channels', []):
             ch_scid = ch.get('short_channel_id')
             if not ch_scid:
@@ -4959,10 +4965,6 @@ def get_channel_ages(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
                 parts = ch_scid.split('x')
                 if len(parts) >= 3:
                     funding_block = int(parts[0])
-
-                    # Get current blockheight
-                    info = ctx.safe_plugin.rpc.getinfo()
-                    current_block = info.get('blockheight', funding_block)
 
                     blocks_old = current_block - funding_block
                     # Approximate 10 minutes per block
@@ -5028,7 +5030,6 @@ def did_issue_credential(ctx: HiveContext, subject_id: str, domain: str,
         return {"error": "DID credential manager not initialized"}
 
     try:
-        import json
         metrics = json.loads(metrics_json)
     except (json.JSONDecodeError, TypeError):
         return {"error": "invalid metrics_json: must be valid JSON"}
