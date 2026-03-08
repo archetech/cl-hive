@@ -17,6 +17,7 @@ Expansion logic will be added in later tickets.
 Author: Lightning Goats Team
 """
 
+import math
 import time
 import secrets
 from dataclasses import dataclass
@@ -41,6 +42,8 @@ except ImportError:
         INTENT = 'intent'
     def serialize(msg_type, payload):
         return b''
+    def get_intent_signing_payload(payload):
+        return ''
 
 try:
     from modules.quality_scorer import PeerQualityScorer
@@ -304,7 +307,6 @@ class ChannelSizer:
         # Factor 1: Target Capacity Score (0.0 to 2.0)
         # Mid-sized nodes preferred - they accept smaller channel minimums
         # =================================================================
-        import math
         btc_capacity = target_capacity_sats / 100_000_000
         if btc_capacity <= 0:
             capacity_score = 0.5
