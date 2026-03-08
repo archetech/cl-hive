@@ -504,7 +504,9 @@ class MCFNetwork:
             True if the node was added or already exists, False if at capacity
         """
         if len(self.nodes) >= MAX_MCF_NODES:
-            return node_id in self.nodes  # False if new node rejected, True if already present
+            if node_id not in self.nodes:
+                return False  # New node rejected, at capacity
+            # Node exists — fall through to update supply/is_fleet_member below
 
         if node_id not in self.nodes:
             self.nodes[node_id] = MCFNode(
