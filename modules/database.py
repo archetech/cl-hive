@@ -21,7 +21,7 @@ import threading
 import hashlib
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Any, Tuple, Generator
-from pathlib import Path
+
 
 
 class HiveDatabase:
@@ -1865,14 +1865,6 @@ class HiveDatabase:
         )
         return result.rowcount > 0
     
-    def get_member_count_by_tier(self) -> Dict[str, int]:
-        """Get count of members by tier."""
-        conn = self._get_connection()
-        rows = conn.execute(
-            "SELECT tier, COUNT(*) as count FROM hive_members GROUP BY tier"
-        ).fetchall()
-        return {row['tier']: row['count'] for row in rows}
-    
     # =========================================================================
     # INTENT LOCK OPERATIONS
     # =========================================================================
@@ -2174,22 +2166,6 @@ class HiveDatabase:
                 now, state_hash, peer_id, peer_id
             ))
     
-    def get_hive_state(self, peer_id: str) -> Optional[Dict]:
-        """Get cached state for a Hive peer."""
-        conn = self._get_connection()
-        row = conn.execute(
-            "SELECT * FROM hive_state WHERE peer_id = ?",
-            (peer_id,)
-        ).fetchone()
-        
-        if not row:
-            return None
-        
-        result = dict(row)
-        result['fee_policy'] = json.loads(result['fee_policy'] or '{}')
-        result['topology'] = json.loads(result['topology'] or '[]')
-        return result
-    
     def get_all_hive_states(self) -> List[Dict]:
         """Get cached state for all Hive peers."""
         conn = self._get_connection()
@@ -2202,11 +2178,6 @@ class HiveDatabase:
             result['topology'] = json.loads(result['topology'] or '[]')
             results.append(result)
         return results
-
-    def delete_hive_state(self, peer_id: str) -> None:
-        """Delete a peer's cached Hive state from the database."""
-        conn = self._get_connection()
-        conn.execute("DELETE FROM hive_state WHERE peer_id = ?", (peer_id,))
 
     def delete_hive_state_if_stale(self, peer_id: str, cutoff_timestamp: int) -> bool:
         """Delete a peer's state only if it's still stale (last_gossip < cutoff).
@@ -2672,44 +2643,6 @@ class HiveDatabase:
         """, (now,))
         return cursor.rowcount
 
-    def get_expired_ban_proposals(self, now_ts: int) -> List[Dict[str, Any]]:
-        """Return all pending ban proposals where expires_at < now_ts."""
-        conn = self._get_connection()
-        rows = conn.execute("""
-            SELECT * FROM ban_proposals
-            WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < ?
-            ORDER BY proposed_at ASC
-        """, (now_ts,)).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_expired_settlement_gaming_proposals(self, now_ts: int,
-                                                 voting_window_seconds: int = 86400
-                                                 ) -> List[Dict[str, Any]]:
-        """
-        Get settlement_gaming ban proposals whose voting window has expired.
-
-        Settlement gaming proposals use reversed voting: non-votes count as
-        approval. This method returns pending proposals where the voting
-        window (proposed_at + voting_window_seconds) has elapsed, so the
-        caller can finalize them.
-
-        Args:
-            now_ts: Current unix timestamp
-            voting_window_seconds: Duration of voting window (default 86400 = 24h)
-
-        Returns:
-            List of expired settlement_gaming proposal dicts
-        """
-        conn = self._get_connection()
-        rows = conn.execute("""
-            SELECT * FROM ban_proposals
-            WHERE proposal_type = 'settlement_gaming'
-              AND status = 'pending'
-              AND (proposed_at + ?) < ?
-            ORDER BY proposed_at ASC
-        """, (voting_window_seconds, now_ts)).fetchall()
-        return [dict(row) for row in rows]
-
     def prune_old_ban_data(self, older_than_days: int = 180) -> int:
         """
         Remove old ban proposals and their votes for terminal states.
@@ -2953,26 +2886,6 @@ class HiveDatabase:
             (peer_id,)
         ).fetchone()
         return dict(row) if row else None
-    
-    def remove_ban(self, peer_id: str) -> bool:
-        """Remove a ban (unban a peer)."""
-        conn = self._get_connection()
-        result = conn.execute(
-            "DELETE FROM hive_bans WHERE peer_id = ?",
-            (peer_id,)
-        )
-        return result.rowcount > 0
-    
-    def get_all_bans(self) -> List[Dict]:
-        """Get all active bans."""
-        conn = self._get_connection()
-        now = int(time.time())
-        rows = conn.execute("""
-            SELECT * FROM hive_bans
-            WHERE expires_at IS NULL OR expires_at > ?
-            LIMIT 1000
-        """, (now,)).fetchall()
-        return [dict(row) for row in rows]
     
     # =========================================================================
     # PENDING ACTIONS (Advisor Mode)
@@ -3828,43 +3741,6 @@ class HiveDatabase:
             "reporter_scores": reporter_scores
         }
 
-    def get_recent_channel_events(self, event_types: List[str] = None,
-                                   days: int = 7, limit: int = 100) -> List[Dict[str, Any]]:
-        """
-        Get recent channel events across all peers.
-
-        Useful for topology monitoring and cooperative expansion decisions.
-
-        Args:
-            event_types: Filter by event types (default: all)
-            days: Only include events from last N days (default: 7)
-            limit: Maximum number of events (default: 100)
-
-        Returns:
-            List of recent events with peer summaries
-        """
-        conn = self._get_connection()
-        cutoff = int(time.time()) - (days * 86400)
-
-        if event_types:
-            placeholders = ','.join('?' * len(event_types))
-            query = f"""
-                SELECT * FROM peer_events
-                WHERE timestamp > ? AND event_type IN ({placeholders})
-                ORDER BY timestamp DESC LIMIT ?
-            """
-            params = [cutoff] + event_types + [limit]
-        else:
-            query = """
-                SELECT * FROM peer_events
-                WHERE timestamp > ?
-                ORDER BY timestamp DESC LIMIT ?
-            """
-            params = [cutoff, limit]
-
-        rows = conn.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
-
     def get_peers_with_events(self, days: int = 90, limit: int = 500) -> List[str]:
         """
         Get list of all external peers that have event history.
@@ -3971,40 +3847,6 @@ class HiveDatabase:
             self.plugin.log(f"Failed to record budget spend: {e}", level='error')
             return False
 
-    def record_delegation_attempt(
-        self,
-        original_action_id: int,
-        target: str,
-        delegation_count: int,
-        failure_type: str
-    ) -> bool:
-        """
-        Record a channel open delegation attempt.
-
-        Args:
-            original_action_id: ID of the failed action being delegated
-            target: Target peer ID for the channel
-            delegation_count: Number of delegation requests sent
-            failure_type: Type of failure that triggered delegation
-
-        Returns:
-            True if recorded successfully
-        """
-        conn = self._get_connection()
-        now = int(time.time())
-
-        try:
-            conn.execute("""
-                INSERT INTO delegation_attempts
-                (original_action_id, target, delegation_count, failure_type, timestamp, status)
-                VALUES (?, ?, ?, ?, ?, 'pending')
-            """, (original_action_id, target, delegation_count, failure_type, now))
-            return True
-        except Exception as e:
-            # Table might not exist yet - that's OK for new feature
-            self.plugin.log(f"Failed to record delegation attempt: {e}", level='debug')
-            return False
-
     # =========================================================================
     # TASK DELEGATION (Phase 10)
     # =========================================================================
@@ -4104,16 +3946,6 @@ class HiveDatabase:
         """, (request_id,)).fetchone()
         return dict(row) if row else None
 
-    def get_pending_outgoing_tasks(self) -> List[Dict[str, Any]]:
-        """Get all pending outgoing task requests."""
-        conn = self._get_connection()
-        rows = conn.execute("""
-            SELECT * FROM task_requests_outgoing
-            WHERE status IN ('pending', 'in_progress')
-            ORDER BY created_at DESC
-        """).fetchall()
-        return [dict(row) for row in rows]
-
     def create_incoming_task_request(
         self,
         request_id: str,
@@ -4203,24 +4035,6 @@ class HiveDatabase:
             self.plugin.log(f"Failed to update incoming task: {e}", level='debug')
             return False
 
-    def get_incoming_task(self, request_id: str) -> Optional[Dict[str, Any]]:
-        """Get an incoming task request by ID."""
-        conn = self._get_connection()
-        row = conn.execute("""
-            SELECT * FROM task_requests_incoming WHERE request_id = ?
-        """, (request_id,)).fetchone()
-        return dict(row) if row else None
-
-    def get_pending_incoming_tasks(self) -> List[Dict[str, Any]]:
-        """Get all pending/accepted incoming task requests."""
-        conn = self._get_connection()
-        rows = conn.execute("""
-            SELECT * FROM task_requests_incoming
-            WHERE status IN ('pending', 'accepted')
-            ORDER BY priority DESC, received_at ASC
-        """).fetchall()
-        return [dict(row) for row in rows]
-
     def count_active_incoming_tasks(self) -> int:
         """Count tasks we've accepted but not completed."""
         conn = self._get_connection()
@@ -4229,38 +4043,6 @@ class HiveDatabase:
             WHERE status = 'accepted'
         """).fetchone()
         return result['count'] if result else 0
-
-    def cleanup_expired_tasks(self, max_age_hours: int = 24) -> int:
-        """
-        Clean up old task requests.
-
-        Args:
-            max_age_hours: Delete tasks older than this
-
-        Returns:
-            Number of tasks deleted
-        """
-        conn = self._get_connection()
-        cutoff = int(time.time()) - (max_age_hours * 3600)
-
-        try:
-            # Clean outgoing
-            cursor = conn.execute("""
-                DELETE FROM task_requests_outgoing
-                WHERE created_at < ? AND status IN ('completed', 'failed')
-            """, (cutoff,))
-            deleted = cursor.rowcount
-
-            # Clean incoming
-            cursor = conn.execute("""
-                DELETE FROM task_requests_incoming
-                WHERE received_at < ? AND status IN ('completed', 'failed', 'rejected')
-            """, (cutoff,))
-            deleted += cursor.rowcount
-
-            return deleted
-        except Exception:
-            return 0
 
     def get_daily_spend(self, date_key: str = None) -> int:
         """
@@ -4450,17 +4232,6 @@ class HiveDatabase:
         """, (round_id,)).fetchall()
         return [dict(row) for row in rows]
 
-    def get_total_held_for_peer(self, peer_id: str) -> int:
-        """Get total amount held for a peer across active holds."""
-        conn = self._get_connection()
-        now = int(time.time())
-        row = conn.execute("""
-            SELECT COALESCE(SUM(amount_sats), 0) as total
-            FROM budget_holds
-            WHERE peer_id = ? AND status = 'active' AND expires_at > ?
-        """, (peer_id, now)).fetchone()
-        return row['total'] if row else 0
-
     def cleanup_expired_holds(self) -> int:
         """Mark all expired holds as expired. Returns count."""
         conn = self._get_connection()
@@ -4552,30 +4323,6 @@ class HiveDatabase:
             WHERE target_peer_id = ? AND timestamp >= ?
             ORDER BY timestamp DESC
         """, (target_peer_id, cutoff)).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_fee_intelligence_by_reporter(
-        self,
-        reporter_id: str,
-        max_age_hours: int = 24
-    ) -> List[Dict[str, Any]]:
-        """
-        Get all fee intelligence reports from a specific reporter.
-
-        Args:
-            reporter_id: Hive member who reported
-            max_age_hours: Maximum age of reports in hours
-
-        Returns:
-            List of fee intelligence reports
-        """
-        conn = self._get_connection()
-        cutoff = int(time.time()) - (max_age_hours * 3600)
-        rows = conn.execute("""
-            SELECT * FROM fee_intelligence
-            WHERE reporter_id = ? AND timestamp >= ?
-            ORDER BY timestamp DESC
-        """, (reporter_id, cutoff)).fetchall()
         return [dict(row) for row in rows]
 
     def get_all_fee_intelligence(
@@ -4972,59 +4719,6 @@ class HiveDatabase:
                     ) VALUES (?, 0, 0, ?, ?, ?)
                 """, (member_id, 1 if rebalancing_active else 0, peers_json, ts))
 
-    def get_member_liquidity_state(
-        self,
-        member_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Get liquidity state for a hive member.
-
-        Args:
-            member_id: Hive member peer ID
-
-        Returns:
-            Liquidity state dict or None if not found
-        """
-        import json
-        conn = self._get_connection()
-        row = conn.execute("""
-            SELECT * FROM member_liquidity_state WHERE peer_id = ?
-        """, (member_id,)).fetchone()
-
-        if not row:
-            return None
-
-        result = dict(row)
-        result['rebalancing_active'] = bool(result.get('rebalancing_active', 0))
-        result['rebalancing_peers'] = json.loads(
-            result.get('rebalancing_peers', '[]')
-        )
-        return result
-
-    def get_all_member_liquidity_states(self) -> List[Dict[str, Any]]:
-        """
-        Get liquidity state for all members.
-
-        Returns:
-            List of liquidity state dicts
-        """
-        import json
-        conn = self._get_connection()
-        rows = conn.execute("""
-            SELECT * FROM member_liquidity_state
-            ORDER BY timestamp DESC LIMIT 1000
-        """).fetchall()
-
-        results = []
-        for row in rows:
-            result = dict(row)
-            result['rebalancing_active'] = bool(result.get('rebalancing_active', 0))
-            result['rebalancing_peers'] = json.loads(
-                result.get('rebalancing_peers', '[]')
-            )
-            results.append(result)
-        return results
-
     # =========================================================================
     # LIQUIDITY NEEDS OPERATIONS (Phase 7.3 - Cooperative Rebalancing)
     # =========================================================================
@@ -5066,28 +4760,6 @@ class HiveDatabase:
             reporter_id, need_type, target_peer_id, amount_sats, urgency,
             max_fee_ppm, reason, current_balance_pct, now
         ))
-
-    def get_liquidity_need(
-        self,
-        reporter_id: str,
-        target_peer_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Get a specific liquidity need.
-
-        Args:
-            reporter_id: Hive member who reported
-            target_peer_id: Target peer
-
-        Returns:
-            Liquidity need dict or None
-        """
-        conn = self._get_connection()
-        row = conn.execute("""
-            SELECT * FROM liquidity_needs
-            WHERE reporter_id = ? AND target_peer_id = ?
-        """, (reporter_id, target_peer_id)).fetchone()
-        return dict(row) if row else None
 
     def get_all_liquidity_needs(
         self,
@@ -5138,38 +4810,6 @@ class HiveDatabase:
             WHERE reporter_id = ?
             ORDER BY timestamp DESC
         """, (reporter_id,)).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_urgent_liquidity_needs(
-        self,
-        urgency_levels: List[str] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Get liquidity needs by urgency level.
-
-        Args:
-            urgency_levels: List of urgency levels to include
-                           (default: critical, high)
-
-        Returns:
-            List of liquidity need dicts
-        """
-        if urgency_levels is None:
-            urgency_levels = ["critical", "high"]
-
-        conn = self._get_connection()
-        placeholders = ",".join("?" * len(urgency_levels))
-        rows = conn.execute(f"""
-            SELECT * FROM liquidity_needs
-            WHERE urgency IN ({placeholders})
-            ORDER BY
-                CASE urgency
-                    WHEN 'critical' THEN 1
-                    WHEN 'high' THEN 2
-                    ELSE 3
-                END,
-                timestamp DESC
-        """, urgency_levels).fetchall()
         return [dict(row) for row in rows]
 
     def cleanup_old_liquidity_needs(self, max_age_hours: int = 24) -> int:
@@ -5317,57 +4957,6 @@ class HiveDatabase:
 
         return results
 
-    def get_route_probe_stats(
-        self,
-        destination: str
-    ) -> Dict[str, Any]:
-        """
-        Get aggregated statistics for routes to a destination.
-
-        Args:
-            destination: Destination pubkey
-
-        Returns:
-            Dict with route statistics
-        """
-        conn = self._get_connection()
-
-        row = conn.execute("""
-            SELECT
-                COUNT(*) as probe_count,
-                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success_count,
-                AVG(CASE WHEN success = 1 THEN latency_ms ELSE NULL END) as avg_latency,
-                AVG(CASE WHEN success = 1 THEN total_fee_ppm ELSE NULL END) as avg_fee,
-                MAX(CASE WHEN success = 1 THEN timestamp ELSE 0 END) as last_success,
-                COUNT(DISTINCT reporter_id) as reporter_count
-            FROM route_probes
-            WHERE destination = ?
-        """, (destination,)).fetchone()
-
-        if not row:
-            return {
-                "probe_count": 0,
-                "success_count": 0,
-                "success_rate": 0.0,
-                "avg_latency_ms": 0,
-                "avg_fee_ppm": 0,
-                "last_success": 0,
-                "reporter_count": 0
-            }
-
-        probe_count = row["probe_count"] or 0
-        success_count = row["success_count"] or 0
-
-        return {
-            "probe_count": probe_count,
-            "success_count": success_count,
-            "success_rate": success_count / probe_count if probe_count > 0 else 0.0,
-            "avg_latency_ms": int(row["avg_latency"] or 0),
-            "avg_fee_ppm": int(row["avg_fee"] or 0),
-            "last_success": row["last_success"] or 0,
-            "reporter_count": row["reporter_count"] or 0
-        }
-
     def cleanup_old_route_probes(self, max_age_hours: int = 168) -> int:
         """
         Remove old route probe records.
@@ -5499,24 +5088,6 @@ class HiveDatabase:
             reports.append(report)
 
         return reports
-
-    def get_peer_reputation_reporters(self, peer_id: str) -> list:
-        """
-        Get list of reporters who have submitted reports for a peer.
-
-        Args:
-            peer_id: External peer pubkey
-
-        Returns:
-            List of unique reporter pubkeys
-        """
-        conn = self._get_connection()
-        rows = conn.execute("""
-            SELECT DISTINCT reporter_id FROM peer_reputation
-            WHERE peer_id = ?
-        """, (peer_id,)).fetchall()
-
-        return [row["reporter_id"] for row in rows]
 
     def cleanup_old_peer_reputation(self, max_age_hours: int = 168) -> int:
         """
@@ -6003,31 +5574,6 @@ class HiveDatabase:
 
         return [dict(row) for row in rows]
 
-    def get_all_flow_samples(
-        self,
-        days: int = 14
-    ) -> List[Dict[str, Any]]:
-        """
-        Get all flow samples within timeframe.
-
-        Args:
-            days: Number of days of history to retrieve
-
-        Returns:
-            List of flow sample dicts
-        """
-        conn = self._get_connection()
-        cutoff = int(time.time()) - (days * 24 * 3600)
-
-        rows = conn.execute("""
-            SELECT * FROM flow_samples
-            WHERE timestamp > ?
-            ORDER BY timestamp DESC
-            LIMIT 50000
-        """, (cutoff,)).fetchall()
-
-        return [dict(row) for row in rows]
-
     def prune_old_flow_samples(self, days_to_keep: int = 30) -> int:
         """
         Remove old flow samples to limit database growth.
@@ -6053,120 +5599,6 @@ class HiveDatabase:
                 level="debug"
             )
         return deleted
-
-    # =========================================================================
-    # TEMPORAL PATTERNS OPERATIONS (Phase 7.1 - Anticipatory Liquidity)
-    # =========================================================================
-
-    def save_temporal_pattern(
-        self,
-        channel_id: str,
-        hour_of_day: Optional[int],
-        day_of_week: Optional[int],
-        direction: str,
-        intensity: float,
-        confidence: float,
-        samples: int,
-        avg_flow_sats: int,
-        detected_at: int
-    ) -> bool:
-        """
-        Save or update a temporal pattern.
-
-        Args:
-            channel_id: Channel SCID
-            hour_of_day: Hour (0-23) or None for all hours
-            day_of_week: Day (0-6) or None for all days
-            direction: "inbound", "outbound", or "balanced"
-            intensity: Relative intensity (1.0 = average)
-            confidence: Pattern confidence (0.0-1.0)
-            samples: Number of observations
-            avg_flow_sats: Average flow in this window
-            detected_at: Detection timestamp
-
-        Returns:
-            True if saved successfully
-        """
-        conn = self._get_connection()
-        try:
-            conn.execute("""
-                INSERT INTO temporal_patterns
-                (channel_id, hour_of_day, day_of_week, direction, intensity,
-                 confidence, samples, avg_flow_sats, detected_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(channel_id, hour_of_day, day_of_week)
-                DO UPDATE SET
-                    direction = excluded.direction,
-                    intensity = excluded.intensity,
-                    confidence = excluded.confidence,
-                    samples = excluded.samples,
-                    avg_flow_sats = excluded.avg_flow_sats,
-                    detected_at = excluded.detected_at
-            """, (channel_id, hour_of_day, day_of_week, direction, intensity,
-                  confidence, samples, avg_flow_sats, detected_at))
-            return True
-        except Exception as e:
-            self.plugin.log(
-                f"Failed to save temporal pattern: {e}",
-                level="debug"
-            )
-            return False
-
-    def get_temporal_patterns(
-        self,
-        channel_id: str = None,
-        min_confidence: float = 0.5
-    ) -> List[Dict[str, Any]]:
-        """
-        Get temporal patterns, optionally filtered by channel.
-
-        Args:
-            channel_id: Filter by channel (None for all)
-            min_confidence: Minimum confidence threshold
-
-        Returns:
-            List of pattern dicts
-        """
-        conn = self._get_connection()
-
-        if channel_id:
-            rows = conn.execute("""
-                SELECT * FROM temporal_patterns
-                WHERE channel_id = ? AND confidence >= ?
-                ORDER BY confidence DESC
-                LIMIT 5000
-            """, (channel_id, min_confidence)).fetchall()
-        else:
-            rows = conn.execute("""
-                SELECT * FROM temporal_patterns
-                WHERE confidence >= ?
-                ORDER BY confidence DESC
-                LIMIT 5000
-            """, (min_confidence,)).fetchall()
-
-        return [dict(row) for row in rows]
-
-    def clear_temporal_patterns(self, channel_id: str = None) -> int:
-        """
-        Clear temporal patterns, optionally for a specific channel.
-
-        Args:
-            channel_id: Channel to clear (None for all)
-
-        Returns:
-            Number of patterns deleted
-        """
-        conn = self._get_connection()
-
-        if channel_id:
-            result = conn.execute("""
-                DELETE FROM temporal_patterns
-                WHERE channel_id = ?
-            """, (channel_id,))
-        else:
-            result = conn.execute("DELETE FROM temporal_patterns")
-
-        return result.rowcount
 
     # =========================================================================
     # LOCAL FEE TRACKING OPERATIONS
@@ -6323,26 +5755,6 @@ class HiveDatabase:
             "window_start_ts": row["window_start_ts"],
             "event_count": row["event_count"]
         }
-
-    def cleanup_old_rate_limits(self, max_age_seconds: int = 86400) -> int:
-        """
-        Clean up rate limit entries older than max_age_seconds.
-
-        Args:
-            max_age_seconds: Maximum age before cleanup (default 24h)
-
-        Returns:
-            Number of entries removed
-        """
-        conn = self._get_connection()
-        cutoff = int(time.time()) - max_age_seconds
-
-        result = conn.execute("""
-            DELETE FROM contribution_rate_limits
-            WHERE window_start < ?
-        """, (cutoff,))
-
-        return result.rowcount
 
     # =========================================================================
     # SPLICE SESSION OPERATIONS (Phase 11)
@@ -6689,28 +6101,6 @@ class HiveDatabase:
         """).fetchall()
         return [dict(row) for row in rows]
 
-    def cleanup_old_fee_reports(self, keep_periods: int = 4) -> int:
-        """
-        Remove fee reports older than keep_periods weeks.
-
-        Args:
-            keep_periods: Number of recent periods to keep (default 4 weeks)
-
-        Returns:
-            Number of rows deleted
-        """
-        conn = self._get_connection()
-        # Get current period and calculate cutoff
-        import datetime
-        now = datetime.datetime.now(tz=datetime.timezone.utc)
-        cutoff_date = now - datetime.timedelta(weeks=keep_periods)
-        cutoff_period = f"{cutoff_date.isocalendar()[0]}-{cutoff_date.isocalendar()[1]:02d}"
-
-        result = conn.execute("""
-            DELETE FROM fee_reports WHERE period < ?
-        """, (cutoff_period,))
-        return result.rowcount
-
     # =========================================================================
     # DISTRIBUTED SETTLEMENT OPERATIONS (Phase 12)
     # =========================================================================
@@ -6873,41 +6263,6 @@ class HiveDatabase:
             WHERE status = 'ready'
             ORDER BY proposed_at ASC
         """).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_proposals_needing_rebroadcast(
-        self,
-        rebroadcast_interval_seconds: int,
-        our_peer_id: str
-    ) -> List[Dict[str, Any]]:
-        """
-        Get pending proposals that need rebroadcast (Issue #49).
-
-        Returns proposals where:
-        - Status is 'pending' (not yet at quorum)
-        - Not expired
-        - We are the proposer
-        - Last broadcast was more than rebroadcast_interval_seconds ago
-
-        Args:
-            rebroadcast_interval_seconds: Minimum seconds between broadcasts
-            our_peer_id: Our node's public key (only proposer rebroadcasts)
-
-        Returns:
-            List of proposals needing rebroadcast
-        """
-        conn = self._get_connection()
-        now = int(time.time())
-        cutoff = now - rebroadcast_interval_seconds
-
-        rows = conn.execute("""
-            SELECT * FROM settlement_proposals
-            WHERE status = 'pending'
-            AND expires_at > ?
-            AND proposer_peer_id = ?
-            AND (last_broadcast_at IS NULL OR last_broadcast_at < ?)
-            ORDER BY proposed_at ASC
-        """, (now, our_peer_id, cutoff)).fetchall()
         return [dict(row) for row in rows]
 
     def update_proposal_broadcast_time(
@@ -7768,12 +7123,12 @@ class HiveDatabase:
         """
         with self.transaction() as conn:
             conn.execute("DELETE FROM pheromone_levels")
-            for row in levels:
-                conn.execute(
-                    """INSERT INTO pheromone_levels (channel_id, level, fee_ppm, last_update)
-                       VALUES (?, ?, ?, ?)""",
-                    (row['channel_id'], row['level'], row['fee_ppm'], row['last_update'])
-                )
+            conn.executemany(
+                """INSERT INTO pheromone_levels (channel_id, level, fee_ppm, last_update)
+                   VALUES (?, ?, ?, ?)""",
+                [(row['channel_id'], row['level'], row['fee_ppm'], row['last_update'])
+                 for row in levels]
+            )
         return len(levels)
 
     def load_pheromone_levels(self) -> List[Dict[str, Any]]:
@@ -7796,17 +7151,17 @@ class HiveDatabase:
         """
         with self.transaction() as conn:
             conn.execute("DELETE FROM stigmergic_markers")
-            for row in markers:
-                conn.execute(
-                    """INSERT INTO stigmergic_markers
-                       (depositor, source_peer_id, destination_peer_id,
-                        fee_ppm, success, volume_sats, timestamp, strength)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (row['depositor'], row['source_peer_id'],
-                     row['destination_peer_id'], row['fee_ppm'],
-                     1 if row['success'] else 0, row['volume_sats'],
-                     row['timestamp'], row['strength'])
-                )
+            conn.executemany(
+                """INSERT INTO stigmergic_markers
+                   (depositor, source_peer_id, destination_peer_id,
+                    fee_ppm, success, volume_sats, timestamp, strength)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(row['depositor'], row['source_peer_id'],
+                  row['destination_peer_id'], row['fee_ppm'],
+                  1 if row['success'] else 0, row['volume_sats'],
+                  row['timestamp'], row['strength'])
+                 for row in markers]
+            )
         return len(markers)
 
     def load_stigmergic_markers(self) -> List[Dict[str, Any]]:
@@ -7854,23 +7209,23 @@ class HiveDatabase:
         with self.transaction() as conn:
             conn.execute("DELETE FROM defense_warning_reports")
             conn.execute("DELETE FROM defense_active_fees")
-            for row in reports:
-                conn.execute(
-                    """INSERT INTO defense_warning_reports
-                       (peer_id, reporter_id, threat_type, severity, timestamp, ttl, evidence_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (row['peer_id'], row['reporter_id'], row['threat_type'],
-                     row['severity'], row['timestamp'], row['ttl'],
-                     row.get('evidence_json', '{}'))
-                )
-            for row in active_fees:
-                conn.execute(
-                    """INSERT INTO defense_active_fees
-                       (peer_id, multiplier, expires_at, threat_type, reporter, report_count)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (row['peer_id'], row['multiplier'], row['expires_at'],
-                     row['threat_type'], row['reporter'], row['report_count'])
-                )
+            conn.executemany(
+                """INSERT INTO defense_warning_reports
+                   (peer_id, reporter_id, threat_type, severity, timestamp, ttl, evidence_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [(row['peer_id'], row['reporter_id'], row['threat_type'],
+                  row['severity'], row['timestamp'], row['ttl'],
+                  row.get('evidence_json', '{}'))
+                 for row in reports]
+            )
+            conn.executemany(
+                """INSERT INTO defense_active_fees
+                   (peer_id, multiplier, expires_at, threat_type, reporter, report_count)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [(row['peer_id'], row['multiplier'], row['expires_at'],
+                  row['threat_type'], row['reporter'], row['report_count'])
+                 for row in active_fees]
+            )
         return len(reports) + len(active_fees)
 
     def load_defense_state(self) -> Dict[str, Any]:
@@ -7905,14 +7260,14 @@ class HiveDatabase:
         """
         with self.transaction() as conn:
             conn.execute("DELETE FROM remote_pheromones")
-            for row in pheromones:
-                conn.execute(
-                    """INSERT INTO remote_pheromones
-                       (peer_id, reporter_id, level, fee_ppm, timestamp, weight)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (row['peer_id'], row['reporter_id'], row['level'],
-                     row['fee_ppm'], row['timestamp'], row['weight'])
-                )
+            conn.executemany(
+                """INSERT INTO remote_pheromones
+                   (peer_id, reporter_id, level, fee_ppm, timestamp, weight)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [(row['peer_id'], row['reporter_id'], row['level'],
+                  row['fee_ppm'], row['timestamp'], row['weight'])
+                 for row in pheromones]
+            )
         return len(pheromones)
 
     def load_remote_pheromones(self) -> List[Dict[str, Any]]:
@@ -7933,12 +7288,11 @@ class HiveDatabase:
         """
         with self.transaction() as conn:
             conn.execute("DELETE FROM fee_observations")
-            for row in observations:
-                conn.execute(
-                    """INSERT INTO fee_observations (timestamp, fee_ppm)
-                       VALUES (?, ?)""",
-                    (row['timestamp'], row['fee_ppm'])
-                )
+            conn.executemany(
+                """INSERT INTO fee_observations (timestamp, fee_ppm)
+                   VALUES (?, ?)""",
+                [(row['timestamp'], row['fee_ppm']) for row in observations]
+            )
         return len(observations)
 
     def load_fee_observations(self) -> List[Dict[str, Any]]:
@@ -8273,17 +7627,6 @@ class HiveDatabase:
                 level='error'
             )
             return False
-
-    def get_management_receipts(self, credential_id: str,
-                                 limit: int = 100) -> List[Dict[str, Any]]:
-        """Get management receipts for a credential."""
-        conn = self._get_connection()
-        rows = conn.execute(
-            "SELECT * FROM management_receipts WHERE credential_id = ? "
-            "ORDER BY executed_at DESC LIMIT ?",
-            (credential_id, limit)
-        ).fetchall()
-        return [dict(r) for r in rows]
 
     # =========================================================================
     # PHASE 5A: NOSTR TRANSPORT STATE
@@ -8789,14 +8132,6 @@ class HiveDatabase:
             )
             return False
 
-    def count_bonds(self) -> int:
-        """Count total bonds."""
-        conn = self._get_connection()
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM settlement_bonds"
-        ).fetchone()
-        return row['cnt'] if row else 0
-
     # =========================================================================
     # PHASE 4B: SETTLEMENT OBLIGATIONS
     # =========================================================================
@@ -8928,14 +8263,6 @@ class HiveDatabase:
             )
             return 0
 
-    def count_obligations(self) -> int:
-        """Count total obligations."""
-        conn = self._get_connection()
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM settlement_obligations"
-        ).fetchone()
-        return row['cnt'] if row else 0
-
     # =========================================================================
     # PHASE 4B: SETTLEMENT DISPUTES
     # =========================================================================
@@ -9037,10 +8364,3 @@ class HiveDatabase:
             )
             return False
 
-    def count_disputes(self) -> int:
-        """Count total disputes."""
-        conn = self._get_connection()
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM settlement_disputes"
-        ).fetchone()
-        return row['cnt'] if row else 0
