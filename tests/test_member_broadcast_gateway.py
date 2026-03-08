@@ -2,6 +2,7 @@
 
 import importlib.util
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -99,12 +100,24 @@ class TestMemberBroadcastGateway:
             log=lambda *args, **kwargs: None,
         )
 
+        shutdown_event = threading.Event()
+        cl_hive.shutdown_event = shutdown_event
+
+        # Sync module globals into protocol_handlers (moved handler code reads from there)
+        cl_hive.protocol_handlers.init_protocol_handlers({
+            'plugin': plugin,
+            'our_pubkey': our_pubkey,
+            'database': cl_hive.database,
+            'relay_mgr': cl_hive.relay_mgr,
+            'shutdown_event': shutdown_event,
+        })
+
         return cl_hive, our_pubkey, sent_messages
 
     def test_gateway_adds_relay_metadata_for_payload_input(self):
         cl_hive, our_pubkey, sent_messages = self._configure_module()
 
-        result = cl_hive._broadcast_member_message(
+        result = cl_hive.protocol_handlers._broadcast_member_message(
             msg_type=HiveMessageType.PHEROMONE_BATCH,
             payload={
                 "reporter_id": our_pubkey,
@@ -133,7 +146,7 @@ class TestMemberBroadcastGateway:
             {"sender_id": our_pubkey, "timestamp": int(time.time()), "signature": "sig"},
         )
 
-        result = cl_hive._broadcast_member_message(
+        result = cl_hive.protocol_handlers._broadcast_member_message(
             message_bytes=raw_msg,
             reliability="direct",
             failure_policy="best_effort",
@@ -163,7 +176,7 @@ class TestMemberBroadcastGateway:
         }
         raw_msg = serialize(HiveMessageType.GOSSIP, raw_payload)
 
-        msg_type, payload, _normalized = cl_hive._normalize_member_broadcast_bytes(
+        msg_type, payload, _normalized = cl_hive.protocol_handlers._normalize_member_broadcast_bytes(
             message_bytes=raw_msg,
         )
 
@@ -174,7 +187,7 @@ class TestMemberBroadcastGateway:
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
 
         with pytest.raises(ValueError, match="fail_closed broadcasts must use reliable delivery"):
-            cl_hive._broadcast_member_message(
+            cl_hive.protocol_handlers._broadcast_member_message(
                 msg_type=HiveMessageType.GOSSIP,
                 payload={"sender_id": our_pubkey, "timestamp": int(time.time())},
                 reliability="direct",
@@ -199,7 +212,7 @@ class TestMemberBroadcastGateway:
         cl_hive = _load_cl_hive_module()
 
         with pytest.raises(ValueError, match=expected_error):
-            cl_hive._normalize_member_broadcast_bytes(
+            cl_hive.protocol_handlers._normalize_member_broadcast_bytes(
                 msg_type=HiveMessageType.GOSSIP,
                 payload=payload,
                 message_bytes=message_bytes,
@@ -209,7 +222,7 @@ class TestMemberBroadcastGateway:
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
 
         with pytest.raises(ValueError, match="unsupported reliability"):
-            cl_hive._broadcast_member_message(
+            cl_hive.protocol_handlers._broadcast_member_message(
                 msg_type=HiveMessageType.GOSSIP,
                 payload={"sender_id": our_pubkey, "timestamp": int(time.time())},
                 reliability="eventual",
@@ -221,7 +234,7 @@ class TestMemberBroadcastGateway:
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
 
         with pytest.raises(ValueError, match="unsupported failure_policy"):
-            cl_hive._broadcast_member_message(
+            cl_hive.protocol_handlers._broadcast_member_message(
                 msg_type=HiveMessageType.GOSSIP,
                 payload={"sender_id": our_pubkey, "timestamp": int(time.time())},
                 reliability="direct",
@@ -238,7 +251,7 @@ class TestMemberBroadcastGateway:
             banned_peer_ids=[banned_peer],
         )
 
-        result = cl_hive._broadcast_member_message(
+        result = cl_hive.protocol_handlers._broadcast_member_message(
             msg_type=HiveMessageType.GOSSIP,
             payload={"sender_id": our_pubkey, "timestamp": int(time.time()), "signature": "sig"},
             reliability="direct",
@@ -263,8 +276,9 @@ class TestMemberBroadcastGateway:
     def test_gateway_best_effort_reliable_falls_back_to_direct_without_outbox(self):
         cl_hive, our_pubkey, sent_messages = self._configure_module()
         cl_hive.outbox_mgr = None
+        cl_hive.protocol_handlers.outbox_mgr = None
 
-        result = cl_hive._broadcast_member_message(
+        result = cl_hive.protocol_handlers._broadcast_member_message(
             msg_type=HiveMessageType.GOSSIP,
             payload={"sender_id": our_pubkey, "timestamp": int(time.time()), "signature": "sig"},
             reliability="reliable",
@@ -281,10 +295,12 @@ class TestMemberBroadcastGateway:
 
     def test_gateway_best_effort_reliable_falls_back_to_direct_on_enqueue_failure(self):
         cl_hive, our_pubkey, sent_messages = self._configure_module()
-        cl_hive.outbox_mgr = MagicMock()
-        cl_hive.outbox_mgr.enqueue.side_effect = RuntimeError("queue unavailable")
+        outbox_mock = MagicMock()
+        outbox_mock.enqueue.side_effect = RuntimeError("queue unavailable")
+        cl_hive.outbox_mgr = outbox_mock
+        cl_hive.protocol_handlers.outbox_mgr = outbox_mock
 
-        result = cl_hive._broadcast_member_message(
+        result = cl_hive.protocol_handlers._broadcast_member_message(
             msg_type=HiveMessageType.GOSSIP,
             payload={"sender_id": our_pubkey, "timestamp": int(time.time()), "signature": "sig"},
             reliability="reliable",
@@ -302,8 +318,9 @@ class TestMemberBroadcastGateway:
     def test_gateway_fail_closed_reliable_does_not_fallback_without_outbox(self):
         cl_hive, our_pubkey, sent_messages = self._configure_module()
         cl_hive.outbox_mgr = None
+        cl_hive.protocol_handlers.outbox_mgr = None
 
-        result = cl_hive._broadcast_member_message(
+        result = cl_hive.protocol_handlers._broadcast_member_message(
             msg_type=HiveMessageType.GOSSIP,
             payload={"sender_id": our_pubkey, "timestamp": int(time.time()), "signature": "sig"},
             reliability="reliable",
@@ -321,17 +338,18 @@ class TestMemberBroadcastGateway:
     def test_gateway_fail_closed_reliable_reports_partial_enqueue_failure(self):
         member_ids = ["02" + "b" * 64, "02" + "c" * 64]
         cl_hive, our_pubkey, _sent_messages = self._configure_module(member_ids=member_ids)
-        cl_hive.outbox_mgr = MagicMock()
-        cl_hive.outbox_mgr.enqueue.return_value = 1
+        outbox_mock = MagicMock()
+        outbox_mock.enqueue.return_value = 1
+        cl_hive.outbox_mgr = outbox_mock
+        cl_hive.protocol_handlers.outbox_mgr = outbox_mock
 
-        result = cl_hive._broadcast_member_message(
+        result = cl_hive.protocol_handlers._broadcast_member_message(
             msg_type=HiveMessageType.FULL_SYNC,
             payload={"sender_id": our_pubkey, "timestamp": int(time.time()), "signature": "sig"},
             reliability="reliable",
             failure_policy="fail_closed",
             log_label="full_sync",
         )
-
         assert result["ok"] is False
         assert result["attempted"] == 2
         assert result["queued"] == 1
@@ -341,10 +359,12 @@ class TestMemberBroadcastGateway:
 
     def test_gateway_reliable_enqueue_uses_explicit_msg_id(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
-        cl_hive.outbox_mgr = MagicMock()
-        cl_hive.outbox_mgr.enqueue.return_value = 1
+        outbox_mock = MagicMock()
+        outbox_mock.enqueue.return_value = 1
+        cl_hive.outbox_mgr = outbox_mock
+        cl_hive.protocol_handlers.outbox_mgr = outbox_mock
 
-        result = cl_hive._broadcast_member_message(
+        result = cl_hive.protocol_handlers._broadcast_member_message(
             msg_type=HiveMessageType.FULL_SYNC,
             payload={"sender_id": our_pubkey, "timestamp": int(time.time()), "signature": "sig"},
             reliability="reliable",
@@ -363,12 +383,12 @@ class TestMemberBroadcastGateway:
             HiveMessageType.GOSSIP,
             {"sender_id": our_pubkey, "timestamp": int(time.time()), "signature": "sig"},
         )
-        cl_hive._broadcast_member_message = MagicMock(return_value={"sent": 3})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"sent": 3})
 
-        sent = cl_hive._broadcast_to_members(raw_msg)
+        sent = cl_hive.protocol_handlers._broadcast_to_members(raw_msg)
 
         assert sent == 3
-        cl_hive._broadcast_member_message.assert_called_once_with(
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once_with(
             message_bytes=raw_msg,
             reliability="direct",
             failure_policy="best_effort",
@@ -381,11 +401,11 @@ class TestMemberBroadcastGateway:
             HiveMessageType.GOSSIP,
             {"sender_id": our_pubkey, "timestamp": int(time.time()), "signature": "sig"},
         )
-        cl_hive._broadcast_member_message = MagicMock(
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(
             return_value={"sent": 0, "failed": 1, "attempted": 1, "ok": False}
         )
 
-        sent = cl_hive._broadcast_to_members(raw_msg)
+        sent = cl_hive.protocol_handlers._broadcast_to_members(raw_msg)
 
         assert sent == 0
         cl_hive.plugin.log.assert_called()
@@ -394,15 +414,15 @@ class TestMemberBroadcastGateway:
     def test_reliable_broadcast_delegates_to_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         payload = {"sender_id": our_pubkey, "timestamp": int(time.time()), "signature": "sig"}
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True})
 
-        cl_hive._reliable_broadcast(
+        cl_hive.protocol_handlers._reliable_broadcast(
             HiveMessageType.FULL_SYNC,
             payload,
             msg_id="fixed-message-id",
         )
 
-        cl_hive._broadcast_member_message.assert_called_once_with(
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once_with(
             msg_type=HiveMessageType.FULL_SYNC,
             payload=payload,
             reliability="reliable",
@@ -414,11 +434,11 @@ class TestMemberBroadcastGateway:
     def test_reliable_broadcast_logs_failed_delivery(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         payload = {"sender_id": our_pubkey, "timestamp": int(time.time()), "signature": "sig"}
-        cl_hive._broadcast_member_message = MagicMock(
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(
             return_value={"ok": True, "failed": 1, "attempted": 2, "queued": 0, "sent": 1}
         )
 
-        cl_hive._reliable_broadcast(
+        cl_hive.protocol_handlers._reliable_broadcast(
             HiveMessageType.FULL_SYNC,
             payload,
             msg_id="fixed-message-id",
@@ -430,16 +450,17 @@ class TestMemberBroadcastGateway:
     def test_full_sync_uses_reliable_fail_closed_gateway(self):
         cl_hive, _our_pubkey, _sent_messages = self._configure_module()
         cl_hive.gossip_mgr = object()
+        cl_hive.protocol_handlers.gossip_mgr = object()
         full_sync_msg = serialize(
             HiveMessageType.FULL_SYNC,
             {"sender_id": "02" + "a" * 64, "timestamp": int(time.time()), "signature": "sig"},
         )
-        cl_hive._create_signed_full_sync_msg = MagicMock(return_value=full_sync_msg)
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
+        cl_hive.protocol_handlers._create_signed_full_sync_msg = MagicMock(return_value=full_sync_msg)
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
 
-        cl_hive._broadcast_full_sync_to_members(cl_hive.plugin)
+        cl_hive.protocol_handlers._broadcast_full_sync_to_members(cl_hive.plugin)
 
-        cl_hive._broadcast_member_message.assert_called_once_with(
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once_with(
             message_bytes=full_sync_msg,
             reliability="reliable",
             failure_policy="fail_closed",
@@ -449,16 +470,17 @@ class TestMemberBroadcastGateway:
     def test_promotion_vote_uses_reliable_fail_closed_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.membership_mgr = MagicMock()
+        cl_hive.protocol_handlers.membership_mgr = MagicMock()
         cl_hive.membership_mgr.build_vouch_message.return_value = "canonical-vouch"
         cl_hive.plugin.rpc.signmessage.return_value = {"zbase": "signed-vouch"}
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
         target_peer_id = "02" + "d" * 64
 
-        result = cl_hive._broadcast_promotion_vote(target_peer_id, our_pubkey)
+        result = cl_hive.protocol_handlers._broadcast_promotion_vote(target_peer_id, our_pubkey)
 
         assert result is True
-        cl_hive._broadcast_member_message.assert_called_once()
-        call_kwargs = cl_hive._broadcast_member_message.call_args.kwargs
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once()
+        call_kwargs = cl_hive.protocol_handlers._broadcast_member_message.call_args.kwargs
         assert call_kwargs["msg_type"] == HiveMessageType.VOUCH
         assert call_kwargs["reliability"] == "reliable"
         assert call_kwargs["failure_policy"] == "fail_closed"
@@ -484,14 +506,14 @@ class TestMemberBroadcastGateway:
         protocol_module = sys.modules["modules.protocol"]
         original_factory = protocol_module.create_mcf_solution_broadcast
         protocol_module.create_mcf_solution_broadcast = MagicMock(return_value=mcf_msg)
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
 
         try:
             cl_hive._broadcast_mcf_solution(solution)
         finally:
             protocol_module.create_mcf_solution_broadcast = original_factory
 
-        cl_hive._broadcast_member_message.assert_called_once_with(
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once_with(
             message_bytes=mcf_msg,
             reliability="reliable",
             failure_policy="fail_closed",
@@ -501,6 +523,7 @@ class TestMemberBroadcastGateway:
     def test_circular_flow_alerts_use_best_effort_reliable_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.cost_reduction_mgr = MagicMock()
+        cl_hive.protocol_handlers.cost_reduction_mgr = MagicMock()
         cl_hive.cost_reduction_mgr.circular_detector.get_shareable_circular_flows.return_value = [
             {
                 "members_involved": [our_pubkey],
@@ -518,14 +541,14 @@ class TestMemberBroadcastGateway:
         protocol_module = sys.modules["modules.protocol"]
         original_factory = protocol_module.create_circular_flow_alert
         protocol_module.create_circular_flow_alert = MagicMock(return_value=alert_msg)
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
 
         try:
             cl_hive._broadcast_circular_flow_alerts()
         finally:
             protocol_module.create_circular_flow_alert = original_factory
 
-        cl_hive._broadcast_member_message.assert_called_once_with(
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once_with(
             message_bytes=alert_msg,
             reliability="reliable",
             failure_policy="best_effort",
@@ -535,6 +558,7 @@ class TestMemberBroadcastGateway:
     def test_positioning_proposals_use_best_effort_reliable_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.strategic_positioning_mgr = MagicMock()
+        cl_hive.protocol_handlers.strategic_positioning_mgr = MagicMock()
         cl_hive.strategic_positioning_mgr.get_shareable_positioning_recommendations.return_value = [
             {
                 "target_pubkey": "02" + "d" * 64,
@@ -552,14 +576,14 @@ class TestMemberBroadcastGateway:
         protocol_module = sys.modules["modules.protocol"]
         original_factory = protocol_module.create_positioning_proposal
         protocol_module.create_positioning_proposal = MagicMock(return_value=proposal_msg)
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
 
         try:
             cl_hive._broadcast_our_positioning_proposals()
         finally:
             protocol_module.create_positioning_proposal = original_factory
 
-        cl_hive._broadcast_member_message.assert_called_once_with(
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once_with(
             message_bytes=proposal_msg,
             reliability="reliable",
             failure_policy="best_effort",
@@ -569,6 +593,7 @@ class TestMemberBroadcastGateway:
     def test_close_proposals_use_best_effort_reliable_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.rationalization_mgr = MagicMock()
+        cl_hive.protocol_handlers.rationalization_mgr = MagicMock()
         cl_hive.rationalization_mgr.get_shareable_close_recommendations.return_value = [
             {
                 "target_member": "02" + "d" * 64,
@@ -586,14 +611,14 @@ class TestMemberBroadcastGateway:
         protocol_module = sys.modules["modules.protocol"]
         original_factory = protocol_module.create_close_proposal
         protocol_module.create_close_proposal = MagicMock(return_value=close_msg)
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
 
         try:
             cl_hive._broadcast_our_close_proposals()
         finally:
             protocol_module.create_close_proposal = original_factory
 
-        cl_hive._broadcast_member_message.assert_called_once_with(
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once_with(
             message_bytes=close_msg,
             reliability="reliable",
             failure_policy="best_effort",
@@ -621,11 +646,11 @@ class TestMemberBroadcastGateway:
             {"sender_id": our_pubkey, "timestamp": int(time.time()), "signature": "sig"},
         )
         cl_hive.fee_intel_mgr.create_fee_intelligence_snapshot_message.return_value = fee_msg
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
 
         cl_hive._broadcast_our_fee_intelligence()
 
-        cl_hive._broadcast_member_message.assert_called_once_with(
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once_with(
             message_bytes=fee_msg,
             reliability="direct",
             failure_policy="best_effort",
@@ -635,6 +660,7 @@ class TestMemberBroadcastGateway:
     def test_stigmergic_markers_use_best_effort_direct_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.fee_coordination_mgr = MagicMock()
+        cl_hive.protocol_handlers.fee_coordination_mgr = MagicMock()
         cl_hive.fee_coordination_mgr.stigmergic_coord.get_shareable_markers.return_value = [
             {
                 "source": "02" + "d" * 64,
@@ -645,12 +671,12 @@ class TestMemberBroadcastGateway:
             }
         ]
         cl_hive.plugin.rpc.signmessage.return_value = {"zbase": "marker-sig"}
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
 
         cl_hive._broadcast_our_stigmergic_markers()
 
-        cl_hive._broadcast_member_message.assert_called_once()
-        call_kwargs = cl_hive._broadcast_member_message.call_args.kwargs
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once()
+        call_kwargs = cl_hive.protocol_handlers._broadcast_member_message.call_args.kwargs
         assert call_kwargs["reliability"] == "direct"
         assert call_kwargs["failure_policy"] == "best_effort"
         assert call_kwargs["log_label"] == "stigmergic_markers"
@@ -661,6 +687,7 @@ class TestMemberBroadcastGateway:
     def test_temporal_patterns_use_best_effort_direct_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.anticipatory_liquidity_mgr = MagicMock()
+        cl_hive.protocol_handlers.anticipatory_liquidity_mgr = MagicMock()
         cl_hive.anticipatory_liquidity_mgr.get_shareable_patterns.return_value = [
             {
                 "peer_id": "02" + "d" * 64,
@@ -676,14 +703,14 @@ class TestMemberBroadcastGateway:
         protocol_module = sys.modules["modules.protocol"]
         original_factory = protocol_module.create_temporal_pattern_batch
         protocol_module.create_temporal_pattern_batch = MagicMock(return_value=pattern_msg)
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
 
         try:
             cl_hive._broadcast_our_temporal_patterns()
         finally:
             protocol_module.create_temporal_pattern_batch = original_factory
 
-        cl_hive._broadcast_member_message.assert_called_once_with(
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once_with(
             message_bytes=pattern_msg,
             reliability="direct",
             failure_policy="best_effort",
@@ -700,14 +727,14 @@ class TestMemberBroadcastGateway:
         protocol_module = sys.modules["modules.protocol"]
         original_factory = protocol_module.create_fee_report
         protocol_module.create_fee_report = MagicMock(return_value=fee_report_msg)
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1, "sent": 0})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1, "sent": 0})
 
         try:
-            cl_hive._broadcast_fee_report(21, 3, 100, 200, rebalance_costs=5)
+            cl_hive.protocol_handlers._broadcast_fee_report(21, 3, 100, 200, rebalance_costs=5)
         finally:
             protocol_module.create_fee_report = original_factory
 
-        cl_hive._broadcast_member_message.assert_called_once_with(
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once_with(
             message_bytes=fee_report_msg,
             reliability="reliable",
             failure_policy="best_effort",
@@ -716,15 +743,17 @@ class TestMemberBroadcastGateway:
 
     def test_intent_abort_uses_best_effort_reliable_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
-        cl_hive.intent_mgr = MagicMock()
-        cl_hive.intent_mgr.our_pubkey = our_pubkey
+        intent_mock = MagicMock()
+        intent_mock.our_pubkey = our_pubkey
+        cl_hive.intent_mgr = intent_mock
+        cl_hive.protocol_handlers.intent_mgr = intent_mock
         cl_hive.plugin.rpc.signmessage.return_value = {"zbase": "abort-sig"}
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
 
-        cl_hive.broadcast_intent_abort("02" + "d" * 64, "splice")
+        cl_hive.protocol_handlers.broadcast_intent_abort("02" + "d" * 64, "splice")
 
-        cl_hive._broadcast_member_message.assert_called_once()
-        call_kwargs = cl_hive._broadcast_member_message.call_args.kwargs
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once()
+        call_kwargs = cl_hive.protocol_handlers._broadcast_member_message.call_args.kwargs
         assert call_kwargs["msg_type"] == HiveMessageType.INTENT_ABORT
         assert call_kwargs["reliability"] == "reliable"
         assert call_kwargs["failure_policy"] == "best_effort"
@@ -734,6 +763,7 @@ class TestMemberBroadcastGateway:
     def test_pheromones_use_best_effort_direct_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.fee_coordination_mgr = MagicMock()
+        cl_hive.protocol_handlers.fee_coordination_mgr = MagicMock()
         cl_hive.fee_coordination_mgr.adaptive_controller.get_shareable_pheromones.return_value = [
             {
                 "peer_id": "02" + "d" * 64,
@@ -752,12 +782,12 @@ class TestMemberBroadcastGateway:
             ]
         }
         cl_hive.plugin.rpc.signmessage.return_value = {"zbase": "pheromone-sig"}
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
 
         cl_hive._broadcast_our_pheromones()
 
-        cl_hive._broadcast_member_message.assert_called_once()
-        call_kwargs = cl_hive._broadcast_member_message.call_args.kwargs
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once()
+        call_kwargs = cl_hive.protocol_handlers._broadcast_member_message.call_args.kwargs
         assert call_kwargs["reliability"] == "direct"
         assert call_kwargs["failure_policy"] == "best_effort"
         assert call_kwargs["log_label"] == "pheromones"
@@ -768,6 +798,7 @@ class TestMemberBroadcastGateway:
     def test_coverage_analysis_uses_best_effort_direct_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.rationalization_mgr = MagicMock()
+        cl_hive.protocol_handlers.rationalization_mgr = MagicMock()
         cl_hive.rationalization_mgr.get_shareable_coverage_analysis.return_value = [
             {
                 "peer_id": "02" + "d" * 64,
@@ -782,14 +813,14 @@ class TestMemberBroadcastGateway:
         protocol_module = sys.modules["modules.protocol"]
         original_factory = protocol_module.create_coverage_analysis_batch
         protocol_module.create_coverage_analysis_batch = MagicMock(return_value=coverage_msg)
-        cl_hive._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
+        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
 
         try:
             cl_hive._broadcast_our_coverage_analysis()
         finally:
             protocol_module.create_coverage_analysis_batch = original_factory
 
-        cl_hive._broadcast_member_message.assert_called_once_with(
+        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once_with(
             message_bytes=coverage_msg,
             reliability="direct",
             failure_policy="best_effort",

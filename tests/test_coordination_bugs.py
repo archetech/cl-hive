@@ -397,6 +397,10 @@ class TestIntelligenceTransport:
                 "strength": 0.5,
             }
         ]
+        cl_hive.protocol_handlers.init_protocol_handlers({
+            'plugin': plugin, 'our_pubkey': cl_hive.our_pubkey,
+            'database': cl_hive.database, 'relay_mgr': cl_hive.relay_mgr,
+        })
 
         cl_hive._broadcast_our_stigmergic_markers()
 
@@ -458,6 +462,10 @@ class TestIntelligenceTransport:
         ]
         cl_hive.fee_coordination_mgr.adaptive_controller.update_channel_peer_mappings = MagicMock()
         cl_hive.anticipatory_liquidity_mgr = None
+        cl_hive.protocol_handlers.init_protocol_handlers({
+            'plugin': plugin, 'our_pubkey': cl_hive.our_pubkey,
+            'database': cl_hive.database, 'relay_mgr': cl_hive.relay_mgr,
+        })
 
         cl_hive._broadcast_our_pheromones()
 
@@ -478,7 +486,11 @@ class TestIntelligenceTransport:
         cl_hive.fee_coordination_mgr = MagicMock()
         cl_hive.database = MagicMock()
         cl_hive.database.get_member.return_value = None
-        cl_hive._should_process_message = MagicMock(return_value=True)
+        cl_hive.protocol_handlers.init_protocol_handlers({
+            'plugin': plugin, 'database': cl_hive.database,
+            'fee_coordination_mgr': cl_hive.fee_coordination_mgr,
+        })
+        cl_hive.protocol_handlers._should_process_message = MagicMock(return_value=True)
 
         payload = {
             "reporter_id": "02" + "a" * 64,
@@ -487,14 +499,14 @@ class TestIntelligenceTransport:
             "markers": [],
         }
 
-        result = cl_hive.handle_stigmergic_marker_batch(
+        result = cl_hive.protocol_handlers.handle_stigmergic_marker_batch(
             peer_id="02" + "b" * 64,
             payload=payload,
             plugin=plugin,
         )
 
         assert result == {"result": "continue"}
-        cl_hive._should_process_message.assert_not_called()
+        cl_hive.protocol_handlers._should_process_message.assert_not_called()
 
     def test_invalid_pheromone_signature_does_not_consume_dedupe_state(self):
         """Signature failures should happen before handler dedupe is consulted."""
@@ -512,7 +524,11 @@ class TestIntelligenceTransport:
             {"peer_id": peer_id, "tier": "member"},
         ]
         cl_hive.database.is_banned.return_value = False
-        cl_hive._should_process_message = MagicMock(return_value=True)
+        cl_hive.protocol_handlers.init_protocol_handlers({
+            'plugin': plugin, 'database': cl_hive.database,
+            'fee_coordination_mgr': cl_hive.fee_coordination_mgr,
+        })
+        cl_hive.protocol_handlers._should_process_message = MagicMock(return_value=True)
 
         payload = {
             "reporter_id": peer_id,
@@ -525,14 +541,14 @@ class TestIntelligenceTransport:
             "modules.protocol.get_pheromone_batch_signing_payload",
             return_value="signed-payload",
         ):
-            result = cl_hive.handle_pheromone_batch(
+            result = cl_hive.protocol_handlers.handle_pheromone_batch(
                 peer_id=peer_id,
                 payload=payload,
                 plugin=plugin,
             )
 
         assert result == {"result": "continue"}
-        cl_hive._should_process_message.assert_not_called()
+        cl_hive.protocol_handlers._should_process_message.assert_not_called()
 
     def test_non_member_gossip_skips_signature_check_and_logs_debug(self):
         """Direct GOSSIP from an ex-member should be ignored before checkmessage."""
@@ -543,10 +559,17 @@ class TestIntelligenceTransport:
         plugin.rpc = MagicMock()
         plugin.rpc.checkmessage.side_effect = Exception("pubkey not found in the graph")
 
+        mock_database = MagicMock()
+        mock_database.get_member.return_value = None
+
         cl_hive.gossip_mgr = MagicMock()
-        cl_hive.database = MagicMock()
-        cl_hive.database.get_member.return_value = None
+        cl_hive.database = mock_database
         cl_hive._should_process_message = MagicMock(return_value=True)
+        cl_hive.protocol_handlers.init_protocol_handlers({
+            'database': mock_database,
+            'gossip_mgr': cl_hive.gossip_mgr,
+            '_should_process_message': cl_hive._should_process_message,
+        })
 
         payload = {
             "sender_id": peer_id,
@@ -555,12 +578,12 @@ class TestIntelligenceTransport:
             "version": 1,
         }
 
-        with patch.object(cl_hive, "validate_gossip", return_value=True), patch.object(
-            cl_hive,
+        with patch.object(cl_hive.protocol_handlers, "validate_gossip", return_value=True), patch.object(
+            cl_hive.protocol_handlers,
             "get_gossip_signing_payload",
             return_value="signed-payload",
         ):
-            result = cl_hive.handle_gossip(
+            result = cl_hive.protocol_handlers.handle_gossip(
                 peer_id=peer_id,
                 payload=payload,
                 plugin=plugin,
@@ -583,15 +606,22 @@ class TestIntelligenceTransport:
         plugin.rpc = MagicMock()
         plugin.rpc.checkmessage.return_value = {"verified": True, "pubkey": sender_id}
 
-        cl_hive.gossip_mgr = MagicMock()
-        cl_hive.gossip_mgr.process_gossip.return_value = False
-        cl_hive.database = MagicMock()
-        cl_hive.database.get_member.side_effect = lambda requested_peer_id: {
+        mock_database = MagicMock()
+        mock_database.get_member.side_effect = lambda requested_peer_id: {
             sender_id: {"peer_id": sender_id, "tier": "member"},
             relay_peer_id: {"peer_id": relay_peer_id, "tier": "member"},
         }.get(requested_peer_id)
-        cl_hive.database.is_banned.return_value = False
+        mock_database.is_banned.return_value = False
+
+        cl_hive.gossip_mgr = MagicMock()
+        cl_hive.gossip_mgr.process_gossip.return_value = False
+        cl_hive.database = mock_database
         cl_hive._should_process_message = MagicMock(return_value=True)
+        cl_hive.protocol_handlers.init_protocol_handlers({
+            'database': mock_database,
+            'gossip_mgr': cl_hive.gossip_mgr,
+            '_should_process_message': cl_hive._should_process_message,
+        })
 
         payload = {
             "sender_id": sender_id,
@@ -607,12 +637,12 @@ class TestIntelligenceTransport:
             },
         }
 
-        with patch.object(cl_hive, "validate_gossip", return_value=True), patch.object(
-            cl_hive,
+        with patch.object(cl_hive.protocol_handlers, "validate_gossip", return_value=True), patch.object(
+            cl_hive.protocol_handlers,
             "get_gossip_signing_payload",
             return_value="signed-payload",
         ):
-            result = cl_hive.handle_gossip(
+            result = cl_hive.protocol_handlers.handle_gossip(
                 peer_id=relay_peer_id,
                 payload=payload,
                 plugin=plugin,

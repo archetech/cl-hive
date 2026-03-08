@@ -417,8 +417,11 @@ class TestTransportMsatParsing:
         cl_hive.plugin = plugin
         cl_hive.fee_coordination_mgr = MagicMock()
         cl_hive.fee_coordination_mgr.adaptive_controller._channel_peer_map = {}
+        cl_hive.protocol_handlers.init_protocol_handlers({
+            'plugin': plugin, 'fee_coordination_mgr': cl_hive.fee_coordination_mgr,
+        })
 
-        cl_hive._record_forward_for_fee_coordination(
+        cl_hive.protocol_handlers._record_forward_for_fee_coordination(
             {
                 "out_channel": "123x1x0",
                 "fee_msat": "1500msat",

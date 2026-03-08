@@ -347,11 +347,14 @@ class TestMembershipVerification:
 
     def test_handle_intent_checks_membership(self):
         """handle_intent should verify peer is a member."""
-        with open(os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'cl-hive.py'
-        )) as f:
-            content = f.read()
+        # Handlers may live in cl-hive.py or modules/protocol_handlers.py
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        content = ""
+        for fname in ('cl-hive.py', os.path.join('modules', 'protocol_handlers.py')):
+            fpath = os.path.join(repo_root, fname)
+            if os.path.exists(fpath):
+                with open(fpath) as f:
+                    content += f.read()
 
         # Find the handle_intent function
         assert 'def handle_intent(peer_id: str, payload: Dict, plugin: Plugin)' in content
@@ -364,11 +367,14 @@ class TestMembershipVerification:
 
     def test_handle_gossip_checks_membership(self):
         """handle_gossip should verify peer is a member."""
-        with open(os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'cl-hive.py'
-        )) as f:
-            content = f.read()
+        # Handlers may live in cl-hive.py or modules/protocol_handlers.py
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        content = ""
+        for fname in ('cl-hive.py', os.path.join('modules', 'protocol_handlers.py')):
+            fpath = os.path.join(repo_root, fname)
+            if os.path.exists(fpath):
+                with open(fpath) as f:
+                    content += f.read()
 
         # Find the handle_gossip function
         assert 'def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin)' in content
@@ -416,18 +422,17 @@ class TestSecurityIntegration:
         assert 'MAX_CONTRIBUTION_ROWS = 500000' in db_content
         assert 'P5-03' in db_content
 
-        # Check cl-hive.py for X-01
-        with open(os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'cl-hive.py'
-        )) as f:
-            main_content = f.read()
+        # Check cl-hive.py + protocol_handlers for X-01
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        main_content = ""
+        for fname in ('cl-hive.py', os.path.join('modules', 'protocol_handlers.py')):
+            fpath = os.path.join(repo_root, fname)
+            if os.path.exists(fpath):
+                with open(fpath) as f:
+                    main_content += f.read()
 
         # Phase 3: RPC Pool (now in modules/rpc_pool.py, imported by cl-hive.py)
-        with open(os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'modules', 'rpc_pool.py'
-        )) as f:
+        with open(os.path.join(repo_root, 'modules', 'rpc_pool.py')) as f:
             rpc_pool_content = f.read()
         assert 'class RpcPool' in rpc_pool_content
         assert 'P3-02' in main_content
