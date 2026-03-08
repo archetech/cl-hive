@@ -19,15 +19,16 @@ Thread Safety:
 - Uses thread-local database connections via HiveDatabase pattern
 """
 
-import os
-import time
+import datetime
+import hashlib
 import json
+import os
+import secrets
 import sqlite3
 import threading
-from dataclasses import dataclass, asdict, field
+import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Tuple
-from decimal import Decimal, ROUND_DOWN
-
 from . import network_metrics
 
 
@@ -322,15 +323,6 @@ class SettlementManager:
         """).fetchall()
         return {"offers": [dict(row) for row in rows]}
 
-    def deactivate_offer(self, peer_id: str) -> Dict[str, Any]:
-        """Deactivate a member's BOLT12 offer."""
-        conn = self._get_connection()
-        conn.execute(
-            "UPDATE settlement_offers SET active = 0 WHERE peer_id = ?",
-            (peer_id,)
-        )
-        return {"status": "deactivated", "peer_id": peer_id}
-
     def generate_and_register_offer(self, peer_id: str) -> Dict[str, Any]:
         """
         Generate a BOLT12 offer and register it for settlement.
@@ -563,8 +555,6 @@ class SettlementManager:
         min_payment_sats: int,
         payments: List[Dict[str, Any]],
     ) -> str:
-        import hashlib
-
         # Canonicalize payments ordering.
         canon_payments = sorted(
             payments,
@@ -971,23 +961,6 @@ class SettlementManager:
             "payments": [dict(p) for p in payments]
         }
 
-    def get_member_settlement_history(
-        self,
-        peer_id: str,
-        limit: int = 10
-    ) -> List[Dict[str, Any]]:
-        """Get settlement history for a specific member."""
-        conn = self._get_connection()
-        rows = conn.execute("""
-            SELECT c.*, p.start_time, p.end_time, p.status as period_status
-            FROM settlement_contributions c
-            JOIN settlement_periods p ON c.period_id = p.period_id
-            WHERE c.peer_id = ?
-            ORDER BY c.period_id DESC
-            LIMIT ?
-        """, (peer_id, limit)).fetchall()
-        return [dict(row) for row in rows]
-
     # =========================================================================
     # DISTRIBUTED SETTLEMENT (Phase 12)
     # =========================================================================
@@ -1003,7 +976,6 @@ class SettlementManager:
         Returns:
             Period string in YYYY-Www format (ISO week)
         """
-        import datetime
         if timestamp is None:
             timestamp = int(time.time())
         dt = datetime.datetime.fromtimestamp(timestamp, tz=datetime.timezone.utc)
@@ -1013,7 +985,6 @@ class SettlementManager:
     @staticmethod
     def get_previous_period() -> str:
         """Get the period string for the previous week."""
-        import datetime
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         prev_week = now - datetime.timedelta(weeks=1)
         iso_year, iso_week, _ = prev_week.isocalendar()
@@ -1037,8 +1008,6 @@ class SettlementManager:
         Returns:
             SHA256 hash (64 hex chars)
         """
-        import hashlib
-
         # Sort contributions by peer_id for determinism
         sorted_contribs = sorted(contributions, key=lambda x: x.get('peer_id', ''))
 
@@ -1167,7 +1136,6 @@ class SettlementManager:
         Returns:
             Proposal dict if created, None if period already has proposal
         """
-        import secrets
         self.last_create_proposal_skip_reason = None
 
         # Check if period already has a proposal
@@ -1946,8 +1914,6 @@ class SettlementTypeRegistry:
 # PHASE 4B: NETTING ENGINE
 # =============================================================================
 
-import hashlib
-
 
 class NettingEngine:
     """
@@ -1971,15 +1937,6 @@ class NettingEngine:
             separators=(',', ':'),
         )
         return hashlib.sha256(canonical.encode()).hexdigest()
-
-    @staticmethod
-    def verify_obligations_hash(obligations: List[Dict],
-                                expected_hash: str) -> bool:
-        """Verify obligations have not changed since hash was computed.
-
-        P4R4-L-2: Call this at execution time to guard against stale data.
-        """
-        return NettingEngine.compute_obligations_hash(obligations) == expected_hash
 
     @staticmethod
     def bilateral_net(obligations: List[Dict],
@@ -2056,7 +2013,7 @@ class NettingEngine:
         Returns list of net payments.
 
         P4R4-L-2: Callers should snapshot obligations and use
-        verify_obligations_hash() at execution time to guard
+        compute_obligations_hash() at execution time to guard
         against stale obligation data.
         """
         # Aggregate net balances per peer
