@@ -19,13 +19,11 @@ Security: All operations use cryptographic signatures.
 
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
 from .protocol import (
-    HiveMessageType,
-    serialize,
     create_liquidity_need,
     create_liquidity_snapshot,
     validate_liquidity_need_payload,
@@ -459,11 +457,11 @@ class LiquidityCoordinator:
 
         # Process each need in the snapshot
         needs = payload.get("needs", [])
-        stored_count = 0
         batch_timestamp = payload.get("timestamp", int(time.time()))
 
+        # Build all LiquidityNeed objects first
+        parsed_needs = []
         for need_data in needs:
-            # Store the liquidity need
             need = LiquidityNeed(
                 reporter_id=reporter_id,
                 need_type=need_data.get("need_type", NEED_REBALANCE),
@@ -478,13 +476,15 @@ class LiquidityCoordinator:
                 timestamp=batch_timestamp,
                 signature=signature
             )
+            parsed_needs.append((f"{reporter_id}:{need.target_peer_id}", need))
 
-            # Use composite key for multiple needs from same reporter
-            key = f"{reporter_id}:{need.target_peer_id}"
-            with self._lock:
+        # Batch-insert under a single lock acquisition
+        with self._lock:
+            for key, need in parsed_needs:
                 self._liquidity_needs[key] = need
 
-            # Store in database
+        # Store in database outside lock (DB has its own locking)
+        for _key, need in parsed_needs:
             self.database.store_liquidity_need(
                 reporter_id=need.reporter_id,
                 need_type=need.need_type,
@@ -497,7 +497,7 @@ class LiquidityCoordinator:
                 timestamp=need.timestamp
             )
 
-            stored_count += 1
+        stored_count = len(parsed_needs)
 
         # Prune old needs if over limit
         self._prune_old_needs()
@@ -726,19 +726,6 @@ class LiquidityCoordinator:
             "low_needs": urgency_counts.get(URGENCY_LOW, 0),
             "struggling_members": len(struggling)
         }
-
-    def cleanup_expired_data(self):
-        """Clean up old liquidity needs."""
-        now = time.time()
-
-        with self._lock:
-            # Remove old needs (older than 1 hour)
-            old_needs = [
-                rid for rid, need in self._liquidity_needs.items()
-                if now - need.timestamp > 3600
-            ]
-            for rid in old_needs:
-                del self._liquidity_needs[rid]
 
     def get_status(self) -> Dict[str, Any]:
         """
@@ -1599,19 +1586,15 @@ class LiquidityCoordinator:
         Returns:
             True if assignment was accepted
         """
-        # Generate assignment ID
-        from_ch = assignment_data.get("from_channel", "")[-8:]
-        to_ch = assignment_data.get("to_channel", "")[-8:]
-        assignment_id = f"mcf_{solution_timestamp}_{assignment_data.get('priority', 0)}_{from_ch}_{to_ch}"
-
-        # Check for duplicate
-        if assignment_id in self._mcf_assignments:
-            return False
-
         # Validate basic fields
         amount_sats = assignment_data.get("amount_sats", 0)
         if amount_sats <= 0:
             return False
+
+        # Generate assignment ID
+        from_ch = assignment_data.get("from_channel", "")[-8:]
+        to_ch = assignment_data.get("to_channel", "")[-8:]
+        assignment_id = f"mcf_{solution_timestamp}_{assignment_data.get('priority', 0)}_{from_ch}_{to_ch}"
 
         # Create assignment
         assignment = MCFAssignment(
@@ -1629,8 +1612,11 @@ class LiquidityCoordinator:
             status="pending",
         )
 
-        # Enforce limits
+        # Duplicate check + insertion under single lock to prevent TOCTOU race
         with self._lock:
+            if assignment_id in self._mcf_assignments:
+                return False
+
             if len(self._mcf_assignments) >= MAX_MCF_ASSIGNMENTS:
                 self._cleanup_old_mcf_assignments_unlocked()
                 # If still at limit after cleanup, reject
@@ -1664,11 +1650,6 @@ class LiquidityCoordinator:
             ]
 
         return sorted(pending, key=lambda a: a.priority)
-
-    def get_mcf_assignment(self, assignment_id: str) -> Optional[MCFAssignment]:
-        """Get a specific MCF assignment by ID."""
-        with self._lock:
-            return self._mcf_assignments.get(assignment_id)
 
     def update_mcf_assignment_status(
         self,
@@ -1835,10 +1816,20 @@ class LiquidityCoordinator:
             solution_ts = self._last_mcf_solution_timestamp
             ack_sent = self._mcf_ack_sent
 
-        pending = [a for a in all_assignments if a.status == "pending"]
-        executing = [a for a in all_assignments if a.status == "executing"]
-        completed = [a for a in all_assignments if a.status == "completed"]
-        failed = [a for a in all_assignments if a.status in ("failed", "rejected")]
+        # Single-pass categorization
+        pending = []
+        executing_count = 0
+        completed_count = 0
+        failed_count = 0
+        for a in all_assignments:
+            if a.status == "pending":
+                pending.append(a)
+            elif a.status == "executing":
+                executing_count += 1
+            elif a.status == "completed":
+                completed_count += 1
+            elif a.status in ("failed", "rejected"):
+                failed_count += 1
 
         return {
             "last_solution_timestamp": solution_ts,
@@ -1846,9 +1837,9 @@ class LiquidityCoordinator:
             "assignment_counts": {
                 "total": len(all_assignments),
                 "pending": len(pending),
-                "executing": len(executing),
-                "completed": len(completed),
-                "failed": len(failed),
+                "executing": executing_count,
+                "completed": completed_count,
+                "failed": failed_count,
             },
             "pending_assignments": [a.to_dict() for a in pending[:10]],
             "total_pending_amount_sats": sum(a.amount_sats for a in pending),
@@ -1877,11 +1868,6 @@ class LiquidityCoordinator:
 
         if expired:
             self._log(f"Cleaned up {len(expired)} old MCF assignments", "debug")
-
-    def _cleanup_old_mcf_assignments(self) -> None:
-        """Remove old/expired MCF assignments (acquires lock)."""
-        with self._lock:
-            self._cleanup_old_mcf_assignments_unlocked()
 
     def get_all_assignments(self) -> List:
         """Return a snapshot of all MCF assignments (thread-safe)."""
