@@ -443,10 +443,14 @@ class TestBanMaintenanceOrder:
 
     def test_settlement_gaming_sweep_runs_before_generic_expiry(self):
         """Settlement-gaming expiry sweep must run before cleanup_expired_ban_proposals."""
-        with open(os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'cl-hive.py'
-        )) as f:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # After monolith decomposition, membership_maintenance_loop lives in
+        # background_loops.py; fall back to cl-hive.py for older layouts.
+        bg_loops_path = os.path.join(repo_root, "modules", "background_loops.py")
+        main_path = os.path.join(repo_root, "cl-hive.py")
+        source_path = bg_loops_path if os.path.exists(bg_loops_path) else main_path
+
+        with open(source_path) as f:
             content = f.read()
 
         sweep_idx = content.find("Settlement gaming ban sweep error")

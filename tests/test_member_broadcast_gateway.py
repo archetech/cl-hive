@@ -112,6 +112,14 @@ class TestMemberBroadcastGateway:
             'shutdown_event': shutdown_event,
         })
 
+        # Sync module globals into background_loops (moved loop code reads from there)
+        cl_hive.background_loops.init_background_loops({
+            'plugin': plugin,
+            'our_pubkey': our_pubkey,
+            'database': cl_hive.database,
+            'shutdown_event': shutdown_event,
+        })
+
         return cl_hive, our_pubkey, sent_messages
 
     def test_gateway_adds_relay_metadata_for_payload_input(self):
@@ -509,7 +517,7 @@ class TestMemberBroadcastGateway:
         cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
 
         try:
-            cl_hive._broadcast_mcf_solution(solution)
+            cl_hive.background_loops._broadcast_mcf_solution(solution)
         finally:
             protocol_module.create_mcf_solution_broadcast = original_factory
 
@@ -523,6 +531,7 @@ class TestMemberBroadcastGateway:
     def test_circular_flow_alerts_use_best_effort_reliable_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.cost_reduction_mgr = MagicMock()
+        cl_hive.background_loops.cost_reduction_mgr = cl_hive.cost_reduction_mgr
         cl_hive.protocol_handlers.cost_reduction_mgr = MagicMock()
         cl_hive.cost_reduction_mgr.circular_detector.get_shareable_circular_flows.return_value = [
             {
@@ -544,7 +553,7 @@ class TestMemberBroadcastGateway:
         cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
 
         try:
-            cl_hive._broadcast_circular_flow_alerts()
+            cl_hive.background_loops._broadcast_circular_flow_alerts()
         finally:
             protocol_module.create_circular_flow_alert = original_factory
 
@@ -558,6 +567,7 @@ class TestMemberBroadcastGateway:
     def test_positioning_proposals_use_best_effort_reliable_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.strategic_positioning_mgr = MagicMock()
+        cl_hive.background_loops.strategic_positioning_mgr = cl_hive.strategic_positioning_mgr
         cl_hive.protocol_handlers.strategic_positioning_mgr = MagicMock()
         cl_hive.strategic_positioning_mgr.get_shareable_positioning_recommendations.return_value = [
             {
@@ -579,7 +589,7 @@ class TestMemberBroadcastGateway:
         cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
 
         try:
-            cl_hive._broadcast_our_positioning_proposals()
+            cl_hive.background_loops._broadcast_our_positioning_proposals()
         finally:
             protocol_module.create_positioning_proposal = original_factory
 
@@ -593,6 +603,7 @@ class TestMemberBroadcastGateway:
     def test_close_proposals_use_best_effort_reliable_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.rationalization_mgr = MagicMock()
+        cl_hive.background_loops.rationalization_mgr = cl_hive.rationalization_mgr
         cl_hive.protocol_handlers.rationalization_mgr = MagicMock()
         cl_hive.rationalization_mgr.get_shareable_close_recommendations.return_value = [
             {
@@ -614,7 +625,7 @@ class TestMemberBroadcastGateway:
         cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "queued": 1})
 
         try:
-            cl_hive._broadcast_our_close_proposals()
+            cl_hive.background_loops._broadcast_our_close_proposals()
         finally:
             protocol_module.create_close_proposal = original_factory
 
@@ -628,6 +639,7 @@ class TestMemberBroadcastGateway:
     def test_fee_intelligence_uses_best_effort_direct_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.fee_intel_mgr = MagicMock()
+        cl_hive.background_loops.fee_intel_mgr = cl_hive.fee_intel_mgr
         cl_hive.plugin.rpc.listfunds.return_value = {
             "channels": [
                 {
@@ -648,7 +660,7 @@ class TestMemberBroadcastGateway:
         cl_hive.fee_intel_mgr.create_fee_intelligence_snapshot_message.return_value = fee_msg
         cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
 
-        cl_hive._broadcast_our_fee_intelligence()
+        cl_hive.background_loops._broadcast_our_fee_intelligence()
 
         cl_hive.protocol_handlers._broadcast_member_message.assert_called_once_with(
             message_bytes=fee_msg,
@@ -660,6 +672,7 @@ class TestMemberBroadcastGateway:
     def test_stigmergic_markers_use_best_effort_direct_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.fee_coordination_mgr = MagicMock()
+        cl_hive.background_loops.fee_coordination_mgr = cl_hive.fee_coordination_mgr
         cl_hive.protocol_handlers.fee_coordination_mgr = MagicMock()
         cl_hive.fee_coordination_mgr.stigmergic_coord.get_shareable_markers.return_value = [
             {
@@ -673,7 +686,7 @@ class TestMemberBroadcastGateway:
         cl_hive.plugin.rpc.signmessage.return_value = {"zbase": "marker-sig"}
         cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
 
-        cl_hive._broadcast_our_stigmergic_markers()
+        cl_hive.background_loops._broadcast_our_stigmergic_markers()
 
         cl_hive.protocol_handlers._broadcast_member_message.assert_called_once()
         call_kwargs = cl_hive.protocol_handlers._broadcast_member_message.call_args.kwargs
@@ -687,6 +700,7 @@ class TestMemberBroadcastGateway:
     def test_temporal_patterns_use_best_effort_direct_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.anticipatory_liquidity_mgr = MagicMock()
+        cl_hive.background_loops.anticipatory_liquidity_mgr = cl_hive.anticipatory_liquidity_mgr
         cl_hive.protocol_handlers.anticipatory_liquidity_mgr = MagicMock()
         cl_hive.anticipatory_liquidity_mgr.get_shareable_patterns.return_value = [
             {
@@ -706,7 +720,7 @@ class TestMemberBroadcastGateway:
         cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
 
         try:
-            cl_hive._broadcast_our_temporal_patterns()
+            cl_hive.background_loops._broadcast_our_temporal_patterns()
         finally:
             protocol_module.create_temporal_pattern_batch = original_factory
 
@@ -763,6 +777,8 @@ class TestMemberBroadcastGateway:
     def test_pheromones_use_best_effort_direct_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.fee_coordination_mgr = MagicMock()
+        cl_hive.background_loops.fee_coordination_mgr = cl_hive.fee_coordination_mgr
+        cl_hive.background_loops.anticipatory_liquidity_mgr = None
         cl_hive.protocol_handlers.fee_coordination_mgr = MagicMock()
         cl_hive.fee_coordination_mgr.adaptive_controller.get_shareable_pheromones.return_value = [
             {
@@ -784,7 +800,7 @@ class TestMemberBroadcastGateway:
         cl_hive.plugin.rpc.signmessage.return_value = {"zbase": "pheromone-sig"}
         cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
 
-        cl_hive._broadcast_our_pheromones()
+        cl_hive.background_loops._broadcast_our_pheromones()
 
         cl_hive.protocol_handlers._broadcast_member_message.assert_called_once()
         call_kwargs = cl_hive.protocol_handlers._broadcast_member_message.call_args.kwargs
@@ -798,6 +814,7 @@ class TestMemberBroadcastGateway:
     def test_coverage_analysis_uses_best_effort_direct_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.rationalization_mgr = MagicMock()
+        cl_hive.background_loops.rationalization_mgr = cl_hive.rationalization_mgr
         cl_hive.protocol_handlers.rationalization_mgr = MagicMock()
         cl_hive.rationalization_mgr.get_shareable_coverage_analysis.return_value = [
             {
@@ -816,7 +833,7 @@ class TestMemberBroadcastGateway:
         cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
 
         try:
-            cl_hive._broadcast_our_coverage_analysis()
+            cl_hive.background_loops._broadcast_our_coverage_analysis()
         finally:
             protocol_module.create_coverage_analysis_batch = original_factory
 

@@ -401,8 +401,13 @@ class TestIntelligenceTransport:
             'plugin': plugin, 'our_pubkey': cl_hive.our_pubkey,
             'database': cl_hive.database, 'relay_mgr': cl_hive.relay_mgr,
         })
+        cl_hive.background_loops.init_background_loops({
+            'plugin': plugin, 'our_pubkey': cl_hive.our_pubkey,
+            'database': cl_hive.database,
+            'fee_coordination_mgr': cl_hive.fee_coordination_mgr,
+        })
 
-        cl_hive._broadcast_our_stigmergic_markers()
+        cl_hive.background_loops._broadcast_our_stigmergic_markers()
 
         assert len(sent_messages) == 1
         method, params = sent_messages[0]
@@ -466,8 +471,14 @@ class TestIntelligenceTransport:
             'plugin': plugin, 'our_pubkey': cl_hive.our_pubkey,
             'database': cl_hive.database, 'relay_mgr': cl_hive.relay_mgr,
         })
+        cl_hive.background_loops.init_background_loops({
+            'plugin': plugin, 'our_pubkey': cl_hive.our_pubkey,
+            'database': cl_hive.database,
+            'fee_coordination_mgr': cl_hive.fee_coordination_mgr,
+            'anticipatory_liquidity_mgr': cl_hive.anticipatory_liquidity_mgr,
+        })
 
-        cl_hive._broadcast_our_pheromones()
+        cl_hive.background_loops._broadcast_our_pheromones()
 
         assert len(sent_messages) == 1
         method, params = sent_messages[0]

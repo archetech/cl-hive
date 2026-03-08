@@ -578,16 +578,21 @@ class TestAnticipatoryChannelMapping:
 
     def test_channel_mapping_update_in_broadcast(self):
         """_broadcast_our_temporal_patterns area should update anticipatory mappings."""
-        main_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "cl-hive.py"
-        )
-        with open(main_path, 'r') as f:
-            content = f.read()
+        # The broadcast helpers live in background_loops.py after monolith decomposition;
+        # fall back to cl-hive.py for older layouts.
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        bg_loops_path = os.path.join(repo_root, "modules", "background_loops.py")
+        main_path = os.path.join(repo_root, "cl-hive.py")
+
+        content = ""
+        for path in (bg_loops_path, main_path):
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    content += f.read()
 
         # Should update anticipatory_liquidity_mgr alongside fee_coordination_mgr
         assert "anticipatory_liquidity_mgr.update_channel_peer_mappings" in content, \
-            "cl-hive.py should update anticipatory_liquidity_mgr channel mappings"
+            "background_loops.py (or cl-hive.py) should update anticipatory_liquidity_mgr channel mappings"
 
 
 # =============================================================================
