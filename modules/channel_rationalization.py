@@ -18,7 +18,6 @@ Author: Lightning Goats Team
 """
 
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -43,11 +42,8 @@ MAX_HEALTHY_REDUNDANCY = 2          # Up to 2 members per peer is healthy
 
 # Performance thresholds for close recommendations
 UNDERPERFORMER_MARKER_RATIO = 0.1   # <10% of leader's markers = underperformer
-UNDERPERFORMER_MIN_AGE_DAYS = 30    # Channel must be >30 days old to recommend close
-UNDERPERFORMER_MIN_CAPACITY = 1_000_000  # Only consider channels >1M sats
 
 # Grace periods
-NEW_CHANNEL_GRACE_DAYS = 14         # Don't recommend close for channels <14 days
 CLOSE_RECOMMENDATION_COOLDOWN_HOURS = 72  # Don't repeat recommendation within 72h
 
 
@@ -386,11 +382,11 @@ class RedundancyAnalyzer:
 
         # Collect all external peers
         all_peers: Set[str] = set()
+        fleet_set = set(fleet_members)
         for member_id in fleet_members:
             topology = self._get_member_topology(member_id)
             # Exclude other fleet members
-            external_peers = topology - set(fleet_members)
-            all_peers.update(external_peers)
+            all_peers.update(topology - fleet_set)
 
         # Analyze each peer
         for peer_id in all_peers:
@@ -409,13 +405,6 @@ class RedundancyAnalyzer:
         """
         all_coverage = self.analyze_all_coverage()
         return list(all_coverage.values())
-
-    def get_over_redundant_peers(self) -> List[PeerCoverage]:
-        """
-        Get list of peers with excessive redundancy (>2 members).
-        """
-        all_coverage = self.analyze_all_coverage()
-        return [c for c in all_coverage.values() if c.is_over_redundant]
 
 
 # =============================================================================
@@ -507,7 +496,7 @@ class ChannelRationalizer:
                     # Return estimated data
                     return {
                         "channel_id": "unknown",
-                        "capacity_sats": getattr(state, 'capacity_sats', 0) // max(1, len(getattr(state, 'topology', [1]) or [1])),
+                        "capacity_sats": getattr(state, 'capacity_sats', 0) // max(1, len(getattr(state, 'topology', None) or [])),
                         "local_balance_sats": 0,
                         "state": "CHANNELD_NORMAL"
                     }
@@ -1134,10 +1123,6 @@ class RationalizationManager:
         if not peer_id:
             return False
 
-        # Initialize remote coverage storage
-        if not hasattr(self, "_remote_coverage"):
-            self._remote_coverage: Dict[str, List[Dict[str, Any]]] = {}
-
         entry = {
             "reporter_id": reporter_id,
             "members_with_channels": coverage_data.get("members_with_channels", []),
@@ -1180,10 +1165,6 @@ class RationalizationManager:
         if not member_id or not peer_id or not channel_id:
             return False
 
-        # Initialize remote proposals storage
-        if not hasattr(self, "_remote_close_proposals"):
-            self._remote_close_proposals: List[Dict[str, Any]] = []
-
         entry = {
             "reporter_id": reporter_id,
             "member_id": member_id,
@@ -1203,98 +1184,28 @@ class RationalizationManager:
 
         return True
 
-    def get_fleet_coverage_consensus(self, peer_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get consensus coverage analysis from fleet reports.
-
-        Args:
-            peer_id: Peer to get consensus for
-
-        Returns:
-            Consensus coverage data or None
-        """
-        if not hasattr(self, "_remote_coverage"):
-            return None
-
-        reports = self._remote_coverage.get(peer_id, [])
-        if not reports:
-            return None
-
-        now = time.time()
-        recent = [r for r in reports if now - r.get("timestamp", 0) < 7 * 86400]
-        if not recent:
-            return None
-
-        # Find consensus owner (most commonly reported)
-        owner_counts: Dict[str, int] = {}
-        for r in recent:
-            owner = r.get("owner_member")
-            if owner:
-                owner_counts[owner] = owner_counts.get(owner, 0) + 1
-
-        consensus_owner = max(owner_counts, key=owner_counts.get) if owner_counts else None
-
-        # Average confidence
-        avg_confidence = sum(r.get("ownership_confidence", 0) for r in recent) / len(recent)
-
-        # Check for over-redundancy consensus
-        over_redundant_count = sum(1 for r in recent if r.get("is_over_redundant"))
-
-        return {
-            "peer_id": peer_id,
-            "consensus_owner": consensus_owner,
-            "avg_ownership_confidence": round(avg_confidence, 3),
-            "is_over_redundant": over_redundant_count > len(recent) // 2,
-            "reporter_count": len(recent)
-        }
-
-    def get_pending_close_proposals_for_us(self) -> List[Dict[str, Any]]:
-        """
-        Get close proposals that target us (our node).
-
-        Returns:
-            List of close proposals where we are the recommended member to close
-        """
-        if not hasattr(self, "_remote_close_proposals"):
-            return []
-
-        our_proposals = []
-        now = time.time()
-
-        for p in self._remote_close_proposals:
-            # Only recent proposals
-            if now - p.get("timestamp", 0) > 7 * 86400:
-                continue
-            # Only proposals for us
-            if p.get("member_id") == self._our_pubkey:
-                our_proposals.append(p)
-
-        return our_proposals
-
     def cleanup_old_remote_data(self, max_age_days: float = 7) -> int:
         """Remove old remote rationalization data."""
         cutoff = time.time() - (max_age_days * 86400)
         cleaned = 0
 
         # Cleanup coverage
-        if hasattr(self, "_remote_coverage"):
-            for peer_id in list(self._remote_coverage.keys()):
-                before = len(self._remote_coverage[peer_id])
-                self._remote_coverage[peer_id] = [
-                    r for r in self._remote_coverage[peer_id]
-                    if r.get("timestamp", 0) > cutoff
-                ]
-                cleaned += before - len(self._remote_coverage[peer_id])
-                if not self._remote_coverage[peer_id]:
-                    del self._remote_coverage[peer_id]
+        for peer_id in list(self._remote_coverage.keys()):
+            before = len(self._remote_coverage[peer_id])
+            self._remote_coverage[peer_id] = [
+                r for r in self._remote_coverage[peer_id]
+                if r.get("timestamp", 0) > cutoff
+            ]
+            cleaned += before - len(self._remote_coverage[peer_id])
+            if not self._remote_coverage[peer_id]:
+                del self._remote_coverage[peer_id]
 
         # Cleanup close proposals
-        if hasattr(self, "_remote_close_proposals"):
-            before = len(self._remote_close_proposals)
-            self._remote_close_proposals = [
-                p for p in self._remote_close_proposals
-                if p.get("timestamp", 0) > cutoff
-            ]
-            cleaned += before - len(self._remote_close_proposals)
+        before = len(self._remote_close_proposals)
+        self._remote_close_proposals = [
+            p for p in self._remote_close_proposals
+            if p.get("timestamp", 0) > cutoff
+        ]
+        cleaned += before - len(self._remote_close_proposals)
 
         return cleaned
