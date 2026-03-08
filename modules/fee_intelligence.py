@@ -11,11 +11,9 @@ Author: Lightning Goats Team
 
 import threading
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from modules.protocol import (
-    HiveMessageType,
     get_fee_intelligence_snapshot_signing_payload,
     validate_fee_intelligence_snapshot_payload,
     get_health_report_signing_payload,
@@ -52,41 +50,6 @@ HEALTH_STRUGGLING = 20  # Was 25 - needs help
 # Elasticity thresholds
 ELASTICITY_VERY_ELASTIC = -0.5
 ELASTICITY_SOMEWHAT_ELASTIC = 0.0
-
-
-# =============================================================================
-# DATA CLASSES
-# =============================================================================
-
-@dataclass
-class PeerFeeProfile:
-    """Aggregated fee intelligence for an external peer."""
-    peer_id: str
-    reporters: List[str]
-    avg_fee_charged: float
-    min_fee_charged: int
-    max_fee_charged: int
-    total_hive_volume: int
-    total_hive_revenue: int
-    avg_utilization: float
-    estimated_elasticity: float
-    optimal_fee_estimate: int
-    last_update: int
-    confidence: float
-
-
-@dataclass
-class MemberHealth:
-    """Health assessment for NNLB."""
-    peer_id: str
-    timestamp: int
-    overall_health: int
-    capacity_score: int
-    revenue_score: int
-    connectivity_score: int
-    tier: str
-    needs_help: bool
-    can_help_others: bool
 
 
 # =============================================================================
@@ -630,7 +593,7 @@ class FeeIntelligenceManager:
         # NNLB health adjustment
         if our_health < HEALTH_STRUGGLING:
             # Critical/struggling: lower fees to attract traffic
-            health_mult = 0.7 + (our_health / 100 * 0.3)  # 0.7x (health=0) to 0.775x (health=25)
+            health_mult = 0.7 + (our_health / 100 * 0.3)  # 0.7x (health=0) to 0.757x (health=19)
             health_reason = "lowered for NNLB (struggling node)"
         elif our_health > HEALTH_THRIVING:
             # Thriving: can yield to others
@@ -1052,6 +1015,7 @@ class FeeIntelligenceManager:
         """
         profiles = self.db.get_all_peer_fee_profiles(limit=limit)
         result = []
+        now = int(time.time())
 
         for profile in profiles:
             peer_id = profile.get("peer_id")
@@ -1074,7 +1038,6 @@ class FeeIntelligenceManager:
             )
 
             # Apply freshness decay
-            now = int(time.time())
             last_update = profile.get("last_update", now)
             age_hours = (now - last_update) / 3600
             freshness_factor = max(0.1, 1.0 - (age_hours / 48))
@@ -1168,7 +1131,7 @@ class FeeIntelligenceManager:
             timestamp = int(time.time())
 
         # Calculate revenue from volume if not provided
-        revenue_sats = int(revenue_rate * 1.0)  # Assuming 1 hour period
+        revenue_sats = int(revenue_rate)  # Assuming 1 hour period
         if forward_volume_sats > 0 and our_fee_ppm > 0:
             revenue_sats = (forward_volume_sats * our_fee_ppm) // 1_000_000
 
