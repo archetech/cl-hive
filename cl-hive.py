@@ -1945,6 +1945,8 @@ def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Pl
             protocol_handlers.handle_ban_proposal(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.BAN_VOTE:
             protocol_handlers.handle_ban_vote(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.BAN:
+            protocol_handlers.handle_ban(peer_id, msg_payload, plugin)
         # Phase 6: Channel Coordination
         elif msg_type == HiveMessageType.PEER_AVAILABLE:
             protocol_handlers.handle_peer_available(peer_id, msg_payload, plugin)

@@ -4265,6 +4265,57 @@ def _check_ban_quorum(proposal_id: str, proposal: Dict, plugin: Plugin) -> bool:
     return False
 
 
+def handle_ban(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle BAN message - notification that a ban has been executed.
+
+    BAN is broadcast by the node that first reaches quorum in _check_ban_quorum.
+    Most nodes will have already executed the ban independently when they tallied
+    enough BAN_VOTEs.  This handler acts as a catch-up mechanism: if this node
+    missed some votes and hasn't banned the target yet, we enforce it now.
+
+    The handler is intentionally lightweight - add_ban is idempotent (returns
+    False if the peer is already banned).
+    """
+    if not database:
+        return {"status": "ignored", "reason": "not_initialised"}
+
+    target_peer_id = payload.get("peer_id")
+    reason = payload.get("reason", "quorum_ban")
+    proposal_id = payload.get("proposal_id")
+
+    if not target_peer_id:
+        plugin.log("cl-hive: BAN message missing peer_id", level='warn')
+        return {"status": "ignored", "reason": "missing_peer_id"}
+
+    # Already banned — nothing to do
+    if database.is_banned(target_peer_id):
+        plugin.log(f"cl-hive: BAN notification for already-banned {target_peer_id[:16]}...", level='debug')
+        return {"status": "already_banned"}
+
+    # Enforce the ban
+    database.add_ban(target_peer_id, reason, peer_id)
+
+    # Full removal: DB, state manager, bridge policy, and forced gossip
+    _execute_member_removal(target_peer_id, reason="banned")
+
+    # Clear any intent locks held by the banned member
+    if intent_mgr:
+        try:
+            cleared = intent_mgr.clear_intents_by_peer(target_peer_id)
+            if cleared:
+                plugin.log(f"cl-hive: Cleared {cleared} intent locks for banned member {target_peer_id[:16]}...")
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to clear intents for banned member: {e}", level='warn')
+
+    plugin.log(f"cl-hive: BAN catch-up executed for {target_peer_id[:16]}... (proposal={proposal_id})")
+
+    if proposal_id:
+        database.update_ban_proposal_status(proposal_id, "approved")
+
+    return {"status": "banned", "peer_id": target_peer_id}
+
+
 # =============================================================================
 # PHASE 6: CHANNEL COORDINATION - PEER AVAILABLE HANDLING
 # =============================================================================

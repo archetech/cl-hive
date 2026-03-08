@@ -82,7 +82,7 @@ class HiveMessageType(IntEnum):
     
     # Phase 3: Coordination (deferred)
     INTENT = 32783      # Intent lock announcement
-    INTENT_ACK = 32785  # Intent acknowledgment
+    # 32785 reserved (was INTENT_ACK, removed — unused)
     INTENT_ABORT = 32787  # Intent abort notification
     
     # Phase 5: Governance (deferred)
