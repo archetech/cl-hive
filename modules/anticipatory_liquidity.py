@@ -21,7 +21,7 @@ import math
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
@@ -142,7 +142,7 @@ class TemporalPattern:
     - Combined: multiple fields set (e.g., "Friday mornings")
     """
     channel_id: str
-    hour_of_day: int              # 0-23 (None if day pattern)
+    hour_of_day: Optional[int]    # 0-23, or None if day-only/monthly pattern
     direction: FlowDirection
     intensity: float              # Relative intensity (1.0 = average)
     confidence: float             # Pattern reliability (0.0-1.0)
@@ -627,7 +627,7 @@ class AnticipatoryLiquidityManager:
             if len(self._flow_history[channel_id]) > MAX_FLOW_SAMPLES_PER_CHANNEL:
                 self._flow_history[channel_id] = self._flow_history[channel_id][-MAX_FLOW_SAMPLES_PER_CHANNEL:]
 
-            # Evict oldest channel if dict exceeds limit (O(1) lookup via tracker)
+            # Evict oldest channel if dict exceeds limit
             if len(self._flow_history) > MAX_FLOW_HISTORY_CHANNELS:
                 oldest_cid = min(
                     (cid for cid in self._flow_history_last_ts if cid != channel_id),
@@ -2194,7 +2194,26 @@ class AnticipatoryLiquidityManager:
                 if ch.get("state") != "CHANNELD_NORMAL":
                     continue
 
-                pred = self.predict_liquidity(scid, hours_ahead=hours_ahead)
+                # Extract channel data to avoid per-channel RPC calls
+                total = ch.get("total_msat", 0)
+                if isinstance(total, str):
+                    total = int(total.replace("msat", ""))
+                total_sats = total // 1000
+
+                local = ch.get("to_us_msat", 0)
+                if isinstance(local, str):
+                    local = int(local.replace("msat", ""))
+                local_sats = local // 1000
+
+                local_pct = local_sats / total_sats if total_sats > 0 else 0.5
+
+                pred = self.predict_liquidity(
+                    scid,
+                    hours_ahead=hours_ahead,
+                    current_local_pct=local_pct,
+                    capacity_sats=total_sats,
+                    peer_id=ch.get("peer_id", ""),
+                )
                 if pred:
                     max_risk = max(pred.depletion_risk, pred.saturation_risk)
                     if max_risk >= min_risk:
@@ -2745,7 +2764,6 @@ class AnticipatoryLiquidityManager:
 
     def get_kalman_velocity_status(self) -> Dict[str, Any]:
         """Get status of Kalman velocity integration."""
-        now = int(time.time())
         with self._lock:
             total_reports = sum(len(r) for r in self._kalman_velocities.values())
             fresh_reports = 0
