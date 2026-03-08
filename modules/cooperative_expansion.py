@@ -20,11 +20,12 @@ Election Criteria:
 Author: Lightning Goats Team
 """
 
+import math
 import secrets
 import time
 import threading
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional, Set, TYPE_CHECKING
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from enum import Enum
 
 if TYPE_CHECKING:
@@ -119,6 +120,10 @@ class CooperativeExpansionManager:
     - Uses a lock to protect round state
     - Background thread handles round expiration
     """
+
+    # State sets (avoid re-creating tuples on every check)
+    _ACTIVE_STATES = frozenset({ExpansionRoundState.NOMINATING, ExpansionRoundState.ELECTING})
+    _TERMINAL_STATES = frozenset({ExpansionRoundState.COMPLETED, ExpansionRoundState.CANCELLED, ExpansionRoundState.EXPIRED})
 
     # Timing constants
     NOMINATION_WINDOW_SECONDS = 30    # Time to collect nominations
@@ -479,7 +484,7 @@ class CooperativeExpansionManager:
         with self._lock:
             for round_obj in self._rounds.values():
                 if (round_obj.target_peer_id == target_peer_id and
-                    round_obj.state in (ExpansionRoundState.NOMINATING, ExpansionRoundState.ELECTING)):
+                    round_obj.state in self._ACTIVE_STATES):
                     self._log(
                         f"Round already active for {target_peer_id[:16]}...",
                         level='debug'
@@ -489,7 +494,7 @@ class CooperativeExpansionManager:
             # Check max active rounds
             active_count = sum(
                 1 for r in self._rounds.values()
-                if r.state in (ExpansionRoundState.NOMINATING, ExpansionRoundState.ELECTING)
+                if r.state in self._ACTIVE_STATES
             )
             if active_count >= self.MAX_ACTIVE_ROUNDS:
                 self._log("Max active rounds reached", level='debug')
@@ -743,7 +748,7 @@ class CooperativeExpansionManager:
             with self._lock:
                 for rid, r in self._rounds.items():
                     if (r.target_peer_id == target_peer_id and
-                        r.state in (ExpansionRoundState.NOMINATING, ExpansionRoundState.ELECTING)):
+                        r.state in self._ACTIVE_STATES):
                         existing_round_id = rid
                         break
 
@@ -778,7 +783,7 @@ class CooperativeExpansionManager:
                 with self._lock:
                     active_count = sum(
                         1 for r in self._rounds.values()
-                        if r.state in (ExpansionRoundState.NOMINATING, ExpansionRoundState.ELECTING)
+                        if r.state in self._ACTIVE_STATES
                     )
                 if active_count >= self.MAX_ACTIVE_ROUNDS:
                     self._log(f"Ignoring remote round {round_id[:8]}...: max active rounds reached", level='debug')
@@ -862,7 +867,6 @@ class CooperativeExpansionManager:
             factors = {}
 
             # Liquidity score (0-1): log scale, caps at 100M sats
-            import math
             liquidity_btc = nom.available_liquidity_sats / 100_000_000
             liquidity_score = max(0.0, min(1.0, 0.3 + 0.7 * math.log10(max(0.01, liquidity_btc)) / 2))
             score += liquidity_score * self.WEIGHT_LIQUIDITY
@@ -948,14 +952,15 @@ class CooperativeExpansionManager:
         target_peer_id = payload.get("target_peer_id")
         channel_size_sats = payload.get("channel_size_sats", 0)
 
+        if not round_id or not elected_id or not target_peer_id:
+            return {"error": "missing round_id, elected_id, or target_peer_id"}
+
         # Update local round state if we have this round
         with self._lock:
             round_obj = self._rounds.get(round_id)
             if round_obj:
                 # Only accept election for rounds in valid pre-election states
-                if round_obj.state in (ExpansionRoundState.COMPLETED,
-                                       ExpansionRoundState.CANCELLED,
-                                       ExpansionRoundState.EXPIRED):
+                if round_obj.state in self._TERMINAL_STATES:
                     self._log(
                         f"Round {round_id[:8]}... ignoring election - already {round_obj.state.value}"
                     )
@@ -1118,10 +1123,7 @@ class CooperativeExpansionManager:
         """Cancel an active round."""
         with self._lock:
             round_obj = self._rounds.get(round_id)
-            if round_obj and round_obj.state in (
-                ExpansionRoundState.NOMINATING,
-                ExpansionRoundState.ELECTING
-            ):
+            if round_obj and round_obj.state in self._ACTIVE_STATES:
                 round_obj.state = ExpansionRoundState.CANCELLED
                 round_obj.result = reason or "cancelled"
 
@@ -1142,7 +1144,7 @@ class CooperativeExpansionManager:
         with self._lock:
             return [
                 r for r in self._rounds.values()
-                if r.state in (ExpansionRoundState.NOMINATING, ExpansionRoundState.ELECTING)
+                if r.state in self._ACTIVE_STATES
             ]
 
     def get_rounds_for_target(self, target_peer_id: str) -> List[ExpansionRound]:
@@ -1166,10 +1168,7 @@ class CooperativeExpansionManager:
         with self._lock:
             for round_id, round_obj in list(self._rounds.items()):
                 if round_obj.expires_at > 0 and now > round_obj.expires_at:
-                    if round_obj.state in (
-                        ExpansionRoundState.NOMINATING,
-                        ExpansionRoundState.ELECTING
-                    ):
+                    if round_obj.state in self._ACTIVE_STATES:
                         round_obj.state = ExpansionRoundState.EXPIRED
                         round_obj.result = "expired"
                         cleaned += 1
@@ -1178,11 +1177,8 @@ class CooperativeExpansionManager:
             old_threshold = now - 3600
             expired_ids = [
                 rid for rid, r in self._rounds.items()
-                if r.state in (
-                    ExpansionRoundState.COMPLETED,
-                    ExpansionRoundState.CANCELLED,
-                    ExpansionRoundState.EXPIRED
-                ) and r.started_at < old_threshold
+                if r.state in self._TERMINAL_STATES
+                and r.started_at < old_threshold
             ]
             for rid in expired_ids:
                 del self._rounds[rid]
@@ -1199,26 +1195,29 @@ class CooperativeExpansionManager:
 
     def get_status(self) -> Dict[str, Any]:
         """Get overall status of the cooperative expansion system."""
+        now = int(time.time())
         with self._lock:
             active = [r for r in self._rounds.values()
-                     if r.state in (ExpansionRoundState.NOMINATING, ExpansionRoundState.ELECTING)]
+                     if r.state in self._ACTIVE_STATES]
             # ELECTED and COMPLETED are both "finished" rounds
             completed = [r for r in self._rounds.values()
                         if r.state in (ExpansionRoundState.ELECTED, ExpansionRoundState.COMPLETED)]
             cancelled = [r for r in self._rounds.values()
                         if r.state in (ExpansionRoundState.CANCELLED, ExpansionRoundState.EXPIRED)]
+            total_rounds = len(self._rounds)
+            cooldowns = {
+                k[:16] + "...": v
+                for k, v in self._target_cooldowns.items()
+                if v > now
+            }
 
         return {
             "active_rounds": len(active),
             "completed_rounds": len(completed),
             "cancelled_rounds": len(cancelled),
-            "total_rounds": len(self._rounds),
+            "total_rounds": total_rounds,
             "max_active_rounds": self.MAX_ACTIVE_ROUNDS,
             "active": [r.to_dict() for r in active],
             "recent_completed": [r.to_dict() for r in completed[-5:]],
-            "cooldowns": {
-                k[:16] + "...": v
-                for k, v in self._target_cooldowns.items()
-                if v > int(time.time())
-            },
+            "cooldowns": cooldowns,
         }
