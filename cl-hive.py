@@ -957,6 +957,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Intent manager initialized")
     
+    # Pre-inject shutdown_event so loop startup delays work before full init
+    background_loops.init_background_loops({'shutdown_event': shutdown_event})
+
     # Start background threads (Phase 3)
     intent_thread = threading.Thread(
         target=background_loops.intent_monitor_loop,
