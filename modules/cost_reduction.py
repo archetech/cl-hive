@@ -15,7 +15,6 @@ Author: Lightning Goats Team
 
 import threading
 import time
-import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict, deque
@@ -60,12 +59,8 @@ CIRCULAR_FLOW_WINDOW_HOURS = 24     # Look back 24 hours
 MIN_CIRCULAR_AMOUNT_SATS = 100000   # Minimum amount to flag circular flow
 CIRCULAR_FLOW_RATIO_THRESHOLD = 0.8  # 80% flow ratio indicates circular
 
-# Rebalance outcome tracking
-REBALANCE_HISTORY_HOURS = 72        # Track rebalances for 72 hours
-
 # Rebalance hub scoring (Use Case 5)
 HIGH_HUB_SCORE_THRESHOLD = 0.6      # Score above this is "high" hub potential
-PREFER_HUB_SCORE_BONUS = 1.2        # 20% preference bonus for high-hub peers
 HUB_SCORE_WEIGHT_IN_PATH = 0.3      # 30% weight for hub score in path selection
 
 
@@ -632,9 +627,27 @@ class FleetRebalanceRouter:
             "recommendation": "use_external_path"
         }
 
-        # Get peers for the channels
-        from_peer = self._get_peer_for_channel(from_channel)
-        to_peer = self._get_peer_for_channel(to_channel)
+        # Resolve both peers and collect our_peers in a single RPC call
+        from_peer = None
+        to_peer = None
+        our_peers = set()
+        try:
+            if self.plugin:
+                from_norm = from_channel.replace(":", "x")
+                to_norm = to_channel.replace(":", "x")
+                channels = self.plugin.rpc.listpeerchannels()
+                for ch in channels.get("channels", []):
+                    pid = ch.get("peer_id")
+                    scid = ch.get("short_channel_id", "")
+                    if pid and scid:
+                        our_peers.add(pid)
+                        scid_norm = scid.replace(":", "x")
+                        if scid_norm == from_norm:
+                            from_peer = pid
+                        elif scid_norm == to_norm:
+                            to_peer = pid
+        except Exception:
+            pass
 
         if not from_peer or not to_peer:
             return result
@@ -663,16 +676,6 @@ class FleetRebalanceRouter:
             # candidates because the route us -> member -> to_peer is 2-hop
             # and zero-fee through fleet channels.
             topology = self._get_fleet_topology()
-            try:
-                our_peers = set()
-                channels = self.plugin.rpc.listpeerchannels()
-                for ch in channels.get("channels", []):
-                    pid = ch.get("peer_id")
-                    if pid and ch.get("short_channel_id"):
-                        our_peers.add(pid)
-            except Exception:
-                our_peers = set()
-
             source_eligible = []
             for member, peers in topology.items():
                 if member in our_peers and to_peer in peers:
@@ -1624,12 +1627,14 @@ class CostReductionManager:
         to_peer = None
         try:
             if self.plugin and self.plugin.rpc:
+                from_norm = from_channel.replace(":", "x")
+                to_norm = to_channel.replace(":", "x")
                 channels = self.plugin.rpc.listpeerchannels()
                 for ch in channels.get("channels", []):
                     scid = ch.get("short_channel_id", "").replace(":", "x")
-                    if scid == from_channel.replace(":", "x"):
+                    if scid == from_norm:
                         from_peer = ch.get("peer_id")
-                    elif scid == to_channel.replace(":", "x"):
+                    elif scid == to_norm:
                         to_peer = ch.get("peer_id")
                     if from_peer and to_peer:
                         break
