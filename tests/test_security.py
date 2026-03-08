@@ -311,11 +311,12 @@ class TestRpcLockTimeout:
             pytest.skip("Could not verify RPC_LOCK_TIMEOUT_SECONDS")
 
     def test_rpc_lock_timeout_error_class_exists(self):
-        """RpcLockTimeoutError should be defined."""
-        with open(os.path.join(
+        """RpcLockTimeoutError should be defined (in modules/rpc_pool.py)."""
+        rpc_pool_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'cl-hive.py'
-        )) as f:
+            'modules', 'rpc_pool.py'
+        )
+        with open(rpc_pool_path) as f:
             content = f.read()
 
         assert 'class RpcLockTimeoutError' in content
@@ -323,10 +324,11 @@ class TestRpcLockTimeout:
 
     def test_rpc_pool_provides_bounded_execution(self):
         """RpcPool should provide hard timeout guarantees via subprocess isolation."""
-        with open(os.path.join(
+        rpc_pool_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'cl-hive.py'
-        )) as f:
+            'modules', 'rpc_pool.py'
+        )
+        with open(rpc_pool_path) as f:
             content = f.read()
 
         # Phase 3: RPC Pool replaces global RPC_LOCK with subprocess-based pool
@@ -421,8 +423,13 @@ class TestSecurityIntegration:
         )) as f:
             main_content = f.read()
 
-        # Phase 3: RPC Pool replaces global RPC_LOCK
-        assert 'class RpcPool' in main_content
+        # Phase 3: RPC Pool (now in modules/rpc_pool.py, imported by cl-hive.py)
+        with open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'modules', 'rpc_pool.py'
+        )) as f:
+            rpc_pool_content = f.read()
+        assert 'class RpcPool' in rpc_pool_content
         assert 'P3-02' in main_content
 
 
