@@ -387,7 +387,8 @@ class TestRevenueOpsIntegration:
             "action": "set",
             "peer_id": "peer123" * 5,
             "strategy": "hive",
-            "rebalance": "enabled"
+            "rebalance": "enabled",
+            "internal": True,
         })
 
     def test_set_hive_policy_non_member(self, bridge, mock_rpc):
@@ -401,7 +402,8 @@ class TestRevenueOpsIntegration:
         mock_rpc.call.assert_called_with("revenue-policy", {
             "action": "set",
             "peer_id": "peer123" * 5,
-            "strategy": "dynamic"
+            "strategy": "dynamic",
+            "internal": True,
         })
     
     def test_set_hive_policy_circuit_open(self, bridge, mock_rpc):

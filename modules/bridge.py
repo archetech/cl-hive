@@ -611,14 +611,16 @@ class Bridge:
                     "action": "set",
                     "peer_id": peer_id,
                     "strategy": "hive",
-                    "rebalance": "enabled"
+                    "rebalance": "enabled",
+                    "internal": True,
                 })
             else:
                 # Revert to dynamic strategy
                 result = self.safe_call("revenue-policy", {
                     "action": "set",
                     "peer_id": peer_id,
-                    "strategy": "dynamic"
+                    "strategy": "dynamic",
+                    "internal": True,
                 })
 
             success = result.get("status") == "success"
