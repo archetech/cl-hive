@@ -18,7 +18,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import network_metrics
 
@@ -72,8 +72,7 @@ TIME_FEE_LOW_INTENSITY = 0.3         # Flow intensity < 30% = low activity
 # Minimum pattern confidence to apply adjustment
 TIME_FEE_MIN_CONFIDENCE = 0.5        # Require 50% confidence
 
-# Transition smoothing (avoid sudden jumps)
-TIME_FEE_TRANSITION_PERIODS = 2      # Smooth over 2 hours
+# Cache TTL
 TIME_FEE_CACHE_TTL_HOURS = 1         # Cache adjustments for 1 hour
 
 # =============================================================================
@@ -86,14 +85,6 @@ TIME_FEE_CACHE_TTL_HOURS = 1         # Cache adjustments for 1 hour
 SALIENT_FEE_CHANGE_PCT = 0.05        # 5% fee change minimum to be salient
 SALIENT_FEE_CHANGE_MIN_PPM = 10      # At least 10 ppm absolute change
 SALIENT_FEE_CHANGE_COOLDOWN = 3600   # 1 hour between fee changes per channel
-
-# Balance change salience
-SALIENT_BALANCE_CHANGE_PCT = 0.05    # 5% balance shift to be salient
-SALIENT_VELOCITY_CHANGE_PCT = 0.10   # 10% velocity change to be salient
-
-# Routing stats salience
-SALIENT_SUCCESS_RATE_CHANGE = 0.10   # 10% success rate change to be salient
-SALIENT_LATENCY_CHANGE_MS = 100      # 100ms latency change to be salient
 
 # =============================================================================
 # CENTRALITY-BASED FEE ADJUSTMENT (Use Case 8)
@@ -137,54 +128,6 @@ def is_fee_change_salient(
 
     if pct_change < SALIENT_FEE_CHANGE_PCT:
         return False, f"pct_change_too_small ({pct_change * 100:.1f}% < {SALIENT_FEE_CHANGE_PCT * 100}%)"
-
-    return True, "salient"
-
-
-def is_balance_change_salient(
-    old_balance_pct: float,
-    new_balance_pct: float
-) -> Tuple[bool, str]:
-    """
-    Determine if a balance change is significant enough to warrant action.
-
-    Args:
-        old_balance_pct: Previous local balance as 0-1 ratio
-        new_balance_pct: Current local balance as 0-1 ratio
-
-    Returns:
-        Tuple of (is_salient, reason)
-    """
-    change = abs(new_balance_pct - old_balance_pct)
-
-    if change < SALIENT_BALANCE_CHANGE_PCT:
-        return False, f"balance_change_too_small ({change * 100:.1f}% < {SALIENT_BALANCE_CHANGE_PCT * 100}%)"
-
-    return True, "salient"
-
-
-def is_velocity_change_salient(
-    old_velocity: float,
-    new_velocity: float
-) -> Tuple[bool, str]:
-    """
-    Determine if a velocity change is significant enough to warrant action.
-
-    Args:
-        old_velocity: Previous velocity (sats/hour)
-        new_velocity: Current velocity (sats/hour)
-
-    Returns:
-        Tuple of (is_salient, reason)
-    """
-    if old_velocity == 0:
-        # Any non-zero velocity from zero is salient
-        return new_velocity != 0, "from_zero" if new_velocity != 0 else "no_change"
-
-    pct_change = abs(new_velocity - old_velocity) / abs(old_velocity)
-
-    if pct_change < SALIENT_VELOCITY_CHANGE_PCT:
-        return False, f"velocity_change_too_small ({pct_change * 100:.1f}% < {SALIENT_VELOCITY_CHANGE_PCT * 100}%)"
 
     return True, "salient"
 
@@ -589,20 +532,6 @@ class FlowCorridorManager:
         self._log(f"Refreshed {len(new_assignments)} corridor assignments")
 
         return list(new_assignments.values())
-
-    def is_primary_for_corridor(
-        self,
-        member_id: str,
-        source: str,
-        destination: str
-    ) -> bool:
-        """Check if member is primary for a specific corridor."""
-        key = (source, destination)
-        assignments, _ = self._assignments_snapshot
-        assignment = assignments.get(key)
-        if assignment:
-            return assignment.primary_member == member_id
-        return False
 
     def get_fee_for_member(
         self,
@@ -1256,7 +1185,6 @@ class StigmergicCoordinator:
             # Evict least-active route pair if dict exceeds limit
             max_routes = 1000
             if len(self._markers) > max_routes:
-                now = time.time()
                 oldest_key = min(
                     (k for k in self._markers if k != key),
                     key=lambda k: max(
@@ -1790,59 +1718,6 @@ class MyceliumDefenseSystem:
         """Set reference to peer reputation manager for warning broadcast."""
         self._peer_rep_mgr = peer_rep_mgr
 
-    def broadcast_warning_via_reputation(
-        self,
-        warning: PeerWarning,
-        rpc: Any
-    ) -> bool:
-        """
-        Broadcast a warning through the PEER_REPUTATION protocol.
-
-        Uses the peer reputation system to propagate threat information,
-        encoding the threat as a warning in the reputation report.
-
-        Args:
-            warning: The PeerWarning to broadcast
-            rpc: RPC interface for signing
-
-        Returns:
-            True if broadcast succeeded
-        """
-        if not hasattr(self, '_peer_rep_mgr') or not self._peer_rep_mgr:
-            self._log("No peer reputation manager - cannot broadcast warning", level='warn')
-            return False
-
-        # Map threat types to warning codes
-        warning_code_map = {
-            "drain": "drain_attack",
-            "unreliable": "unreliable",
-            "force_close": "force_close_risk"
-        }
-        warning_code = warning_code_map.get(warning.threat_type, warning.threat_type)
-
-        try:
-            # Create a peer reputation message with the warning
-            msg = self._peer_rep_mgr.create_reputation_message(
-                peer_id=warning.peer_id,
-                rpc=rpc,
-                uptime_pct=1.0 - warning.severity,  # Lower uptime = worse reputation
-                htlc_success_rate=1.0 - warning.severity if warning.threat_type == "unreliable" else 1.0,
-                warnings=[warning_code],
-                observation_days=7
-            )
-
-            if msg:
-                self._log(
-                    f"Warning broadcast prepared for {warning.peer_id[:12]}: "
-                    f"{warning.threat_type} (severity={warning.severity:.2f})"
-                )
-                return True
-
-        except Exception as e:
-            self._log(f"Failed to broadcast warning: {e}", level='error')
-
-        return False
-
     def get_accumulated_warnings(self, peer_id: str) -> Dict[str, Any]:
         """
         Get accumulated warning information for a peer.
@@ -2268,7 +2143,7 @@ class TimeBasedFeeAdjuster:
                     "hour": pattern.hour_of_day,
                     "day": pattern.day_of_week,
                     "day_name": self.DAY_NAMES[pattern.day_of_week]
-                        if pattern.day_of_week is not None and pattern.day_of_week >= 0 else "Any",
+                        if pattern.day_of_week is not None and 0 <= pattern.day_of_week <= 6 else "Any",
                     "intensity": round(pattern.intensity, 2),
                     "direction": pattern.direction,
                     "confidence": round(pattern.confidence, 2),
@@ -2301,7 +2176,7 @@ class TimeBasedFeeAdjuster:
                     "hour": pattern.hour_of_day,
                     "day": pattern.day_of_week,
                     "day_name": self.DAY_NAMES[pattern.day_of_week]
-                        if pattern.day_of_week is not None and pattern.day_of_week >= 0 else "Any",
+                        if pattern.day_of_week is not None and 0 <= pattern.day_of_week <= 6 else "Any",
                     "intensity": round(pattern.intensity, 2),
                     "direction": pattern.direction,
                     "confidence": round(pattern.confidence, 2),
@@ -2345,12 +2220,6 @@ class TimeBasedFeeAdjuster:
             }
         }
 
-    def clear_cache(self) -> int:
-        """Clear adjustment cache. Returns number of entries cleared."""
-        with self._cache_lock:
-            count = len(self._adjustment_cache)
-            self._adjustment_cache.clear()
-            return count
 
 
 # =============================================================================
@@ -2752,8 +2621,10 @@ class FeeCoordinationManager:
 
         self.database.save_pheromone_levels(pheromone_snapshot)
 
-        # Snapshot marker data under lock
+        # Single timestamp for all expiry checks in this save
         now = time.time()
+
+        # Snapshot marker data under lock
         marker_snapshot = []
         with self.stigmergic_coord._lock:
             for (src, dst), markers in self.stigmergic_coord._markers.items():
@@ -2775,7 +2646,6 @@ class FeeCoordinationManager:
         self.database.save_stigmergic_markers(marker_snapshot)
 
         # Snapshot defense state under lock
-        now = time.time()
         reports_snapshot = []
         fees_snapshot = []
         with self.defense_system._lock:
