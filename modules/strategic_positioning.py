@@ -5,8 +5,7 @@ Positions the fleet on critical network paths to maximize routing opportunities:
 
 1. RouteValueAnalyzer: Identify high-value corridors with volume and limited competition
 2. FleetPositioningStrategy: Coordinate channel opens without duplication
-3. ExchangeConnectivity: Prioritize connections to major Lightning exchanges
-4. PhysarumChannelManager: Flow-based channel lifecycle (strengthen/atrophy)
+3. PhysarumChannelManager: Flow-based channel lifecycle (strengthen/atrophy)
 
 The goal is strategic capital deployment - position on high-value routes where
 the fleet can capture significant routing fees.
@@ -14,8 +13,8 @@ the fleet can capture significant routing fees.
 Author: Lightning Goats Team
 """
 
+import json
 import time
-import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -45,7 +44,6 @@ AUTO_STIMULATE_ENABLED = True               # Enable auto fee reduction for youn
 
 # Auto-trigger thresholds
 MIN_AUTO_STRENGTHEN_FLOW = 0.025            # 2.5% flow for auto-strengthen (above base)
-MIN_SUSTAIN_PERIODS = 3                     # Flow must be sustained for 3 periods
 AUTO_STRENGTHEN_MIN_SATS = 1_000_000        # Minimum 1M sats for auto splice-in
 AUTO_STRENGTHEN_MAX_SATS = 5_000_000        # Maximum 5M sats for auto splice-in
 
@@ -56,11 +54,9 @@ MIN_STRENGTHEN_INTERVAL_HOURS = 24          # Minimum 24h between strengthen for
 
 # Safety constraints
 AUTO_TRIGGER_MIN_ON_CHAIN_SATS = 500_000    # Minimum 500k sats on-chain reserve
-AUTO_TRIGGER_MAX_PCT_OF_CAPACITY = 0.10     # Max 10% of total capacity per action
 
 # Positioning priorities
 EXCHANGE_PRIORITY_BONUS = 1.5               # 50% bonus for exchange channels
-BRIDGE_PRIORITY_BONUS = 1.3                 # 30% bonus for bridge positions
 UNDERSERVED_PRIORITY_BONUS = 1.2            # 20% bonus for underserved targets
 
 # Centrality-aware targeting (Use Case 4)
@@ -1383,10 +1379,6 @@ class PhysarumChannelManager:
         """Set database reference for pending_actions."""
         self._database = database
 
-    def set_decision_engine(self, decision_engine) -> None:
-        """Set decision engine reference for governance checks."""
-        self._decision_engine = decision_engine
-
     def execute_physarum_cycle(self) -> Dict[str, Any]:
         """
         Execute one Physarum optimization cycle.
@@ -1641,8 +1633,6 @@ class PhysarumChannelManager:
         expires_hours: int = 72
     ) -> Optional[int]:
         """Create a pending action in the database."""
-        import json
-
         if not hasattr(self, '_database') or not self._database:
             return None
 
