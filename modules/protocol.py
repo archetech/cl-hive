@@ -22,7 +22,6 @@ import json
 import time
 from enum import IntEnum
 from typing import Dict, Any, List, Optional, Tuple
-from dataclasses import dataclass, field
 
 
 # =============================================================================
@@ -31,7 +30,6 @@ from dataclasses import dataclass, field
 
 # 4-byte magic prefix: ASCII "HIVE" = 0x48 0x49 0x56 0x45
 HIVE_MAGIC = b'HIVE'
-HIVE_MAGIC_HEX = 0x48495645
 
 # Protocol version for compatibility checks
 PROTOCOL_VERSION = 1
@@ -50,7 +48,6 @@ MAX_PEER_ID_LEN = 128
 
 # Maximum length for freeform string fields
 MAX_REASON_LEN = 512
-MAX_STRING_FIELD_LEN = 1024
 
 # =============================================================================
 # MESSAGE TYPES
@@ -255,174 +252,6 @@ VOUCH_TTL_SECONDS = 7 * 24 * 3600
 
 
 # =============================================================================
-# PAYLOAD STRUCTURES
-# =============================================================================
-
-@dataclass
-class HelloPayload:
-    """
-    HIVE_HELLO message payload - Introduction to hive.
-
-    Channel existence serves as proof of stake - no ticket needed.
-    If sender has a channel with a hive member, they can join as neophyte.
-    """
-    pubkey: str         # Sender's public key (66 hex chars)
-    protocol_version: int = PROTOCOL_VERSION
-
-
-@dataclass
-class ChallengePayload:
-    """HIVE_CHALLENGE message payload - Nonce for authentication."""
-    nonce: str          # 32-byte random hex string
-    hive_id: str        # Hive identifier (for multi-hive future)
-
-
-@dataclass  
-class AttestPayload:
-    """HIVE_ATTEST message payload - Signed manifest + nonce response."""
-    pubkey: str         # Node public key (66 hex chars)
-    version: str        # Plugin version string
-    features: list      # Supported features ["splice", "dual-fund", ...]
-    nonce_signature: str  # signmessage(nonce) result
-    manifest_signature: str  # signmessage(manifest_json) result
-
-
-@dataclass
-class WelcomePayload:
-    """HIVE_WELCOME message payload - Session established."""
-    hive_id: str        # Assigned Hive identifier
-    tier: str           # 'neophyte' or 'member'
-    member_count: int   # Current Hive size
-    state_hash: str     # Current state hash for anti-entropy
-
-
-# =============================================================================
-# PHASE 7: FEE INTELLIGENCE PAYLOADS
-# =============================================================================
-
-@dataclass
-class FeeIntelligencePayload:
-    """
-    FEE_INTELLIGENCE message payload - Share fee observations with hive.
-
-    Enables cooperative fee setting by sharing observations about
-    external peers' fee elasticity and routing performance.
-    """
-    reporter_id: str              # Who observed this (must match sender)
-    target_peer_id: str           # External peer being reported on
-    timestamp: int                # Unix timestamp of observation
-    signature: str                # Required signature over payload
-
-    # Current fee configuration
-    our_fee_ppm: int              # Fee we charge to this peer
-    their_fee_ppm: int            # Fee they charge us (if known)
-
-    # Performance metrics (observation period)
-    forward_count: int            # Number of forwards through this peer
-    forward_volume_sats: int      # Total volume routed
-    revenue_sats: int             # Fees earned from this peer
-
-    # Flow analysis
-    flow_direction: str           # 'source', 'sink', 'balanced'
-    utilization_pct: float        # Channel utilization (0.0-1.0)
-
-    # Elasticity observation (optional)
-    last_fee_change_ppm: int = 0  # Previous fee rate (for elasticity calc)
-    volume_delta_pct: float = 0.0 # Volume change after fee change
-
-    # Confidence
-    days_observed: int = 1        # How long we've observed this peer
-
-
-@dataclass
-class LiquidityNeedPayload:
-    """
-    LIQUIDITY_NEED message payload - Broadcast rebalancing needs.
-
-    Enables cooperative rebalancing by sharing liquidity requirements.
-    """
-    reporter_id: str              # Who needs liquidity
-    timestamp: int
-    signature: str
-
-    # What we need
-    need_type: str                # 'inbound', 'outbound', 'rebalance'
-    target_peer_id: str           # External peer (or hive member)
-    amount_sats: int              # How much we need
-    urgency: str                  # 'critical', 'high', 'medium', 'low'
-    max_fee_ppm: int              # Maximum fee we'll pay
-
-    # Why we need it
-    reason: str                   # 'channel_depleted', 'opportunity', 'nnlb_assist'
-    current_balance_pct: float    # Current local balance percentage
-
-    # Reciprocity - what we can offer
-    can_provide_inbound: int = 0  # Sats of inbound we can provide
-    can_provide_outbound: int = 0 # Sats of outbound we can provide
-
-
-@dataclass
-class HealthReportPayload:
-    """
-    HEALTH_REPORT message payload - NNLB health status.
-
-    Periodic health report for No Node Left Behind coordination.
-    Allows hive to identify who needs help.
-    """
-    reporter_id: str
-    timestamp: int
-    signature: str
-
-    # Self-reported health scores (0-100)
-    overall_health: int
-    capacity_score: int
-    revenue_score: int
-    connectivity_score: int
-
-    # Specific needs (optional flags)
-    needs_inbound: bool = False
-    needs_outbound: bool = False
-    needs_channels: bool = False
-
-    # Willingness to help others
-    can_provide_assistance: bool = False
-    assistance_budget_sats: int = 0
-
-
-@dataclass
-class RouteProbePayload:
-    """
-    ROUTE_PROBE message payload - Routing intelligence.
-
-    Share payment path quality observations to build collective
-    routing intelligence across the hive.
-    """
-    reporter_id: str
-    timestamp: int
-    signature: str
-
-    # Route definition
-    destination: str           # Final destination pubkey
-    path: List[str]            # Intermediate hops (pubkeys)
-
-    # Probe results
-    success: bool              # Did the probe succeed
-    latency_ms: int            # Round-trip time in milliseconds
-    failure_reason: str = ""   # If failed: 'temporary', 'permanent', 'capacity'
-    failure_hop: int = -1      # Which hop failed (0-indexed, -1 if success)
-
-    # Capacity observations
-    estimated_capacity_sats: int = 0  # Max amount that would succeed
-
-    # Fee observations
-    total_fee_ppm: int = 0     # Total fees for this route
-    per_hop_fees: List[int] = field(default_factory=list)  # Fee at each hop
-
-    # Amount probed
-    amount_probed_sats: int = 0
-
-
-# =============================================================================
 # PHASE 7 VALIDATION CONSTANTS
 # =============================================================================
 
@@ -503,7 +332,6 @@ VALID_PRIORITY_TIERS = {"critical", "high", "medium", "low"}
 COVERAGE_ANALYSIS_BATCH_RATE_LIMIT = (2, 86400) # 2 batches per day
 MAX_COVERAGE_ENTRIES_IN_BATCH = 200             # Maximum coverage entries
 MIN_COVERAGE_OWNERSHIP_CONFIDENCE = 0.5         # Minimum confidence to share ownership
-MIN_OWNERSHIP_CONFIDENCE = MIN_COVERAGE_OWNERSHIP_CONFIDENCE  # Alias
 CLOSE_PROPOSAL_RATE_LIMIT = (5, 86400)          # 5 close proposals per day
 MAX_CLOSE_PROPOSALS_PER_CYCLE = 5               # Alias for broadcast function
 
@@ -1831,8 +1659,6 @@ def get_fee_intelligence_snapshot_signing_payload(payload: Dict[str, Any]) -> st
     Returns:
         Canonical string for signmessage()
     """
-    import hashlib
-    import json
 
     # Create deterministic hash of peers data
     peers = payload.get("peers", [])
@@ -1862,7 +1688,7 @@ def validate_fee_intelligence_snapshot_payload(payload: Dict[str, Any]) -> bool:
     Returns:
         True if valid, False otherwise
     """
-    import time as time_module
+
 
     # Required string fields
     reporter_id = payload.get("reporter_id")
@@ -1877,7 +1703,7 @@ def validate_fee_intelligence_snapshot_payload(payload: Dict[str, Any]) -> bool:
     timestamp = payload.get("timestamp", 0)
     if not isinstance(timestamp, int) or timestamp < 0:
         return False
-    if abs(time_module.time() - timestamp) > FEE_INTELLIGENCE_MAX_AGE:
+    if abs(time.time() - timestamp) > FEE_INTELLIGENCE_MAX_AGE:
         return False
 
     # Peers array
@@ -2020,8 +1846,6 @@ def get_liquidity_snapshot_signing_payload(payload: Dict[str, Any]) -> str:
     Returns:
         Canonical string for signmessage()
     """
-    import hashlib
-    import json
 
     # Create deterministic hash of needs data
     needs = payload.get("needs", [])
@@ -2051,7 +1875,7 @@ def validate_liquidity_snapshot_payload(payload: Dict[str, Any]) -> bool:
     Returns:
         True if valid, False otherwise
     """
-    import time as time_module
+
 
     # Required string fields
     reporter_id = payload.get("reporter_id")
@@ -2066,7 +1890,7 @@ def validate_liquidity_snapshot_payload(payload: Dict[str, Any]) -> bool:
     timestamp = payload.get("timestamp", 0)
     if not isinstance(timestamp, int) or timestamp < 0:
         return False
-    if abs(time_module.time() - timestamp) > 3600:
+    if abs(time.time() - timestamp) > 3600:
         return False
 
     # Needs array
@@ -2405,8 +2229,6 @@ def get_route_probe_batch_signing_payload(payload: Dict[str, Any]) -> str:
     Returns:
         Canonical string for signmessage()
     """
-    import hashlib
-    import json
 
     # Create deterministic hash of probes data
     probes = payload.get("probes", [])
@@ -2436,7 +2258,7 @@ def validate_route_probe_batch_payload(payload: Dict[str, Any]) -> bool:
     Returns:
         True if valid, False otherwise
     """
-    import time as time_module
+
 
     # Required string fields
     reporter_id = payload.get("reporter_id")
@@ -2451,7 +2273,7 @@ def validate_route_probe_batch_payload(payload: Dict[str, Any]) -> bool:
     timestamp = payload.get("timestamp", 0)
     if not isinstance(timestamp, int) or timestamp < 0:
         return False
-    if abs(time_module.time() - timestamp) > 3600:
+    if abs(time.time() - timestamp) > 3600:
         return False
 
     # Probes array
@@ -2588,8 +2410,6 @@ def get_peer_reputation_snapshot_signing_payload(payload: Dict[str, Any]) -> str
     Returns:
         Canonical string for signmessage()
     """
-    import hashlib
-    import json
 
     # Create deterministic hash of peers data
     peers = payload.get("peers", [])
@@ -2619,7 +2439,7 @@ def validate_peer_reputation_snapshot_payload(payload: Dict[str, Any]) -> bool:
     Returns:
         True if valid, False otherwise
     """
-    import time as time_module
+
 
     # Required string fields
     reporter_id = payload.get("reporter_id")
@@ -2634,7 +2454,7 @@ def validate_peer_reputation_snapshot_payload(payload: Dict[str, Any]) -> bool:
     timestamp = payload.get("timestamp", 0)
     if not isinstance(timestamp, int) or timestamp < 0:
         return False
-    if abs(time_module.time() - timestamp) > 3600:
+    if abs(time.time() - timestamp) > 3600:
         return False
 
     # Peers array
@@ -3230,7 +3050,7 @@ def validate_task_request_payload(payload: Dict[str, Any]) -> bool:
     Returns:
         True if valid, False otherwise
     """
-    import time as time_module
+
 
     # Required fields
     required = ["requester_id", "request_id", "timestamp", "task_type",
@@ -3275,7 +3095,7 @@ def validate_task_request_payload(payload: Dict[str, Any]) -> bool:
         return False
 
     # Timestamp freshness
-    now = int(time_module.time())
+    now = int(time.time())
     if abs(now - payload["timestamp"]) > TASK_REQUEST_MAX_AGE:
         return False
 
@@ -3317,7 +3137,7 @@ def validate_task_response_payload(payload: Dict[str, Any]) -> bool:
     Returns:
         True if valid, False otherwise
     """
-    import time as time_module
+
 
     # Required fields
     required = ["responder_id", "request_id", "timestamp", "status", "signature"]
@@ -3351,7 +3171,7 @@ def validate_task_response_payload(payload: Dict[str, Any]) -> bool:
         return False
 
     # Timestamp freshness (responses can be slightly older due to task execution time)
-    now = int(time_module.time())
+    now = int(time.time())
     if abs(now - payload["timestamp"]) > 3600:  # 1 hour tolerance for responses
         return False
 
@@ -4425,8 +4245,6 @@ def get_stigmergic_marker_batch_signing_payload(payload: Dict[str, Any]) -> str:
     Returns:
         Canonical string for signmessage()
     """
-    import hashlib
-
     markers = payload.get("markers", [])
 
     # Create deterministic hash of markers
@@ -4465,7 +4283,7 @@ def validate_stigmergic_marker_batch(payload: Dict[str, Any]) -> bool:
     Returns:
         True if valid, False otherwise
     """
-    import time as time_module
+
 
     # Required fields
     if not payload.get("reporter_id"):
@@ -4483,7 +4301,7 @@ def validate_stigmergic_marker_batch(payload: Dict[str, Any]) -> bool:
         return False
 
     # Timestamp must be recent (within 1 hour) and not in future
-    now = int(time_module.time())
+    now = int(time.time())
     timestamp = payload.get("timestamp", 0)
     if not isinstance(timestamp, int):
         return False
@@ -4542,49 +4360,6 @@ def validate_stigmergic_marker_batch(payload: Dict[str, Any]) -> bool:
             return False
 
     return True
-
-
-def create_stigmergic_marker_batch(
-    reporter_id: str,
-    timestamp: int,
-    signature: str,
-    markers: List[Dict[str, Any]]
-) -> bytes:
-    """
-    Create a STIGMERGIC_MARKER_BATCH message.
-
-    This message shares successful/failed routing markers with the fleet,
-    enabling indirect coordination on fee levels. Other members read these
-    markers and adjust their fees accordingly (stigmergic coordination).
-
-    SECURITY: The signature must be created using signmessage() over the
-    canonical payload returned by get_stigmergic_marker_batch_signing_payload().
-
-    Args:
-        reporter_id: Hive member sharing markers
-        timestamp: Unix timestamp
-        signature: zbase-encoded signature from signmessage()
-        markers: List of route marker dicts, each containing:
-            - source_peer_id: Source of the route
-            - destination_peer_id: Destination of the route
-            - fee_ppm: Fee charged for this route
-            - success: Whether routing succeeded
-            - volume_sats: Volume routed
-            - timestamp: When the routing occurred
-            - strength: Current marker strength (after decay)
-            - channel_id: Optional - channel used for routing
-
-    Returns:
-        Serialized STIGMERGIC_MARKER_BATCH message
-    """
-    payload = {
-        "reporter_id": reporter_id,
-        "timestamp": timestamp,
-        "signature": signature,
-        "markers": markers,
-    }
-
-    return serialize(HiveMessageType.STIGMERGIC_MARKER_BATCH, payload)
 
 
 # =============================================================================
@@ -4692,53 +4467,6 @@ def validate_pheromone_batch(payload: Dict[str, Any]) -> bool:
                 return False
 
     return True
-
-
-def create_pheromone_batch(
-    pheromones: List[Dict[str, Any]],
-    rpc: Any,
-    our_pubkey: str
-) -> Optional[bytes]:
-    """
-    Create a PHEROMONE_BATCH message.
-
-    This message shares pheromone levels (fee memory from successful routing)
-    with the fleet, enabling collective learning about what fees work for
-    specific external peers.
-
-    Args:
-        pheromones: List of pheromone entries, each containing:
-            - peer_id: External peer pubkey
-            - level: Pheromone level (strength of fee memory)
-            - fee_ppm: Fee that earned this pheromone
-            - channel_id: Optional - channel ID
-        rpc: CLN RPC interface for signing
-        our_pubkey: Our node's public key
-
-    Returns:
-        Serialized PHEROMONE_BATCH message, or None on error
-    """
-    timestamp = int(time.time())
-    reporter_id = our_pubkey
-
-    # Create payload for signing
-    payload = {
-        "reporter_id": reporter_id,
-        "timestamp": timestamp,
-        "signature": "",  # Placeholder
-        "pheromones": pheromones,
-    }
-
-    # Sign the payload
-    try:
-        signing_payload = get_pheromone_batch_signing_payload(payload)
-        sign_result = rpc.signmessage(signing_payload)
-        signature = sign_result.get("signature", sign_result.get("zbase", ""))
-        payload["signature"] = signature
-    except Exception:
-        return None
-
-    return serialize(HiveMessageType.PHEROMONE_BATCH, payload)
 
 
 # =============================================================================
@@ -6105,7 +5833,6 @@ def create_did_credential_present(
 ) -> bytes:
     """Create a DID_CREDENTIAL_PRESENT message to gossip a credential."""
     if not timestamp:
-        import time
         timestamp = int(time.time())
     if not event_id:
         import uuid
@@ -6178,9 +5905,9 @@ def validate_did_credential_present(payload: dict) -> bool:
     if not isinstance(metrics, dict):
         return False
     # Enforce metrics size limit
-    import json as _json
+
     try:
-        metrics_json = _json.dumps(metrics, separators=(',', ':'))
+        metrics_json = json.dumps(metrics, separators=(',', ':'))
         if len(metrics_json) > MAX_CREDENTIAL_METRICS_LEN:
             return False
     except (TypeError, ValueError):
@@ -6195,7 +5922,7 @@ def validate_did_credential_present(payload: dict) -> bool:
         if not all(isinstance(e, (str, dict)) for e in evidence):
             return False
         try:
-            evidence_json = _json.dumps(evidence, separators=(',', ':'))
+            evidence_json = json.dumps(evidence, separators=(',', ':'))
             if len(evidence_json) > MAX_CREDENTIAL_EVIDENCE_LEN:
                 return False
         except (TypeError, ValueError):
@@ -6249,8 +5976,6 @@ def validate_did_credential_present(payload: dict) -> bool:
 
 def get_did_credential_present_signing_payload(payload: dict) -> str:
     """Get deterministic signing payload from a credential present message."""
-    import hashlib
-    import json
     credential = payload.get("credential", {})
     signing_data = {
         "credential_id": credential.get("credential_id", ""),
@@ -6281,7 +6006,6 @@ def create_did_credential_revoke(
 ) -> bytes:
     """Create a DID_CREDENTIAL_REVOKE message."""
     if not timestamp:
-        import time
         timestamp = int(time.time())
     if not event_id:
         import uuid
@@ -6348,7 +6072,6 @@ def validate_did_credential_revoke(payload: dict) -> bool:
 
 def get_did_credential_revoke_signing_payload(credential_id: str, reason: str) -> str:
     """Get deterministic signing payload for a credential revocation."""
-    import json
     return json.dumps({
         "credential_id": credential_id,
         "action": "revoke",
@@ -6379,7 +6102,6 @@ def create_mgmt_credential_present(
 ) -> bytes:
     """Create a MGMT_CREDENTIAL_PRESENT message to share a management credential."""
     if not timestamp:
-        import time
         timestamp = int(time.time())
     if not event_id:
         import uuid
@@ -6448,9 +6170,9 @@ def validate_mgmt_credential_present(payload: dict) -> bool:
     allowed_schemas = credential.get("allowed_schemas")
     if not isinstance(allowed_schemas, list):
         return False
-    import json as _json
+
     try:
-        schemas_json = _json.dumps(allowed_schemas, separators=(',', ':'))
+        schemas_json = json.dumps(allowed_schemas, separators=(',', ':'))
         if len(schemas_json) > MAX_MGMT_ALLOWED_SCHEMAS_LEN:
             return False
     except (TypeError, ValueError):
@@ -6464,13 +6186,13 @@ def validate_mgmt_credential_present(payload: dict) -> bool:
         return False
     try:
         if isinstance(constraints, dict):
-            constraints_json = _json.dumps(constraints, separators=(',', ':'))
+            constraints_json = json.dumps(constraints, separators=(',', ':'))
             # P2R4-I-2: Enforce key-count limit on dict constraints
             if len(constraints) > 50:
                 return False
         else:
             # P3-L-8: Verify string constraints are valid JSON
-            parsed_constraints = _json.loads(constraints)
+            parsed_constraints = json.loads(constraints)
             constraints_json = constraints
             # P2R4-I-2: Enforce key-count limit on string constraints after parsing
             if isinstance(parsed_constraints, dict) and len(parsed_constraints) > 50:
@@ -6509,7 +6231,6 @@ def validate_mgmt_credential_present(payload: dict) -> bool:
 
 def get_mgmt_credential_present_signing_payload(payload: dict) -> str:
     """Get deterministic signing payload from a management credential present message."""
-    import json
     credential = payload.get("credential", {})
     signing_data = {
         "credential_id": credential.get("credential_id", ""),
@@ -6536,7 +6257,6 @@ def create_mgmt_credential_revoke(
 ) -> bytes:
     """Create a MGMT_CREDENTIAL_REVOKE message."""
     if not timestamp:
-        import time
         timestamp = int(time.time())
     if not event_id:
         import uuid
@@ -6603,7 +6323,6 @@ def validate_mgmt_credential_revoke(payload: dict) -> bool:
 
 def get_mgmt_credential_revoke_signing_payload(credential_id: str, reason: str) -> str:
     """Get deterministic signing payload for a management credential revocation."""
-    import json
     return json.dumps({
         "credential_id": credential_id,
         "action": "mgmt_revoke",
@@ -6617,7 +6336,6 @@ def get_mgmt_credential_revoke_signing_payload(credential_id: str, reason: str) 
 
 # Size limits for Phase 4 messages
 MAX_RECEIPT_DATA_LEN = 8192
-MAX_BOND_TOKEN_LEN = 16384
 MAX_NETTING_OBLIGATIONS_LEN = 65000
 MAX_EVIDENCE_LEN = 16384
 MAX_VOTE_REASON_LEN = 1000
@@ -6653,7 +6371,6 @@ def create_settlement_receipt(
 ) -> bytes:
     """Create a SETTLEMENT_RECEIPT message."""
     if not timestamp:
-        import time
         timestamp = int(time.time())
     if not event_id:
         import uuid
@@ -6724,9 +6441,9 @@ def validate_settlement_receipt(payload: dict) -> bool:
     receipt_data = payload.get("receipt_data")
     if not isinstance(receipt_data, dict):
         return False
-    import json as _json
+
     try:
-        rd_json = _json.dumps(receipt_data, separators=(',', ':'))
+        rd_json = json.dumps(receipt_data, separators=(',', ':'))
         if len(rd_json) > MAX_RECEIPT_DATA_LEN:
             return False
     except (TypeError, ValueError):
@@ -6745,7 +6462,6 @@ def get_settlement_receipt_signing_payload(
     receipt_data: Optional[dict] = None,
 ) -> str:
     """Get deterministic signing payload for a settlement receipt."""
-    import json
     return json.dumps({
         "action": "settlement_receipt",
         "amount_sats": amount_sats,
@@ -6773,7 +6489,6 @@ def create_bond_posting(
 ) -> bytes:
     """Create a BOND_POSTING message."""
     if not timestamp:
-        import time
         timestamp = int(time.time())
     if not event_id:
         import uuid
@@ -6844,7 +6559,6 @@ def get_bond_posting_signing_payload(
     token_hash: str = "",
 ) -> str:
     """Get deterministic signing payload for a bond posting."""
-    import json
     return json.dumps({
         "action": "bond_posting",
         "amount_sats": amount_sats,
@@ -6869,7 +6583,6 @@ def create_bond_slash(
 ) -> bytes:
     """Create a BOND_SLASH message."""
     if not timestamp:
-        import time
         timestamp = int(time.time())
     if not event_id:
         import uuid
@@ -6934,7 +6647,6 @@ def get_bond_slash_signing_payload(
     reason: str = "",
 ) -> str:
     """Get deterministic signing payload for a bond slash."""
-    import json
     return json.dumps({
         "action": "bond_slash",
         "bond_id": bond_id,
@@ -6958,7 +6670,6 @@ def create_netting_proposal(
 ) -> bytes:
     """Create a NETTING_PROPOSAL message."""
     if not timestamp:
-        import time
         timestamp = int(time.time())
     if not event_id:
         import uuid
@@ -7010,9 +6721,9 @@ def validate_netting_proposal(payload: dict) -> bool:
     net_payments = payload.get("net_payments")
     if not isinstance(net_payments, list):
         return False
-    import json as _json
+
     try:
-        np_json = _json.dumps(net_payments, separators=(',', ':'))
+        np_json = json.dumps(net_payments, separators=(',', ':'))
         if len(np_json) > MAX_NETTING_OBLIGATIONS_LEN:
             return False
     except (TypeError, ValueError):
@@ -7041,7 +6752,6 @@ def get_netting_proposal_signing_payload(
     net_payments: Optional[list] = None,
 ) -> str:
     """Get deterministic signing payload for a netting proposal."""
-    import json
     return json.dumps({
         "action": "netting_proposal",
         "netting_type": netting_type,
@@ -7064,7 +6774,6 @@ def create_netting_ack(
 ) -> bytes:
     """Create a NETTING_ACK message."""
     if not timestamp:
-        import time
         timestamp = int(time.time())
     if not event_id:
         import uuid
@@ -7123,7 +6832,6 @@ def get_netting_ack_signing_payload(
     window_id: str, obligations_hash: str, accepted: bool,
 ) -> str:
     """Get deterministic signing payload for a netting acknowledgment."""
-    import json
     return json.dumps({
         "accepted": accepted,
         "action": "netting_ack",
@@ -7151,7 +6859,6 @@ def create_violation_report(
     violation report deterministically select the same arbitration panel.
     """
     if not timestamp:
-        import time
         timestamp = int(time.time())
     if not event_id:
         import uuid
@@ -7207,9 +6914,9 @@ def validate_violation_report(payload: dict) -> bool:
     evidence = payload.get("evidence")
     if not isinstance(evidence, dict):
         return False
-    import json as _json
+
     try:
-        ev_json = _json.dumps(evidence, separators=(',', ':'))
+        ev_json = json.dumps(evidence, separators=(',', ':'))
         if len(ev_json) > MAX_EVIDENCE_LEN:
             return False
     except (TypeError, ValueError):
@@ -7233,7 +6940,6 @@ def get_violation_report_signing_payload(
     evidence: Optional[dict] = None,
 ) -> str:
     """Get deterministic signing payload for a violation report."""
-    import json
     return json.dumps({
         "action": "violation_report",
         "evidence": evidence or {},
@@ -7256,7 +6962,6 @@ def create_arbitration_vote(
 ) -> bytes:
     """Create an ARBITRATION_VOTE message."""
     if not timestamp:
-        import time
         timestamp = int(time.time())
     if not event_id:
         import uuid
@@ -7315,7 +7020,6 @@ def get_arbitration_vote_signing_payload(
     dispute_id: str, vote: str, reason: str = "",
 ) -> str:
     """Get deterministic signing payload for an arbitration vote."""
-    import json
     return json.dumps({
         "action": "arbitration_vote",
         "dispute_id": dispute_id,
