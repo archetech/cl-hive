@@ -955,17 +955,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Intent manager initialized")
     
-    # Pre-inject shutdown_event so loop startup delays work before full init
-    background_loops.init_background_loops({'shutdown_event': shutdown_event})
+    # Collect background loop threads — started after init_background_loops() injects deps
+    _deferred_threads = []
 
-    # Start background threads (Phase 3)
-    intent_thread = threading.Thread(
+    # Background threads (Phase 3)
+    _deferred_threads.append(threading.Thread(
         target=background_loops.intent_monitor_loop,
         name="cl-hive-intent-monitor",
         daemon=True
-    )
-    intent_thread.start()
-    plugin.log("cl-hive: Intent monitor thread started")
+    ))
     
     # Initialize Integration Bridge (Phase 4)
     # Uses Circuit Breaker pattern for resilient cl-revenue-ops integration
@@ -996,14 +994,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Membership and contribution managers initialized")
 
-    # Start membership maintenance thread (Phase 5)
-    membership_thread = threading.Thread(
+    # Membership maintenance thread (Phase 5)
+    _deferred_threads.append(threading.Thread(
         target=background_loops.membership_maintenance_loop,
         name="cl-hive-membership-maintenance",
         daemon=True
-    )
-    membership_thread.start()
-    plugin.log("cl-hive: Membership maintenance thread started")
+    ))
 
     # Sync bridge policies with database state on startup
     # This ensures members have correct 0 ppm policy even if previous set_tier failed
@@ -1101,14 +1097,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Planner initialized")
 
-    # Start planner loop thread (Phase 6)
-    planner_thread = threading.Thread(
+    # Planner loop thread (Phase 6)
+    _deferred_threads.append(threading.Thread(
         target=background_loops.planner_loop,
         name="cl-hive-planner",
         daemon=True
-    )
-    planner_thread.start()
-    plugin.log("cl-hive: Planner thread started")
+    ))
 
     # Initialize Cooperative Expansion Manager (Phase 6.4)
     global coop_expansion, quality_scorer_mgr
@@ -1140,32 +1134,26 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Health aggregator initialized")
 
-    # Start fee intelligence background thread (Phase 7)
-    fee_intel_thread = threading.Thread(
+    # Fee intelligence background thread (Phase 7)
+    _deferred_threads.append(threading.Thread(
         target=background_loops.fee_intelligence_loop,
         name="cl-hive-fee-intelligence",
         daemon=True
-    )
-    fee_intel_thread.start()
-    plugin.log("cl-hive: Fee intelligence thread started")
+    ))
 
-    # Start gossip loop thread (broadcasts capacity/state to hive members)
-    gossip_thread = threading.Thread(
+    # Gossip loop thread (broadcasts capacity/state to hive members)
+    _deferred_threads.append(threading.Thread(
         target=background_loops.gossip_loop,
         name="cl-hive-gossip",
         daemon=True
-    )
-    gossip_thread.start()
-    plugin.log("cl-hive: Gossip thread started")
+    ))
 
-    # Start distributed settlement loop thread (Phase 12)
-    settlement_thread = threading.Thread(
+    # Distributed settlement loop thread (Phase 12)
+    _deferred_threads.append(threading.Thread(
         target=background_loops.settlement_loop,
         name="cl-hive-settlement",
         daemon=True
-    )
-    settlement_thread.start()
-    plugin.log("cl-hive: Settlement thread started")
+    ))
 
     # Load persisted fee tracking state (Settlement Phase)
     _load_fee_tracking_state()
@@ -1298,14 +1286,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     cost_reduction_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Cost reduction manager initialized")
 
-    # Start MCF optimization background thread (Phase 15)
-    mcf_thread = threading.Thread(
+    # MCF optimization background thread (Phase 15)
+    _deferred_threads.append(threading.Thread(
         target=background_loops.mcf_optimization_loop,
         name="cl-hive-mcf-optimization",
         daemon=True
-    )
-    mcf_thread.start()
-    plugin.log("cl-hive: MCF optimization thread started")
+    ))
 
     # Initialize Rationalization Manager (Channel Rationalization)
     global rationalization_mgr
@@ -1377,14 +1363,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Outbox manager initialized")
 
-    # Start outbox retry background thread
-    outbox_thread = threading.Thread(
+    # Outbox retry background thread
+    _deferred_threads.append(threading.Thread(
         target=background_loops.outbox_retry_loop,
         name="cl-hive-outbox-retry",
         daemon=True
-    )
-    outbox_thread.start()
-    plugin.log("cl-hive: Outbox retry thread started")
+    ))
 
     _phase6_plugins = phase6_optional_plugins if isinstance(phase6_optional_plugins, dict) else {}
     _comms_active = bool(_phase6_plugins.get("cl_hive_comms", {}).get("active"))
@@ -1438,14 +1422,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         settlement_mgr.did_credential_mgr = did_credential_mgr
 
     if _companion_stack_active:
-        # Start DID maintenance background thread
-        did_maintenance_thread = threading.Thread(
+        # DID maintenance background thread
+        _deferred_threads.append(threading.Thread(
             target=background_loops.did_maintenance_loop,
             name="cl-hive-did-maintenance",
             daemon=True
-        )
-        did_maintenance_thread.start()
-        plugin.log("cl-hive: DID maintenance thread started")
+        ))
 
         # Phase 4A: Cashu Escrow Manager
         mint_urls_str = plugin.get_option('hive-cashu-mints')
@@ -1464,14 +1446,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             settlement_mgr.register_extended_types(cashu_escrow_mgr, did_credential_mgr)
             plugin.log("cl-hive: Extended settlement types registered")
 
-        # Start escrow maintenance background thread
-        escrow_maintenance_thread = threading.Thread(
+        # Escrow maintenance background thread
+        _deferred_threads.append(threading.Thread(
             target=background_loops.escrow_maintenance_loop,
             name="cl-hive-escrow-maintenance",
             daemon=True
-        )
-        escrow_maintenance_thread.start()
-        plugin.log("cl-hive: Escrow maintenance thread started")
+        ))
 
     # Phase 5A/6: Nostr transport — external companion plugin only (cl-hive-comms)
     global nostr_transport
@@ -1564,21 +1544,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             liquidity_mgr = None
             plugin.log(f"cl-hive: Liquidity manager disabled (init error): {e}", level='warn')
 
-        marketplace_maintenance_thread = threading.Thread(
+        _deferred_threads.append(threading.Thread(
             target=background_loops.marketplace_maintenance_loop,
             name="cl-hive-marketplace-maintenance",
             daemon=True,
-        )
-        marketplace_maintenance_thread.start()
-        plugin.log("cl-hive: Marketplace maintenance thread started")
-
-        liquidity_maintenance_thread = threading.Thread(
+        ))
+        _deferred_threads.append(threading.Thread(
             target=background_loops.liquidity_maintenance_loop,
             name="cl-hive-liquidity-maintenance",
             daemon=True,
-        )
-        liquidity_maintenance_thread.start()
-        plugin.log("cl-hive: Liquidity maintenance thread started")
+        ))
 
     # Link anticipatory manager to fee coordination for time-based fees (Phase 7.4)
     if fee_coordination_mgr:
@@ -1697,6 +1672,11 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'BAN_PROPOSAL_TTL_SECONDS': protocol_handlers.BAN_PROPOSAL_TTL_SECONDS,
     })
     plugin.log("cl-hive: Background loops initialized")
+
+    # Start all deferred background loop threads now that deps are injected
+    for t in _deferred_threads:
+        t.start()
+    plugin.log(f"cl-hive: Started {len(_deferred_threads)} background threads")
 
     # Remove ghost members (gone from gossip graph) BEFORE syncing policies,
     # so stale members don't get hive strategy re-applied on startup.
