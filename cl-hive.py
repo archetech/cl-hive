@@ -1353,6 +1353,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Traffic intelligence manager initialized")
 
+    # Phase 3c: Wire traffic intelligence into fee coordination
+    fee_coordination_mgr.set_traffic_intel_mgr(traffic_intel_mgr)
+
     # Initialize Task Manager (Phase 10 - Task Delegation Protocol)
     global task_mgr
     task_mgr = TaskManager(
