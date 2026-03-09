@@ -20,7 +20,7 @@ Author: Lightning Goats Team
 
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -520,20 +520,6 @@ class IntentManager:
         with self._callback_lock:
             self._commit_callbacks[intent_type] = callback
         self._log(f"Registered commit callback for {intent_type}")
-    
-    def get_pending_intents_ready_to_commit(self) -> List[Dict]:
-        """
-        Get local intents that are ready to commit.
-
-        An intent is ready if:
-        - Status is 'pending'
-        - Current time > timestamp + hold_seconds
-        - Intent has not expired
-
-        Returns:
-            List of intent rows from database
-        """
-        return self.db.get_pending_intents_ready(self.hold_seconds)
     
     def commit_intent(self, intent_id: int) -> bool:
         """

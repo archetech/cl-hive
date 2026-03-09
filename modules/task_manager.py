@@ -11,10 +11,9 @@ Author: Lightning Goats Team
 import json
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .protocol import (
-    HiveMessageType,
     create_task_request,
     create_task_response,
     validate_task_request_payload,
@@ -30,8 +29,6 @@ from .protocol import (
     TASK_STATUS_FAILED,
     TASK_REJECT_BUSY,
     TASK_REJECT_NO_FUNDS,
-    TASK_REJECT_NO_CONNECTION,
-    TASK_REJECT_POLICY,
     TASK_PRIORITY_NORMAL,
     TASK_DEFAULT_DEADLINE_HOURS,
     MAX_PENDING_TASKS,
@@ -74,23 +71,6 @@ class TaskManager:
         self._rate_lock = threading.Lock()
         self._request_rate: Dict[str, List[int]] = {}
         self._response_rate: Dict[str, List[int]] = {}
-
-        # Callback for executing tasks
-        self._task_executor: Optional[Callable] = None
-
-    def set_task_executor(self, executor: Callable):
-        """
-        Set the callback for executing tasks.
-
-        The executor function should have signature:
-            executor(task_type: str, task_params: dict) -> dict
-
-        Returns dict with:
-            - success: bool
-            - result: dict (if success)
-            - error: str (if failure)
-        """
-        self._task_executor = executor
 
     def _log(self, msg: str, level: str = 'info'):
         """Log a message."""
@@ -468,7 +448,6 @@ class TaskManager:
         Returns:
             (can_accept: bool, reject_reason: str or None)
         """
-        target = task_params.get('target')
         amount_sats = task_params.get('amount_sats', 0)
 
         # Check if we have enough funds
@@ -487,14 +466,6 @@ class TaskManager:
                 return (False, TASK_REJECT_NO_FUNDS)
         except Exception:
             return (False, TASK_REJECT_NO_FUNDS)
-
-        # Check if we can connect to the target
-        try:
-            # Try to get peer info (doesn't actually connect)
-            peers = rpc.listpeers(target)
-            # If we already have a channel, that's fine
-        except Exception:
-            pass  # Connection check happens during execution
 
         return (True, None)
 

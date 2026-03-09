@@ -14,7 +14,6 @@ from . import network_metrics
 
 ACTIVE_MEMBER_WINDOW_SECONDS = 24 * 3600
 BAN_QUORUM_THRESHOLD = 0.51  # 51% quorum for ban proposals
-BAN_COOLDOWN_SECONDS = 7 * 24 * 3600  # 7-day cooldown before re-proposing ban
 CONTRIBUTION_RATIO_NO_DATA = 10.0
 
 
@@ -425,42 +424,6 @@ class MembershipManager:
         # Minimum 2 votes to prevent unilateral governance actions,
         # but never more than the number of active members.
         return min(active_members, max(2, threshold))
-
-    def check_ban_cooldown(self, target_peer_id: str,
-                           cooldown_seconds: int = 0) -> bool:
-        """
-        Check if a ban proposal for target_peer_id is within cooldown.
-
-        P5-L-3: Uses current time (time.time()) as the reference point,
-        not the incoming proposal's timestamp. The cooldown checks if
-        enough wall-clock time has passed since the last ban proposal
-        against the same target.
-
-        Args:
-            target_peer_id: The peer being proposed for ban
-            cooldown_seconds: Cooldown period (default: BAN_COOLDOWN_SECONDS)
-
-        Returns:
-            True if cooldown is active (ban should be rejected),
-            False if cooldown has expired (ban is allowed)
-        """
-        if cooldown_seconds <= 0:
-            cooldown_seconds = BAN_COOLDOWN_SECONDS
-
-        recent_proposal = self.db.get_ban_proposal_for_target(target_peer_id)
-        if not recent_proposal:
-            return False  # No prior proposal, no cooldown
-
-        recent_ts = recent_proposal.get("proposed_at", 0)
-        now = int(time.time())
-        if now - recent_ts < cooldown_seconds:
-            self._log(
-                f"Ban cooldown active for {target_peer_id[:16]}... "
-                f"({now - recent_ts}s < {cooldown_seconds}s)",
-                level='info'
-            )
-            return True  # Cooldown active
-        return False  # Cooldown expired
 
     def build_vouch_message(self, target_pubkey: str, request_id: str, timestamp: int) -> str:
         """
