@@ -2183,12 +2183,15 @@ class Planner:
         spendable_onchain = int(onchain_balance * (1.0 - budget_reserve_pct))
         max_per_channel = int(daily_budget * budget_max_per_channel_pct)
 
-        available_budget = min(daily_remaining, spendable_onchain, max_per_channel)
+        pending_committed = self.db.get_pending_channel_open_total()
+        gross_available = min(daily_remaining, spendable_onchain, max_per_channel)
+        available_budget = max(0, gross_available - pending_committed)
 
         if available_budget < min_channel_size:
             self._log(
                 f"Skipping expansion to {selected_target.target[:16]}... - "
                 f"insufficient budget ({available_budget:,} < {min_channel_size:,} min). "
+                f"gross={gross_available:,}, pending_committed={pending_committed:,}, "
                 f"daily_remaining={daily_remaining:,}, spendable={spendable_onchain:,}, "
                 f"max_per_channel={max_per_channel:,}",
                 level='info'
