@@ -517,3 +517,82 @@ class TestTrafficIntelligenceGossip:
         rpc = MagicMock()
         result = traffic_mgr.handle_traffic_intelligence_batch(sender, payload, rpc)
         assert result.get("error") == "reporter_mismatch"
+
+
+from datetime import datetime, timezone
+
+
+class TestRebalanceConflictCheck:
+    """Test temporal rebalance conflict detection."""
+
+    def test_no_conflict_no_data(self, traffic_mgr):
+        """No conflict when no traffic data exists."""
+        result = traffic_mgr.check_rebalance_conflict(
+            peer_id="unknown_peer",
+            direction="outbound",
+            amount_sats=100000,
+        )
+        assert result["conflict"] is False
+        assert result["peer_in_peak_hours"] is False
+
+    def test_peak_hour_detection(self, traffic_mgr):
+        """Detects when peer is in peak hours."""
+        current_hour = datetime.now(timezone.utc).hour
+        traffic_mgr.store_local_profile(
+            peer_id="peer_aaa", profile_type="retail",
+            peak_hours_utc=[current_hour],
+            quiet_hours_utc=[(current_hour + 12) % 24],
+            avg_forward_size_sats=50000.0, daily_volume_sats=5000000.0,
+            drain_direction="outbound_heavy", confidence=0.85,
+            observation_window_hours=168,
+        )
+        result = traffic_mgr.check_rebalance_conflict(
+            peer_id="peer_aaa", direction="outbound", amount_sats=100000,
+        )
+        assert result["peer_in_peak_hours"] is True
+
+    def test_suggested_window_from_quiet_hours(self, traffic_mgr):
+        """Suggests rebalance window from quiet hours."""
+        current_hour = datetime.now(timezone.utc).hour
+        quiet = [(current_hour + 6) % 24, (current_hour + 7) % 24]
+        traffic_mgr.store_local_profile(
+            peer_id="peer_aaa", profile_type="retail",
+            peak_hours_utc=[current_hour],
+            quiet_hours_utc=quiet,
+            avg_forward_size_sats=50000.0, daily_volume_sats=5000000.0,
+            drain_direction="outbound_heavy", confidence=0.85,
+            observation_window_hours=168,
+        )
+        result = traffic_mgr.check_rebalance_conflict(
+            peer_id="peer_aaa", direction="outbound", amount_sats=100000,
+        )
+        assert result["suggested_window_utc"] is not None
+        assert len(result["suggested_window_utc"]) == 2
+
+    def test_conflict_response_structure(self, traffic_mgr):
+        """Response has all expected fields."""
+        result = traffic_mgr.check_rebalance_conflict(
+            peer_id="any_peer", direction="outbound", amount_sats=100000,
+        )
+        assert "conflict" in result
+        assert "conflicting_member" in result
+        assert "peer_in_peak_hours" in result
+        assert "suggested_window_utc" in result
+        assert "fleet_drain_forecast_sats" in result
+
+
+class TestFleetDemandForecast:
+    """Test fleet demand forecasting."""
+
+    def test_forecast_no_data(self, traffic_mgr):
+        """Forecast returns empty structure when no data."""
+        forecast = traffic_mgr.get_fleet_demand_forecast(hours_ahead=6)
+        assert "members" in forecast
+        assert isinstance(forecast["members"], list)
+
+    def test_forecast_structure(self, traffic_mgr):
+        """Forecast response has expected top-level fields."""
+        forecast = traffic_mgr.get_fleet_demand_forecast(hours_ahead=6)
+        assert "members" in forecast
+        assert "generated_at" in forecast
+        assert "hours_ahead" in forecast

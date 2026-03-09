@@ -392,3 +392,192 @@ class TrafficIntelligenceManager:
             level="debug",
         )
         return {"success": True, "profiles_stored": stored}
+
+    # ── Rebalance Conflict Check ───────────────────────────────────
+
+    def check_rebalance_conflict(
+        self,
+        peer_id: str,
+        direction: str,
+        amount_sats: int,
+    ) -> Dict[str, Any]:
+        """
+        Check if rebalancing through a peer would conflict with fleet activity.
+
+        Checks:
+        1. Is any fleet member actively rebalancing through this peer? (MCF)
+        2. Is this peer currently in peak traffic hours?
+        3. What is the fleet's combined drain forecast for this peer?
+
+        Args:
+            peer_id: External peer to rebalance through
+            direction: inbound or outbound
+            amount_sats: Rebalance amount
+
+        Returns:
+            Conflict assessment dict
+        """
+        result = {
+            "conflict": False,
+            "conflicting_member": None,
+            "peer_in_peak_hours": False,
+            "suggested_window_utc": None,
+            "fleet_drain_forecast_sats": 0,
+        }
+
+        # Check active MCF assignments for this peer
+        if self.liquidity_coordinator:
+            try:
+                mcf_status = self.liquidity_coordinator.get_mcf_status()
+                active = mcf_status.get("active_assignments", [])
+                for a in active:
+                    if peer_id in (a.get("from_channel", ""), a.get("to_channel", "")):
+                        result["conflict"] = True
+                        result["conflicting_member"] = a.get("member_id")
+                        break
+            except Exception:
+                pass
+
+        # Check fleet traffic intelligence for peak hours
+        agg = self.get_aggregated_profile(peer_id)
+        if agg:
+            now_utc = datetime.now(timezone.utc).hour
+            peak_hours = agg.get("peak_hours_utc", [])
+            quiet_hours = agg.get("quiet_hours_utc", [])
+
+            if now_utc in peak_hours:
+                result["peer_in_peak_hours"] = True
+
+            # Suggest window from quiet hours
+            if quiet_hours:
+                # Find the next quiet hour block
+                start = None
+                for h in sorted(quiet_hours):
+                    if h > now_utc:
+                        start = h
+                        break
+                if start is None and quiet_hours:
+                    start = quiet_hours[0]  # Wrap to tomorrow
+
+                if start is not None:
+                    # Find contiguous block
+                    end = start
+                    for h in sorted(quiet_hours):
+                        if h == end + 1:
+                            end = h
+                    result["suggested_window_utc"] = [start, end + 1]
+
+            # Estimate drain forecast
+            daily_vol = agg.get("daily_volume_sats", 0)
+            drain_dir = agg.get("drain_direction", "balanced")
+            if drain_dir == "outbound_heavy":
+                result["fleet_drain_forecast_sats"] = int(daily_vol * 0.3)
+            elif drain_dir == "inbound_heavy":
+                result["fleet_drain_forecast_sats"] = int(-daily_vol * 0.3)
+
+        return result
+
+    # ── Fleet Demand Forecast ──────────────────────────────────────
+
+    def get_fleet_demand_forecast(
+        self, hours_ahead: int = 6
+    ) -> Dict[str, Any]:
+        """
+        Generate fleet-wide demand forecast combining Kalman predictions
+        with traffic intelligence.
+
+        Args:
+            hours_ahead: Prediction horizon in hours
+
+        Returns:
+            Forecast dict with per-member predictions
+        """
+        forecast = {
+            "members": [],
+            "generated_at": int(time.time()),
+            "hours_ahead": hours_ahead,
+        }
+
+        # Get Kalman predictions from anticipatory liquidity manager
+        if not self.anticipatory_mgr:
+            return forecast
+
+        try:
+            predictions = self.anticipatory_mgr.get_all_predictions()
+        except Exception:
+            predictions = {}
+
+        if not predictions:
+            return forecast
+
+        # Get all traffic profiles for enrichment
+        all_profiles = self.db.get_all_traffic_profiles()
+        profile_by_peer = {}
+        for p in all_profiles:
+            pid = p.get("peer_id")
+            if pid not in profile_by_peer:
+                profile_by_peer[pid] = []
+            profile_by_peer[pid].append(p)
+
+        # Build per-member forecast
+        now = time.time()
+        now_utc = datetime.now(timezone.utc).hour
+
+        for channel_id, pred in predictions.items():
+            if not isinstance(pred, dict):
+                continue
+
+            peer_id = pred.get("peer_id", "")
+            predicted_pct = pred.get("predicted_local_pct")
+            velocity = pred.get("velocity_pct_per_hour", 0)
+
+            if predicted_pct is None:
+                continue
+
+            current_pct = pred.get("current_local_pct", 50)
+            hours_to_depletion = None
+            hours_to_saturation = None
+
+            if velocity < 0 and current_pct > 0:
+                hours_to_depletion = current_pct / abs(velocity)
+            elif velocity > 0 and current_pct < 100:
+                hours_to_saturation = (100 - current_pct) / velocity
+
+            # Enrich with traffic intelligence
+            optimal_window = None
+            traffic_profiles = profile_by_peer.get(peer_id, [])
+            if traffic_profiles:
+                best = max(traffic_profiles, key=lambda p: p.get("confidence", 0))
+                quiet_str = best.get("quiet_hours_utc", "[]")
+                quiet = json.loads(quiet_str) if isinstance(quiet_str, str) else quiet_str
+                if quiet:
+                    next_quiet = None
+                    for h in sorted(quiet):
+                        if h > now_utc:
+                            next_quiet = h
+                            break
+                    if next_quiet is None and quiet:
+                        next_quiet = quiet[0]
+                    if next_quiet is not None:
+                        optimal_window = next_quiet
+
+            entry = {
+                "channel_id": channel_id,
+                "peer_id": peer_id,
+                "current_local_pct": current_pct,
+                "velocity_pct_per_hour": velocity,
+                "hours_to_depletion": hours_to_depletion,
+                "hours_to_saturation": hours_to_saturation,
+                "optimal_rebalance_hour_utc": optimal_window,
+            }
+
+            if hours_to_depletion is not None and hours_to_depletion <= hours_ahead:
+                entry["action"] = "depleting"
+            elif hours_to_saturation is not None and hours_to_saturation <= hours_ahead:
+                entry["action"] = "saturating"
+            else:
+                entry["action"] = "stable"
+
+            forecast["members"].append(entry)
+
+        return forecast
