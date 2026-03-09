@@ -688,9 +688,16 @@ EOF
 fi
 
 # Append additional hive config if exists
-if [ -f /etc/lightning/cl-hive.conf ]; then
+if [ -f /etc/lightning/custom/cl-hive.conf ]; then
     echo "" >> "$CONFIG_FILE"
-    grep -v "^hive-governance-mode" /etc/lightning/cl-hive.conf >> "$CONFIG_FILE" || true
+    grep -v "^hive-governance-mode" /etc/lightning/custom/cl-hive.conf >> "$CONFIG_FILE" || true
+fi
+
+# Append additional revenue-ops config if exists
+if [ -f /etc/lightning/custom/cl-revenue-ops.conf ]; then
+    echo "" >> "$CONFIG_FILE"
+    # db-path is already set by entrypoint above; skip it and comments
+    grep -v "^revenue-ops-db-path" /etc/lightning/custom/cl-revenue-ops.conf | grep -v "^#" | grep -v "^$" >> "$CONFIG_FILE" || true
 fi
 
 # -----------------------------------------------------------------------------

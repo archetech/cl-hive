@@ -47,8 +47,8 @@ services:
       - ../../cl_revenue_ops:/opt/cl-revenue-ops:ro
 
       # Optional Phase 6 plugin repos (for local development)
-      # - ../../cl-hive-comms:/opt/cl-hive-comms:ro
-      # - ../../cl-hive-archon:/opt/cl-hive-archon:ro
+      - ../../cl-hive-comms:/opt/cl-hive-comms:ro
+      - ../../cl-hive-archon:/opt/cl-hive-archon:ro
 
       # bitcoin-cli mount (if not baked into image)
       - ./bitcoin-cli:/usr/local/bin/bitcoin-cli:ro
