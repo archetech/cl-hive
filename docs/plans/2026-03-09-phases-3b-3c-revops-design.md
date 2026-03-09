@@ -67,8 +67,8 @@ daily_forward_volume_sats, flow_direction (sink/source/balanced), peak_hours,
 quiet_hours.
 
 Field mapping:
-- `flow_direction` → `drain_direction`: sink→outbound_heavy,
-  source→inbound_heavy, balanced→balanced
+- `flow_direction` → `drain_direction`: source→outbound_heavy,
+  sink→inbound_heavy, balanced→balanced
 - `peak_hours`/`quiet_hours` → `peak_hours_utc`/`quiet_hours_utc`
 - Profile type: volume/forward-size heuristic (high volume + small forwards =
   retail, low volume + large forwards = wholesale, etc.)

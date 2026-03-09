@@ -1770,19 +1770,25 @@ def _process_mcf_assignments():
         completed_count = counts.get("completed", 0)
         failed_count = counts.get("failed", 0)
 
-        # Phase 3b: Check traffic intelligence before ACK
-        if pending_count > 0 and traffic_intel_mgr:
+        # Fetch pending assignments once (reused by traffic check and ACK)
+        pending = None
+        if pending_count > 0:
             pending = liquidity_coord.get_pending_mcf_assignments()
-            for assignment in (pending or []):
+
+        # Phase 3b: Check traffic intelligence before ACK
+        if pending and traffic_intel_mgr:
+            active_ids = set()
+            for assignment in pending:
                 peer_id = getattr(assignment, 'to_channel', '')
                 assign_id = getattr(assignment, 'assignment_id', str(id(assignment)))
+                active_ids.add(assign_id)
 
                 # Check fleet rebalancing conflict and peak hours
                 try:
                     conflict_info = traffic_intel_mgr.check_rebalance_conflict(
                         peer_id=peer_id,
                         direction="outbound",
-                        amount_sats=0,
+                        amount_sats=getattr(assignment, 'amount_sats', 0),
                     )
                 except Exception:
                     conflict_info = {}
@@ -1813,9 +1819,13 @@ def _process_mcf_assignments():
                 # Clear defer count on execution
                 _mcf_defer_counts.pop(assign_id, None)
 
+            # Prune stale defer entries for assignments no longer pending
+            stale_ids = [k for k in _mcf_defer_counts if k not in active_ids]
+            for k in stale_ids:
+                _mcf_defer_counts.pop(k, None)
+
         # Send ACK if we have pending assignments and haven't ACKed yet
-        if pending_count > 0 and not status.get("ack_sent", False):
-            pending = liquidity_coord.get_pending_mcf_assignments()
+        if pending and not status.get("ack_sent", False):
             if pending:
                 solution_timestamp = pending[0].solution_timestamp
                 ack_msg = liquidity_coord.create_mcf_ack_message()
