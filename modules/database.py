@@ -23,6 +23,29 @@ from contextlib import contextmanager
 from typing import Dict, List, Optional, Any, Tuple, Generator
 
 
+def _get_pending_channel_open_total_sql(conn) -> int:
+    """Sum proposed_size_sats from all active pending channel_open actions.
+
+    Uses json_extract to read the size from the payload JSON.
+    Falls back to channel_size_sats if proposed_size_sats is absent.
+    Excludes expired and non-pending actions.
+    """
+    now = int(time.time())
+    row = conn.execute("""
+        SELECT COALESCE(SUM(
+            COALESCE(
+                json_extract(payload, '$.proposed_size_sats'),
+                json_extract(payload, '$.channel_size_sats'),
+                0
+            )
+        ), 0) AS total
+        FROM pending_actions
+        WHERE action_type = 'channel_open'
+          AND status = 'pending'
+          AND (expires_at IS NULL OR expires_at > ?)
+    """, (now,)).fetchone()
+    return int(row[0] if row else 0)
+
 
 class HiveDatabase:
     """
@@ -4101,6 +4124,11 @@ class HiveDatabase:
         spent_today = self.get_daily_spend()
         available = max(0, daily_budget - spent_today)
         return available
+
+    def get_pending_channel_open_total(self) -> int:
+        """Sum of proposed_size_sats from all pending channel_open actions."""
+        conn = self._get_connection()
+        return _get_pending_channel_open_total_sql(conn)
 
     def get_budget_summary(self, daily_budget: int, days: int = 7) -> Dict[str, Any]:
         """
