@@ -596,3 +596,27 @@ class TestFleetDemandForecast:
         assert "members" in forecast
         assert "generated_at" in forecast
         assert "hours_ahead" in forecast
+
+
+from modules import protocol_handlers
+
+
+class TestTrafficIntelligenceHandler:
+    """Test protocol handler for TRAFFIC_INTELLIGENCE_BATCH."""
+
+    def test_handler_exists(self):
+        """handle_traffic_intelligence_batch function exists."""
+        assert hasattr(protocol_handlers, 'handle_traffic_intelligence_batch')
+
+    def test_handler_returns_continue_when_no_manager(self):
+        """Handler returns continue when traffic_intel_mgr is None."""
+        # Save and clear the global
+        original = getattr(protocol_handlers, 'traffic_intel_mgr', None)
+        protocol_handlers.traffic_intel_mgr = None
+        try:
+            result = protocol_handlers.handle_traffic_intelligence_batch(
+                "peer_id", {}, Mock()
+            )
+            assert result == {"result": "continue"}
+        finally:
+            protocol_handlers.traffic_intel_mgr = original

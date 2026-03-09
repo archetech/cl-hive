@@ -94,6 +94,7 @@ outbox_mgr = None
 did_credential_mgr = None
 management_schema_registry = None
 cashu_escrow_mgr = None
+traffic_intel_mgr = None
 peer_available_limiter = None
 outbox = None
 
@@ -5489,6 +5490,72 @@ def handle_fee_intelligence_snapshot(peer_id: str, payload: Dict, plugin: Plugin
             f"cl-hive: FEE_INTELLIGENCE_SNAPSHOT rejected from {reporter_id[:16]}...: {result.get('error')}",
             level='debug'
         )
+
+    return {"result": "continue"}
+
+
+def handle_traffic_intelligence_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle TRAFFIC_INTELLIGENCE_BATCH message from a hive member.
+
+    RELAY: Supports multi-hop relay for non-mesh topologies.
+    """
+    if not traffic_intel_mgr or not database:
+        return {"result": "continue"}
+
+    # RELAY: Check deduplication
+    if not _should_process_message(payload):
+        return {"result": "continue"}
+
+    reporter_id = payload.get("reporter_id", peer_id)
+    is_relayed = _is_relayed_message(payload)
+
+    # Verify sender is a member and not banned
+    sender = database.get_member(reporter_id)
+    if not sender or database.is_banned(reporter_id):
+        plugin.log(f"cl-hive: TRAFFIC_INTELLIGENCE_BATCH from non-member {reporter_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    # Identity binding for direct messages
+    if not is_relayed and reporter_id != peer_id:
+        plugin.log(f"cl-hive: TRAFFIC_INTELLIGENCE_BATCH reporter mismatch", level='debug')
+        return {"result": "continue"}
+
+    # Timestamp freshness
+    if not _check_timestamp_freshness(payload, 48 * 3600, "TRAFFIC_INTELLIGENCE_BATCH"):
+        return {"result": "continue"}
+
+    # Signature verification
+    signature = payload.get("signature")
+    if not signature:
+        plugin.log(f"cl-hive: TRAFFIC_INTELLIGENCE_BATCH missing signature", level='warn')
+        return {"result": "continue"}
+
+    from modules.protocol import get_traffic_intelligence_batch_signing_payload
+    signing_payload = get_traffic_intelligence_batch_signing_payload(payload)
+    try:
+        verify_result = plugin.rpc.checkmessage(signing_payload, signature)
+        if not verify_result.get("verified") or verify_result.get("pubkey") != reporter_id:
+            plugin.log(f"cl-hive: TRAFFIC_INTELLIGENCE_BATCH invalid signature", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: TRAFFIC_INTELLIGENCE_BATCH signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    # Delegate to manager
+    result = traffic_intel_mgr.handle_traffic_intelligence_batch(reporter_id, payload, plugin.rpc)
+
+    if result.get("success"):
+        relay_info = " (relayed)" if is_relayed else ""
+        plugin.log(
+            f"cl-hive: Stored traffic intelligence from {reporter_id[:16]}...{relay_info} "
+            f"with {result.get('profiles_stored', 0)} profiles",
+            level='debug'
+        )
+        from modules.protocol import HiveMessageType
+        relay_count = _relay_message(HiveMessageType.TRAFFIC_INTELLIGENCE_BATCH, payload, peer_id)
+        if relay_count > 0:
+            plugin.log(f"cl-hive: TRAFFIC_INTELLIGENCE_BATCH relayed to {relay_count} members", level='debug')
 
     return {"result": "continue"}
 

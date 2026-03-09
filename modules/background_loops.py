@@ -1974,6 +1974,26 @@ def _broadcast_our_fee_intelligence():
             plugin.log(f"cl-hive: Fee intelligence broadcast error: {e}", level='warn')
 
 
+def _broadcast_our_traffic_intelligence():
+    """
+    Broadcast our traffic intelligence profiles to the fleet.
+
+    Called every 6 hours by the intelligence broadcast loop.
+    Collects locally-stored traffic profiles and sends a
+    TRAFFIC_INTELLIGENCE_BATCH message.
+    """
+    if not traffic_intel_mgr or not plugin or not outbox_mgr:
+        return
+
+    try:
+        msg = traffic_intel_mgr.create_traffic_intelligence_batch_message(plugin.rpc)
+        if msg:
+            outbox_mgr.broadcast(msg)
+            plugin.log("cl-hive: Broadcast traffic intelligence to fleet", level='debug')
+    except Exception as e:
+        plugin.log(f"cl-hive: Traffic intelligence broadcast error: {e}", level='warn')
+
+
 def _broadcast_our_stigmergic_markers():
     """
     Broadcast our stigmergic markers to hive members for fleet-wide learning.
