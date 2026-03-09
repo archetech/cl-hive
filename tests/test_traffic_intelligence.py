@@ -279,3 +279,147 @@ class TestTrafficIntelligenceProtocol:
         assert payload["reporter_id"] == "reporter_abc"
         assert len(payload["profiles"]) == 1
         assert payload["profiles"][0]["profile_type"] == "retail"
+
+
+from modules.traffic_intelligence import TrafficIntelligenceManager
+
+
+@pytest.fixture
+def traffic_mgr(db):
+    """Create a TrafficIntelligenceManager with test database."""
+    plugin = Mock()
+    plugin.log = Mock()
+    plugin.rpc = MagicMock()
+    mgr = TrafficIntelligenceManager(
+        database=db,
+        plugin=plugin,
+        our_pubkey="our_node_pubkey_abc123",
+    )
+    return mgr
+
+
+class TestTrafficIntelligenceManager:
+    """Test TrafficIntelligenceManager core methods."""
+
+    def test_store_local_profile(self, traffic_mgr, db):
+        """store_local_profile saves to database."""
+        result = traffic_mgr.store_local_profile(
+            peer_id="peer_aaa",
+            profile_type="retail",
+            peak_hours_utc=[9, 10, 11, 14, 15, 16],
+            quiet_hours_utc=[1, 2, 3, 4, 5],
+            avg_forward_size_sats=50000.0,
+            daily_volume_sats=5000000.0,
+            drain_direction="outbound_heavy",
+            confidence=0.85,
+            observation_window_hours=168,
+        )
+        assert result is True
+        profiles = db.get_traffic_profiles_for_peer("peer_aaa")
+        assert len(profiles) == 1
+        assert profiles[0]["profile_type"] == "retail"
+        assert profiles[0]["reporter_id"] == "our_node_pubkey_abc123"
+
+    def test_store_local_profile_rejects_invalid_type(self, traffic_mgr):
+        """store_local_profile rejects invalid profile_type."""
+        result = traffic_mgr.store_local_profile(
+            peer_id="peer_aaa", profile_type="INVALID",
+            peak_hours_utc=[], quiet_hours_utc=[],
+            avg_forward_size_sats=100.0, daily_volume_sats=1000.0,
+            drain_direction="balanced", confidence=0.5,
+            observation_window_hours=24,
+        )
+        assert result is False
+
+    def test_get_aggregated_profile_single_reporter(self, traffic_mgr):
+        """get_aggregated_profile with one reporter returns its data."""
+        traffic_mgr.store_local_profile(
+            peer_id="peer_aaa", profile_type="retail",
+            peak_hours_utc=[9, 10, 11], quiet_hours_utc=[1, 2, 3],
+            avg_forward_size_sats=50000.0, daily_volume_sats=5000000.0,
+            drain_direction="outbound_heavy", confidence=0.85,
+            observation_window_hours=168,
+        )
+        agg = traffic_mgr.get_aggregated_profile("peer_aaa")
+        assert agg is not None
+        assert agg["profile_type"] == "retail"
+        assert agg["confidence"] == 0.85
+        assert 9 in agg["peak_hours_utc"]
+
+    def test_get_aggregated_profile_multiple_reporters(self, traffic_mgr, db):
+        """get_aggregated_profile merges multiple reporters."""
+        now = time.time()
+        # Our report
+        traffic_mgr.store_local_profile(
+            peer_id="peer_aaa", profile_type="retail",
+            peak_hours_utc=[9, 10, 11], quiet_hours_utc=[1, 2, 3],
+            avg_forward_size_sats=50000.0, daily_volume_sats=5000000.0,
+            drain_direction="outbound_heavy", confidence=0.9,
+            observation_window_hours=168,
+        )
+        # Remote report with different peak hours
+        db.save_traffic_profile(
+            peer_id="peer_aaa", reporter_id="remote_node_xyz",
+            profile_type="wholesale", peak_hours_utc=json.dumps([14, 15, 16]),
+            quiet_hours_utc=json.dumps([4, 5, 6]),
+            avg_forward_size_sats=200000.0, daily_volume_sats=20000000.0,
+            drain_direction="inbound_heavy", confidence=0.7,
+            observation_window_hours=168, received_at=now, ttl_hours=168.0,
+        )
+        agg = traffic_mgr.get_aggregated_profile("peer_aaa")
+        assert agg is not None
+        # Highest confidence reporter's profile_type wins
+        assert agg["profile_type"] == "retail"
+        # Peak hours are union of both reporters
+        assert 9 in agg["peak_hours_utc"]
+        assert 14 in agg["peak_hours_utc"]
+
+    def test_get_aggregated_profile_nonexistent_peer(self, traffic_mgr):
+        """get_aggregated_profile returns None for unknown peer."""
+        assert traffic_mgr.get_aggregated_profile("unknown_peer") is None
+
+    def test_get_all_profiles_no_filter(self, traffic_mgr):
+        """get_all_profiles returns all stored profiles."""
+        for peer in ["peer_aaa", "peer_bbb"]:
+            traffic_mgr.store_local_profile(
+                peer_id=peer, profile_type="retail",
+                peak_hours_utc=[], quiet_hours_utc=[],
+                avg_forward_size_sats=100.0, daily_volume_sats=1000.0,
+                drain_direction="balanced", confidence=0.5,
+                observation_window_hours=24,
+            )
+        profiles = traffic_mgr.get_all_profiles()
+        assert len(profiles) == 2
+
+    def test_get_all_profiles_filter_by_type(self, traffic_mgr):
+        """get_all_profiles filters by profile_type."""
+        traffic_mgr.store_local_profile(
+            peer_id="peer_aaa", profile_type="retail",
+            peak_hours_utc=[], quiet_hours_utc=[],
+            avg_forward_size_sats=100.0, daily_volume_sats=1000.0,
+            drain_direction="balanced", confidence=0.5,
+            observation_window_hours=24,
+        )
+        traffic_mgr.store_local_profile(
+            peer_id="peer_bbb", profile_type="wholesale",
+            peak_hours_utc=[], quiet_hours_utc=[],
+            avg_forward_size_sats=500000.0, daily_volume_sats=50000000.0,
+            drain_direction="balanced", confidence=0.5,
+            observation_window_hours=24,
+        )
+        retail = traffic_mgr.get_all_profiles(profile_type="retail")
+        assert len(retail) == 1
+        assert retail[0]["profile_type"] == "retail"
+
+    def test_cleanup_expired(self, traffic_mgr, db):
+        """cleanup_expired_profiles delegates to database."""
+        old_time = time.time() - (200 * 3600)
+        db.save_traffic_profile(
+            peer_id="peer_old", reporter_id="reporter_111",
+            profile_type="retail", peak_hours_utc="[]", quiet_hours_utc="[]",
+            avg_forward_size_sats=100.0, daily_volume_sats=1000.0,
+            drain_direction="balanced", confidence=0.5,
+            observation_window_hours=24, received_at=old_time, ttl_hours=168.0,
+        )
+        deleted = traffic_mgr.cleanup_expired_profiles()
+        assert deleted == 1
