@@ -93,6 +93,7 @@ from modules.cooperative_expansion import CooperativeExpansionManager
 from modules.governance import DecisionEngine
 from modules.vpn_transport import VPNTransportManager
 from modules.fee_intelligence import FeeIntelligenceManager
+from modules.traffic_intelligence import TrafficIntelligenceManager
 from modules.liquidity_coordinator import LiquidityCoordinator
 from modules.splice_coordinator import SpliceCoordinator
 from modules.health_aggregator import HealthScoreAggregator, HealthTier
@@ -263,6 +264,11 @@ from modules.rpc_commands import (
     liquidity_heartbeat as rpc_liquidity_heartbeat,
     liquidity_lease_status as rpc_liquidity_lease_status,
     liquidity_terminate as rpc_liquidity_terminate,
+    # Phase 14: Traffic Intelligence
+    report_traffic_profile as rpc_report_traffic_profile,
+    get_traffic_intelligence as rpc_get_traffic_intelligence,
+    check_rebalance_conflict as rpc_check_rebalance_conflict,
+    get_fleet_demand_forecast as rpc_get_fleet_demand_forecast,
 )
 
 # Initialize the plugin
@@ -306,6 +312,7 @@ decision_engine: Optional[DecisionEngine] = None
 vpn_transport: Optional[VPNTransportManager] = None
 coop_expansion: Optional[CooperativeExpansionManager] = None
 fee_intel_mgr: Optional[FeeIntelligenceManager] = None
+traffic_intel_mgr: Optional[TrafficIntelligenceManager] = None
 health_aggregator: Optional[HealthScoreAggregator] = None
 liquidity_coord: Optional[LiquidityCoordinator] = None
 splice_coord: Optional[SpliceCoordinator] = None
@@ -568,6 +575,7 @@ def _get_hive_context() -> HiveContext:
         nostr_transport=_nostr_transport,
         marketplace_mgr=marketplace_mgr,
         liquidity_mgr=liquidity_mgr,
+        traffic_intel_mgr=traffic_intel_mgr,
         nostr_transport_enabled=bool(_nostr_transport),
         comms_active=_comms_active,
         archon_active=_archon_active,
@@ -1333,6 +1341,18 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Anticipatory liquidity manager initialized")
 
+    # Initialize Traffic Intelligence Manager (Phase 14 - Traffic Intelligence)
+    global traffic_intel_mgr
+    traffic_intel_mgr = TrafficIntelligenceManager(
+        database=database,
+        plugin=plugin,
+        our_pubkey=our_pubkey,
+        anticipatory_mgr=anticipatory_liquidity_mgr,
+        liquidity_coordinator=liquidity_coord,
+        membership_mgr=membership_mgr,
+    )
+    plugin.log("cl-hive: Traffic intelligence manager initialized")
+
     # Initialize Task Manager (Phase 10 - Task Delegation Protocol)
     global task_mgr
     task_mgr = TaskManager(
@@ -1615,6 +1635,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'did_credential_mgr': did_credential_mgr,
         'management_schema_registry': management_schema_registry,
         'cashu_escrow_mgr': cashu_escrow_mgr,
+        'traffic_intel_mgr': traffic_intel_mgr,
         'peer_available_limiter': peer_available_limiter,
         'outbox': outbox_mgr,  # handlers reference 'outbox' for the outbox manager
         # Fee tracking state
@@ -1665,6 +1686,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'strategic_positioning_mgr': strategic_positioning_mgr,
         'rationalization_mgr': rationalization_mgr,
         'cost_reduction_mgr': cost_reduction_mgr,
+        'traffic_intel_mgr': traffic_intel_mgr,
         'settlement_mgr': settlement_mgr,
         'liquidity_coord': liquidity_coord,
         'routing_pool': routing_pool,
@@ -2034,6 +2056,9 @@ def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Pl
             protocol_handlers.handle_violation_report(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.ARBITRATION_VOTE:
             protocol_handlers.handle_arbitration_vote(peer_id, msg_payload, plugin)
+        # Phase 16: Traffic Intelligence
+        elif msg_type == HiveMessageType.TRAFFIC_INTELLIGENCE_BATCH:
+            protocol_handlers.handle_traffic_intelligence_batch(peer_id, msg_payload, plugin)
         else:
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
 
@@ -4859,29 +4884,60 @@ def hive_update_rebalancing_activity(
 
 
 @plugin.method("hive-check-rebalance-conflict")
-def hive_check_rebalance_conflict(plugin: Plugin, peer_id: str):
-    """
-    Check if another fleet member is rebalancing through a peer.
+def hive_check_rebalance_conflict(
+    plugin: Plugin,
+    peer_id: str = "",
+    direction: str = "outbound",
+    amount_sats: int = 0,
+):
+    """Check rebalance conflict with fleet activity."""
+    ctx = _get_hive_context()
+    return rpc_check_rebalance_conflict(
+        ctx, peer_id=peer_id, direction=direction, amount_sats=amount_sats,
+    )
 
-    INFORMATION ONLY - helps avoid competing for same routes.
 
-    Args:
-        peer_id: The peer to check
+@plugin.method("hive-report-traffic-profile")
+def hive_report_traffic_profile(
+    plugin: Plugin,
+    peer_id: str = "",
+    profile_type: str = "mixed",
+    peak_hours_utc: list = None,
+    quiet_hours_utc: list = None,
+    avg_forward_size_sats: float = 0.0,
+    daily_volume_sats: float = 0.0,
+    drain_direction: str = "balanced",
+    confidence: float = 0.5,
+    observation_window_hours: int = 24,
+):
+    """Receive traffic profile from cl-revenue-ops."""
+    ctx = _get_hive_context()
+    return rpc_report_traffic_profile(
+        ctx, peer_id=peer_id, profile_type=profile_type,
+        peak_hours_utc=peak_hours_utc, quiet_hours_utc=quiet_hours_utc,
+        avg_forward_size_sats=avg_forward_size_sats,
+        daily_volume_sats=daily_volume_sats,
+        drain_direction=drain_direction, confidence=confidence,
+        observation_window_hours=observation_window_hours,
+    )
 
-    Returns:
-        Conflict info if another member is rebalancing through this peer
 
-    Permission: Member or Admin
-    """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
-    if perm_error:
-        return perm_error
+@plugin.method("hive-traffic-intelligence")
+def hive_traffic_intelligence(
+    plugin: Plugin,
+    peer_id: str = None,
+    profile_type: str = None,
+):
+    """Query aggregated fleet traffic intelligence."""
+    ctx = _get_hive_context()
+    return rpc_get_traffic_intelligence(ctx, peer_id=peer_id, profile_type=profile_type)
 
-    if not liquidity_coord:
-        return {"error": "Liquidity coordinator not initialized"}
 
-    return liquidity_coord.check_rebalancing_conflict(peer_id)
+@plugin.method("hive-fleet-demand-forecast")
+def hive_fleet_demand_forecast(plugin: Plugin, hours_ahead: int = 6):
+    """Get fleet-wide demand forecast."""
+    ctx = _get_hive_context()
+    return rpc_get_fleet_demand_forecast(ctx, hours_ahead=hours_ahead)
 
 
 @plugin.method("hive-splice-check")

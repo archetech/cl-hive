@@ -660,6 +660,18 @@ def fee_intelligence_loop():
             _broadcast_our_close_proposals()
             shutdown_event.wait(0.05)
 
+            # Step 5k: Broadcast traffic intelligence (Phase 14 - every 6 hours)
+            try:
+                from datetime import datetime, timezone
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                last_traffic_broadcast = getattr(_broadcast_our_traffic_intelligence, '_last_ts', 0)
+                if now_ts - last_traffic_broadcast >= 6 * 3600:
+                    _broadcast_our_traffic_intelligence()
+                    _broadcast_our_traffic_intelligence._last_ts = now_ts
+                    shutdown_event.wait(0.05)
+            except Exception as e:
+                plugin.log(f"cl-hive: Traffic intelligence broadcast check error: {e}", level='debug')
+
             # Step 6: Cleanup old liquidity needs
             try:
                 deleted_needs = database.cleanup_old_liquidity_needs(max_age_hours=24)
