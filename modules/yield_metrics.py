@@ -12,11 +12,10 @@ These metrics enable:
 This module bridges cl-hive coordination with cl-revenue-ops profitability data.
 """
 
-import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 # =============================================================================
@@ -30,9 +29,6 @@ FLOW_INTENSITY_LOW = 0.001     # 0.1% daily turn rate = low flow
 # Velocity prediction thresholds
 DEPLETION_RISK_THRESHOLD = 0.15     # <15% local = depletion risk
 SATURATION_RISK_THRESHOLD = 0.85    # >85% local = saturation risk
-
-# Competition detection
-MIN_CHANNELS_FOR_COMPETITION = 2    # Need at least 2 members with channels
 
 
 # =============================================================================
@@ -210,8 +206,8 @@ class ChannelVelocityPrediction:
             "velocity_sats_per_hour": self.velocity_sats_per_hour,
             "predicted_local_pct_24h": round(self.predicted_local_pct_24h, 4),
             "predicted_local_pct_48h": round(self.predicted_local_pct_48h, 4),
-            "hours_to_depletion": round(self.hours_to_depletion, 1) if self.hours_to_depletion else None,
-            "hours_to_saturation": round(self.hours_to_saturation, 1) if self.hours_to_saturation else None,
+            "hours_to_depletion": round(self.hours_to_depletion, 1) if self.hours_to_depletion is not None else None,
+            "hours_to_saturation": round(self.hours_to_saturation, 1) if self.hours_to_saturation is not None else None,
             "depletion_risk": round(self.depletion_risk, 3),
             "saturation_risk": round(self.saturation_risk, 3),
             "recommended_action": self.recommended_action,
@@ -393,15 +389,13 @@ class YieldMetricsManager:
 
         try:
             # Get channel list
+            channels_resp = self.plugin.rpc.listpeerchannels()
+            channels = channels_resp.get("channels", [])
             if channel_id:
-                channels_resp = self.plugin.rpc.listpeerchannels()
                 channels = [
-                    ch for ch in channels_resp.get("channels", [])
+                    ch for ch in channels
                     if ch.get("short_channel_id") == channel_id
                 ]
-            else:
-                channels_resp = self.plugin.rpc.listpeerchannels()
-                channels = channels_resp.get("channels", [])
 
             # Get profitability data from cl-revenue-ops if available
             profitability_data = {}
@@ -552,10 +546,9 @@ class YieldMetricsManager:
             hours_to_saturation = None
 
             if velocity_pct_per_hour < 0:  # Draining
-                hours_to_depletion = local_pct / abs(velocity_pct_per_hour) if velocity_pct_per_hour != 0 else None
+                hours_to_depletion = local_pct / abs(velocity_pct_per_hour)
             elif velocity_pct_per_hour > 0:  # Filling
-                remaining = 1.0 - local_pct
-                hours_to_saturation = remaining / velocity_pct_per_hour if velocity_pct_per_hour != 0 else None
+                hours_to_saturation = (1.0 - local_pct) / velocity_pct_per_hour
 
             # Calculate risk scores
             depletion_risk = 0.0
@@ -671,7 +664,7 @@ class YieldMetricsManager:
                     if len(self._velocity_cache) > 500:
                         oldest_key = min(
                             self._velocity_cache,
-                            key=lambda k: self._velocity_cache[k].get("timestamp", 0)
+                            key=lambda ck: self._velocity_cache[ck].get("timestamp", 0)
                         )
                         del self._velocity_cache[oldest_key]
                 self._velocity_cache[channel_id] = result
@@ -967,21 +960,6 @@ class YieldMetricsManager:
             "reporter_count": len(recent),
             "confidence": min(1.0, len(recent) / 3)  # 3+ reporters = high confidence
         }
-
-    def get_all_fleet_yield_consensus(self) -> Dict[str, Dict[str, Any]]:
-        """Get consensus yield metrics for all peers with fleet data."""
-        if not hasattr(self, "_remote_yield_metrics"):
-            return {}
-
-        with self._lock:
-            peer_ids = list(self._remote_yield_metrics.keys())
-
-        consensus = {}
-        for peer_id in peer_ids:
-            result = self.get_fleet_yield_consensus(peer_id)
-            if result:
-                consensus[peer_id] = result
-        return consensus
 
     def cleanup_old_remote_yield_metrics(self, max_age_days: float = 7) -> int:
         """Remove old remote yield data."""
