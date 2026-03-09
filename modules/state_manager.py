@@ -18,14 +18,11 @@ import json
 import threading
 import time
 from dataclasses import dataclass, asdict, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-
-# Minimum interval between state hash checks (seconds)
-STATE_CHECK_INTERVAL = 60
 
 # Maximum age for stale state entries (seconds) - 1 hour
 STALE_STATE_THRESHOLD = 3600
@@ -137,6 +134,9 @@ class HivePeerState:
         # Capabilities (optional, backward compatible - old nodes have no capabilities)
         capabilities = data.get("capabilities", [])
 
+        # Boltz activity (optional, backward compatible - defaults to empty)
+        boltz_activity = data.get("boltz_activity", {})
+
         return cls(
             peer_id=peer_id,
             capacity_sats=capacity_sats,
@@ -155,6 +155,7 @@ class HivePeerState:
             fees_last_report=fees_last_report,
             fees_costs_sats=fees_costs_sats,
             capabilities=list(capabilities),   # defensive copy
+            boltz_activity=dict(boltz_activity) if isinstance(boltz_activity, dict) else {},
         )
     
     def to_hash_tuple(self) -> Dict[str, Any]:
@@ -203,8 +204,6 @@ class StateManager:
         self.plugin = plugin
         self._lock = threading.Lock()  # Protects _local_state access
         self._local_state: Dict[str, HivePeerState] = {}
-        self._last_hash: str = ""
-        self._last_hash_time: int = 0
 
         # Load persisted state from database on startup
         self._load_state_from_db()
@@ -484,25 +483,6 @@ class StateManager:
                 "rebalance_costs_sats": state.fees_costs_sats
             }
 
-    def get_all_peer_fees(self) -> Dict[str, Dict[str, int]]:
-        """
-        Get fee reporting data for all peers.
-
-        Returns:
-            Dict mapping peer_id to fee data dict
-        """
-        with self._lock:
-            result = {}
-            for peer_id, state in self._local_state.items():
-                result[peer_id] = {
-                    "fees_earned_sats": state.fees_earned_sats,
-                    "forward_count": state.fees_forward_count,
-                    "period_start": state.fees_period_start,
-                    "last_report": state.fees_last_report,
-                    "rebalance_costs_sats": state.fees_costs_sats
-                }
-            return result
-
     def update_local_state(self, capacity_sats: int, available_sats: int,
                            fee_policy: Dict[str, Any], topology: List[str],
                            our_pubkey: str, force_version: Optional[int] = None) -> HivePeerState:
@@ -699,44 +679,12 @@ class StateManager:
 
         # Calculate SHA256
         hash_bytes = hashlib.sha256(json_str.encode('utf-8')).digest()
-        hash_hex = hash_bytes.hex()
-
-        with self._lock:
-            self._last_hash = hash_hex
-            self._last_hash_time = int(time.time())
-
-        return hash_hex
-    
-    def get_cached_hash(self) -> Tuple[str, int]:
-        """
-        Get the cached fleet hash if still fresh.
-
-        Returns:
-            Tuple of (hash_hex, age_seconds)
-        """
-        with self._lock:
-            last_hash = self._last_hash
-            last_hash_time = self._last_hash_time
-        age = int(time.time()) - last_hash_time
-        return (last_hash, age)
+        return hash_bytes.hex()
     
     # =========================================================================
     # ANTI-ENTROPY (DIVERGENCE DETECTION)
     # =========================================================================
-    
-    def compare_hash(self, remote_hash: str) -> bool:
-        """
-        Compare remote hash against local state.
-        
-        Args:
-            remote_hash: Fleet hash received from another node
-            
-        Returns:
-            True if hashes match (no divergence), False otherwise
-        """
-        local_hash = self.calculate_fleet_hash()
-        return local_hash == remote_hash
-    
+
     def get_full_state_for_sync(self) -> List[Dict[str, Any]]:
         """
         Get complete state data for FULL_SYNC response.
