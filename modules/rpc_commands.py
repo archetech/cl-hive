@@ -206,6 +206,7 @@ class HiveContext:
     nostr_transport: Any = None  # NostrTransport (Phase 5A - Nostr transport)
     marketplace_mgr: Any = None  # MarketplaceManager (Phase 5B - Advisor marketplace)
     liquidity_mgr: Any = None  # LiquidityMarketplaceManager (Phase 5C - Liquidity marketplace)
+    traffic_intel_mgr: Any = None  # TrafficIntelligenceManager (Phase 14 - Traffic Intelligence)
     policy_engine: Any = None  # PolicyEngine (Phase 6A - client policy)
     our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
     nostr_transport_enabled: bool = False
@@ -5960,3 +5961,124 @@ def liquidity_terminate(ctx: HiveContext, lease_id: str,
     if not lease_id:
         return {"error": "lease_id is required"}
     return ctx.liquidity_mgr.terminate_lease(lease_id, reason)
+
+
+# =============================================================================
+# Phase 14 – Traffic Intelligence RPCs
+# =============================================================================
+
+def report_traffic_profile(
+    ctx,
+    peer_id: str = "",
+    profile_type: str = "mixed",
+    peak_hours_utc: list = None,
+    quiet_hours_utc: list = None,
+    avg_forward_size_sats: float = 0.0,
+    daily_volume_sats: float = 0.0,
+    drain_direction: str = "balanced",
+    confidence: float = 0.5,
+    observation_window_hours: int = 24,
+):
+    """
+    Receive traffic profile from cl-revenue-ops.
+
+    Permission: None (local integration)
+    """
+    if not ctx.database or not ctx.traffic_intel_mgr:
+        return {"error": "Traffic intelligence not initialized"}
+
+    if not peer_id:
+        return {"error": "peer_id is required"}
+
+    try:
+        ok = ctx.traffic_intel_mgr.store_local_profile(
+            peer_id=peer_id,
+            profile_type=profile_type,
+            peak_hours_utc=peak_hours_utc or [],
+            quiet_hours_utc=quiet_hours_utc or [],
+            avg_forward_size_sats=avg_forward_size_sats,
+            daily_volume_sats=daily_volume_sats,
+            drain_direction=drain_direction,
+            confidence=confidence,
+            observation_window_hours=observation_window_hours,
+        )
+        if ok:
+            return {"status": "accepted", "peer_id": peer_id}
+        else:
+            return {"error": "Failed to store profile (validation failed)"}
+    except Exception as e:
+        return {"error": f"Failed to store profile: {e}"}
+
+
+def get_traffic_intelligence(
+    ctx,
+    peer_id: str = None,
+    profile_type: str = None,
+):
+    """
+    Query aggregated fleet traffic intelligence.
+
+    Permission: None (local query)
+    """
+    if not ctx.traffic_intel_mgr:
+        return {"error": "Traffic intelligence not initialized"}
+
+    try:
+        if peer_id:
+            agg = ctx.traffic_intel_mgr.get_aggregated_profile(peer_id)
+            if agg:
+                return {"profiles": [agg]}
+            return {"profiles": []}
+        else:
+            profiles = ctx.traffic_intel_mgr.get_all_profiles(
+                profile_type=profile_type,
+            )
+            return {"profiles": profiles}
+    except Exception as e:
+        return {"error": f"Query failed: {e}"}
+
+
+def check_rebalance_conflict(
+    ctx,
+    peer_id: str = "",
+    direction: str = "outbound",
+    amount_sats: int = 0,
+):
+    """
+    Check if rebalancing through a peer conflicts with fleet activity.
+
+    Permission: None (local query)
+    """
+    if not ctx.traffic_intel_mgr:
+        return {"error": "Traffic intelligence not initialized"}
+
+    if not peer_id:
+        return {"error": "peer_id is required"}
+
+    try:
+        return ctx.traffic_intel_mgr.check_rebalance_conflict(
+            peer_id=peer_id,
+            direction=direction,
+            amount_sats=amount_sats,
+        )
+    except Exception as e:
+        return {"error": f"Conflict check failed: {e}"}
+
+
+def get_fleet_demand_forecast(ctx, hours_ahead: int = 6):
+    """
+    Get fleet-wide demand forecast.
+
+    Permission: None (local query)
+    """
+    if not ctx.traffic_intel_mgr:
+        return {"error": "Traffic intelligence not initialized"}
+
+    hours_ahead = max(1, min(hours_ahead, 168))
+
+    try:
+        return ctx.traffic_intel_mgr.get_fleet_demand_forecast(
+            hours_ahead=hours_ahead,
+        )
+    except Exception as e:
+        return {"error": f"Forecast failed: {e}"}

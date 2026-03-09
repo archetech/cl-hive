@@ -620,3 +620,73 @@ class TestTrafficIntelligenceHandler:
             assert result == {"result": "continue"}
         finally:
             protocol_handlers.traffic_intel_mgr = original
+
+
+from modules.rpc_commands import (
+    report_traffic_profile,
+    get_traffic_intelligence,
+    check_rebalance_conflict,
+    get_fleet_demand_forecast,
+)
+
+
+class TestTrafficIntelligenceRPCs:
+    """Test RPC command implementations."""
+
+    @pytest.fixture
+    def ctx(self, db, traffic_mgr):
+        """Create a mock HiveContext."""
+        ctx = Mock()
+        ctx.database = db
+        ctx.traffic_intel_mgr = traffic_mgr
+        ctx.safe_plugin = Mock()
+        ctx.safe_plugin.rpc = MagicMock()
+        return ctx
+
+    def test_report_traffic_profile_success(self, ctx):
+        """report_traffic_profile stores profile and returns accepted."""
+        result = report_traffic_profile(
+            ctx,
+            peer_id="peer_aaa",
+            profile_type="retail",
+            peak_hours_utc=[9, 10, 11],
+            quiet_hours_utc=[1, 2, 3],
+            avg_forward_size_sats=50000.0,
+            daily_volume_sats=5000000.0,
+            drain_direction="outbound_heavy",
+            confidence=0.85,
+            observation_window_hours=168,
+        )
+        assert result["status"] == "accepted"
+
+    def test_report_traffic_profile_missing_peer(self, ctx):
+        """report_traffic_profile returns error for missing peer_id."""
+        result = report_traffic_profile(ctx, peer_id="")
+        assert "error" in result
+
+    def test_get_traffic_intelligence_all(self, ctx):
+        """get_traffic_intelligence returns all profiles."""
+        ctx.traffic_intel_mgr.store_local_profile(
+            peer_id="peer_aaa", profile_type="retail",
+            peak_hours_utc=[], quiet_hours_utc=[],
+            avg_forward_size_sats=100.0, daily_volume_sats=1000.0,
+            drain_direction="balanced", confidence=0.5,
+            observation_window_hours=24,
+        )
+        result = get_traffic_intelligence(ctx)
+        assert "profiles" in result
+        assert len(result["profiles"]) >= 1
+
+    def test_check_rebalance_conflict_returns_assessment(self, ctx):
+        """check_rebalance_conflict returns conflict assessment."""
+        result = check_rebalance_conflict(
+            ctx, peer_id="peer_aaa", direction="outbound", amount_sats=100000,
+        )
+        assert "conflict" in result
+        assert "peer_in_peak_hours" in result
+
+    def test_get_fleet_demand_forecast_returns_forecast(self, ctx):
+        """get_fleet_demand_forecast returns forecast structure."""
+        result = get_fleet_demand_forecast(ctx, hours_ahead=6)
+        assert "members" in result
+        assert "hours_ahead" in result
