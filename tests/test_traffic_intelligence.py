@@ -836,3 +836,109 @@ class TestMCFScheduling:
             msg = call[0][0] if call[0] else ""
             assert "deferred" not in msg
             assert "skipped" not in msg
+
+
+class TestSizeAwareFeeEnrichment:
+    """Phase 3c: Size-aware fee adjustment based on fleet traffic intelligence."""
+
+    def test_large_forwards_get_discount(self):
+        """Peers with large average forwards get a fee discount (0.9x)."""
+        from modules.fee_coordination import FeeCoordinationManager
+        mock_db = MagicMock()
+        mock_plugin = MagicMock()
+        mgr = FeeCoordinationManager(mock_db, mock_plugin)
+        mock_traffic_intel = MagicMock()
+        mock_traffic_intel.get_aggregated_profile.return_value = {
+            "avg_forward_size_sats": 600000,
+            "daily_volume_sats": 5000000,
+            "confidence": 0.8,
+        }
+        mgr.traffic_intel_mgr = mock_traffic_intel
+        multiplier = mgr.get_size_aware_adjustment("02" + "a" * 64)
+        assert 0.85 <= multiplier <= 0.95
+
+    def test_small_forwards_get_premium(self):
+        """Peers with small average forwards get a fee premium (1.1x)."""
+        from modules.fee_coordination import FeeCoordinationManager
+        mock_db = MagicMock()
+        mock_plugin = MagicMock()
+        mgr = FeeCoordinationManager(mock_db, mock_plugin)
+        mock_traffic_intel = MagicMock()
+        mock_traffic_intel.get_aggregated_profile.return_value = {
+            "avg_forward_size_sats": 5000,
+            "daily_volume_sats": 2000000,
+            "confidence": 0.8,
+        }
+        mgr.traffic_intel_mgr = mock_traffic_intel
+        multiplier = mgr.get_size_aware_adjustment("02" + "a" * 64)
+        assert 1.05 <= multiplier <= 1.15
+
+    def test_high_volume_gets_floor_boost(self):
+        """High-volume peers get +0.05 floor boost."""
+        from modules.fee_coordination import FeeCoordinationManager
+        mock_db = MagicMock()
+        mock_plugin = MagicMock()
+        mgr = FeeCoordinationManager(mock_db, mock_plugin)
+        mock_traffic_intel = MagicMock()
+        mock_traffic_intel.get_aggregated_profile.return_value = {
+            "avg_forward_size_sats": 100000,
+            "daily_volume_sats": 15000000,
+            "confidence": 0.8,
+        }
+        mgr.traffic_intel_mgr = mock_traffic_intel
+        multiplier = mgr.get_size_aware_adjustment("02" + "a" * 64)
+        assert multiplier >= 1.04
+
+    def test_no_traffic_data_returns_neutral(self):
+        """No traffic data returns neutral 1.0 multiplier."""
+        from modules.fee_coordination import FeeCoordinationManager
+        mock_db = MagicMock()
+        mock_plugin = MagicMock()
+        mgr = FeeCoordinationManager(mock_db, mock_plugin)
+        mock_traffic_intel = MagicMock()
+        mock_traffic_intel.get_aggregated_profile.return_value = None
+        mgr.traffic_intel_mgr = mock_traffic_intel
+        multiplier = mgr.get_size_aware_adjustment("02" + "a" * 64)
+        assert multiplier == 1.0
+
+    def test_no_traffic_intel_mgr_returns_neutral(self):
+        """No traffic_intel_mgr returns neutral 1.0 multiplier."""
+        from modules.fee_coordination import FeeCoordinationManager
+        mock_db = MagicMock()
+        mock_plugin = MagicMock()
+        mgr = FeeCoordinationManager(mock_db, mock_plugin)
+        mgr.traffic_intel_mgr = None
+        multiplier = mgr.get_size_aware_adjustment("02" + "a" * 64)
+        assert multiplier == 1.0
+
+    def test_multiplier_bounded(self):
+        """Multiplier is always bounded to [0.8, 1.3]."""
+        from modules.fee_coordination import FeeCoordinationManager
+        mock_db = MagicMock()
+        mock_plugin = MagicMock()
+        mgr = FeeCoordinationManager(mock_db, mock_plugin)
+        mock_traffic_intel = MagicMock()
+        mock_traffic_intel.get_aggregated_profile.return_value = {
+            "avg_forward_size_sats": 1,
+            "daily_volume_sats": 100000000,
+            "confidence": 1.0,
+        }
+        mgr.traffic_intel_mgr = mock_traffic_intel
+        multiplier = mgr.get_size_aware_adjustment("02" + "a" * 64)
+        assert 0.8 <= multiplier <= 1.3
+
+    def test_low_confidence_returns_neutral(self):
+        """Low confidence (<0.3) returns neutral 1.0 multiplier."""
+        from modules.fee_coordination import FeeCoordinationManager
+        mock_db = MagicMock()
+        mock_plugin = MagicMock()
+        mgr = FeeCoordinationManager(mock_db, mock_plugin)
+        mock_traffic_intel = MagicMock()
+        mock_traffic_intel.get_aggregated_profile.return_value = {
+            "avg_forward_size_sats": 600000,
+            "daily_volume_sats": 5000000,
+            "confidence": 0.2,
+        }
+        mgr.traffic_intel_mgr = mock_traffic_intel
+        multiplier = mgr.get_size_aware_adjustment("02" + "a" * 64)
+        assert multiplier == 1.0

@@ -286,6 +286,7 @@ class FeeRecommendation:
     defensive_multiplier: float = 1.0
     time_adjustment_pct: float = 0.0    # Phase 7.4: Time-based adjustment
     centrality_adjustment_pct: float = 0.0  # Use Case 8: Centrality-based adjustment
+    size_adjustment_pct: float = 0.0        # Phase 3c: Size-aware adjustment
     our_hive_centrality: float = 0.0       # Current node's centrality
 
     # Salience detection (noise filtering)
@@ -320,6 +321,8 @@ class FeeRecommendation:
         if self.centrality_adjustment_pct != 0.0:
             result["centrality_adjustment_pct"] = round(self.centrality_adjustment_pct * 100, 1)
             result["our_hive_centrality"] = round(self.our_hive_centrality, 3)
+        if self.size_adjustment_pct != 0.0:
+            result["size_adjustment_pct"] = round(self.size_adjustment_pct * 100, 1)
         return result
 
 
@@ -2274,6 +2277,9 @@ class FeeCoordinationManager:
         # Optional reference to FeeIntelligenceManager for cross-system blending
         self.fee_intelligence_mgr = None
 
+        # Phase 3c: Optional reference to TrafficIntelligenceManager for size-aware fees
+        self.traffic_intel_mgr = None
+
     def set_our_pubkey(self, pubkey: str) -> None:
         self.our_pubkey = pubkey
         self.corridor_mgr.set_our_pubkey(pubkey)
@@ -2289,6 +2295,10 @@ class FeeCoordinationManager:
     def set_fee_intelligence_mgr(self, mgr: Any) -> None:
         """Set reference to FeeIntelligenceManager for cross-system blending."""
         self.fee_intelligence_mgr = mgr
+
+    def set_traffic_intel_mgr(self, mgr: Any) -> None:
+        """Set reference to TrafficIntelligenceManager for size-aware fee enrichment."""
+        self.traffic_intel_mgr = mgr
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
@@ -2356,6 +2366,55 @@ class FeeCoordinationManager:
 
         # Middle range = no adjustment
         return 0.0, centrality
+
+    def get_size_aware_adjustment(self, peer_id: str) -> float:
+        """
+        Calculate fee adjustment based on fleet traffic intelligence forward sizes.
+
+        Phase 3c: Returns a multiplier (0.8-1.3) based on:
+        - avg_forward_size > 500k sats -> 0.9x (attract whale traffic)
+        - avg_forward_size < 10k sats -> 1.1x (HTLC slot cost for small forwards)
+        - daily_volume > 10M sats -> +0.05 floor boost (protect capacity)
+        - No traffic data -> 1.0x (neutral, preserve current behavior)
+
+        Args:
+            peer_id: External peer to check
+
+        Returns:
+            Fee multiplier bounded to [0.8, 1.3]
+        """
+        if not self.traffic_intel_mgr:
+            return 1.0
+
+        try:
+            profile = self.traffic_intel_mgr.get_aggregated_profile(peer_id)
+        except Exception:
+            return 1.0
+
+        if not profile:
+            return 1.0
+
+        avg_fwd = profile.get("avg_forward_size_sats", 0)
+        daily_vol = profile.get("daily_volume_sats", 0)
+        confidence = profile.get("confidence", 0)
+
+        if confidence < 0.3:
+            return 1.0
+
+        multiplier = 1.0
+
+        # Size-based adjustment
+        if avg_fwd > 500_000:
+            multiplier = 0.9  # Attract whale traffic
+        elif avg_fwd < 10_000 and avg_fwd > 0:
+            multiplier = 1.1  # HTLC slot cost for small forwards
+
+        # Volume floor boost
+        if daily_vol > 10_000_000:
+            multiplier += 0.05
+
+        # Bound to [0.8, 1.3]
+        return max(0.8, min(1.3, multiplier))
 
     def get_fee_recommendation(
         self,
@@ -2497,6 +2556,17 @@ class FeeCoordinationManager:
                 else:
                     reasons.append(f"centrality_discount_{abs(centrality_adjustment_pct)*100:.1f}%")
 
+        # 6b. Apply size-aware adjustment (Phase 3c)
+        size_adjustment_pct = 0.0
+        size_multiplier = self.get_size_aware_adjustment(peer_id)
+        if size_multiplier != 1.0:
+            size_adjustment_pct = size_multiplier - 1.0
+            recommended_fee = int(recommended_fee * size_multiplier)
+            if size_multiplier > 1.0:
+                reasons.append(f"size_premium_{size_adjustment_pct*100:.1f}%")
+            else:
+                reasons.append(f"size_discount_{size_adjustment_pct*100:.1f}%")
+
         # Defense must remain a hard floor through later adjustments.
         if defended_floor_fee is not None and recommended_fee < defended_floor_fee:
             recommended_fee = defended_floor_fee
@@ -2560,6 +2630,7 @@ class FeeCoordinationManager:
             defensive_multiplier=defensive_multiplier,
             time_adjustment_pct=time_adjustment_pct,
             centrality_adjustment_pct=centrality_adjustment_pct,
+            size_adjustment_pct=size_adjustment_pct,
             our_hive_centrality=our_hive_centrality,
             is_salient=is_salient,
             salience_reason=salience_reason,
