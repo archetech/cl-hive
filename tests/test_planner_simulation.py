@@ -70,6 +70,7 @@ def mock_database():
     db.get_recent_expansion_rejections.return_value = []
     # Mock budget tracking
     db.get_available_budget.return_value = 2_000_000
+    db.get_pending_channel_open_total.return_value = 0
     # Mock ignored peers (planner ignore feature)
     db.is_peer_ignored.return_value = False
     # Mock peer event summary for quality scorer (neutral values)
