@@ -1754,6 +1754,29 @@ class HiveDatabase:
             )
         """)
 
+        # FLEET TRAFFIC INTELLIGENCE TABLE (Phase 15+)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fleet_traffic_intelligence (
+                peer_id TEXT NOT NULL,
+                reporter_id TEXT NOT NULL,
+                profile_type TEXT,
+                peak_hours_utc TEXT,
+                quiet_hours_utc TEXT,
+                avg_forward_size_sats REAL,
+                daily_volume_sats REAL,
+                drain_direction TEXT,
+                confidence REAL,
+                observation_window_hours INTEGER,
+                received_at REAL,
+                ttl_hours REAL DEFAULT 168.0,
+                PRIMARY KEY (peer_id, reporter_id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_traffic_intel_peer
+            ON fleet_traffic_intelligence(peer_id)
+        """)
+
         conn.execute("PRAGMA optimize;")
         self.plugin.log("HiveDatabase: Schema initialized")
     
@@ -8363,4 +8386,70 @@ class HiveDatabase:
                 f"HiveDatabase: update_dispute_outcome error: {e}", level='error'
             )
             return False
+
+    # =========================================================================
+    # FLEET TRAFFIC INTELLIGENCE OPERATIONS (Phase 15+)
+    # =========================================================================
+
+    def save_traffic_profile(
+        self, peer_id: str, reporter_id: str, profile_type: str,
+        peak_hours_utc: str, quiet_hours_utc: str,
+        avg_forward_size_sats: float, daily_volume_sats: float,
+        drain_direction: str, confidence: float,
+        observation_window_hours: int, received_at: float,
+        ttl_hours: float = 168.0,
+    ) -> bool:
+        """Save or update a traffic profile (upsert on peer_id + reporter_id)."""
+        try:
+            conn = self._get_connection()
+            conn.execute("""
+                INSERT OR REPLACE INTO fleet_traffic_intelligence (
+                    peer_id, reporter_id, profile_type, peak_hours_utc,
+                    quiet_hours_utc, avg_forward_size_sats, daily_volume_sats,
+                    drain_direction, confidence, observation_window_hours,
+                    received_at, ttl_hours
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                peer_id, reporter_id, profile_type, peak_hours_utc,
+                quiet_hours_utc, avg_forward_size_sats, daily_volume_sats,
+                drain_direction, confidence, observation_window_hours,
+                received_at, ttl_hours,
+            ))
+            return True
+        except Exception:
+            return False
+
+    def get_traffic_profiles_for_peer(
+        self, peer_id: str
+    ) -> list:
+        """Get all traffic profiles for a specific peer."""
+        conn = self._get_connection()
+        now = time.time()
+        rows = conn.execute("""
+            SELECT * FROM fleet_traffic_intelligence
+            WHERE peer_id = ? AND (received_at + ttl_hours * 3600) > ?
+            ORDER BY confidence DESC
+        """, (peer_id, now)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_all_traffic_profiles(self) -> list:
+        """Get all non-expired traffic profiles."""
+        conn = self._get_connection()
+        now = time.time()
+        rows = conn.execute("""
+            SELECT * FROM fleet_traffic_intelligence
+            WHERE (received_at + ttl_hours * 3600) > ?
+            ORDER BY peer_id, confidence DESC
+        """, (now,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def cleanup_expired_traffic_profiles(self) -> int:
+        """Remove expired traffic profiles. Returns count deleted."""
+        conn = self._get_connection()
+        now = time.time()
+        cursor = conn.execute("""
+            DELETE FROM fleet_traffic_intelligence
+            WHERE (received_at + ttl_hours * 3600) <= ?
+        """, (now,))
+        return cursor.rowcount
 
