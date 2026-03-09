@@ -63,6 +63,8 @@ EVENT_ID_FIELDS: Dict[str, list] = {
     "NETTING_ACK": ["window_id", "sender_id"],
     "VIOLATION_REPORT": ["violation_id"],
     "ARBITRATION_VOTE": ["dispute_id", "sender_id"],
+    # Phase 16: Traffic Intelligence
+    "TRAFFIC_INTELLIGENCE_BATCH": ["reporter_id", "timestamp"],
 }
 
 

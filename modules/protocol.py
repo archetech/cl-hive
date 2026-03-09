@@ -172,6 +172,9 @@ class HiveMessageType(IntEnum):
     VIOLATION_REPORT = 32901         # Report policy violation with evidence
     ARBITRATION_VOTE = 32903         # Cast arbitration panel vote
 
+    # Phase 16: Traffic Intelligence
+    TRAFFIC_INTELLIGENCE_BATCH = 32905
+
 
 # =============================================================================
 # PHASE D: RELIABLE DELIVERY CONSTANTS
@@ -207,6 +210,8 @@ RELIABLE_MESSAGE_TYPES = frozenset({
     HiveMessageType.NETTING_ACK,
     HiveMessageType.VIOLATION_REPORT,
     HiveMessageType.ARBITRATION_VOTE,
+    # Phase 16: Traffic Intelligence
+    HiveMessageType.TRAFFIC_INTELLIGENCE_BATCH,
 })
 
 # Implicit ack mapping: response type -> request type it satisfies
@@ -347,6 +352,16 @@ MCF_MIN_AMOUNT_SATS = 10000                     # Minimum amount for MCF assignm
 MCF_MAX_AMOUNT_SATS = 100_000_000_000           # 1000 BTC max per assignment
 VALID_MCF_NEED_TYPES = {'inbound', 'outbound'}  # Valid need types
 VALID_MCF_URGENCY_LEVELS = {'critical', 'high', 'medium', 'low'}
+
+# Traffic intelligence bounds
+VALID_PROFILE_TYPES = {'retail', 'wholesale', 'burst', 'steady', 'mixed'}
+VALID_DRAIN_DIRECTIONS = {'inbound_heavy', 'outbound_heavy', 'balanced'}
+MAX_PROFILES_IN_BATCH = 200
+TRAFFIC_INTELLIGENCE_MAX_AGE = 48 * 3600  # 48 hours
+TRAFFIC_INTELLIGENCE_BATCH_RATE_LIMIT = (1, 6 * 3600)  # 1 per 6 hours per sender
+MAX_DAILY_VOLUME_SATS = 1_000_000_000_000  # 10k BTC
+MAX_FORWARD_SIZE_SATS = 100_000_000_000  # 1k BTC
+MAX_OBSERVATION_WINDOW_HOURS = 720  # 30 days
 
 # Route probe constants
 MAX_PATH_LENGTH = 20                        # Maximum hops in a path
@@ -7026,3 +7041,95 @@ def get_arbitration_vote_signing_payload(
         "reason": reason,
         "vote": vote,
     }, sort_keys=True, separators=(',', ':'))
+
+
+# =============================================================================
+# PHASE 16: TRAFFIC INTELLIGENCE
+# =============================================================================
+
+def get_traffic_intelligence_batch_signing_payload(payload: Dict[str, Any]) -> str:
+    """Get canonical string to sign for TRAFFIC_INTELLIGENCE_BATCH."""
+    profiles = payload.get("profiles", [])
+    sorted_profiles = sorted(profiles, key=lambda p: p.get("peer_id", ""))
+    profiles_json = json.dumps(sorted_profiles, sort_keys=True, separators=(',', ':'))
+    profiles_hash = hashlib.sha256(profiles_json.encode()).hexdigest()[:16]
+    return (
+        f"TRAFFIC_INTELLIGENCE_BATCH:"
+        f"{payload.get('reporter_id', '')}:"
+        f"{payload.get('timestamp', 0)}:"
+        f"{len(profiles)}:"
+        f"{profiles_hash}"
+    )
+
+
+def validate_traffic_intelligence_batch(payload: Dict[str, Any]) -> bool:
+    """Validate a TRAFFIC_INTELLIGENCE_BATCH payload."""
+    reporter_id = payload.get("reporter_id")
+    if not isinstance(reporter_id, str) or not reporter_id:
+        return False
+
+    signature = payload.get("signature")
+    if not isinstance(signature, str) or len(signature) < 10:
+        return False
+
+    timestamp = payload.get("timestamp", 0)
+    if not isinstance(timestamp, (int, float)):
+        return False
+    now = time.time()
+    if timestamp > now + 300:
+        return False
+    if timestamp < now - TRAFFIC_INTELLIGENCE_MAX_AGE:
+        return False
+
+    profiles = payload.get("profiles")
+    if not isinstance(profiles, list):
+        return False
+    if len(profiles) > MAX_PROFILES_IN_BATCH:
+        return False
+
+    for p in profiles:
+        if not isinstance(p, dict):
+            return False
+        peer_id = p.get("peer_id")
+        if not isinstance(peer_id, str) or not peer_id:
+            return False
+        if p.get("profile_type") not in VALID_PROFILE_TYPES:
+            return False
+        if p.get("drain_direction") not in VALID_DRAIN_DIRECTIONS:
+            return False
+        confidence = p.get("confidence", 0)
+        if not isinstance(confidence, (int, float)) or not (0 <= confidence <= 1):
+            return False
+        avg_size = p.get("avg_forward_size_sats", 0)
+        if not isinstance(avg_size, (int, float)) or avg_size < 0 or avg_size > MAX_FORWARD_SIZE_SATS:
+            return False
+        daily_vol = p.get("daily_volume_sats", 0)
+        if not isinstance(daily_vol, (int, float)) or daily_vol < 0 or daily_vol > MAX_DAILY_VOLUME_SATS:
+            return False
+        obs_window = p.get("observation_window_hours", 0)
+        if not isinstance(obs_window, (int, float)) or obs_window < 0 or obs_window > MAX_OBSERVATION_WINDOW_HOURS:
+            return False
+        peak = p.get("peak_hours_utc")
+        if not isinstance(peak, list) or not all(isinstance(h, int) and 0 <= h <= 23 for h in peak):
+            return False
+        quiet = p.get("quiet_hours_utc")
+        if not isinstance(quiet, list) or not all(isinstance(h, int) and 0 <= h <= 23 for h in quiet):
+            return False
+
+    return True
+
+
+def create_traffic_intelligence_batch(
+    reporter_id: str,
+    timestamp: int,
+    signature: str,
+    profiles: list,
+) -> bytes:
+    """Create a TRAFFIC_INTELLIGENCE_BATCH message."""
+    payload = {
+        "reporter_id": reporter_id,
+        "timestamp": timestamp,
+        "signature": signature,
+        "profiles": profiles,
+    }
+    return serialize(HiveMessageType.TRAFFIC_INTELLIGENCE_BATCH, payload)
