@@ -238,3 +238,157 @@ class TrafficIntelligenceManager:
     def cleanup_expired_profiles(self) -> int:
         """Remove profiles past their TTL."""
         return self.db.cleanup_expired_traffic_profiles()
+
+    # ── Gossip: Create Batch ───────────────────────────────────────
+
+    def create_traffic_intelligence_batch_message(
+        self, rpc
+    ) -> Optional[bytes]:
+        """
+        Create a signed TRAFFIC_INTELLIGENCE_BATCH message from local profiles.
+
+        Args:
+            rpc: RPC proxy for signmessage
+
+        Returns:
+            Serialized message bytes or None
+        """
+        if not self.our_pubkey:
+            self._log("Cannot create batch: no pubkey set", level="warn")
+            return None
+
+        # Get our locally-stored profiles (we are the reporter)
+        all_profiles = self.db.get_all_traffic_profiles()
+        our_profiles = [
+            p for p in all_profiles
+            if p.get("reporter_id") == self.our_pubkey
+        ]
+
+        if not our_profiles:
+            return None
+
+        if len(our_profiles) > MAX_PROFILES_IN_BATCH:
+            our_profiles = our_profiles[:MAX_PROFILES_IN_BATCH]
+
+        # Build payload profiles list
+        profiles_data = []
+        for p in our_profiles:
+            peak = p.get("peak_hours_utc", "[]")
+            quiet = p.get("quiet_hours_utc", "[]")
+            profiles_data.append({
+                "peer_id": p["peer_id"],
+                "profile_type": p.get("profile_type", "mixed"),
+                "peak_hours_utc": json.loads(peak) if isinstance(peak, str) else peak,
+                "quiet_hours_utc": json.loads(quiet) if isinstance(quiet, str) else quiet,
+                "avg_forward_size_sats": p.get("avg_forward_size_sats", 0),
+                "daily_volume_sats": p.get("daily_volume_sats", 0),
+                "drain_direction": p.get("drain_direction", "balanced"),
+                "confidence": p.get("confidence", 0.5),
+                "observation_window_hours": p.get("observation_window_hours", 0),
+            })
+
+        timestamp = int(time.time())
+        payload = {
+            "reporter_id": self.our_pubkey,
+            "timestamp": timestamp,
+            "signature": "",
+            "profiles": profiles_data,
+        }
+
+        try:
+            signing_msg = get_traffic_intelligence_batch_signing_payload(payload)
+            sig_result = rpc.signmessage(signing_msg)
+            signature = sig_result.get("signature", sig_result.get("zbase", ""))
+            payload["signature"] = signature
+        except Exception as e:
+            self._log(f"Failed to sign batch: {e}", level="error")
+            return None
+
+        return create_traffic_intelligence_batch(
+            reporter_id=self.our_pubkey,
+            timestamp=timestamp,
+            signature=signature,
+            profiles=profiles_data,
+        )
+
+    # ── Gossip: Handle Incoming ────────────────────────────────────
+
+    def handle_traffic_intelligence_batch(
+        self,
+        sender_id: str,
+        payload: Dict[str, Any],
+        rpc,
+    ) -> Dict[str, Any]:
+        """
+        Handle incoming TRAFFIC_INTELLIGENCE_BATCH from fleet member.
+
+        Args:
+            sender_id: Peer who sent the message
+            payload: Message payload
+            rpc: RPC proxy for checkmessage
+
+        Returns:
+            Dict with success/error status
+        """
+        # Rate limit
+        if not self._check_rate_limit(
+            sender_id, self._batch_rate, TRAFFIC_INTELLIGENCE_BATCH_RATE_LIMIT
+        ):
+            return {"error": "rate_limited"}
+
+        # Reporter must match sender
+        reporter_id = payload.get("reporter_id")
+        if reporter_id != sender_id:
+            return {"error": "reporter_mismatch"}
+
+        # Validate payload structure
+        if not validate_traffic_intelligence_batch(payload):
+            return {"error": "invalid_payload"}
+
+        # Verify sender is a member
+        member = self.db.get_member(reporter_id)
+        if not member:
+            return {"error": "not_a_member"}
+
+        # Verify signature
+        signature = payload.get("signature")
+        signing_msg = get_traffic_intelligence_batch_signing_payload(payload)
+        try:
+            verify = rpc.checkmessage(signing_msg, signature)
+            if not verify.get("verified"):
+                return {"error": "invalid_signature"}
+            if verify.get("pubkey") != reporter_id:
+                return {"error": "signature_mismatch"}
+        except Exception as e:
+            self._log(f"Signature check failed: {e}", level="error")
+            return {"error": "verification_failed"}
+
+        # Record for rate limiting
+        self._record_message(sender_id, self._batch_rate)
+
+        # Store each profile
+        profiles = payload.get("profiles", [])
+        timestamp = payload.get("timestamp", int(time.time()))
+        stored = 0
+        for p in profiles:
+            ok = self.db.save_traffic_profile(
+                peer_id=p["peer_id"],
+                reporter_id=reporter_id,
+                profile_type=p.get("profile_type", "mixed"),
+                peak_hours_utc=json.dumps(p.get("peak_hours_utc", [])),
+                quiet_hours_utc=json.dumps(p.get("quiet_hours_utc", [])),
+                avg_forward_size_sats=p.get("avg_forward_size_sats", 0),
+                daily_volume_sats=p.get("daily_volume_sats", 0),
+                drain_direction=p.get("drain_direction", "balanced"),
+                confidence=p.get("confidence", 0.5),
+                observation_window_hours=p.get("observation_window_hours", 0),
+                received_at=time.time(),
+            )
+            if ok:
+                stored += 1
+
+        self._log(
+            f"Stored {stored}/{len(profiles)} profiles from {sender_id[:16]}...",
+            level="debug",
+        )
+        return {"success": True, "profiles_stored": stored}

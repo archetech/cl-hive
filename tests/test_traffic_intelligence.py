@@ -423,3 +423,97 @@ class TestTrafficIntelligenceManager:
         )
         deleted = traffic_mgr.cleanup_expired_profiles()
         assert deleted == 1
+
+
+class TestTrafficIntelligenceGossip:
+    """Test gossip creation and handling."""
+
+    def test_create_batch_message(self, traffic_mgr):
+        """create_traffic_intelligence_batch_message creates signed bytes."""
+        traffic_mgr.store_local_profile(
+            peer_id="peer_aaa", profile_type="retail",
+            peak_hours_utc=[9, 10], quiet_hours_utc=[1, 2],
+            avg_forward_size_sats=50000.0, daily_volume_sats=5000000.0,
+            drain_direction="outbound_heavy", confidence=0.85,
+            observation_window_hours=168,
+        )
+        rpc = MagicMock()
+        rpc.signmessage.return_value = {"zbase": "fakesig123abc"}
+        msg = traffic_mgr.create_traffic_intelligence_batch_message(rpc)
+        assert msg is not None
+        rpc.signmessage.assert_called_once()
+
+    def test_create_batch_message_no_profiles(self, traffic_mgr):
+        """create_traffic_intelligence_batch_message returns None with no data."""
+        rpc = MagicMock()
+        msg = traffic_mgr.create_traffic_intelligence_batch_message(rpc)
+        assert msg is None
+
+    def test_handle_batch_valid(self, traffic_mgr, db):
+        """handle_traffic_intelligence_batch stores remote profiles."""
+        sender = "remote_node_xyz"
+        db.add_member(sender, tier="full")
+        payload = {
+            "reporter_id": sender,
+            "timestamp": int(time.time()),
+            "signature": "valid_sig_long_enough",
+            "profiles": [{
+                "peer_id": "peer_ext",
+                "profile_type": "wholesale",
+                "peak_hours_utc": [14, 15, 16],
+                "quiet_hours_utc": [2, 3, 4],
+                "avg_forward_size_sats": 200000.0,
+                "daily_volume_sats": 20000000.0,
+                "drain_direction": "inbound_heavy",
+                "confidence": 0.8,
+                "observation_window_hours": 168,
+            }],
+        }
+        rpc = MagicMock()
+        rpc.checkmessage.return_value = {"verified": True, "pubkey": sender}
+        result = traffic_mgr.handle_traffic_intelligence_batch(sender, payload, rpc)
+        assert result.get("success") is True
+        assert result.get("profiles_stored") == 1
+        profiles = db.get_traffic_profiles_for_peer("peer_ext")
+        assert len(profiles) == 1
+
+    def test_handle_batch_rejects_nonmember(self, traffic_mgr):
+        """handle_traffic_intelligence_batch rejects non-member."""
+        payload = {
+            "reporter_id": "stranger",
+            "timestamp": int(time.time()),
+            "signature": "sig_long_enough_here",
+            "profiles": [],
+        }
+        rpc = MagicMock()
+        result = traffic_mgr.handle_traffic_intelligence_batch("stranger", payload, rpc)
+        assert "error" in result
+
+    def test_handle_batch_rejects_bad_signature(self, traffic_mgr, db):
+        """handle_traffic_intelligence_batch rejects invalid signature."""
+        sender = "remote_node_xyz"
+        db.add_member(sender, tier="full")
+        payload = {
+            "reporter_id": sender,
+            "timestamp": int(time.time()),
+            "signature": "bad_sig_long_enough",
+            "profiles": [],
+        }
+        rpc = MagicMock()
+        rpc.checkmessage.return_value = {"verified": False}
+        result = traffic_mgr.handle_traffic_intelligence_batch(sender, payload, rpc)
+        assert result.get("error") == "invalid_signature"
+
+    def test_handle_batch_rejects_reporter_mismatch(self, traffic_mgr, db):
+        """handle_traffic_intelligence_batch rejects if reporter != sender."""
+        sender = "real_sender"
+        db.add_member(sender, tier="full")
+        payload = {
+            "reporter_id": "impersonator",
+            "timestamp": int(time.time()),
+            "signature": "sig_long_enough_here",
+            "profiles": [],
+        }
+        rpc = MagicMock()
+        result = traffic_mgr.handle_traffic_intelligence_batch(sender, payload, rpc)
+        assert result.get("error") == "reporter_mismatch"
