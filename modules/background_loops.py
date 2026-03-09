@@ -22,6 +22,10 @@ from modules.protocol import (
     create_mcf_needs_batch,
 )
 
+# Phase 3b: MCF assignment defer tracking
+_mcf_defer_counts: Dict[str, int] = {}
+_MCF_MAX_DEFER_CYCLES = 3
+
 
 def init_background_loops(deps: dict):
     """Inject dependency references into this module's namespace.
@@ -1748,21 +1752,16 @@ def _process_mcf_assignments():
     """
     Process pending MCF assignments for our node.
 
-    Manages the lifecycle of MCF assignments:
-    1. Sends ACK to coordinator when new assignments received
-    2. Monitors assignment progress (pending -> executing -> completed/failed)
-    3. Cleans up stale assignments
-
-    Actual execution is triggered by cl-revenue-ops via:
-    - hive-mcf-assignments: Query pending assignments
-    - hive-claim-mcf-assignment: Claim assignment for execution
-    - hive-report-mcf-completion: Report execution outcome
+    Phase 3b: Before ACK, checks traffic intelligence for peak-hour
+    conflicts and active fleet rebalancing. Defers up to 3 cycles
+    (~90 minutes), then executes regardless.
     """
+    global _mcf_defer_counts
+
     if not liquidity_coord or not cost_reduction_mgr:
         return
 
     try:
-        # Get all assignments
         status = liquidity_coord.get_mcf_status()
         counts = status.get("assignment_counts", {})
 
@@ -1770,6 +1769,49 @@ def _process_mcf_assignments():
         executing_count = counts.get("executing", 0)
         completed_count = counts.get("completed", 0)
         failed_count = counts.get("failed", 0)
+
+        # Phase 3b: Check traffic intelligence before ACK
+        if pending_count > 0 and traffic_intel_mgr:
+            pending = liquidity_coord.get_pending_mcf_assignments()
+            for assignment in (pending or []):
+                peer_id = getattr(assignment, 'to_channel', '')
+                assign_id = getattr(assignment, 'assignment_id', str(id(assignment)))
+
+                # Check fleet rebalancing conflict and peak hours
+                try:
+                    conflict_info = traffic_intel_mgr.check_rebalance_conflict(
+                        peer_id=peer_id,
+                        direction="outbound",
+                        amount_sats=0,
+                    )
+                except Exception:
+                    conflict_info = {}
+
+                # Active conflict — skip entirely (another member rebalancing)
+                if conflict_info.get("conflict"):
+                    member = conflict_info.get("conflicting_member", "unknown")
+                    plugin.log(
+                        f"cl-hive: MCF assignment {assign_id[:12]}... skipped — "
+                        f"conflict with {str(member)[:12]}...",
+                        level='info'
+                    )
+                    continue
+
+                # Peak hours — defer up to max_defer_cycles
+                defer_count = _mcf_defer_counts.get(assign_id, 0)
+                if conflict_info.get("peer_in_peak_hours") and defer_count < _MCF_MAX_DEFER_CYCLES:
+                    _mcf_defer_counts[assign_id] = defer_count + 1
+                    window = conflict_info.get("suggested_window_utc")
+                    plugin.log(
+                        f"cl-hive: MCF assignment {assign_id[:12]}... deferred "
+                        f"(peer in peak hours, defer {defer_count + 1}/{_MCF_MAX_DEFER_CYCLES})"
+                        f"{f', suggested window: {window}' if window else ''}",
+                        level='info'
+                    )
+                    continue
+
+                # Clear defer count on execution
+                _mcf_defer_counts.pop(assign_id, None)
 
         # Send ACK if we have pending assignments and haven't ACKed yet
         if pending_count > 0 and not status.get("ack_sent", False):
@@ -1780,7 +1822,7 @@ def _process_mcf_assignments():
                 if ack_msg:
                     _broadcast_mcf_ack(ack_msg)
 
-        # Log status periodically (only if there's activity)
+        # Log status periodically
         if pending_count > 0 or executing_count > 0:
             plugin.log(
                 f"cl-hive: MCF assignments - pending={pending_count}, "
@@ -1789,7 +1831,6 @@ def _process_mcf_assignments():
                 level='debug'
             )
 
-        # Check for stuck assignments (executing for too long)
         _check_stuck_mcf_assignments()
 
     except Exception as e:

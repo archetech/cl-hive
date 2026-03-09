@@ -690,3 +690,149 @@ class TestTrafficIntelligenceRPCs:
         result = get_fleet_demand_forecast(ctx, hours_ahead=6)
         assert "members" in result
         assert "hours_ahead" in result
+
+
+from modules import background_loops
+
+
+class TestMCFScheduling:
+    """Test Phase 3b: MCF scheduling with traffic intelligence."""
+
+    def _make_assignment(self, peer_id="peer_aaa", assign_id="assign_001"):
+        """Create a mock MCF assignment object."""
+        a = MagicMock()
+        a.to_channel = peer_id
+        a.assignment_id = assign_id
+        a.solution_timestamp = int(time.time())
+        return a
+
+    @pytest.fixture(autouse=True)
+    def setup_bg(self):
+        """Wire module-level globals for background_loops."""
+        self.mock_plugin = MagicMock()
+        self.mock_lc = MagicMock()
+        self.mock_traffic_intel = MagicMock()
+
+        background_loops.plugin = self.mock_plugin
+        background_loops.liquidity_coord = self.mock_lc
+        background_loops.cost_reduction_mgr = MagicMock()
+        background_loops.traffic_intel_mgr = self.mock_traffic_intel
+        background_loops._mcf_defer_counts = {}
+        yield
+        # Cleanup
+        background_loops.plugin = None
+        background_loops.liquidity_coord = None
+        background_loops.cost_reduction_mgr = None
+        background_loops.traffic_intel_mgr = None
+        background_loops._mcf_defer_counts = {}
+
+    def test_mcf_defers_during_peak_hours(self):
+        """When peer_in_peak_hours=True, assignment is deferred with log."""
+        assignment = self._make_assignment()
+        self.mock_lc.get_mcf_status.return_value = {
+            "assignment_counts": {"pending": 1, "executing": 0,
+                                  "completed": 0, "failed": 0},
+            "ack_sent": True,
+        }
+        self.mock_lc.get_pending_mcf_assignments.return_value = [assignment]
+        self.mock_traffic_intel.check_rebalance_conflict.return_value = {
+            "conflict": False,
+            "conflicting_member": None,
+            "peer_in_peak_hours": True,
+            "suggested_window_utc": ["03:00", "05:00"],
+            "fleet_drain_forecast_sats": 0,
+        }
+
+        background_loops._process_mcf_assignments()
+
+        # Should defer and log
+        assert background_loops._mcf_defer_counts["assign_001"] == 1
+        self.mock_plugin.log.assert_any_call(
+            "cl-hive: MCF assignment assign_001... deferred "
+            "(peer in peak hours, defer 1/3), suggested window: ['03:00', '05:00']",
+            level='info'
+        )
+
+    def test_mcf_executes_after_max_deferrals(self):
+        """After 3 deferrals, assignment proceeds regardless."""
+        assignment = self._make_assignment()
+        background_loops._mcf_defer_counts = {"assign_001": 3}
+        self.mock_lc.get_mcf_status.return_value = {
+            "assignment_counts": {"pending": 1, "executing": 0,
+                                  "completed": 0, "failed": 0},
+            "ack_sent": False,
+        }
+        self.mock_lc.get_pending_mcf_assignments.return_value = [assignment]
+        self.mock_lc.create_mcf_ack_message.return_value = b"ack_msg"
+        self.mock_traffic_intel.check_rebalance_conflict.return_value = {
+            "conflict": False,
+            "conflicting_member": None,
+            "peer_in_peak_hours": True,
+            "suggested_window_utc": None,
+            "fleet_drain_forecast_sats": 0,
+        }
+
+        background_loops._process_mcf_assignments()
+
+        # Defer count should be cleared (popped) since it reached max
+        assert "assign_001" not in background_loops._mcf_defer_counts
+        # ACK should have been sent since ack_sent=False
+        self.mock_lc.create_mcf_ack_message.assert_called_once()
+
+    def test_mcf_skips_on_active_conflict(self):
+        """When conflict=True, assignment is skipped entirely."""
+        assignment = self._make_assignment()
+        self.mock_lc.get_mcf_status.return_value = {
+            "assignment_counts": {"pending": 1, "executing": 0,
+                                  "completed": 0, "failed": 0},
+            "ack_sent": True,
+        }
+        self.mock_lc.get_pending_mcf_assignments.return_value = [assignment]
+        self.mock_traffic_intel.check_rebalance_conflict.return_value = {
+            "conflict": True,
+            "conflicting_member": "member_xyz_123456",
+            "peer_in_peak_hours": False,
+            "suggested_window_utc": None,
+            "fleet_drain_forecast_sats": 0,
+        }
+
+        background_loops._process_mcf_assignments()
+
+        # Should skip and log conflict
+        self.mock_plugin.log.assert_any_call(
+            "cl-hive: MCF assignment assign_001... skipped \u2014 "
+            "conflict with member_xyz_1...",
+            level='info'
+        )
+        # Defer count should not be set
+        assert "assign_001" not in background_loops._mcf_defer_counts
+
+    def test_mcf_proceeds_when_clear(self):
+        """When no conflict and no peak hours, assignment proceeds normally."""
+        assignment = self._make_assignment()
+        self.mock_lc.get_mcf_status.return_value = {
+            "assignment_counts": {"pending": 1, "executing": 0,
+                                  "completed": 0, "failed": 0},
+            "ack_sent": False,
+        }
+        self.mock_lc.get_pending_mcf_assignments.return_value = [assignment]
+        self.mock_lc.create_mcf_ack_message.return_value = b"ack_msg"
+        self.mock_traffic_intel.check_rebalance_conflict.return_value = {
+            "conflict": False,
+            "conflicting_member": None,
+            "peer_in_peak_hours": False,
+            "suggested_window_utc": None,
+            "fleet_drain_forecast_sats": 0,
+        }
+
+        background_loops._process_mcf_assignments()
+
+        # No deferral
+        assert "assign_001" not in background_loops._mcf_defer_counts
+        # ACK should be sent
+        self.mock_lc.create_mcf_ack_message.assert_called_once()
+        # No "deferred" or "skipped" info-level logs
+        for call in self.mock_plugin.log.call_args_list:
+            msg = call[0][0] if call[0] else ""
+            assert "deferred" not in msg
+            assert "skipped" not in msg
