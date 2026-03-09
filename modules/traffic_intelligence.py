@@ -16,7 +16,6 @@ Provides:
 import json
 import time
 import threading
-import hashlib
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 
@@ -368,7 +367,6 @@ class TrafficIntelligenceManager:
 
         # Store each profile
         profiles = payload.get("profiles", [])
-        timestamp = payload.get("timestamp", int(time.time()))
         stored = 0
         for p in profiles:
             ok = self.db.save_traffic_profile(
@@ -460,12 +458,12 @@ class TrafficIntelligenceManager:
                     start = quiet_hours[0]  # Wrap to tomorrow
 
                 if start is not None:
-                    # Find contiguous block
+                    # Find contiguous block from start
                     end = start
                     for h in sorted(quiet_hours):
-                        if h == end + 1:
+                        if h == (end + 1) % 24:
                             end = h
-                    result["suggested_window_utc"] = [start, end + 1]
+                    result["suggested_window_utc"] = [start, (end + 1) % 24]
 
             # Estimate drain forecast
             daily_vol = agg.get("daily_volume_sats", 0)
