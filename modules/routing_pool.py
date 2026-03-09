@@ -14,11 +14,9 @@ This is the economic foundation that enables all other coordination:
 Author: Lightning Goats Team
 """
 
-import time
 import datetime
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from collections import defaultdict
 
 from . import network_metrics
 
@@ -31,9 +29,6 @@ from . import network_metrics
 CAPITAL_WEIGHT = 0.70      # Capacity, weighted capacity, uptime
 POSITION_WEIGHT = 0.20     # Centrality, unique peers, bridge score
 OPERATIONS_WEIGHT = 0.10   # Success rate, response time
-
-# Settlement period
-DEFAULT_SETTLEMENT_DAYS = 7
 
 # Minimum contribution to receive distribution
 MIN_CONTRIBUTION_THRESHOLD = 0.001  # 0.1% of pool
@@ -199,21 +194,6 @@ class RoutingPool:
         except Exception as e:
             self._log(f"Error recording revenue: {e}", level='error')
             return False
-
-    def get_period_revenue(self, period: str = None) -> Dict[str, Any]:
-        """
-        Get revenue statistics for a period.
-
-        Args:
-            period: Period string (default: current week)
-
-        Returns:
-            Revenue stats including total, by_member breakdown
-        """
-        if period is None:
-            period = self._current_period()
-
-        return self.db.get_pool_revenue(period=period)
 
     # =========================================================================
     # CONTRIBUTION CALCULATION

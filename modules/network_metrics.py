@@ -23,7 +23,7 @@ Author: Lightning Goats Team
 import time
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 
 # =============================================================================
@@ -36,10 +36,6 @@ METRICS_CACHE_TTL = 300  # 5 minutes
 # Normalization constants
 MAX_EXTERNAL_CENTRALITY = 0.1   # Typical max betweenness centrality
 MAX_UNIQUE_PEERS = 50           # Normalize unique peer count
-MAX_HIVE_CENTRALITY = 1.0       # Already normalized 0-1
-
-# Minimum topology size to be considered "well connected"
-MIN_WELL_CONNECTED_PEERS = 5
 
 
 # =============================================================================

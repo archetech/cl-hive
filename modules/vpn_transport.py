@@ -33,9 +33,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # Default VPN port for Lightning
 DEFAULT_VPN_PORT = 9735
 
-# Cache duration for peer VPN status (seconds)
-VPN_STATUS_CACHE_TTL = 300
-
 # Maximum number of VPN subnets to configure
 MAX_VPN_SUBNETS = 10
 
@@ -430,7 +427,6 @@ class VPNTransportManager:
         with self._lock:
             mode = self._mode
             required_messages = set(self._required_messages)
-            vpn_subnets = list(self._vpn_subnets)
 
         # Always accept in ANY mode
         if mode == TransportMode.ANY:
@@ -494,38 +490,6 @@ class VPNTransportManager:
         with self._lock:
             self._stats["messages_accepted"] += 1
         return (True, "transport check passed")
-
-    def _message_requires_vpn(self, message_type: str) -> bool:
-        """
-        Check if a message type requires VPN transport.
-
-        Args:
-            message_type: Hive message type
-
-        Returns:
-            True if VPN is required for this message type
-        """
-        if MessageRequirement.NONE in self._required_messages:
-            return False
-
-        if MessageRequirement.ALL in self._required_messages:
-            return True
-
-        message_type_upper = message_type.upper()
-
-        if MessageRequirement.GOSSIP in self._required_messages:
-            if "GOSSIP" in message_type_upper or "STATE" in message_type_upper:
-                return True
-
-        if MessageRequirement.INTENT in self._required_messages:
-            if "INTENT" in message_type_upper:
-                return True
-
-        if MessageRequirement.SYNC in self._required_messages:
-            if "SYNC" in message_type_upper or "FULL_STATE" in message_type_upper:
-                return True
-
-        return False
 
     @staticmethod
     def _message_requires_vpn_snapshot(
