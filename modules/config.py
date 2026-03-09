@@ -9,16 +9,11 @@ thread-safe configuration access during background operations.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, FrozenSet, TYPE_CHECKING
+from typing import Optional, Dict, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .database import HiveDatabase
 
-
-# Immutable keys that cannot be changed at runtime
-IMMUTABLE_CONFIG_KEYS: FrozenSet[str] = frozenset({
-    'db_path',
-})
 
 # Type mapping for config fields (for validation)
 CONFIG_FIELD_TYPES: Dict[str, type] = {

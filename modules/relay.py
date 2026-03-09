@@ -21,8 +21,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Any, Callable
-from enum import Enum
+from typing import Dict, List, Optional, Any, Callable
 
 
 # =============================================================================
@@ -427,14 +426,6 @@ class RelayManager:
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
-
-def extract_relay_metadata(payload: Dict[str, Any]) -> Optional[RelayMetadata]:
-    """Extract relay metadata from message payload."""
-    relay_data = payload.get("_relay")
-    if not relay_data:
-        return None
-    return RelayMetadata.from_dict(relay_data)
-
 
 def is_relayed_message(payload: Dict[str, Any]) -> bool:
     """Check if message was relayed (not direct from origin)."""

@@ -398,22 +398,6 @@ class BudgetHoldManager:
 
         return None
 
-    def get_hold_for_round(self, round_id: str) -> Optional[BudgetHold]:
-        """Get the active hold for a specific round, if any."""
-        with self._lock:
-            for hold in self._holds.values():
-                if hold.round_id == round_id and hold.is_active():
-                    return hold
-        return None
-
-    def get_next_expiry(self) -> int:
-        """Get the timestamp of the next hold expiry, or 0 if no active holds."""
-        with self._lock:
-            active = [h for h in self._holds.values() if h.is_active()]
-        if not active:
-            return 0
-        return min(h.expires_at for h in active)
-
     # =========================================================================
     # MAINTENANCE
     # =========================================================================
@@ -477,27 +461,3 @@ class BudgetHoldManager:
 
         self._log(f"Loaded {loaded} active budget holds from database")
         return loaded
-
-    # =========================================================================
-    # STATISTICS
-    # =========================================================================
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get budget hold statistics."""
-        active = self.get_active_holds()
-
-        return {
-            "active_holds": len(active),
-            "total_held_sats": self.get_total_held(),
-            "max_concurrent_holds": MAX_CONCURRENT_HOLDS,
-            "next_expiry": self.get_next_expiry(),
-            "holds": [
-                {
-                    "hold_id": h.hold_id[:12] + "...",
-                    "round_id": h.round_id[:8] + "..." if h.round_id else "",
-                    "amount_sats": h.amount_sats,
-                    "expires_in_sec": max(0, h.expires_at - int(time.time())),
-                }
-                for h in active
-            ],
-        }

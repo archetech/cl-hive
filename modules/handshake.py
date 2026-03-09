@@ -22,7 +22,6 @@ Note: Tickets are deprecated. Channel existence serves as proof of stake.
 Having a channel demonstrates economic commitment to the network.
 """
 
-import os
 import json
 import threading
 import time

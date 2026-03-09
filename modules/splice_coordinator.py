@@ -395,17 +395,3 @@ class SpliceCoordinator:
 
         return recs
 
-    def get_status(self) -> Dict[str, Any]:
-        """Get splice coordinator status."""
-        return {
-            "active": True,
-            "cache_entries": len(self._channel_cache),
-            "min_fleet_capacity_pct": MIN_FLEET_CAPACITY_PCT,
-            "min_fleet_capacity_sats": MIN_FLEET_CAPACITY_SATS
-        }
-
-    def clear_cache(self) -> None:
-        """Clear the channel cache."""
-        with self._cache_lock:
-            self._channel_cache.clear()
-        self._log("Channel cache cleared")

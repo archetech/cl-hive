@@ -28,9 +28,6 @@ CAPACITY_CHANGE_THRESHOLD = 0.10
 # Default heartbeat interval in seconds (5 minutes)
 DEFAULT_HEARTBEAT_INTERVAL = 300
 
-# Minimum interval between gossip broadcasts to same peer (seconds)
-MIN_GOSSIP_INTERVAL = 10
-
 # Bounds to prevent unbounded payload growth
 MAX_TOPOLOGY_ENTRIES = 200
 MAX_FULL_SYNC_STATES = 2000
@@ -44,10 +41,6 @@ FULL_SYNC_COOLDOWN = 60
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
-
-# Capability constants for version-aware feature negotiation
-CAPABILITY_MCF = "mcf"  # Min-Cost Max-Flow optimization support
-
 
 @dataclass
 class GossipState:
@@ -104,14 +97,11 @@ class GossipManager:
         self.heartbeat_interval = heartbeat_interval
         self.get_membership_hash = get_membership_hash
 
-        # Lock protecting _last_broadcast_state, _peer_gossip_times, _active_peers
+        # Lock protecting _last_broadcast_state, _active_peers
         self._lock = threading.Lock()
 
         # Track our last broadcast state
         self._last_broadcast_state = GossipState()
-
-        # Track when we last sent gossip to each peer
-        self._peer_gossip_times: Dict[str, int] = {}
 
         # Set of peers we've received gossip from (for connectivity tracking)
         self._active_peers: Set[str] = set()
@@ -260,7 +250,7 @@ class GossipManager:
 
         # Default capabilities include MCF support (this node has it)
         if capabilities is None:
-            capabilities = [CAPABILITY_MCF]
+            capabilities = ["mcf"]
 
         with self._lock:
             new_version = self._last_broadcast_state.version + 1
@@ -383,7 +373,7 @@ class GossipManager:
 
         # Delegate to state manager
         return self.state_manager.update_peer_state(sender_id, payload)
-    
+
     # =========================================================================
     # STATE HASH OPERATIONS
     # =========================================================================
@@ -534,53 +524,9 @@ class GossipManager:
         return updated
     
     # =========================================================================
-    # PEER MANAGEMENT
-    # =========================================================================
-    
-    def get_active_peers(self) -> List[str]:
-        """Get list of peers we've received gossip from."""
-        with self._lock:
-            return list(self._active_peers)
-    
-    def mark_peer_inactive(self, peer_id: str) -> None:
-        """Mark a peer as inactive (disconnected) and cleanup tracking data."""
-        with self._lock:
-            self._active_peers.discard(peer_id)
-            self._peer_gossip_times.pop(peer_id, None)
-    
-    def can_send_gossip_to(self, peer_id: str) -> bool:
-        """
-        Check if we can send gossip to a peer (rate limiting).
-
-        Enforces minimum interval between gossip to same peer.
-
-        Args:
-            peer_id: Target peer's public key
-
-        Returns:
-            True if enough time has passed since last gossip
-        """
-        now = int(time.time())
-        with self._lock:
-            last_time = self._peer_gossip_times.get(peer_id, 0)
-        return (now - last_time) >= MIN_GOSSIP_INTERVAL
-    
-    def record_gossip_sent(self, peer_id: str) -> None:
-        """Record that we sent gossip to a peer."""
-        now = int(time.time())
-        with self._lock:
-            self._peer_gossip_times[peer_id] = now
-            # Periodic cleanup: remove stale entries to prevent unbounded growth
-            if len(self._peer_gossip_times) > 200:
-                cutoff = now - self.heartbeat_interval * 2
-                stale = [k for k, t in self._peer_gossip_times.items() if t < cutoff]
-                for k in stale:
-                    del self._peer_gossip_times[k]
-    
-    # =========================================================================
     # STATISTICS
     # =========================================================================
-    
+
     def force_next_broadcast(self) -> None:
         """Force the next gossip cycle to broadcast by resetting the heartbeat timer."""
         with self._lock:
@@ -597,13 +543,9 @@ class GossipManager:
         with self._lock:
             last_broadcast = self._last_broadcast_state.last_broadcast
             version = self._last_broadcast_state.version
-            active_peers_count = len(self._active_peers)
-            tracked_peers_count = len(self._peer_gossip_times)
 
         return {
             "version": version,
             "last_broadcast_ago": now - last_broadcast if last_broadcast else None,
             "heartbeat_interval": self.heartbeat_interval,
-            "active_peers": active_peers_count,
-            "tracked_peers": tracked_peers_count
         }
