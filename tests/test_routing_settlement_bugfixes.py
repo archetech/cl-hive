@@ -24,6 +24,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from modules import background_loops
 from modules.settlement import (
     SettlementManager,
     MemberContribution,
@@ -453,3 +454,112 @@ class TestPoolPeriodCompatibility:
         rows = database.get_pool_contributions("2026-08")
         assert len(rows) == 1
         assert rows[0]["member_id"] == PEER_A
+
+
+# =============================================================================
+# BUG 11: routing-pool backlog auto-finalization
+# =============================================================================
+
+class TestAutoFinalizePoolBacklog:
+    """Bug 11: settlement loop should auto-finalize at most one backlog pool period."""
+
+    def test_auto_finalize_pool_backlog_settles_oldest_unsettled_period_first(
+        self, mock_db, mock_plugin
+    ):
+        """Skip settled/cleared periods and settle the oldest remaining candidate."""
+        routing_pool = MagicMock()
+        settlement_mgr = MagicMock()
+        settlement_mgr.get_previous_period.return_value = "2026-W10"
+        mock_db.get_pool_candidate_periods_up_to.return_value = ["2026-W08", "2026-W09", "2026-W10"]
+        mock_db.get_pool_distributions.side_effect = [
+            [{"period": "2026-W08"}],
+            [],
+            [],
+        ]
+        mock_db.get_pool_settlement_marker.side_effect = [
+            {"period": "2026-W09", "reason": "zero_total_revenue"},
+            None,
+        ]
+        mock_db.get_pool_contributions.return_value = [{"member_id": PEER_A, "pool_share": 1.0}]
+        mock_db.get_pool_revenue.return_value = {"total_sats": 5000}
+
+        result = background_loops._auto_finalize_pool_backlog(
+            routing_pool=routing_pool,
+            settlement_mgr=settlement_mgr,
+            database=mock_db,
+            plugin=mock_plugin,
+        )
+
+        assert result == "2026-W10"
+        routing_pool.settle_period.assert_called_once_with("2026-W10")
+        mock_db.mark_pool_period_cleared.assert_not_called()
+
+    def test_auto_finalize_pool_backlog_marks_zero_revenue_period_cleared(
+        self, mock_db, mock_plugin
+    ):
+        """Zero-revenue periods should be cleared and stop the cycle."""
+        routing_pool = MagicMock()
+        settlement_mgr = MagicMock()
+        settlement_mgr.get_previous_period.return_value = "2026-W10"
+        mock_db.get_pool_candidate_periods_up_to.return_value = ["2026-W09"]
+        mock_db.get_pool_distributions.return_value = []
+        mock_db.get_pool_settlement_marker.return_value = None
+        mock_db.get_pool_contributions.return_value = [{"member_id": PEER_A, "pool_share": 1.0}]
+        mock_db.get_pool_revenue.return_value = {"total_sats": 0}
+
+        result = background_loops._auto_finalize_pool_backlog(
+            routing_pool=routing_pool,
+            settlement_mgr=settlement_mgr,
+            database=mock_db,
+            plugin=mock_plugin,
+        )
+
+        assert result == "2026-W09"
+        mock_db.mark_pool_period_cleared.assert_called_once_with("2026-W09", "zero_total_revenue")
+        routing_pool.settle_period.assert_not_called()
+        routing_pool.snapshot_contributions.assert_not_called()
+
+    def test_auto_finalize_pool_backlog_marks_no_contributions_after_snapshot_attempt(
+        self, mock_db, mock_plugin
+    ):
+        """Missing contributions should trigger one snapshot attempt before clearing."""
+        routing_pool = MagicMock()
+        settlement_mgr = MagicMock()
+        settlement_mgr.get_previous_period.return_value = "2026-W10"
+        mock_db.get_pool_candidate_periods_up_to.return_value = ["2026-W09"]
+        mock_db.get_pool_distributions.return_value = []
+        mock_db.get_pool_settlement_marker.return_value = None
+        mock_db.get_pool_contributions.side_effect = [[], []]
+        mock_db.get_pool_revenue.return_value = {"total_sats": 5000}
+
+        result = background_loops._auto_finalize_pool_backlog(
+            routing_pool=routing_pool,
+            settlement_mgr=settlement_mgr,
+            database=mock_db,
+            plugin=mock_plugin,
+        )
+
+        assert result == "2026-W09"
+        routing_pool.snapshot_contributions.assert_called_once_with("2026-W09")
+        mock_db.mark_pool_period_cleared.assert_called_once_with("2026-W09", "no_contributions")
+        routing_pool.settle_period.assert_not_called()
+
+    def test_auto_finalize_pool_backlog_uses_previous_period_ceiling(
+        self, mock_db, mock_plugin
+    ):
+        """Candidate discovery must be bounded by settlement_mgr.get_previous_period()."""
+        routing_pool = MagicMock()
+        settlement_mgr = MagicMock()
+        settlement_mgr.get_previous_period.return_value = "2026-W10"
+        mock_db.get_pool_candidate_periods_up_to.return_value = []
+
+        result = background_loops._auto_finalize_pool_backlog(
+            routing_pool=routing_pool,
+            settlement_mgr=settlement_mgr,
+            database=mock_db,
+            plugin=mock_plugin,
+        )
+
+        assert result is None
+        mock_db.get_pool_candidate_periods_up_to.assert_called_once_with("2026-W10")
+        routing_pool.settle_period.assert_not_called()

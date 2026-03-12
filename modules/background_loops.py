@@ -890,6 +890,39 @@ SETTLEMENT_CHECK_INTERVAL = 3600
 SETTLEMENT_REBROADCAST_INTERVAL = 4 * 3600
 
 
+def _auto_finalize_pool_backlog(routing_pool, settlement_mgr, database, plugin):
+    """
+    Process at most one unsettled routing-pool backlog period for this cycle.
+
+    Returns the period handled, or None if nothing was eligible.
+    """
+    previous_period = settlement_mgr.get_previous_period()
+    for period in database.get_pool_candidate_periods_up_to(previous_period):
+        if database.get_pool_distributions(period):
+            continue
+        if database.get_pool_settlement_marker(period):
+            continue
+
+        contributions = database.get_pool_contributions(period)
+        if not contributions:
+            routing_pool.snapshot_contributions(period)
+            contributions = database.get_pool_contributions(period)
+
+        total_revenue = database.get_pool_revenue(period=period).get("total_sats", 0)
+        if total_revenue == 0:
+            database.mark_pool_period_cleared(period, "zero_total_revenue")
+            return period
+
+        if not contributions:
+            database.mark_pool_period_cleared(period, "no_contributions")
+            return period
+
+        routing_pool.settle_period(period)
+        return period
+
+    return None
+
+
 def settlement_loop():
     """
     Background thread for distributed settlement coordination.
@@ -937,6 +970,19 @@ def settlement_loop():
                             )
             except Exception as e:
                 plugin.log(f"SETTLEMENT: Pool snapshot ensure error: {e}", level='warn')
+
+            # Step 0.5: Auto-finalize at most one historical routing-pool period
+            # before creating any new distributed settlement proposals.
+            try:
+                if routing_pool:
+                    _auto_finalize_pool_backlog(
+                        routing_pool=routing_pool,
+                        settlement_mgr=settlement_mgr,
+                        database=database,
+                        plugin=plugin,
+                    )
+            except Exception as e:
+                plugin.log(f"SETTLEMENT: Pool backlog finalize error: {e}", level='warn')
 
             # Step 1: Check if we should propose settlement for previous week
             try:
@@ -2869,4 +2915,3 @@ def _broadcast_liquidity_needs():
     except Exception as e:
         if plugin:
             plugin.log(f"cl-hive: Liquidity needs broadcast error: {e}", level='warn')
-
