@@ -486,6 +486,14 @@ class TestPoolSettlementMarkers:
         marker = database.get_pool_settlement_marker("2026-W01")
         assert marker["reason"] == "zero_total_revenue"
 
+    def test_pool_settlement_marker_can_be_reopened_after_removal(self, tmp_path):
+        database = _make_real_database(tmp_path)
+
+        assert database.mark_pool_period_cleared("2026-W01", "zero_total_revenue") is True
+        assert database.remove_pool_settlement_marker("2026-W01") is True
+        assert database.get_pool_settlement_marker("2026-W01") is None
+        assert database.mark_pool_period_cleared("2026-W01", "no_contributions") is True
+
     def test_get_pool_candidate_periods_up_to_unions_normalizes_and_caps(self, tmp_path):
         database = _make_real_database(tmp_path)
 

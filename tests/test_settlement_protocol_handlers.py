@@ -2,8 +2,26 @@
 Focused tests for settlement proposal diagnostics at protocol boundaries.
 """
 
+import sys
 import time
+import types
 from unittest.mock import MagicMock
+
+if "pyln.client" not in sys.modules:
+    pyln_module = types.ModuleType("pyln")
+    pyln_client_module = types.ModuleType("pyln.client")
+
+    class _Plugin:
+        pass
+
+    class _RpcError(Exception):
+        pass
+
+    pyln_client_module.Plugin = _Plugin
+    pyln_client_module.RpcError = _RpcError
+    pyln_module.client = pyln_client_module
+    sys.modules.setdefault("pyln", pyln_module)
+    sys.modules["pyln.client"] = pyln_client_module
 
 import modules.protocol as protocol
 from modules import background_loops, protocol_handlers
@@ -11,6 +29,14 @@ from modules import background_loops, protocol_handlers
 
 PEER_A = "02" + "a" * 64
 PEER_B = "02" + "b" * 64
+
+
+def test_pyln_client_stub_supports_unit_imports():
+    assert "pyln.client" in sys.modules
+    assert hasattr(sys.modules["pyln.client"], "Plugin")
+    assert hasattr(sys.modules["pyln.client"], "RpcError")
+    assert hasattr(protocol_handlers, "handle_settlement_propose")
+    assert hasattr(background_loops, "_process_pending_settlement_proposals_once")
 
 
 def _make_plugin():

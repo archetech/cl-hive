@@ -900,21 +900,31 @@ def _auto_finalize_pool_backlog(routing_pool, settlement_mgr, database, plugin):
     for period in database.get_pool_candidate_periods_up_to(previous_period):
         if database.get_pool_distributions(period):
             continue
-        if database.get_pool_settlement_marker(period):
-            continue
 
         contributions = database.get_pool_contributions(period)
-        if not contributions:
-            routing_pool.snapshot_contributions(period)
-            contributions = database.get_pool_contributions(period)
-
         total_revenue = database.get_pool_revenue(period=period).get("total_sats", 0)
+        marker = database.get_pool_settlement_marker(period)
+        if marker:
+            marker_reason = marker.get("reason")
+            should_reopen = total_revenue > 0
+            if not should_reopen and marker_reason != "zero_total_revenue" and contributions:
+                should_reopen = True
+
+            if should_reopen:
+                if not database.remove_pool_settlement_marker(period):
+                    continue
+            else:
+                continue
+
+        # Historical backlog periods must not fabricate shares from current state.
+        if not contributions:
+            if total_revenue == 0:
+                database.mark_pool_period_cleared(period, "zero_total_revenue")
+                return period
+            return None
+
         if total_revenue == 0:
             database.mark_pool_period_cleared(period, "zero_total_revenue")
-            return period
-
-        if not contributions:
-            database.mark_pool_period_cleared(period, "no_contributions")
             return period
 
         routing_pool.settle_period(period)

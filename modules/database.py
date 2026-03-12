@@ -5467,6 +5467,20 @@ class HiveDatabase:
         ).fetchone()
         return dict(row) if row else None
 
+    def remove_pool_settlement_marker(self, period: str) -> bool:
+        """Remove a persisted settlement marker so a period can be reconsidered."""
+        conn = self._get_connection()
+        normalized_period = self._normalize_pool_period(period)
+        try:
+            result = conn.execute(
+                "DELETE FROM pool_settlement_markers WHERE period = ?",
+                (normalized_period,),
+            )
+            return result.rowcount > 0
+        except sqlite3.Error as e:
+            self.plugin.log(f"Error removing pool settlement marker: {e}", level='error')
+            return False
+
     def get_pool_candidate_periods_up_to(self, max_period: str) -> List[str]:
         """
         Discover unique routing-pool periods up to and including max_period.

@@ -19,10 +19,27 @@ import datetime
 import pytest
 from unittest.mock import MagicMock, patch
 from dataclasses import dataclass
+import types
 
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+if "pyln.client" not in sys.modules:
+    pyln_module = types.ModuleType("pyln")
+    pyln_client_module = types.ModuleType("pyln.client")
+
+    class _Plugin:
+        pass
+
+    class _RpcError(Exception):
+        pass
+
+    pyln_client_module.Plugin = _Plugin
+    pyln_client_module.RpcError = _RpcError
+    pyln_module.client = pyln_client_module
+    sys.modules.setdefault("pyln", pyln_module)
+    sys.modules["pyln.client"] = pyln_client_module
 
 from modules import background_loops
 from modules.settlement import (
@@ -480,8 +497,14 @@ class TestAutoFinalizePoolBacklog:
             {"period": "2026-W09", "reason": "zero_total_revenue"},
             None,
         ]
-        mock_db.get_pool_contributions.return_value = [{"member_id": PEER_A, "pool_share": 1.0}]
-        mock_db.get_pool_revenue.return_value = {"total_sats": 5000}
+        mock_db.get_pool_contributions.side_effect = [
+            [],
+            [{"member_id": PEER_A, "pool_share": 1.0}],
+        ]
+        mock_db.get_pool_revenue.side_effect = [
+            {"total_sats": 0},
+            {"total_sats": 5000},
+        ]
 
         result = background_loops._auto_finalize_pool_backlog(
             routing_pool=routing_pool,
@@ -519,17 +542,20 @@ class TestAutoFinalizePoolBacklog:
         routing_pool.settle_period.assert_not_called()
         routing_pool.snapshot_contributions.assert_not_called()
 
-    def test_auto_finalize_pool_backlog_marks_no_contributions_after_snapshot_attempt(
+    def test_auto_finalize_pool_backlog_reopens_cleared_period_when_late_data_arrives(
         self, mock_db, mock_plugin
     ):
-        """Missing contributions should trigger one snapshot attempt before clearing."""
+        """A cleared period should reopen once late revenue/contributions exist."""
         routing_pool = MagicMock()
         settlement_mgr = MagicMock()
         settlement_mgr.get_previous_period.return_value = "2026-W10"
         mock_db.get_pool_candidate_periods_up_to.return_value = ["2026-W09"]
         mock_db.get_pool_distributions.return_value = []
-        mock_db.get_pool_settlement_marker.return_value = None
-        mock_db.get_pool_contributions.side_effect = [[], []]
+        mock_db.get_pool_settlement_marker.return_value = {
+            "period": "2026-W09",
+            "reason": "zero_total_revenue",
+        }
+        mock_db.get_pool_contributions.return_value = [{"member_id": PEER_A, "pool_share": 1.0}]
         mock_db.get_pool_revenue.return_value = {"total_sats": 5000}
 
         result = background_loops._auto_finalize_pool_backlog(
@@ -540,8 +566,34 @@ class TestAutoFinalizePoolBacklog:
         )
 
         assert result == "2026-W09"
-        routing_pool.snapshot_contributions.assert_called_once_with("2026-W09")
-        mock_db.mark_pool_period_cleared.assert_called_once_with("2026-W09", "no_contributions")
+        mock_db.remove_pool_settlement_marker.assert_called_once_with("2026-W09")
+        routing_pool.settle_period.assert_called_once_with("2026-W09")
+        mock_db.mark_pool_period_cleared.assert_not_called()
+        routing_pool.snapshot_contributions.assert_not_called()
+
+    def test_auto_finalize_pool_backlog_does_not_snapshot_historical_period_without_contributions(
+        self, mock_db, mock_plugin
+    ):
+        """Historical periods with revenue but no stored contributions should stay unresolved."""
+        routing_pool = MagicMock()
+        settlement_mgr = MagicMock()
+        settlement_mgr.get_previous_period.return_value = "2026-W10"
+        mock_db.get_pool_candidate_periods_up_to.return_value = ["2026-W08"]
+        mock_db.get_pool_distributions.return_value = []
+        mock_db.get_pool_settlement_marker.return_value = None
+        mock_db.get_pool_contributions.return_value = []
+        mock_db.get_pool_revenue.return_value = {"total_sats": 5000}
+
+        result = background_loops._auto_finalize_pool_backlog(
+            routing_pool=routing_pool,
+            settlement_mgr=settlement_mgr,
+            database=mock_db,
+            plugin=mock_plugin,
+        )
+
+        assert result is None
+        routing_pool.snapshot_contributions.assert_not_called()
+        mock_db.mark_pool_period_cleared.assert_not_called()
         routing_pool.settle_period.assert_not_called()
 
     def test_auto_finalize_pool_backlog_uses_previous_period_ceiling(
