@@ -1014,6 +1014,16 @@ class HiveDatabase:
             "ON pool_distributions(period)"
         )
 
+        # Pool settlement markers - durable cleared/processed period markers
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pool_settlement_markers (
+                period TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                reason TEXT,
+                settled_at INTEGER NOT NULL
+            )
+        """)
+
         # =====================================================================
         # FLOW SAMPLES TABLE (Phase 7.1 - Anticipatory Liquidity)
         # =====================================================================
@@ -5427,6 +5437,72 @@ class HiveDatabase:
         """, (member_id, limit)).fetchall()
         return [dict(row) for row in rows]
 
+    def mark_pool_period_cleared(self, period: str, reason: str) -> bool:
+        """
+        Persist a durable cleared marker for a routing-pool period.
+
+        Returns True on first insert and False if the period was already marked.
+        """
+        conn = self._get_connection()
+        normalized_period = self._normalize_pool_period(period)
+        try:
+            conn.execute("""
+                INSERT INTO pool_settlement_markers (period, status, reason, settled_at)
+                VALUES (?, 'cleared', ?, ?)
+            """, (normalized_period, reason, int(time.time())))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+        except sqlite3.Error as e:
+            self.plugin.log(f"Error marking pool period cleared: {e}", level='error')
+            return False
+
+    def get_pool_settlement_marker(self, period: str) -> Optional[Dict[str, Any]]:
+        """Get a persisted settlement marker for a routing-pool period."""
+        conn = self._get_connection()
+        normalized_period = self._normalize_pool_period(period)
+        row = conn.execute(
+            "SELECT * FROM pool_settlement_markers WHERE period = ?",
+            (normalized_period,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_pool_candidate_periods_up_to(self, max_period: str) -> List[str]:
+        """
+        Discover unique routing-pool periods up to and including max_period.
+
+        Candidates come from:
+        - ISO weeks derived from pool_revenue.recorded_at
+        - Stored pool_contributions periods
+        - Stored pool_distributions periods
+        """
+        import datetime
+
+        conn = self._get_connection()
+        max_normalized = self._normalize_pool_period(max_period)
+        candidates = set()
+
+        def add_candidate(period: str) -> None:
+            normalized = self._normalize_pool_period(period)
+            if len(normalized) == 8 and normalized[4:6] == "-W" and normalized <= max_normalized:
+                candidates.add(normalized)
+
+        for row in conn.execute("SELECT DISTINCT recorded_at FROM pool_revenue").fetchall():
+            recorded_at = row["recorded_at"]
+            iso = datetime.datetime.fromtimestamp(
+                int(recorded_at),
+                tz=datetime.timezone.utc,
+            ).isocalendar()
+            add_candidate(f"{iso.year}-W{iso.week:02d}")
+
+        for row in conn.execute("SELECT DISTINCT period FROM pool_contributions").fetchall():
+            add_candidate(row["period"])
+
+        for row in conn.execute("SELECT DISTINCT period FROM pool_distributions").fetchall():
+            add_candidate(row["period"])
+
+        return sorted(candidates)
+
     def _normalize_pool_period(self, period: str) -> str:
         """
         Normalize pool period to canonical weekly format YYYY-Www.
@@ -8480,4 +8556,3 @@ class HiveDatabase:
             WHERE (received_at + ttl_hours * 3600) <= ?
         """, (now,))
         return cursor.rowcount
-

@@ -9,10 +9,12 @@ Tests cover:
 - Pool status reporting
 """
 
+import datetime
 import pytest
 import time
 from unittest.mock import MagicMock, patch
 
+from modules.database import HiveDatabase
 from modules.routing_pool import (
     RoutingPool,
     MemberContribution,
@@ -112,6 +114,14 @@ class MockStateManager:
         state.capacity_sats = capacity
         state.topology = topology or []
         self.peer_states[peer_id] = state
+
+
+def _make_real_database(tmp_path):
+    plugin = MagicMock()
+    plugin.log = MagicMock()
+    db = HiveDatabase(str(tmp_path / "test_routing_pool.db"), plugin)
+    db.initialize()
+    return db
 
 
 class TestRevenueRecording:
@@ -446,6 +456,78 @@ class TestSettlement:
         assert results[0].member_id == "02" + "a" * 64
         assert results[0].revenue_share_sats == 10000
         assert len(db.pool_distributions) == 1
+
+
+class TestPoolSettlementMarkers:
+    """Test durable routing-pool settlement markers."""
+
+    def test_pool_settlement_marker_round_trip(self, tmp_path):
+        database = _make_real_database(tmp_path)
+
+        assert database.get_pool_settlement_marker("2026-W01") is None
+
+        marked = database.mark_pool_period_cleared(
+            period="2026-W01",
+            reason="zero_total_revenue",
+        )
+
+        assert marked is True
+        marker = database.get_pool_settlement_marker("2026-W01")
+        assert marker["period"] == "2026-W01"
+        assert marker["status"] == "cleared"
+        assert marker["reason"] == "zero_total_revenue"
+
+    def test_pool_settlement_marker_is_idempotent(self, tmp_path):
+        database = _make_real_database(tmp_path)
+
+        assert database.mark_pool_period_cleared("2026-W01", "zero_total_revenue") is True
+        assert database.mark_pool_period_cleared("2026-W01", "no_contributions") is False
+
+        marker = database.get_pool_settlement_marker("2026-W01")
+        assert marker["reason"] == "zero_total_revenue"
+
+    def test_get_pool_candidate_periods_up_to_unions_normalizes_and_caps(self, tmp_path):
+        database = _make_real_database(tmp_path)
+
+        member_id = "02" + "a" * 64
+
+        for offset, period in enumerate(("2026-W08", "2026-W10")):
+            monday = datetime.datetime.strptime(f"{period}-1", "%G-W%V-%u").replace(
+                tzinfo=datetime.timezone.utc
+            )
+            with patch("modules.database.time.time", return_value=int(monday.timestamp()) + offset):
+                database.record_pool_revenue(
+                    member_id=member_id,
+                    amount_sats=1000 + offset,
+                    payment_hash=f"{offset + 1:064x}",
+                )
+
+        database.record_pool_contribution(
+            member_id=member_id,
+            period="2026-09",
+            total_capacity_sats=1_000_000,
+            weighted_capacity_sats=900_000,
+            uptime_pct=0.9,
+            betweenness_centrality=0.1,
+            unique_peers=1,
+            bridge_score=0.1,
+            routing_success_rate=0.95,
+            avg_response_time_ms=10.0,
+            pool_share=1.0,
+        )
+        database.record_pool_distribution(
+            period="2026-W11",
+            member_id=member_id,
+            contribution_share=1.0,
+            revenue_share_sats=1000,
+            total_pool_revenue_sats=1000,
+        )
+
+        assert database.get_pool_candidate_periods_up_to("2026-W10") == [
+            "2026-W08",
+            "2026-W09",
+            "2026-W10",
+        ]
 
 
 class TestIntegration:
