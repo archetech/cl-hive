@@ -13,6 +13,7 @@ import json
 import time
 import pytest
 import hashlib
+import threading
 from unittest.mock import MagicMock, patch, Mock, AsyncMock
 from dataclasses import dataclass
 
@@ -153,6 +154,21 @@ def settlement_manager(mock_database, mock_plugin, mock_rpc):
         plugin=mock_plugin,
         rpc=mock_rpc
     )
+
+
+def _make_valid_proposal(settlement_manager, mock_state_manager, proposal_id='test_proposal_123', period='2024-05'):
+    contributions = settlement_manager.gather_contributions_from_gossip(
+        mock_state_manager, period
+    )
+    plan = settlement_manager.compute_settlement_plan(period, contributions)
+    return {
+        'proposal_id': proposal_id,
+        'period': period,
+        'data_hash': plan["data_hash"],
+        'plan_hash': plan["plan_hash"],
+        'total_fees_sats': 18000,
+        'member_count': 3,
+    }
 
 
 # =============================================================================
@@ -503,6 +519,130 @@ class TestVoting:
 
         assert vote is not None
         assert settlement_manager.last_verify_and_vote_reason["reason"] == "verified"
+        assert settlement_manager.last_verify_and_vote_reason["proposal_id"] == "test_proposal_123"
+        assert settlement_manager.last_verify_and_vote_reason["period"] == "2024-05"
+
+    def test_verify_and_vote_reason_accessor_is_thread_local(
+        self, settlement_manager
+    ):
+        """Diagnostics should be isolated per thread while keeping the same accessor."""
+        settlement_manager.last_verify_and_vote_reason = {
+            "reason": "main_thread",
+            "proposal_id": "main",
+            "period": "2024-05",
+        }
+        worker_initial = []
+
+        def worker():
+            worker_initial.append(settlement_manager.last_verify_and_vote_reason)
+            settlement_manager.last_verify_and_vote_reason = {
+                "reason": "worker_thread",
+                "proposal_id": "worker",
+                "period": "2024-06",
+            }
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        assert worker_initial == [None]
+        assert settlement_manager.last_verify_and_vote_reason["reason"] == "main_thread"
+
+    def test_verify_and_vote_records_expired_reason(
+        self, settlement_manager, mock_database, mock_state_manager, mock_rpc
+    ):
+        """Expired proposals should store the rejection reason."""
+        mock_database.get_settlement_proposal.return_value = {
+            'proposal_id': 'test_proposal_123',
+            'expires_at': int(time.time()) - 1,
+        }
+        proposal = _make_valid_proposal(settlement_manager, mock_state_manager)
+
+        vote = settlement_manager.verify_and_vote(
+            proposal=proposal,
+            our_peer_id='02' + 'a' * 64,
+            state_manager=mock_state_manager,
+            rpc=mock_rpc
+        )
+
+        assert vote is None
+        assert settlement_manager.last_verify_and_vote_reason["reason"] == "expired"
+        assert settlement_manager.last_verify_and_vote_reason["proposal_id"] == "test_proposal_123"
+        assert settlement_manager.last_verify_and_vote_reason["period"] == "2024-05"
+
+    def test_verify_and_vote_records_period_already_settled_reason(
+        self, settlement_manager, mock_database, mock_state_manager, mock_rpc
+    ):
+        """Settled periods should store the rejection reason."""
+        mock_database.is_period_settled.return_value = True
+        proposal = _make_valid_proposal(settlement_manager, mock_state_manager)
+
+        vote = settlement_manager.verify_and_vote(
+            proposal=proposal,
+            our_peer_id='02' + 'a' * 64,
+            state_manager=mock_state_manager,
+            rpc=mock_rpc
+        )
+
+        assert vote is None
+        assert settlement_manager.last_verify_and_vote_reason["reason"] == "period_already_settled"
+        assert settlement_manager.last_verify_and_vote_reason["proposal_id"] == "test_proposal_123"
+        assert settlement_manager.last_verify_and_vote_reason["period"] == "2024-05"
+
+    def test_verify_and_vote_records_plan_hash_mismatch_reason(
+        self, settlement_manager, mock_database, mock_state_manager, mock_rpc
+    ):
+        """Plan hash mismatches should store the rejection reason."""
+        proposal = _make_valid_proposal(settlement_manager, mock_state_manager)
+        proposal['plan_hash'] = 'f' * 64
+
+        vote = settlement_manager.verify_and_vote(
+            proposal=proposal,
+            our_peer_id='02' + 'a' * 64,
+            state_manager=mock_state_manager,
+            rpc=mock_rpc
+        )
+
+        assert vote is None
+        assert settlement_manager.last_verify_and_vote_reason["reason"] == "plan_hash_mismatch"
+        assert settlement_manager.last_verify_and_vote_reason["proposal_id"] == "test_proposal_123"
+        assert settlement_manager.last_verify_and_vote_reason["period"] == "2024-05"
+
+    def test_verify_and_vote_records_sign_failed_reason(
+        self, settlement_manager, mock_database, mock_state_manager, mock_rpc
+    ):
+        """Signing failures should store the rejection reason."""
+        mock_rpc.signmessage.side_effect = RuntimeError("sign broke")
+        proposal = _make_valid_proposal(settlement_manager, mock_state_manager)
+
+        vote = settlement_manager.verify_and_vote(
+            proposal=proposal,
+            our_peer_id='02' + 'a' * 64,
+            state_manager=mock_state_manager,
+            rpc=mock_rpc
+        )
+
+        assert vote is None
+        assert settlement_manager.last_verify_and_vote_reason["reason"] == "sign_failed"
+        assert settlement_manager.last_verify_and_vote_reason["proposal_id"] == "test_proposal_123"
+        assert settlement_manager.last_verify_and_vote_reason["period"] == "2024-05"
+
+    def test_verify_and_vote_records_vote_record_failed_reason(
+        self, settlement_manager, mock_database, mock_state_manager, mock_rpc
+    ):
+        """Vote record failures should store the rejection reason."""
+        mock_database.add_settlement_ready_vote.return_value = False
+        proposal = _make_valid_proposal(settlement_manager, mock_state_manager)
+
+        vote = settlement_manager.verify_and_vote(
+            proposal=proposal,
+            our_peer_id='02' + 'a' * 64,
+            state_manager=mock_state_manager,
+            rpc=mock_rpc
+        )
+
+        assert vote is None
+        assert settlement_manager.last_verify_and_vote_reason["reason"] == "vote_record_failed"
         assert settlement_manager.last_verify_and_vote_reason["proposal_id"] == "test_proposal_123"
         assert settlement_manager.last_verify_and_vote_reason["period"] == "2024-05"
 

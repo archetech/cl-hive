@@ -158,12 +158,20 @@ class SettlementManager:
         # Diagnostic reason for why create_proposal() most recently returned None.
         # Used by the settlement loop to explain backlog-first skips.
         self.last_create_proposal_skip_reason: Optional[str] = None
-        # Structured reason for the most recent verify_and_vote() outcome.
-        self.last_verify_and_vote_reason: Optional[Dict[str, Any]] = None
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get thread-local database connection."""
         return self.db._get_connection()
+
+    @property
+    def last_verify_and_vote_reason(self) -> Optional[Dict[str, Any]]:
+        """Return the latest verify-and-vote diagnostic for the current thread."""
+        return getattr(self._local, "last_verify_and_vote_reason", None)
+
+    @last_verify_and_vote_reason.setter
+    def last_verify_and_vote_reason(self, value: Optional[Dict[str, Any]]) -> None:
+        """Store verify-and-vote diagnostics on thread-local state."""
+        self._local.last_verify_and_vote_reason = value
 
     def initialize_tables(self):
         """Create settlement-related database tables."""
