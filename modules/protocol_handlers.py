@@ -7196,6 +7196,8 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
         }
         _reliable_broadcast(HiveMessageType.SETTLEMENT_READY, vote_payload)
         plugin.log(f"SETTLEMENT: Voted on proposal {proposal_id[:16]}... (hash verified)")
+    else:
+        _log_settlement_vote_skip_reason(plugin, proposal_id, period, settlement_mgr)
 
     # Phase D: Acknowledge receipt
     _emit_ack(peer_id, payload.get("_event_id"))
@@ -7204,6 +7206,19 @@ def handle_settlement_propose(peer_id: str, payload: Dict, plugin: Plugin) -> Di
     _relay_message(HiveMessageType.SETTLEMENT_PROPOSE, payload, peer_id)
 
     return {"result": "continue"}
+
+
+def _log_settlement_vote_skip_reason(plugin: Plugin, proposal_id: Optional[str], period: Optional[str], settlement_mgr) -> None:
+    """Log a compact operational reason for why a settlement proposal was not voted locally."""
+    reason_payload = getattr(settlement_mgr, "last_verify_and_vote_reason", None) or {}
+    reason = reason_payload.get("reason", "unknown")
+    effective_period = reason_payload.get("period") or period
+    proposal_prefix = str(reason_payload.get("proposal_id") or proposal_id or "")[:16]
+    plugin.log(
+        f"SETTLEMENT: Proposal {proposal_prefix}... not voted locally "
+        f"(reason={reason}, period={effective_period})",
+        level="info",
+    )
 
 
 def handle_settlement_ready(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
@@ -8388,4 +8403,3 @@ def _send_settlement_offer_to_peer(target_peer_id: str, our_peer_id: str, bolt12
     except Exception as e:
         plugin.log(f"cl-hive: Failed to send settlement offer to {target_peer_id[:16]}...: {e}", level='debug')
         return False
-

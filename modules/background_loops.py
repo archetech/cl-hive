@@ -923,6 +923,41 @@ def _auto_finalize_pool_backlog(routing_pool, settlement_mgr, database, plugin):
     return None
 
 
+def _process_pending_settlement_proposals_once(settlement_mgr, database, state_manager, plugin, our_pubkey):
+    """Process pending settlement proposals once, logging verify failures with context."""
+    pending = database.get_pending_settlement_proposals()
+    for proposal in pending:
+        proposal_id = proposal.get('proposal_id')
+        member_count = proposal.get('member_count', 0)
+
+        if not database.has_voted_settlement(proposal_id, our_pubkey):
+            vote = settlement_mgr.verify_and_vote(
+                proposal=proposal,
+                our_peer_id=our_pubkey,
+                state_manager=state_manager,
+                rpc=plugin.rpc
+            )
+            if vote:
+                from modules.protocol import create_settlement_ready
+                vote_msg = create_settlement_ready(
+                    proposal_id=vote['proposal_id'],
+                    voter_peer_id=vote['voter_peer_id'],
+                    data_hash=vote['data_hash'],
+                    timestamp=vote['timestamp'],
+                    signature=vote['signature']
+                )
+                protocol_handlers._broadcast_to_members(vote_msg)
+            else:
+                protocol_handlers._log_settlement_vote_skip_reason(
+                    plugin,
+                    proposal_id,
+                    proposal.get("period"),
+                    settlement_mgr,
+                )
+
+        settlement_mgr.check_quorum_and_mark_ready(proposal_id, member_count)
+
+
 def settlement_loop():
     """
     Background thread for distributed settlement coordination.
@@ -1180,33 +1215,13 @@ def settlement_loop():
 
             # Step 3: Process pending proposals (vote if hash matches)
             try:
-                pending = database.get_pending_settlement_proposals()
-                for proposal in pending:
-                    proposal_id = proposal.get('proposal_id')
-                    member_count = proposal.get('member_count', 0)
-
-                    # Check if we've voted
-                    if not database.has_voted_settlement(proposal_id, our_pubkey):
-                        # Try to vote
-                        vote = settlement_mgr.verify_and_vote(
-                            proposal=proposal,
-                            our_peer_id=our_pubkey,
-                            state_manager=state_manager,
-                            rpc=plugin.rpc
-                        )
-                        if vote:
-                            from modules.protocol import create_settlement_ready
-                            vote_msg = create_settlement_ready(
-                                proposal_id=vote['proposal_id'],
-                                voter_peer_id=vote['voter_peer_id'],
-                                data_hash=vote['data_hash'],
-                                timestamp=vote['timestamp'],
-                                signature=vote['signature']
-                            )
-                            protocol_handlers._broadcast_to_members(vote_msg)
-
-                    # Check if quorum reached
-                    settlement_mgr.check_quorum_and_mark_ready(proposal_id, member_count)
+                _process_pending_settlement_proposals_once(
+                    settlement_mgr=settlement_mgr,
+                    database=database,
+                    state_manager=state_manager,
+                    plugin=plugin,
+                    our_pubkey=our_pubkey,
+                )
             except Exception as e:
                 plugin.log(f"SETTLEMENT: Error processing pending: {e}", level='warn')
 
