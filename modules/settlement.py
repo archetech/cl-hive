@@ -158,6 +158,8 @@ class SettlementManager:
         # Diagnostic reason for why create_proposal() most recently returned None.
         # Used by the settlement loop to explain backlog-first skips.
         self.last_create_proposal_skip_reason: Optional[str] = None
+        # Structured reason for the most recent verify_and_vote() outcome.
+        self.last_verify_and_vote_reason: Optional[Dict[str, Any]] = None
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get thread-local database connection."""
@@ -1273,6 +1275,12 @@ class SettlementManager:
         # Check proposal expiry before voting
         db_proposal = self.db.get_settlement_proposal(proposal_id)
         if db_proposal and db_proposal.get('expires_at', 0) < int(time.time()):
+            self._set_verify_and_vote_reason(
+                "expired",
+                proposal_id,
+                period,
+                expires_at=db_proposal.get('expires_at'),
+            )
             self.plugin.log(
                 f"Proposal {proposal_id[:16]}... has expired, skipping vote",
                 level='info'
@@ -1281,6 +1289,12 @@ class SettlementManager:
 
         # Check if we already voted
         if self.db.has_voted_settlement(proposal_id, our_peer_id):
+            self._set_verify_and_vote_reason(
+                "already_voted",
+                proposal_id,
+                period,
+                voter_peer_id=our_peer_id,
+            )
             self.plugin.log(
                 f"Already voted on proposal {proposal_id[:16]}...",
                 level='debug'
@@ -1289,6 +1303,11 @@ class SettlementManager:
 
         # Check if period already settled
         if self.db.is_period_settled(period):
+            self._set_verify_and_vote_reason(
+                "period_already_settled",
+                proposal_id,
+                period,
+            )
             self.plugin.log(
                 f"Period {period} already settled, skipping vote",
                 level='debug'
@@ -1305,6 +1324,13 @@ class SettlementManager:
 
             # Verify hash matches
             if our_hash != proposed_hash:
+                self._set_verify_and_vote_reason(
+                    "hash_mismatch",
+                    proposal_id,
+                    period,
+                    expected_hash=our_hash,
+                    proposed_hash=proposed_hash,
+                )
                 self.plugin.log(
                     f"Hash mismatch for proposal {proposal_id[:16]}...: "
                     f"ours={our_hash[:16]}... theirs={proposed_hash[:16]}...",
@@ -1313,6 +1339,13 @@ class SettlementManager:
                 return None
 
             if not isinstance(proposed_plan_hash, str) or len(proposed_plan_hash) != 64:
+                self._set_verify_and_vote_reason(
+                    "plan_hash_mismatch",
+                    proposal_id,
+                    period,
+                    expected_plan_hash=our_plan_hash,
+                    proposed_plan_hash=proposed_plan_hash,
+                )
                 self.plugin.log(
                     f"Missing/invalid plan_hash for proposal {proposal_id[:16]}...",
                     level='warn'
@@ -1320,6 +1353,13 @@ class SettlementManager:
                 return None
 
             if our_plan_hash != proposed_plan_hash:
+                self._set_verify_and_vote_reason(
+                    "plan_hash_mismatch",
+                    proposal_id,
+                    period,
+                    expected_plan_hash=our_plan_hash,
+                    proposed_plan_hash=proposed_plan_hash,
+                )
                 self.plugin.log(
                     f"Plan hash mismatch for proposal {proposal_id[:16]}...: "
                     f"ours={our_plan_hash[:16]}... theirs={proposed_plan_hash[:16]}...",
@@ -1346,6 +1386,12 @@ class SettlementManager:
             sig_result = rpc.signmessage(signing_payload)
             signature = sig_result.get('zbase', '')
         except Exception as e:
+            self._set_verify_and_vote_reason(
+                "sign_failed",
+                proposal_id,
+                period,
+                error=str(e),
+            )
             self.plugin.log(f"Failed to sign settlement vote: {e}", level='warn')
             return None
 
@@ -1356,7 +1402,20 @@ class SettlementManager:
             data_hash=data_hash_for_vote,
             signature=signature
         ):
+            self._set_verify_and_vote_reason(
+                "vote_record_failed",
+                proposal_id,
+                period,
+                voter_peer_id=our_peer_id,
+            )
             return None
+
+        self._set_verify_and_vote_reason(
+            "verified" if not skip_hash_verify else "voted",
+            proposal_id,
+            period,
+            voter_peer_id=our_peer_id,
+        )
 
         self.plugin.log(
             f"Voted on settlement proposal {proposal_id[:16]}... "
@@ -1392,7 +1451,7 @@ class SettlementManager:
         vote_count = sum(1 for v in votes if v.get('voter_peer_id') in current_members)
         # Use current member count for quorum (not stale count from proposal creation)
         active_count = max(len(current_members), 1)
-        quorum_needed = (active_count // 2) + 1
+        quorum_needed = self._settlement_quorum_needed(active_count)
 
         if vote_count >= quorum_needed:
             proposal = self.db.get_settlement_proposal(proposal_id)
@@ -1405,6 +1464,27 @@ class SettlementManager:
                 return True
 
         return False
+
+    def _set_verify_and_vote_reason(
+        self,
+        reason: str,
+        proposal_id: Optional[str],
+        period: Optional[str],
+        **extra: Any,
+    ) -> None:
+        """Store a compact diagnostic payload for the latest verify_and_vote outcome."""
+        self.last_verify_and_vote_reason = {
+            "reason": reason,
+            "proposal_id": proposal_id,
+            "period": period,
+            **extra,
+        }
+
+    def _settlement_quorum_needed(self, active_count: int) -> int:
+        """Settlement bootstrap quorum: 1/2 votes is enough in a two-member hive."""
+        if active_count == 2:
+            return 1
+        return (active_count // 2) + 1
 
     def calculate_our_balance(
         self,

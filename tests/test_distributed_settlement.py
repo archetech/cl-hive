@@ -400,6 +400,31 @@ class TestVoting:
         assert vote is None
         mock_database.add_settlement_ready_vote.assert_not_called()
 
+    def test_verify_and_vote_records_hash_mismatch_reason(
+        self, settlement_manager, mock_database, mock_state_manager, mock_rpc
+    ):
+        """Should record a structured reason when hash verification fails."""
+        proposal = {
+            'proposal_id': 'test_proposal_123',
+            'period': '2024-05',
+            'data_hash': 'wrong_hash_' + 'x' * 54,
+            'plan_hash': 'y' * 64,
+            'total_fees_sats': 18000,
+            'member_count': 3,
+        }
+
+        vote = settlement_manager.verify_and_vote(
+            proposal=proposal,
+            our_peer_id='02' + 'a' * 64,
+            state_manager=mock_state_manager,
+            rpc=mock_rpc
+        )
+
+        assert vote is None
+        assert settlement_manager.last_verify_and_vote_reason["reason"] == "hash_mismatch"
+        assert settlement_manager.last_verify_and_vote_reason["proposal_id"] == "test_proposal_123"
+        assert settlement_manager.last_verify_and_vote_reason["period"] == "2024-05"
+
     def test_verify_and_vote_rejects_already_voted(
         self, settlement_manager, mock_database, mock_state_manager, mock_rpc
     ):
@@ -421,6 +446,66 @@ class TestVoting:
 
         assert vote is None
 
+    def test_verify_and_vote_records_already_voted_reason(
+        self, settlement_manager, mock_database, mock_state_manager, mock_rpc
+    ):
+        """Should record a structured reason when we already voted."""
+        mock_database.has_voted_settlement.return_value = True
+
+        proposal = {
+            'proposal_id': 'test_proposal_123',
+            'period': '2024-05',
+            'data_hash': 'any_hash_' + 'x' * 55,
+        }
+
+        vote = settlement_manager.verify_and_vote(
+            proposal=proposal,
+            our_peer_id='02' + 'a' * 64,
+            state_manager=mock_state_manager,
+            rpc=mock_rpc
+        )
+
+        assert vote is None
+        assert settlement_manager.last_verify_and_vote_reason["reason"] == "already_voted"
+        assert settlement_manager.last_verify_and_vote_reason["proposal_id"] == "test_proposal_123"
+        assert settlement_manager.last_verify_and_vote_reason["period"] == "2024-05"
+
+    def test_verify_and_vote_success_overwrites_stale_reason(
+        self, settlement_manager, mock_database, mock_state_manager, mock_rpc
+    ):
+        """A successful vote should clear stale rejection state."""
+        settlement_manager.last_verify_and_vote_reason = {
+            "reason": "hash_mismatch",
+            "proposal_id": "stale",
+            "period": "2024-04",
+        }
+
+        contributions = settlement_manager.gather_contributions_from_gossip(
+            mock_state_manager, "2024-05"
+        )
+        plan = settlement_manager.compute_settlement_plan("2024-05", contributions)
+
+        proposal = {
+            'proposal_id': 'test_proposal_123',
+            'period': '2024-05',
+            'data_hash': plan["data_hash"],
+            'plan_hash': plan["plan_hash"],
+            'total_fees_sats': 18000,
+            'member_count': 3,
+        }
+
+        vote = settlement_manager.verify_and_vote(
+            proposal=proposal,
+            our_peer_id='02' + 'a' * 64,
+            state_manager=mock_state_manager,
+            rpc=mock_rpc
+        )
+
+        assert vote is not None
+        assert settlement_manager.last_verify_and_vote_reason["reason"] == "verified"
+        assert settlement_manager.last_verify_and_vote_reason["proposal_id"] == "test_proposal_123"
+        assert settlement_manager.last_verify_and_vote_reason["period"] == "2024-05"
+
 
 # =============================================================================
 # QUORUM TESTS
@@ -428,6 +513,32 @@ class TestVoting:
 
 class TestQuorum:
     """Tests for quorum detection."""
+
+    def test_quorum_reached_with_one_of_two_members(
+        self, settlement_manager, mock_database
+    ):
+        """Settlement bootstrap quorum should allow 1/2 ready votes."""
+        mock_database.get_settlement_ready_votes.return_value = [
+            {'voter_peer_id': 'peer_a'},
+        ]
+        mock_database.get_all_members.return_value = [
+            {'peer_id': 'peer_a'},
+            {'peer_id': 'peer_b'},
+        ]
+        mock_database.get_settlement_proposal.return_value = {
+            'proposal_id': 'test_proposal',
+            'status': 'pending'
+        }
+
+        result = settlement_manager.check_quorum_and_mark_ready(
+            proposal_id='test_proposal',
+            member_count=2
+        )
+
+        assert result is True
+        mock_database.update_settlement_proposal_status.assert_called_with(
+            'test_proposal', 'ready'
+        )
 
     def test_quorum_reached_with_majority(
         self, settlement_manager, mock_database
