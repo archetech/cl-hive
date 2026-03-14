@@ -2143,6 +2143,18 @@ def _require_rpc(plugin_obj: Plugin):
     return plugin_obj.rpc, None
 
 
+def _is_missing_file_rpc_error(exc: Exception) -> bool:
+    """Return True when an RpcError is a filesystem missing-file failure."""
+    if not isinstance(exc, RpcError):
+        return False
+    error = getattr(exc, "error", None)
+    if isinstance(error, dict):
+        message = str(error.get("message", ""))
+    else:
+        message = str(error or exc)
+    return "no such file or directory" in message.lower()
+
+
 @plugin.method("hive-getinfo")
 def hive_getinfo(plugin: Plugin):
     """Proxy to CLN getinfo via plugin (native RPC)."""
@@ -2378,7 +2390,21 @@ def hive_sling_deletejob(plugin: Plugin, job: str = None):
         return err
     if not job:
         return {"error": "job is required"}
-    return rpc.call("sling-deletejob", {"job": job})
+    try:
+        return rpc.call("sling-deletejob", {"job": job})
+    except RpcError as exc:
+        if job == "all" and _is_missing_file_rpc_error(exc):
+            plugin.log(
+                "SLING_DELETEJOB_NOOP: jobs store not initialized; treating delete-all as empty state.",
+                level="info",
+            )
+            return {
+                "status": "noop",
+                "job": job,
+                "deleted": 0,
+                "message": "sling jobs store not initialized",
+            }
+        raise
 
 
 @plugin.method("hive-askrene-listlayers")
