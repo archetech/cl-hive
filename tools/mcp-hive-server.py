@@ -1756,7 +1756,7 @@ which channels have strong fee signals.""",
         # =====================================================================
         Tool(
             name="revenue_status",
-            description="Get cl-revenue-ops plugin status including fee controller state, recent changes, and configuration.",
+            description="Get cl-revenue-ops plugin status including operator controls, fee decision state, and current defense/debug surfaces.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1890,18 +1890,19 @@ Concentration risks: Highly correlated channels that move together (undiversifie
         ),
         Tool(
             name="revenue_policy",
-            description="""Manage peer-level fee and rebalance policies. Actions: list, get, set, delete.
+            description="""Diagnostic-first view of peer-level fee and rebalance policies. Actions: list, get, find, changes, set, delete.
 
 Use static policies to lock in fees for problem channels that Hill Climbing can't fix:
 - Stagnant (100% local, no flow): strategy=static, fee_ppm=50, rebalance=disabled
 - Depleted (<10% local): strategy=static, fee_ppm=200, rebalance=sink_only
 - Zombie (offline/inactive): strategy=static, fee_ppm=2000, rebalance=disabled
 
-Dynamic policies can also set a fee autoband using:
+Dynamic policies can still set fallback auto band bounds using:
 - fee_ppm (anchor)
 - fee_multiplier_min / fee_multiplier_max (relative bounds, e.g. 500-1000ppm => 500 * 1.0-2.0)
 
-Remove policies with action=delete when channels recover.""",
+Learned per-channel auto bands take precedence once enough data exists.
+Use allow_write=true for set/delete because revenue_policy is diagnostic-first for normal callers.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1911,12 +1912,20 @@ Remove policies with action=delete when channels recover.""",
                     },
                     "action": {
                         "type": "string",
-                        "enum": ["list", "get", "set", "delete"],
+                        "enum": ["list", "get", "find", "changes", "set", "delete"],
                         "description": "Policy action to perform"
                     },
                     "peer_id": {
                         "type": "string",
                         "description": "Peer pubkey (required for get/set/delete)"
+                    },
+                    "tag": {
+                        "type": "string",
+                        "description": "Policy tag to search for (required for find)"
+                    },
+                    "since": {
+                        "type": "integer",
+                        "description": "Unix timestamp filter for changes action"
                     },
                     "strategy": {
                         "type": "string",
@@ -1943,6 +1952,10 @@ Remove policies with action=delete when channels recover.""",
                     "expires_in_hours": {
                         "type": "integer",
                         "description": "Optional policy auto-expiry in hours (set action)"
+                    },
+                    "allow_write": {
+                        "type": "boolean",
+                        "description": "Required for set/delete. Confirms intentional tactical policy writes."
                     }
                 },
                 "required": ["node", "action"]
@@ -10609,12 +10622,15 @@ async def handle_revenue_policy(args: Dict) -> Dict:
     node_name = args.get("node")
     action = args.get("action")
     peer_id = args.get("peer_id")
+    tag = args.get("tag")
+    since = args.get("since")
     strategy = args.get("strategy")
     rebalance = args.get("rebalance")
     fee_ppm = args.get("fee_ppm")
     fee_multiplier_min = args.get("fee_multiplier_min")
     fee_multiplier_max = args.get("fee_multiplier_max")
     expires_in_hours = args.get("expires_in_hours")
+    allow_write = args.get("allow_write", False)
 
     node = fleet.get_node(node_name)
     if not node:
@@ -10622,7 +10638,16 @@ async def handle_revenue_policy(args: Dict) -> Dict:
 
     # Validate required action parameter
     if not action:
-        return {"error": "action is required (list, get, set, delete)"}
+        return {"error": "action is required (list, get, find, changes, set, delete)"}
+
+    action = str(action).strip().lower()
+    if action in {"set", "delete"} and not allow_write:
+        return {
+            "error": (
+                "revenue_policy write actions require allow_write=true. "
+                "Use list/get/find/changes for diagnostics."
+            )
+        }
 
     # Build the action string for revenue-policy command
     if action == "list":
@@ -10631,10 +10656,23 @@ async def handle_revenue_policy(args: Dict) -> Dict:
         if not peer_id:
             return {"error": "peer_id required for get action"}
         return await node.call("revenue-policy", {"action": "get", "peer_id": peer_id})
+    elif action == "find":
+        if not tag:
+            return {"error": "tag required for find action"}
+        return await node.call("revenue-policy", {"action": "find", "tag": tag})
+    elif action == "changes":
+        params = {"action": "changes"}
+        if since is not None:
+            params["since"] = since
+        return await node.call("revenue-policy", params)
     elif action == "delete":
         if not peer_id:
             return {"error": "peer_id required for delete action"}
-        return await node.call("revenue-policy", {"action": "delete", "peer_id": peer_id})
+        return await node.call("revenue-policy", {
+            "action": "delete",
+            "peer_id": peer_id,
+            "internal": True,
+        })
     elif action == "set":
         if not peer_id:
             return {"error": "peer_id required for set action"}
@@ -10653,7 +10691,7 @@ async def handle_revenue_policy(args: Dict) -> Dict:
                     }
             except Exception as e:
                 return {"error": f"Cannot verify hive membership for zero-fee guard: {e}. Refusing to set policy."}
-        params = {"action": "set", "peer_id": peer_id}
+        params = {"action": "set", "peer_id": peer_id, "internal": True}
         if strategy:
             params["strategy"] = strategy
         if rebalance:
@@ -14895,7 +14933,8 @@ async def handle_remediate_stagnant(args: Dict) -> Dict:
                         "peer_id": peer_id,
                         "strategy": "static",
                         "fee_ppm": 50,
-                        "rebalance": "disabled"
+                        "rebalance": "disabled",
+                        "allow_write": True,
                     })
                     action_detail["executed"] = "error" not in result
                     if "error" in result:
@@ -17788,7 +17827,7 @@ async def handle_bulk_policy(args: Dict) -> Dict:
             })
         else:
             # Actually apply the policy
-            params = {"action": "set", "peer_id": peer_id}
+            params = {"action": "set", "peer_id": peer_id, "internal": True}
             if strategy:
                 params["strategy"] = strategy
             if fee_ppm is not None:

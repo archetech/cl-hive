@@ -439,6 +439,54 @@ class TestRevenueOpsIntegration:
         
         assert result == {"strategy": "hive", "base_fee": 0}
 
+    def test_get_fee_config_reads_operator_controls_values(self, bridge, mock_rpc):
+        """get_fee_config prefers current revenue-status operator controls."""
+        bridge._status = BridgeStatus.ENABLED
+        mock_rpc.call.return_value = {
+            "operator_controls": {
+                "values": {
+                    "min_fee_ppm": 30,
+                    "max_fee_ppm": 1500,
+                }
+            }
+        }
+
+        result = bridge.get_fee_config()
+
+        assert result == {
+            "min_fee_ppm": 30,
+            "max_fee_ppm": 1500,
+            "midpoint_ppm": 765,
+        }
+
+    def test_get_fee_config_falls_back_to_legacy_config_fee_range(self, bridge, mock_rpc):
+        """get_fee_config remains compatible with legacy revenue-status shape."""
+        bridge._status = BridgeStatus.ENABLED
+        mock_rpc.call.return_value = {
+            "config": {
+                "fee_range_ppm": [50, 2500],
+            }
+        }
+
+        result = bridge.get_fee_config()
+
+        assert result == {
+            "min_fee_ppm": 50,
+            "max_fee_ppm": 2500,
+            "midpoint_ppm": 1275,
+        }
+
+    def test_get_fee_config_returns_none_when_no_fee_bounds_available(self, bridge, mock_rpc):
+        """get_fee_config returns None when neither status shape exposes bounds."""
+        bridge._status = BridgeStatus.ENABLED
+        mock_rpc.call.return_value = {
+            "operator_controls": {
+                "values": {}
+            }
+        }
+
+        assert bridge.get_fee_config() is None
+
 
 # =============================================================================
 # STATISTICS TESTS

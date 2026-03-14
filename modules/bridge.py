@@ -836,20 +836,39 @@ class Bridge:
         Get fee configuration from cl-revenue-ops.
 
         Returns:
-            Dict with fee_range_ppm [min, max] and midpoint, or None if unavailable
+            Dict with min/max fee bounds and midpoint, or None if unavailable
         """
         if self._status == BridgeStatus.DISABLED:
             return None
 
         try:
             result = self.safe_call("revenue-status")
-            config = result.get("config", {})
-            fee_range = config.get("fee_range_ppm", [50, 2500])
-            if isinstance(fee_range, list) and len(fee_range) == 2:
+            operator_values = (
+                result.get("operator_controls", {}).get("values", {})
+                if isinstance(result, dict)
+                else {}
+            )
+            min_fee = operator_values.get("min_fee_ppm")
+            max_fee = operator_values.get("max_fee_ppm")
+
+            if min_fee is not None and max_fee is not None:
+                min_fee = int(min_fee)
+                max_fee = int(max_fee)
                 return {
-                    "min_fee_ppm": fee_range[0],
-                    "max_fee_ppm": fee_range[1],
-                    "midpoint_ppm": (fee_range[0] + fee_range[1]) // 2
+                    "min_fee_ppm": min_fee,
+                    "max_fee_ppm": max_fee,
+                    "midpoint_ppm": (min_fee + max_fee) // 2,
+                }
+
+            config = result.get("config", {}) if isinstance(result, dict) else {}
+            fee_range = config.get("fee_range_ppm")
+            if isinstance(fee_range, list) and len(fee_range) == 2:
+                min_fee = int(fee_range[0])
+                max_fee = int(fee_range[1])
+                return {
+                    "min_fee_ppm": min_fee,
+                    "max_fee_ppm": max_fee,
+                    "midpoint_ppm": (min_fee + max_fee) // 2,
                 }
             return None
         except Exception:

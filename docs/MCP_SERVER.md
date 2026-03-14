@@ -190,10 +190,10 @@ claude -p "Use hive_status to check the fleet"
 
 | Tool | Description |
 |------|-------------|
-| `revenue_status` | Plugin status, fee controller state, recent changes |
+| `revenue_status` | Plugin status, operator controls, fee decision state, defense/debug surfaces |
 | `revenue_profitability` | Channel ROI, costs, revenue, classification |
 | `revenue_dashboard` | Financial health: TLV, operating margin, ROC |
-| `revenue_policy` | Manage peer-level fee/rebalance policies |
+| `revenue_policy` | Diagnostic-first peer policy view; writes require explicit override |
 | `revenue_set_fee` | Set channel fee with clboss coordination |
 | `revenue_rebalance` | Trigger manual rebalance with EV constraints |
 | `revenue_report` | Generate summary, peer, hive, or cost reports |

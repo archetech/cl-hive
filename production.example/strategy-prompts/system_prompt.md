@@ -75,7 +75,7 @@ You have access to 150+ MCP tools. Use the right tool for the job:
 |------|---------|
 | `hive_approve_action` | Approve pending action with reasoning |
 | `hive_reject_action` | Reject pending action with reasoning |
-| `revenue_policy` | Set per-peer static policy |
+| `revenue_policy` | Inspect peer policies; use writes only with explicit override |
 | `bulk_policy` | Apply policy to multiple channels |
 
 ### Config Tuning Tools (Fee Strategy)

@@ -495,3 +495,85 @@ class TestRpcWrapperAudit:
 
         assert '"from_channel": source_channel' in block
         assert '"to_channel": dest_channel' in block
+
+
+# =============================================================================
+# Revenue-Ops Integration Refresh Regressions
+# =============================================================================
+
+class TestRevenueOpsIntegrationRefresh:
+    """Keep MCP revenue-ops surfaces aligned with current cl-revenue-ops."""
+
+    def _read_server_source(self):
+        server_path = os.path.join(
+            os.path.dirname(__file__), '..', 'tools', 'mcp-hive-server.py'
+        )
+        with open(server_path, 'r') as f:
+            return f.read()
+
+    def test_revenue_policy_tool_supports_diagnostic_actions(self):
+        """revenue_policy tool should expose find/changes alongside write actions."""
+        source = self._read_server_source()
+
+        start = source.find('name="revenue_policy"')
+        assert start != -1, "revenue_policy tool not found"
+        end = source.find('\n        Tool(', start + 1)
+        block = source[start:end] if end != -1 else source[start:]
+
+        assert '"find"' in block
+        assert '"changes"' in block
+        assert 'allow_write' in block
+
+    def test_revenue_policy_handler_requires_explicit_write_override(self):
+        """revenue_policy writes should require explicit allow_write override."""
+        source = self._read_server_source()
+
+        start = source.find("async def handle_revenue_policy")
+        assert start != -1, "handle_revenue_policy not found"
+        end = source.find("\n\nasync def ", start + 1)
+        block = source[start:end] if end != -1 else source[start:]
+
+        assert 'allow_write = args.get("allow_write", False)' in block
+        assert 'action in {"set", "delete"} and not allow_write' in block
+        assert '"internal": True' in block
+
+    def test_internal_policy_writers_preserve_override(self):
+        """Internal MCP helper flows should pass explicit write override."""
+        source = self._read_server_source()
+
+        stagnant_start = source.find('elif action == "static_policy":')
+        assert stagnant_start != -1, "stagnant remediation static_policy block not found"
+        stagnant_end = source.find("\n            except Exception", stagnant_start)
+        stagnant_block = source[stagnant_start:stagnant_end]
+        assert '"allow_write": True' in stagnant_block
+
+        bulk_start = source.find("# Actually apply the policy")
+        assert bulk_start != -1, "bulk policy apply block not found"
+        bulk_end = source.find("\n    return {", bulk_start)
+        bulk_block = source[bulk_start:bulk_end]
+        assert '"internal": True' in bulk_block
+
+    def test_revenue_policy_description_matches_current_autoband_semantics(self):
+        """Tool description should describe manual multipliers as fallback bands."""
+        source = self._read_server_source()
+
+        start = source.find('name="revenue_policy"')
+        assert start != -1, "revenue_policy tool not found"
+        end = source.find('\n        Tool(', start + 1)
+        block = source[start:end] if end != -1 else source[start:]
+
+        assert "diagnostic-first" in block
+        assert "fallback" in block
+        assert "auto band" in block or "autoband" in block
+
+    def test_revenue_status_description_mentions_operator_controls(self):
+        """revenue_status description should mention current operator/debug surfaces."""
+        source = self._read_server_source()
+
+        start = source.find('name="revenue_status"')
+        assert start != -1, "revenue_status tool not found"
+        end = source.find('\n        Tool(', start + 1)
+        block = source[start:end] if end != -1 else source[start:]
+
+        assert "operator controls" in block.lower()
+        assert "decision" in block.lower()

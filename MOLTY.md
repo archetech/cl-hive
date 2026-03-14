@@ -162,7 +162,7 @@ hive_reject_action        # Reject a pending action
 hive_set_fees            # Change channel fees
 revenue_set_fee          # Set fee with coordination
 revenue_rebalance        # Trigger rebalance
-revenue_policy           # Set peer policies
+revenue_policy           # Inspect peer policies; writes need allow_write=true
 ```
 
 ## Example Monitoring Session
