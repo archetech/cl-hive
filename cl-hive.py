@@ -168,6 +168,7 @@ from modules.rpc_commands import (
     internal_competition as rpc_internal_competition,
     # Phase 2: Fee Coordination
     fee_recommendation as rpc_fee_recommendation,
+    egress_desaturation_bias as rpc_egress_desaturation_bias,
     corridor_assignments as rpc_corridor_assignments,
     stigmergic_markers as rpc_stigmergic_markers,
     deposit_marker as rpc_deposit_marker,
@@ -7256,6 +7257,30 @@ def hive_coord_fee_recommendation(
         local_balance_pct=local_balance_pct,
         source=source,
         destination=destination
+    )
+
+
+@plugin.method("hive-egress-desaturation-bias")
+def hive_egress_desaturation_bias(
+    plugin: Plugin,
+    channel_id: str = None,
+    peer_id: str = None
+):
+    """
+    Report whether a local non-hive exit competes with a saturated local
+    hive-member egress and recommend a bounded surcharge.
+
+    Args:
+        channel_id: Optional channel ID to inspect
+        peer_id: Optional peer ID to inspect
+
+    Returns:
+        Structured bias payload with match status and surcharge recommendation.
+    """
+    return rpc_egress_desaturation_bias(
+        _get_hive_context(),
+        channel_id=channel_id,
+        peer_id=peer_id
     )
 
 

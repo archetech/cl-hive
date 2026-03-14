@@ -98,6 +98,11 @@ CENTRALITY_FEE_LOW_THRESHOLD = 0.3          # Below this = discount positioning
 CENTRALITY_FEE_MAX_PREMIUM_PCT = 0.15       # +15% max for high centrality
 CENTRALITY_FEE_MAX_DISCOUNT_PCT = 0.10      # -10% max for low centrality
 
+# Hive egress desaturation bias
+EGRESS_DESATURATION_MIN_LOCAL_PCT = 90.0
+EGRESS_DESATURATION_BASE_SURCHARGE_PPM = 25
+EGRESS_DESATURATION_MAX_SURCHARGE_PPM = 150
+
 
 def is_fee_change_salient(
     current_fee: int,
@@ -2299,6 +2304,171 @@ class FeeCoordinationManager:
     def set_traffic_intel_mgr(self, mgr: Any) -> None:
         """Set reference to TrafficIntelligenceManager for size-aware fee enrichment."""
         self.traffic_intel_mgr = mgr
+
+    def _is_hive_member_peer(self, peer_id: str) -> bool:
+        """Return True when the peer is a hive member/neophyte."""
+        if not self.database or not peer_id:
+            return False
+        member = self.database.get_member(peer_id)
+        return bool(member and member.get("tier") in ("member", "neophyte"))
+
+    def _resolve_peer_id_from_channel(self, channel_id: Optional[str]) -> str:
+        """Resolve peer_id from a short_channel_id when available."""
+        if not channel_id or not self.plugin:
+            return ""
+
+        try:
+            channels = self.plugin.rpc.listpeerchannels()
+            for ch in channels.get("channels", []):
+                if ch.get("short_channel_id") == channel_id:
+                    return ch.get("peer_id", "")
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _normalize_local_pct(value: Any) -> float:
+        """Normalize local balance percent values from ratio or percent form."""
+        try:
+            local_pct = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+        if local_pct <= 1.0:
+            local_pct *= 100.0
+        return max(0.0, min(100.0, local_pct))
+
+    def _get_our_saturated_hive_channels(self) -> List[Dict[str, Any]]:
+        """Return locally saturated hive-member channels from existing liquidity state."""
+        liquidity_coord = self.corridor_mgr.liquidity_coordinator
+        if not liquidity_coord or not self.our_pubkey:
+            return []
+
+        lock = getattr(liquidity_coord, "_lock", None)
+        state_map = getattr(liquidity_coord, "_member_liquidity_state", None)
+        if lock is None or state_map is None:
+            return []
+
+        with lock:
+            our_state = dict(state_map.get(self.our_pubkey, {}))
+
+        saturated = []
+        for channel in our_state.get("saturated_channels", []):
+            hive_peer_id = channel.get("peer_id", "")
+            if not self._is_hive_member_peer(hive_peer_id):
+                continue
+            enriched = dict(channel)
+            enriched["local_pct"] = self._normalize_local_pct(channel.get("local_pct"))
+            saturated.append(enriched)
+
+        saturated.sort(key=lambda ch: ch.get("local_pct", 0.0), reverse=True)
+        return saturated
+
+    def _peer_competes_with_saturated_hive_egress(
+        self,
+        target_peer_id: str,
+        hive_peer_id: str
+    ) -> Tuple[bool, str]:
+        """
+        Check whether an external peer competes with a saturated hive-member egress.
+
+        First prefer the hive member's known external topology, then fall back to
+        corridor assignments that already indicate the member serves that peer.
+        """
+        state_manager = self.corridor_mgr.state_manager
+        if state_manager:
+            state = state_manager.get_peer_state(hive_peer_id)
+            topology = set(getattr(state, "topology", []) or [])
+            if target_peer_id in topology:
+                return True, "member_topology"
+
+        assignments = self.corridor_mgr.get_assignments()
+        for assignment in assignments:
+            if assignment.primary_member != hive_peer_id:
+                continue
+            corridor = assignment.corridor
+            if target_peer_id in (corridor.source_peer_id, corridor.destination_peer_id):
+                return True, "corridor_assignment"
+
+        return False, ""
+
+    def get_egress_desaturation_bias(
+        self,
+        channel_id: Optional[str] = None,
+        peer_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Report whether a local non-hive exit should be biased upward to favor a
+        saturated local hive egress.
+        """
+        resolved_peer_id = peer_id or self._resolve_peer_id_from_channel(channel_id)
+        base_result = {
+            "channel_id": channel_id,
+            "peer_id": resolved_peer_id,
+            "matched": False,
+            "recommended_surcharge_ppm": 0,
+            "max_surcharge_ppm": EGRESS_DESATURATION_MAX_SURCHARGE_PPM,
+            "confidence": 0.0,
+            "reason": "",
+            "signal_source": "",
+            "saturated_hive_peer_id": "",
+            "saturated_hive_channel_id": "",
+            "saturated_local_pct": 0.0,
+        }
+
+        if not resolved_peer_id:
+            base_result["reason"] = "peer_not_found"
+            return base_result
+
+        if self._is_hive_member_peer(resolved_peer_id):
+            base_result["reason"] = "hive_peer_zero_fee"
+            return base_result
+
+        saturated_hive_channels = self._get_our_saturated_hive_channels()
+        if not saturated_hive_channels:
+            base_result["reason"] = "no_saturated_hive_egress"
+            return base_result
+
+        for saturated in saturated_hive_channels:
+            hive_peer_id = saturated.get("peer_id", "")
+            competes, signal_source = self._peer_competes_with_saturated_hive_egress(
+                resolved_peer_id,
+                hive_peer_id,
+            )
+            if not competes:
+                continue
+
+            local_pct = self._normalize_local_pct(saturated.get("local_pct"))
+            severity = max(
+                0.0,
+                min(1.0, (local_pct - EGRESS_DESATURATION_MIN_LOCAL_PCT) / 10.0),
+            )
+            surcharge = int(round(
+                EGRESS_DESATURATION_BASE_SURCHARGE_PPM +
+                severity * (
+                    EGRESS_DESATURATION_MAX_SURCHARGE_PPM -
+                    EGRESS_DESATURATION_BASE_SURCHARGE_PPM
+                )
+            ))
+            surcharge = max(
+                EGRESS_DESATURATION_BASE_SURCHARGE_PPM,
+                min(EGRESS_DESATURATION_MAX_SURCHARGE_PPM, surcharge),
+            )
+
+            return {
+                **base_result,
+                "matched": True,
+                "recommended_surcharge_ppm": surcharge,
+                "confidence": round(min(0.95, 0.5 + severity * 0.4), 2),
+                "reason": "competes_with_saturated_hive_egress",
+                "signal_source": signal_source,
+                "saturated_hive_peer_id": hive_peer_id,
+                "saturated_hive_channel_id": saturated.get("channel_id", ""),
+                "saturated_local_pct": local_pct,
+            }
+
+        base_result["reason"] = "no_competing_saturated_hive_egress"
+        return base_result
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:

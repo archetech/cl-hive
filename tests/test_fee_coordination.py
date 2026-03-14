@@ -12,6 +12,7 @@ Tests cover:
 import pytest
 import time
 import math
+import threading
 from unittest.mock import MagicMock, patch
 
 from modules.fee_coordination import (
@@ -28,6 +29,7 @@ from modules.fee_coordination import (
     WARNING_TTL_HOURS,
     MARKER_MIN_STRENGTH,
     MARKER_HALF_LIFE_HOURS,
+    EGRESS_DESATURATION_MAX_SURCHARGE_PPM,
     # Data classes
     FlowCorridor,
     CorridorAssignment,
@@ -104,6 +106,8 @@ class MockLiquidityCoordinator:
 
     def __init__(self):
         self.competitions = []
+        self._lock = threading.Lock()
+        self._member_liquidity_state = {}
 
     def detect_internal_competition(self):
         return self.competitions
@@ -117,6 +121,11 @@ class MockLiquidityCoordinator:
             "competing_members": members,
             "total_fleet_capacity_sats": 10_000_000 * len(members)
         })
+
+    def set_local_saturated_channels(self, member_id, channels):
+        with self._lock:
+            state = self._member_liquidity_state.setdefault(member_id, {})
+            state["saturated_channels"] = channels
 
 
 # =============================================================================
@@ -758,6 +767,99 @@ class TestFeeCoordinationManager:
         assert "defense_status" in status
         assert "fleet_fee_floor" in status
         assert "fleet_fee_ceiling" in status
+
+    def test_egress_desaturation_bias_no_match_without_saturated_hive_channels(self):
+        """No local saturated hive channels means no bias."""
+        result = self.manager.get_egress_desaturation_bias(
+            channel_id="123x1x0",
+            peer_id="03" + "a" * 64,
+        )
+
+        assert result["matched"] is False
+        assert result["recommended_surcharge_ppm"] == 0
+        assert result["reason"] == "no_saturated_hive_egress"
+
+    def test_egress_desaturation_bias_no_match_without_competing_hive_egress(self):
+        """Saturated hive channels should not bias unrelated external exits."""
+        hive_peer = "02" + "b" * 64
+        external_peer = "03" + "c" * 64
+
+        self.db.members[hive_peer] = {"peer_id": hive_peer, "tier": "member"}
+        self.state_manager.set_peer_state(
+            hive_peer,
+            topology=["03" + "d" * 64],
+        )
+        self.liquidity_coord.set_local_saturated_channels(
+            self.manager.our_pubkey,
+            [{"peer_id": hive_peer, "local_pct": 97.0, "capacity_sats": 5_000_000}],
+        )
+
+        result = self.manager.get_egress_desaturation_bias(
+            channel_id="123x1x0",
+            peer_id=external_peer,
+        )
+
+        assert result["matched"] is False
+        assert result["recommended_surcharge_ppm"] == 0
+        assert result["reason"] == "no_competing_saturated_hive_egress"
+
+    def test_egress_desaturation_bias_returns_bounded_surcharge_for_competing_exit(self):
+        """A competing non-hive exit should receive a bounded surcharge."""
+        hive_peer = "02" + "b" * 64
+        external_peer = "03" + "c" * 64
+
+        self.db.members[hive_peer] = {"peer_id": hive_peer, "tier": "member"}
+        self.state_manager.set_peer_state(
+            hive_peer,
+            topology=[external_peer],
+        )
+        self.liquidity_coord.set_local_saturated_channels(
+            self.manager.our_pubkey,
+            [{"peer_id": hive_peer, "local_pct": 96.0, "capacity_sats": 5_000_000}],
+        )
+
+        result = self.manager.get_egress_desaturation_bias(
+            channel_id="123x1x0",
+            peer_id=external_peer,
+        )
+
+        assert result["matched"] is True
+        assert result["saturated_hive_peer_id"] == hive_peer
+        assert 0 < result["recommended_surcharge_ppm"] <= EGRESS_DESATURATION_MAX_SURCHARGE_PPM
+        assert result["reason"] == "competes_with_saturated_hive_egress"
+
+    def test_egress_desaturation_bias_increases_with_more_severe_saturation(self):
+        """More severe saturation should increase the recommended surcharge."""
+        hive_peer = "02" + "b" * 64
+        external_peer = "03" + "c" * 64
+
+        self.db.members[hive_peer] = {"peer_id": hive_peer, "tier": "member"}
+        self.state_manager.set_peer_state(
+            hive_peer,
+            topology=[external_peer],
+        )
+
+        self.liquidity_coord.set_local_saturated_channels(
+            self.manager.our_pubkey,
+            [{"peer_id": hive_peer, "local_pct": 92.0, "capacity_sats": 5_000_000}],
+        )
+        mild = self.manager.get_egress_desaturation_bias(
+            channel_id="123x1x0",
+            peer_id=external_peer,
+        )
+
+        self.liquidity_coord.set_local_saturated_channels(
+            self.manager.our_pubkey,
+            [{"peer_id": hive_peer, "local_pct": 99.0, "capacity_sats": 5_000_000}],
+        )
+        severe = self.manager.get_egress_desaturation_bias(
+            channel_id="123x1x0",
+            peer_id=external_peer,
+        )
+
+        assert mild["matched"] is True
+        assert severe["matched"] is True
+        assert severe["recommended_surcharge_ppm"] > mild["recommended_surcharge_ppm"]
 
 
 # =============================================================================

@@ -2636,6 +2636,38 @@ def fee_recommendation(
         return {"error": f"Failed to get fee recommendation: {e}"}
 
 
+def egress_desaturation_bias(
+    ctx: HiveContext,
+    channel_id: str = None,
+    peer_id: str = None
+) -> Dict[str, Any]:
+    """
+    Report whether a local non-hive exit should be surcharged to favor a
+    saturated local hive-member egress.
+
+    Args:
+        ctx: HiveContext
+        channel_id: Optional channel ID to inspect
+        peer_id: Optional peer ID to inspect
+
+    Returns:
+        Structured bias payload with match status and surcharge recommendation.
+    """
+    if not ctx.fee_coordination_mgr:
+        return {"error": "Fee coordination not initialized"}
+
+    if not channel_id and not peer_id:
+        return {"error": "channel_id or peer_id is required"}
+
+    try:
+        return ctx.fee_coordination_mgr.get_egress_desaturation_bias(
+            channel_id=channel_id,
+            peer_id=peer_id,
+        )
+    except Exception as e:
+        return {"error": f"Failed to get egress desaturation bias: {e}"}
+
+
 def corridor_assignments(ctx: HiveContext, force_refresh: bool = False) -> Dict[str, Any]:
     """
     Get flow corridor assignments for the fleet.

@@ -222,6 +222,21 @@ class TestToolRegistry:
         assert '"Unknown tool:' in source or "'Unknown tool:" in source
 
 
+class TestEgressDesaturationBiasRpcSurface:
+    """Source-level regression for the new read-only bias RPC."""
+
+    def test_cl_hive_registers_egress_desaturation_bias_rpc(self):
+        """The plugin should expose the egress desaturation bias RPC wrapper."""
+        plugin_path = os.path.join(
+            os.path.dirname(__file__), '..', 'cl-hive.py'
+        )
+        with open(plugin_path, 'r') as f:
+            source = f.read()
+
+        assert '@plugin.method("hive-egress-desaturation-bias")' in source
+        assert "return rpc_egress_desaturation_bias(" in source
+
+
 # =============================================================================
 # AdvisorDB Concurrent Access Test (Stage 3)
 # =============================================================================
