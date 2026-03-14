@@ -11223,23 +11223,10 @@ async def handle_revenue_rebalance(args: Dict) -> Dict:
         elif "budget" in lower:
             failure_type = "budget"
 
-        # Upgrade: if we hit a stale job lock, try clearing sling job registry ONCE and retry.
-        retry_result = None
         retry_attempted = False
-        if failure_type == "job_locked":
-            try:
-                retry_attempted = True
-                await node.call("hive-sling-deletejob", {"job": "all"})
-                retry_result = await node.call("revenue-rebalance", params)
-                if isinstance(retry_result, dict):
-                    if retry_result.get("ok") is False or retry_result.get("success") is False or retry_result.get("status") == "error" or retry_result.get("error"):
-                        raise RuntimeError(str(retry_result.get("error") or retry_result))
-                return await _finalize_rebalance_command_success(
-                    retry_result, note="success after clearing stale sling job locks"
-                )
-            except Exception as clear_err:
-                # Retry failed; fall through to record failure
-                err = f"{err} | retry_after_sling_deletejob_failed: {clear_err}"
+        # cl-revenue-ops owns Sling job lifecycle, including lock-healing retries.
+        # Surface the failure here instead of reaching around it to issue direct
+        # sling-deletejob calls from the coordination layer.
 
         if decision_id is not None:
             try:

@@ -496,6 +496,22 @@ class TestRpcWrapperAudit:
         assert '"from_channel": source_channel' in block
         assert '"to_channel": dest_channel' in block
 
+    def test_revenue_rebalance_does_not_clear_sling_jobs_directly(self):
+        """Revenue rebalance flow should leave Sling job control to cl-revenue-ops."""
+        server_path = os.path.join(
+            os.path.dirname(__file__), '..', 'tools', 'mcp-hive-server.py'
+        )
+        with open(server_path, 'r') as f:
+            source = f.read()
+
+        start = source.find("async def handle_revenue_rebalance(args: Dict) -> Dict:")
+        assert start != -1, "handle_revenue_rebalance not found"
+        end = source.find("\n\nasync def ", start + 1)
+        block = source[start:end] if end != -1 else source[start:]
+
+        assert 'node.call("revenue-rebalance"' in block
+        assert 'node.call("hive-sling-deletejob"' not in block
+
 
 # =============================================================================
 # Revenue-Ops Integration Refresh Regressions
