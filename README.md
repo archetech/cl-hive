@@ -7,7 +7,7 @@
 - This is the fleet coordination layer, not the local execution engine.
 - `cl-hive` shares state and recommendations across members. `cl-revenue-ops` still owns local fee execution, local rebalance execution, and Sling job control.
 - The most important operator jobs are membership, governance, fleet visibility, and making sure coordination inputs are available to local execution.
-- Recent integration work tightened the boundary: `cl-hive` exposes coordinated fee recommendations, competition signals, and saturated-hive egress bias signals; `cl-revenue-ops` applies them locally.
+- Recent integration work tightened the boundary: `cl-hive` exposes coordinated fee recommendations, competition-avoidance signals, and saturated-hive egress bias signals; `cl-revenue-ops` applies them locally.
 
 ## Architecture
 
@@ -81,7 +81,7 @@ If you are deploying from the provided container stack, start with [production.e
 Current integration points include:
 
 - coordinated corridor fee recommendations
-- corridor ownership and internal-competition signals
+- corridor ownership and competition-avoidance signals
 - peer reputation and defense intelligence
 - traffic and liquidity intelligence
 - saturated-hive egress bias signals for desaturating locally full hive exits
