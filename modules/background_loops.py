@@ -2122,8 +2122,14 @@ def _broadcast_our_traffic_intelligence():
     try:
         msg = traffic_intel_mgr.create_traffic_intelligence_batch_message(plugin.rpc)
         if msg:
-            outbox_mgr.broadcast(msg)
-            plugin.log("cl-hive: Broadcast traffic intelligence to fleet", level='debug')
+            result = protocol_handlers._broadcast_member_message(
+                message_bytes=msg,
+                reliability="direct",
+                failure_policy="best_effort",
+                log_label="traffic_intelligence",
+            )
+            if result["sent"] > 0:
+                plugin.log("cl-hive: Broadcast traffic intelligence to fleet", level='debug')
     except Exception as e:
         plugin.log(f"cl-hive: Traffic intelligence broadcast error: {e}", level='warn')
 

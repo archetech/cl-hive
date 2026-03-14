@@ -712,11 +712,13 @@ class TestMCFScheduling:
         self.mock_plugin = MagicMock()
         self.mock_lc = MagicMock()
         self.mock_traffic_intel = MagicMock()
+        self.mock_outbox = MagicMock()
 
         background_loops.plugin = self.mock_plugin
         background_loops.liquidity_coord = self.mock_lc
         background_loops.cost_reduction_mgr = MagicMock()
         background_loops.traffic_intel_mgr = self.mock_traffic_intel
+        background_loops.outbox_mgr = self.mock_outbox
         background_loops._mcf_defer_counts = {}
         yield
         # Cleanup
@@ -724,6 +726,7 @@ class TestMCFScheduling:
         background_loops.liquidity_coord = None
         background_loops.cost_reduction_mgr = None
         background_loops.traffic_intel_mgr = None
+        background_loops.outbox_mgr = None
         background_loops._mcf_defer_counts = {}
 
     def test_mcf_defers_during_peak_hours(self):
@@ -836,6 +839,26 @@ class TestMCFScheduling:
             msg = call[0][0] if call[0] else ""
             assert "deferred" not in msg
             assert "skipped" not in msg
+
+    def test_traffic_intelligence_broadcast_uses_member_broadcast_gateway(self):
+        """Traffic intelligence should send serialized bytes through the shared gateway."""
+        self.mock_traffic_intel.create_traffic_intelligence_batch_message.return_value = b"traffic_batch"
+        self.mock_outbox = object()
+        background_loops.outbox_mgr = self.mock_outbox
+
+        with patch.object(
+            background_loops.protocol_handlers,
+            "_broadcast_member_message",
+            return_value={"sent": 2},
+        ) as mock_broadcast:
+            background_loops._broadcast_our_traffic_intelligence()
+
+        mock_broadcast.assert_called_once_with(
+            message_bytes=b"traffic_batch",
+            reliability="direct",
+            failure_policy="best_effort",
+            log_label="traffic_intelligence",
+        )
 
 
 class TestSizeAwareFeeEnrichment:
