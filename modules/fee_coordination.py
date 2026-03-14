@@ -2359,6 +2359,8 @@ class FeeCoordinationManager:
                 continue
             enriched = dict(channel)
             enriched["local_pct"] = self._normalize_local_pct(channel.get("local_pct"))
+            if enriched["local_pct"] < EGRESS_DESATURATION_MIN_LOCAL_PCT:
+                continue
             saturated.append(enriched)
 
         saturated.sort(key=lambda ch: ch.get("local_pct", 0.0), reverse=True)
@@ -2384,7 +2386,7 @@ class FeeCoordinationManager:
 
         assignments = self.corridor_mgr.get_assignments()
         for assignment in assignments:
-            if assignment.primary_member != hive_peer_id:
+            if assignment.primary_member != hive_peer_id and hive_peer_id not in assignment.secondary_members:
                 continue
             corridor = assignment.corridor
             if target_peer_id in (corridor.source_peer_id, corridor.destination_peer_id):

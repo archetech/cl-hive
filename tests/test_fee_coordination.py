@@ -803,6 +803,30 @@ class TestFeeCoordinationManager:
         assert result["recommended_surcharge_ppm"] == 0
         assert result["reason"] == "no_competing_saturated_hive_egress"
 
+    def test_egress_desaturation_bias_ignores_channels_below_feature_threshold(self):
+        """General saturation state below 90% should not trigger the bias feature."""
+        hive_peer = "02" + "b" * 64
+        external_peer = "03" + "c" * 64
+
+        self.db.members[hive_peer] = {"peer_id": hive_peer, "tier": "member"}
+        self.state_manager.set_peer_state(
+            hive_peer,
+            topology=[external_peer],
+        )
+        self.liquidity_coord.set_local_saturated_channels(
+            self.manager.our_pubkey,
+            [{"peer_id": hive_peer, "local_pct": 85.0, "capacity_sats": 5_000_000}],
+        )
+
+        result = self.manager.get_egress_desaturation_bias(
+            channel_id="123x1x0",
+            peer_id=external_peer,
+        )
+
+        assert result["matched"] is False
+        assert result["recommended_surcharge_ppm"] == 0
+        assert result["reason"] == "no_saturated_hive_egress"
+
     def test_egress_desaturation_bias_returns_bounded_surcharge_for_competing_exit(self):
         """A competing non-hive exit should receive a bounded surcharge."""
         hive_peer = "02" + "b" * 64
@@ -860,6 +884,66 @@ class TestFeeCoordinationManager:
         assert mild["matched"] is True
         assert severe["matched"] is True
         assert severe["recommended_surcharge_ppm"] > mild["recommended_surcharge_ppm"]
+
+    def test_egress_desaturation_bias_uses_corridor_assignment_secondary_fallback(self):
+        """Fallback corridor matches should accept the hive member as a secondary owner."""
+        hive_peer = "02" + "b" * 64
+        primary_peer = "02" + "d" * 64
+        external_peer = "03" + "c" * 64
+
+        self.db.members[hive_peer] = {"peer_id": hive_peer, "tier": "member"}
+        corridor = FlowCorridor(
+            source_peer_id=external_peer,
+            destination_peer_id="03" + "e" * 64,
+        )
+        assignment = CorridorAssignment(
+            corridor=corridor,
+            primary_member=primary_peer,
+            secondary_members=[hive_peer],
+            primary_fee_ppm=500,
+            secondary_fee_ppm=700,
+            assignment_reason="test",
+            confidence=0.7,
+        )
+        self.manager.corridor_mgr._assignments_snapshot = (
+            {(corridor.source_peer_id, corridor.destination_peer_id): assignment},
+            time.time(),
+        )
+        self.liquidity_coord.set_local_saturated_channels(
+            self.manager.our_pubkey,
+            [{"peer_id": hive_peer, "local_pct": 97.0, "capacity_sats": 5_000_000}],
+        )
+
+        result = self.manager.get_egress_desaturation_bias(
+            channel_id="123x1x0",
+            peer_id=external_peer,
+        )
+
+        assert result["matched"] is True
+        assert result["signal_source"] == "corridor_assignment"
+
+    def test_egress_desaturation_bias_resolves_peer_from_channel_id(self):
+        """Channel-only calls should resolve peer identity through listpeerchannels."""
+        hive_peer = "02" + "b" * 64
+        external_peer = "03" + "c" * 64
+
+        self.db.members[hive_peer] = {"peer_id": hive_peer, "tier": "member"}
+        self.plugin.rpc.channels = [
+            {"short_channel_id": "123x1x0", "peer_id": external_peer},
+        ]
+        self.state_manager.set_peer_state(
+            hive_peer,
+            topology=[external_peer],
+        )
+        self.liquidity_coord.set_local_saturated_channels(
+            self.manager.our_pubkey,
+            [{"peer_id": hive_peer, "local_pct": 96.0, "capacity_sats": 5_000_000}],
+        )
+
+        result = self.manager.get_egress_desaturation_bias(channel_id="123x1x0")
+
+        assert result["matched"] is True
+        assert result["peer_id"] == external_peer
 
 
 # =============================================================================
