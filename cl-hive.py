@@ -53,28 +53,13 @@ from modules.database import HiveDatabase
 from modules.protocol import (
     HIVE_MAGIC, HiveMessageType,
     MAX_MESSAGE_BYTES, is_hive_message, deserialize, serialize,
-    validate_promotion_request, validate_vouch, validate_promotion,
-    validate_member_left, validate_ban_proposal, validate_ban_vote,
-    validate_peer_available, create_peer_available,
-    validate_expansion_nominate, validate_expansion_elect, validate_expansion_decline,
-    create_expansion_nominate, create_expansion_elect, create_expansion_decline,
-    get_expansion_nominate_signing_payload, get_expansion_elect_signing_payload,
-    get_expansion_decline_signing_payload,
-    VOUCH_TTL_SECONDS, MAX_VOUCHES_IN_PROMOTION,
+    validate_member_left,
     create_challenge, create_welcome,
     # Signed message validation (security hardening)
     validate_gossip, validate_state_hash, validate_full_sync, validate_intent_abort,
     get_gossip_signing_payload, get_state_hash_signing_payload,
     get_full_sync_signing_payload, get_intent_signing_payload, get_intent_abort_signing_payload,
-    get_peer_available_signing_payload, compute_states_hash,
-    # Settlement offer broadcast
-    create_settlement_offer, get_settlement_offer_signing_payload,
-    # MCF (Min-Cost Max-Flow) optimization
-    validate_mcf_needs_batch, validate_mcf_solution_broadcast,
-    validate_mcf_assignment_ack, validate_mcf_completion_report,
-    get_mcf_needs_batch_signing_payload, get_mcf_solution_signing_payload,
-    get_mcf_assignment_ack_signing_payload, get_mcf_completion_signing_payload,
-    create_mcf_needs_batch,
+    compute_states_hash,
     # Phase D: Reliable delivery
     create_msg_ack, validate_msg_ack,
     IMPLICIT_ACK_MAP, IMPLICIT_ACK_MATCH_FIELD,
@@ -108,7 +93,7 @@ from modules.phase6_ingest import parse_injected_hive_packet
 from modules import network_metrics
 from modules.plugin_options import (
     RateLimiter, _parse_bool, _parse_setconfig_value,
-    OPTION_TO_CONFIG_MAP, VPN_OPTIONS, register_options,
+    OPTION_TO_CONFIG_MAP, register_options,
 )
 from modules.log_writer import BatchedLogWriter
 from modules import protocol_handlers
@@ -203,36 +188,20 @@ membership_mgr: Optional[MembershipManager] = None
 contribution_mgr: Optional[ContributionManager] = None
 planner: Optional[Planner] = None
 decision_engine: Optional[DecisionEngine] = None
-vpn_transport: Optional[Any] = None  # Removed (VPNTransportManager deleted)
-coop_expansion: Optional[Any] = None  # Removed (CooperativeExpansionManager deleted)
 fee_intel_mgr: Optional[FeeIntelligenceManager] = None
 traffic_intel_mgr: Optional[TrafficIntelligenceManager] = None
 health_aggregator: Optional[HealthScoreAggregator] = None
 liquidity_coord: Optional[LiquidityCoordinator] = None
-splice_coord: Optional[Any] = None  # Removed (SpliceCoordinator deleted)
 routing_map: Optional[HiveRoutingMap] = None
 peer_reputation_mgr: Optional[PeerReputationManager] = None
-routing_pool: Optional[Any] = None  # Removed (RoutingPool deleted)
-settlement_mgr: Optional[Any] = None  # Removed (SettlementManager deleted)
 yield_metrics_mgr: Optional[YieldMetricsManager] = None
 fee_coordination_mgr: Optional[FeeCoordinationManager] = None
-cost_reduction_mgr: Optional[Any] = None  # Removed (CostReductionManager deleted)
 rationalization_mgr: Optional[RationalizationManager] = None
 strategic_positioning_mgr: Optional[StrategicPositioningManager] = None
 anticipatory_liquidity_mgr: Optional[AnticipatoryLiquidityManager] = None
 quality_scorer_mgr: Optional[PeerQualityScorer] = None
-task_mgr: Optional[Any] = None  # Removed (TaskManager deleted)
-splice_mgr: Optional[Any] = None  # Removed (SpliceManager deleted)
 relay_mgr: Optional[RelayManager] = None
 outbox_mgr: Optional[OutboxManager] = None
-did_credential_mgr: Optional[Any] = None  # Removed (DIDCredentialManager deleted)
-management_schema_registry: Optional[Any] = None  # Removed
-cashu_escrow_mgr: Optional[Any] = None  # Removed (CashuEscrowManager deleted)
-nostr_transport: Optional[Any] = None  # Removed (ExternalCommsTransport deleted)
-identity_adapter: Optional[Any] = None  # Removed (IdentityInterface deleted)
-marketplace_mgr: Optional[Any] = None  # Removed (MarketplaceManager deleted)
-liquidity_mgr: Optional[Any] = None  # Removed (LiquidityMarketplaceManager deleted)
-policy_engine: Optional[Any] = None
 our_pubkey: Optional[str] = None
 phase6_optional_plugins: Dict[str, Any] = {
     "cl_hive_comms": {"installed": False, "active": False, "name": ""},
@@ -243,13 +212,13 @@ phase6_optional_plugins: Dict[str, Any] = {
 # Startup timestamp for lightweight health endpoint (Phase 4)
 _start_time: float = time.time()
 
-# Fee tracking for real-time gossip (Settlement Phase)
+# Fee tracking for real-time gossip
 _local_fees_earned_sats: int = 0
 _local_fees_forward_count: int = 0
 _local_fees_period_start: int = 0
 _local_fees_last_broadcast: int = 0
 _local_fees_last_broadcast_amount: int = 0  # Tracks fees at last broadcast
-_local_rebalance_costs_sats: int = 0  # Rebalance costs for net profit settlement (Issue #42)
+_local_rebalance_costs_sats: int = 0
 _local_fees_lock = threading.Lock()
 
 # Fee broadcast thresholds
@@ -276,8 +245,8 @@ def _load_fee_tracking_state() -> None:
 
     now = int(time.time())
 
-    # Check if saved state is from the current settlement period
-    # (Weekly periods aligned to Monday 00:00 UTC)
+    # Check if saved state is from the current weekly period
+    # (Aligned to Monday 00:00 UTC)
     from datetime import datetime, timezone
     dt = datetime.fromtimestamp(now, tz=timezone.utc)
     days_since_monday = dt.weekday()
@@ -288,7 +257,7 @@ def _load_fee_tracking_state() -> None:
 
     with _local_fees_lock:
         if saved_period_start >= current_week_start:
-            # Same settlement period - restore the state
+            # Same weekly period - restore the state
             _local_fees_earned_sats = saved.get("earned_sats", 0)
             _local_fees_forward_count = saved.get("forward_count", 0)
             _local_fees_period_start = saved_period_start
@@ -301,7 +270,7 @@ def _load_fee_tracking_state() -> None:
                 level="info"
             )
         else:
-            # New settlement period - start fresh but log the old data
+            # New weekly period - start fresh but log the old data
             plugin.log(
                 f"cl-hive: Fee tracking from previous period "
                 f"({saved.get('earned_sats', 0)} sats) - starting new period",
@@ -343,22 +312,6 @@ def _save_fee_tracking_state() -> None:
 # Global rate limiter for PEER_AVAILABLE messages
 peer_available_limiter: Optional[RateLimiter] = None
 
-# Phase 4B per-peer sliding-window limits (count, window_seconds)
-PHASE4B_RATE_LIMITS = {
-    "SETTLEMENT_RECEIPT": (30, 3600),
-    "BOND_POSTING": (5, 3600),
-    "BOND_SLASH": (5, 3600),
-    "NETTING_PROPOSAL": (10, 3600),
-    "NETTING_ACK": (10, 3600),
-    "VIOLATION_REPORT": (5, 3600),
-    "ARBITRATION_VOTE": (5, 3600),
-}
-_phase4b_rate_windows: Dict[tuple, List[int]] = {}
-_phase4b_rate_lock = threading.Lock()
-
-# Track latest verified netting proposals by settlement window.
-_phase4b_netting_proposals: Dict[str, Dict[str, Any]] = {}
-_phase4b_netting_lock = threading.Lock()
 
 
 def _check_permission(required_tier: str) -> Optional[Dict[str, Any]]:
@@ -449,7 +402,6 @@ def _get_hive_context() -> HiveContext:
         strategic_positioning_mgr=_strategic_positioning_mgr,
         anticipatory_manager=_anticipatory_liquidity_mgr,
         traffic_intel_mgr=traffic_intel_mgr,
-        nostr_transport_enabled=False,
         comms_active=_comms_active,
         archon_active=_archon_active,
         signing_backend="none",
@@ -577,8 +529,6 @@ def _submit_hive_message(peer_id: str, msg_type: HiveMessageType, msg_payload: D
     if not peer_id or msg_type is None or not isinstance(msg_payload, dict):
         return False
 
-    # VPN Transport Policy Check — removed (vpn_transport deleted)
-
     # Dispatch to a background thread so ingress paths return immediately.
     if _msg_executor is not None:
         _msg_executor.submit(_dispatch_hive_message, peer_id, msg_type, msg_payload, plugin_obj)
@@ -631,11 +581,6 @@ def _handle_external_transport_dm(envelope: Dict[str, Any]) -> None:
         plugin.log(f"cl-hive: external transport DM handling error: {exc}", level="warn")
 
 
-def _external_transport_pump():
-    """Removed — ExternalCommsTransport deleted."""
-    pass
-
-
 # =============================================================================
 # INITIALIZATION
 # =============================================================================
@@ -660,34 +605,17 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     plugin.log("cl-hive: Initializing Swarm Intelligence layer...")
 
     # Build configuration from options
+    # Options removed in fleet simplification use dataclass defaults in HiveConfig.
     config = HiveConfig(
         db_path=options.get('hive-db-path', '~/.lightning/cl_hive.db'),
-        governance_mode=options.get('hive-governance-mode', 'advisor'),
-        membership_enabled=_parse_bool(options.get('hive-membership-enabled', 'true')),
-        auto_join_enabled=_parse_bool(options.get('hive-auto-join', 'false')),
-        auto_vouch_enabled=_parse_bool(options.get('hive-auto-vouch', 'true')),
-        auto_promote_enabled=_parse_bool(options.get('hive-auto-promote', 'true')),
-        ban_autotrigger_enabled=_parse_bool(options.get('hive-ban-autotrigger', 'false')),
-        neophyte_fee_discount_pct=float(options.get('hive-neophyte-fee-discount', '0.5')),
         member_fee_ppm=int(options.get('hive-member-fee-ppm', '0')),
-        probation_days=int(options.get('hive-probation-days', '90')),
         max_members=int(options.get('hive-max-members', '50')),
         market_share_cap_pct=float(options.get('hive-market-share-cap', '0.20')),
+        auto_join_enabled=_parse_bool(options.get('hive-auto-join', 'false')),
         intent_hold_seconds=int(options.get('hive-intent-hold-seconds', '60')),
         gossip_threshold_pct=float(options.get('hive-gossip-threshold', '0.10')),
         heartbeat_interval=int(options.get('hive-heartbeat-interval', '300')),
         planner_interval=int(options.get('hive-planner-interval', '3600')),
-        planner_enable_expansions=_parse_bool(options.get('hive-planner-enable-expansions', 'false')),
-        planner_min_channel_sats=int(options.get('hive-planner-min-channel-sats', '1000000')),
-        planner_max_channel_sats=int(options.get('hive-planner-max-channel-sats', '50000000')),
-        planner_default_channel_sats=int(options.get('hive-planner-default-channel-sats', '5000000')),
-        planner_max_active_channels=int(options.get('hive-planner-max-active-channels', '50')),
-        # Budget options (failsafe mode)
-        failsafe_budget_per_day=int(options.get('hive-failsafe-budget-per-day', '10000000')),
-        budget_reserve_pct=float(options.get('hive-budget-reserve-pct', '0.20')),
-        budget_max_per_channel_pct=float(options.get('hive-budget-max-per-channel-pct', '0.50')),
-        max_expansion_feerate_perkb=int(options.get('hive-max-expansion-feerate', '5000')),
-        rpc_pool_size=int(options.get('hive-rpc-pool-size', '3')),
     )
 
     # Thread pool for message dispatch
@@ -836,13 +764,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sync bridge policies: {e}", level="warn")
 
-    # Initialize local node presence for settlement uptime tracking (Bug fix #1)
-    # Without this, the local node shows 0% uptime in settlement calculations
+    # Initialize local node presence for uptime tracking
     if our_pubkey:
         try:
             database.update_presence(our_pubkey, is_online=True, now_ts=int(time.time()), 
                                     window_seconds=30 * 86400)
-            plugin.log(f"cl-hive: Initialized local node presence for settlement uptime")
+            plugin.log(f"cl-hive: Initialized local node presence for uptime tracking")
         except Exception as e:
             plugin.log(f"cl-hive: Failed to initialize local presence: {e}", level="warn")
     
@@ -1107,10 +1034,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         daemon=True
     ))
 
-    # Removed modules: DID, cashu, marketplace, liquidity marketplace,
-    # nostr transport, identity adapter — all deleted in simplification
-
-    # Link anticipatory manager to fee coordination for time-based fees (Phase 7.4)
+    # Link anticipatory manager to fee coordination for time-based fees
     if fee_coordination_mgr:
         fee_coordination_mgr.set_anticipatory_manager(anticipatory_liquidity_mgr)
         plugin.log("cl-hive: Time-based fee adjustment enabled")
@@ -1148,28 +1072,18 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'membership_mgr': membership_mgr,
         'contribution_mgr': contribution_mgr,
         'bridge': bridge,
-        'vpn_transport': None,  # Removed
         'relay_mgr': relay_mgr,
-        'coop_expansion': None,  # Removed
         'fee_intel_mgr': fee_intel_mgr,
         'health_aggregator': health_aggregator,
         'liquidity_coord': liquidity_coord,
         'routing_map': routing_map,
         'peer_reputation_mgr': peer_reputation_mgr,
-        'routing_pool': None,  # Removed
-        'settlement_mgr': None,  # Removed
         'yield_metrics_mgr': yield_metrics_mgr,
         'fee_coordination_mgr': fee_coordination_mgr,
-        'cost_reduction_mgr': None,  # Removed
         'rationalization_mgr': rationalization_mgr,
         'strategic_positioning_mgr': strategic_positioning_mgr,
         'anticipatory_liquidity_mgr': anticipatory_liquidity_mgr,
-        'task_mgr': None,  # Removed
-        'splice_mgr': None,  # Removed
         'outbox_mgr': outbox_mgr,
-        'did_credential_mgr': None,  # Removed
-        'management_schema_registry': None,  # Removed
-        'cashu_escrow_mgr': None,  # Removed
         'traffic_intel_mgr': traffic_intel_mgr,
         'peer_available_limiter': peer_available_limiter,
         'outbox': outbox_mgr,
@@ -1183,11 +1097,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         '_local_rebalance_costs_sats': _local_rebalance_costs_sats,
         'FEE_BROADCAST_MIN_SATS': FEE_BROADCAST_MIN_SATS,
         'FEE_BROADCAST_MIN_INTERVAL': FEE_BROADCAST_MIN_INTERVAL,
-        'PHASE4B_RATE_LIMITS': PHASE4B_RATE_LIMITS,
-        '_phase4b_rate_lock': _phase4b_rate_lock,
-        '_phase4b_rate_windows': _phase4b_rate_windows,
-        '_phase4b_netting_lock': _phase4b_netting_lock,
-        '_phase4b_netting_proposals': _phase4b_netting_proposals,
     })
     plugin.log("cl-hive: Protocol handlers initialized")
 
@@ -1203,13 +1112,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'intent_mgr': intent_mgr,
         'membership_mgr': membership_mgr,
         'contribution_mgr': contribution_mgr,
-        'did_credential_mgr': None,  # Removed
-        'cashu_escrow_mgr': None,  # Removed
-        'marketplace_mgr': None,  # Removed
-        'liquidity_mgr': None,  # Removed
         'outbox_mgr': outbox_mgr,
         'planner': planner,
-        'coop_expansion': None,  # Removed
         'fee_intel_mgr': fee_intel_mgr,
         'gossip_mgr': gossip_mgr,
         'bridge': bridge,
@@ -1220,12 +1124,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'anticipatory_liquidity_mgr': anticipatory_liquidity_mgr,
         'strategic_positioning_mgr': strategic_positioning_mgr,
         'rationalization_mgr': rationalization_mgr,
-        'cost_reduction_mgr': None,  # Removed
         'traffic_intel_mgr': traffic_intel_mgr,
-        'settlement_mgr': None,  # Removed
         'liquidity_coord': liquidity_coord,
-        'routing_pool': None,  # Removed
-        'splice_mgr': None,  # Removed
         'BAN_PROPOSAL_TTL_SECONDS': protocol_handlers.BAN_PROPOSAL_TTL_SECONDS,
     })
     plugin.log("cl-hive: Background loops initialized")
@@ -1809,7 +1709,6 @@ def hive_expansion_recommendations(plugin: Plugin, limit: int = 10):
     - Hive coverage diversity (% of members with channels)
     - Network competition (peer channel count)
     - Bottleneck detection (from liquidity_coordinator)
-    - Splice recommendations (from splice_coordinator)
 
     Args:
         limit: Maximum number of recommendations to return (default: 10)
@@ -1896,8 +1795,7 @@ def hive_channel_closed(plugin: Plugin, peer_id: str, channel_id: str,
     result["message"] = f"Channel {channel_id} closed ({closer})"
 
     plugin.log(
-        f"cl-hive: Channel {channel_id} closed by {closer}, "
-        f"notified {broadcast_count} members (pnl={net_pnl_sats} sats)",
+        f"cl-hive: Channel {channel_id} closed by {closer} (pnl={net_pnl_sats} sats)",
         level='info'
     )
 
@@ -1967,8 +1865,7 @@ def hive_channel_opened(plugin: Plugin, peer_id: str, channel_id: str,
     result["message"] = f"Channel {channel_id} opened ({opener})"
 
     plugin.log(
-        f"cl-hive: Channel {channel_id} opened with {peer_id[:16]}... ({opener}), "
-        f"notified {broadcast_count} members",
+        f"cl-hive: Channel {channel_id} opened with {peer_id[:16]}... ({opener})",
         level='info'
     )
 
@@ -4777,17 +4674,6 @@ def hive_genesis(plugin: Plugin, hive_id: str = None):
 
     try:
         result = handshake_mgr.genesis(hive_id)
-
-        # Auto-generate and register BOLT12 offer for settlement
-        if settlement_mgr:
-            our_pubkey = handshake_mgr.get_our_pubkey()
-            offer_result = settlement_mgr.generate_and_register_offer(our_pubkey)
-            if "error" in offer_result:
-                plugin.log(f"cl-hive: Failed to auto-register settlement offer: {offer_result['error']}", level='warn')
-            else:
-                result["settlement_offer"] = offer_result.get("status")
-                plugin.log(f"cl-hive: Settlement offer auto-registered for genesis member")
-
         return result
     except ValueError as e:
         return {"error": str(e)}

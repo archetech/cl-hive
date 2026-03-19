@@ -335,13 +335,6 @@ def planner_loop():
                         f"cl-hive: Planner cycle complete: {len(decisions)} decisions"
                     )
 
-                # Clean up expired expansion rounds
-                if coop_expansion:
-                    cleaned = coop_expansion.cleanup_expired_rounds()
-                    if cleaned > 0 and plugin:
-                        plugin.log(
-                            f"cl-hive: Cleaned up {cleaned} expired expansion rounds"
-                        )
         except Exception as e:
             if plugin:
                 plugin.log(f"Planner loop error: {e}", level='warn')

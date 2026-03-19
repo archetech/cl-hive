@@ -51,7 +51,6 @@ state_manager = None
 intent_mgr = None
 contribution_mgr = None
 bridge = None
-vpn_transport = None
 relay_mgr = None
 fee_intel_mgr = None
 liquidity_coord = None
@@ -1088,9 +1087,6 @@ def _handle_peer_connected(peer_id: str, member: Dict):
             if peers and peers.get('peers'):
                 netaddr = peers['peers'][0].get('netaddr', [])
                 if netaddr:
-                    peer_address = netaddr[0]
-                    if vpn_transport:
-                        vpn_transport.on_peer_connected(peer_id, peer_address)
                     if not member.get('addresses'):
                         database.update_member(peer_id, addresses=json.dumps(netaddr))
         except Exception:
