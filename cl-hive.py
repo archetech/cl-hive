@@ -953,15 +953,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     fee_coordination_mgr.set_fee_intelligence_mgr(fee_intel_mgr)
     plugin.log("cl-hive: Fee coordination manager initialized")
 
-    # Restore persisted routing intelligence
+    # Restore persisted routing intelligence (no-op after simplification)
     try:
-        restored = fee_coordination_mgr.restore_state_from_database()
-        plugin.log(f"cl-hive: Restored routing intelligence "
-                   f"(pheromones={restored['pheromones']}, markers={restored['markers']}, "
-                   f"defense_reports={restored.get('defense_reports', 0)}, "
-                   f"defense_fees={restored.get('defense_fees', 0)}, "
-                   f"remote_pheromones={restored.get('remote_pheromones', 0)}, "
-                   f"fee_observations={restored.get('fee_observations', 0)})")
+        fee_coordination_mgr.restore_state_from_database()
     except Exception as e:
         plugin.log(f"cl-hive: Failed to restore routing intelligence: {e}", level='warn')
 
@@ -1038,10 +1032,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         fee_coordination_mgr.set_anticipatory_manager(anticipatory_liquidity_mgr)
         plugin.log("cl-hive: Time-based fee adjustment enabled")
 
-    # Link defense system to peer reputation manager for collective warnings
-    if fee_coordination_mgr and peer_reputation_mgr:
-        fee_coordination_mgr.defense_system.set_peer_reputation_manager(peer_reputation_mgr)
-        plugin.log("cl-hive: Defense system linked to peer reputation (collective warnings enabled)")
+    # (Defense system removed during simplification)
 
     # Link yield optimization modules to Planner (Slime mold coordination)
     # These enable the planner to avoid redundant opens and prioritize high-value corridors
@@ -4290,10 +4281,10 @@ def hive_coord_fee_recommendation(
     destination: str = None
 ):
     """
-    Get coordinated fee recommendation for a channel (Phase 2 Fee Coordination).
+    Get coordinated fee recommendation for a channel.
 
-    Uses corridor ownership, pheromone levels, stigmergic markers, and defense
-    signals to recommend optimal fees while avoiding internal fleet competition.
+    Uses corridor ownership and centrality signals to recommend optimal fees
+    while avoiding internal fleet competition.
 
     Args:
         channel_id: Channel ID to get recommendation for
@@ -4365,10 +4356,7 @@ def hive_record_routing_outcome(
     destination: str = None
 ):
     """
-    Record a routing outcome for pheromone and stigmergic learning.
-
-    Updates pheromone levels for the channel and optionally deposits
-    a stigmergic marker if source/destination are provided.
+    Record a routing outcome (no-op after simplification, kept for compatibility).
 
     Args:
         channel_id: Channel that routed the payment
@@ -4376,8 +4364,8 @@ def hive_record_routing_outcome(
         fee_ppm: Fee charged in ppm
         success: Whether routing succeeded
         amount_sats: Forwarded amount in satoshis
-        source: Source peer (optional, for stigmergic marker)
-        destination: Destination peer (optional, for stigmergic marker)
+        source: Source peer (optional)
+        destination: Destination peer (optional)
 
     Returns:
         Dict with status.
@@ -4417,55 +4405,22 @@ def hive_ban_candidates(plugin: Plugin, auto_propose: bool = False):
     Returns:
         Dict with ban candidates and their severity scores.
     """
-    if not fee_coordination_mgr:
-        return {"error": "Fee coordination manager not initialized"}
-
-    # Get candidates from defense system
-    candidates = fee_coordination_mgr.defense_system.get_ban_candidates()
-
-    result = {
-        "ban_candidates": candidates,
-        "count": len(candidates),
+    # Defense system removed during simplification
+    return {
+        "ban_candidates": [],
+        "count": 0,
         "auto_propose_enabled": auto_propose
     }
-
-    if auto_propose and candidates:
-        # Check each candidate for auto-ban threshold
-        proposed = []
-        for candidate in candidates:
-            peer_id = candidate.get("peer_id")
-            reason = fee_coordination_mgr.defense_system.should_auto_propose_ban(peer_id)
-            if reason:
-                # Create ban proposal
-                try:
-                    ban_result = hive_ban(plugin, peer_id, reason)
-                    if "error" not in ban_result:
-                        proposed.append({
-                            "peer_id": peer_id,
-                            "reason": reason,
-                            "proposal_id": ban_result.get("proposal_id")
-                        })
-                except Exception as e:
-                    plugin.log(f"cl-hive: Failed to auto-propose ban for {peer_id[:16]}: {e}", level='warn')
-
-        result["auto_proposed"] = proposed
-        result["auto_proposed_count"] = len(proposed)
-
-    return result
 @plugin.method("hive-get-routing-intelligence")
 def hive_get_routing_intelligence(plugin: Plugin, scid: str = None):
     """
-    Get routing intelligence for channel(s).
-
-    Exports pheromone levels, trends, and corridor membership for use by
-    external fee optimization systems (e.g., cl-revenue-ops Thompson sampling).
+    Get routing intelligence based on corridor assignments.
 
     Args:
-        scid: Optional specific channel short_channel_id. If None, returns all.
+        scid: Optional specific channel short_channel_id (unused, kept for compat).
 
     Returns:
-        Dict with routing intelligence including pheromone levels, trends,
-        last forward age, marker count, and active corridor status.
+        Dict with corridor assignment data.
     """
     return rpc_get_routing_intelligence(_get_hive_context(), scid=scid)
 
@@ -4537,7 +4492,7 @@ def hive_coverage_analysis(plugin: Plugin, peer_id: str = None):
     Analyze fleet coverage for redundant channels.
 
     Shows which fleet members have channels to the same peers
-    and determines ownership based on routing activity (stigmergic markers).
+    and determines ownership based on corridor assignments.
 
     Args:
         peer_id: Specific peer to analyze, or omit for all redundant peers
@@ -4553,11 +4508,8 @@ def hive_close_recommendations(plugin: Plugin, our_node_only: bool = False):
     """
     Get channel close recommendations for underperforming redundant channels.
 
-    Uses stigmergic markers (routing success) to determine which member
-    "owns" each peer relationship. Recommends closes for members with
-    <10% of the owner's routing activity.
-
-    Part of the Hive covenant: members follow swarm intelligence.
+    Uses corridor assignments to determine which member "owns" each peer
+    relationship. Recommends closes for members with redundant channels.
 
     Args:
         our_node_only: If True, only return recommendations for our node
@@ -4975,193 +4927,24 @@ def hive_backfill_routing_intelligence(
     status_filter: str = "settled"
 ):
     """
-    Backfill pheromone levels and stigmergic markers from historical forwards.
-
-    Reads historical forward data and populates the fee coordination systems
-    (pheromones + stigmergic markers) to bootstrap swarm intelligence.
-
-    Args:
-        days: Number of days of history to process (default: 30)
-        status_filter: Forward status to include: "settled", "failed", or "all" (default: settled)
-
-    Returns:
-        Dict with backfill statistics.
+    No-op after simplification (pheromone/stigmergy systems removed).
+    Kept for RPC compatibility.
     """
-    if not fee_coordination_mgr:
-        return {"error": "Fee coordination manager not initialized"}
-
-    if not plugin:
-        return {"error": "Plugin not initialized"}
-
-    try:
-        # Get historical forwards
-        forwards_result = plugin.rpc.listforwards(status=status_filter if status_filter != "all" else None)
-        forwards = forwards_result.get("forwards", [])
-
-        if not forwards:
-            return {
-                "status": "no_data",
-                "message": "No forwards found to backfill",
-                "processed": 0
-            }
-
-        # Get channel info for peer mapping
-        funds = plugin.rpc.listfunds()
-        channels = {ch.get("short_channel_id"): ch for ch in funds.get("channels", [])}
-
-        # Calculate cutoff time
-        cutoff_time = int(time.time()) - (days * 86400)
-
-        # Process forwards
-        processed = 0
-        skipped = 0
-        errors = 0
-        pheromone_deposits = 0
-        marker_deposits = 0
-
-        for fwd in forwards:
-            try:
-                # Check timestamp if available
-                received_time = fwd.get("received_time", 0)
-                if received_time and received_time < cutoff_time:
-                    skipped += 1
-                    continue
-
-                out_channel = fwd.get("out_channel", "")
-                in_channel = fwd.get("in_channel", "")
-                fee_msat = protocol_handlers._parse_msat_value(
-                    fwd.get("fee_msat", fwd.get("fee_msatoshi", 0))
-                )
-                out_msat = protocol_handlers._parse_msat_value(
-                    fwd.get("out_msat", fwd.get("out_msatoshi", 0))
-                )
-                status = fwd.get("status", "unknown")
-
-                if not out_channel:
-                    skipped += 1
-                    continue
-
-                # Get peer IDs
-                out_peer = channels.get(out_channel, {}).get("peer_id", "")
-                in_peer = channels.get(in_channel, {}).get("peer_id", "") if in_channel else ""
-
-                if not out_peer:
-                    skipped += 1
-                    continue
-
-                # Calculate metrics
-                fee_ppm = int((fee_msat * 1_000_000) / out_msat) if out_msat > 0 else 0
-                fee_sats = fee_msat // 1000
-                volume_sats = out_msat // 1000 if out_msat else 0
-                success = status == "settled"
-
-                # Record to fee coordination manager
-                fee_coordination_mgr.record_routing_outcome(
-                    channel_id=out_channel,
-                    peer_id=out_peer,
-                    fee_ppm=fee_ppm,
-                    success=success,
-                    revenue_sats=fee_sats if success else 0,
-                    volume_sats=volume_sats if success else 0,
-                    source=in_peer if in_peer else None,
-                    destination=out_peer
-                )
-
-                processed += 1
-
-                # Track what was deposited
-                if success and fee_sats > 0:
-                    pheromone_deposits += 1
-                if in_peer and out_peer:
-                    marker_deposits += 1
-
-            except Exception as e:
-                errors += 1
-                continue
-
-        # Get current levels after backfill
-        pheromone_levels = fee_coordination_mgr.adaptive_controller.get_all_pheromone_levels()
-        markers = fee_coordination_mgr.stigmergic_coord.get_all_markers()
-
-        return {
-            "status": "success",
-            "days_processed": days,
-            "status_filter": status_filter,
-            "forwards_found": len(forwards),
-            "processed": processed,
-            "skipped": skipped,
-            "errors": errors,
-            "pheromone_deposits": pheromone_deposits,
-            "marker_deposits": marker_deposits,
-            "current_pheromone_channels": len(pheromone_levels),
-            "current_active_markers": len(markers),
-            "pheromone_summary": {
-                ch: round(level, 2)
-                for ch, level in sorted(
-                    pheromone_levels.items(),
-                    key=lambda x: x[1],
-                    reverse=True
-                )[:10]  # Top 10 channels
-            }
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e)
-        }
+    return {
+        "status": "no_op",
+        "message": "Backfill no longer needed -- corridor assignments are ephemeral"
+    }
 
 
 @plugin.method("hive-routing-intelligence-status")
 def hive_routing_intelligence_status(plugin: Plugin):
     """
-    Get current status of routing intelligence systems (pheromones + markers).
-
-    Returns current pheromone levels and stigmergic markers.
-
-    Returns:
-        Dict with routing intelligence status.
+    Get current routing intelligence status (corridor assignments).
     """
     if not fee_coordination_mgr:
         return {"error": "Fee coordination manager not initialized"}
 
-    pheromone_levels = fee_coordination_mgr.adaptive_controller.get_all_pheromone_levels()
-    markers = fee_coordination_mgr.stigmergic_coord.get_all_markers()
-
-    # Build marker summary
-    marker_summary = []
-    for m in markers[:20]:  # Limit to 20 most recent
-        marker_summary.append({
-            "source": m.source_peer_id[:12] + "..." if m.source_peer_id else "",
-            "destination": m.destination_peer_id[:12] + "..." if m.destination_peer_id else "",
-            "fee_ppm": m.fee_ppm,
-            "success": m.success,
-            "strength": round(m.strength, 3),
-            "age_hours": round((time.time() - m.timestamp) / 3600, 1)
-        })
-
-    # Build pheromone summary
-    pheromone_summary = []
-    for ch, level in sorted(pheromone_levels.items(), key=lambda x: x[1], reverse=True):
-        pheromone_summary.append({
-            "channel_id": ch,
-            "level": round(level, 3),
-            "above_threshold": level > 10.0  # PHEROMONE_EXPLOIT_THRESHOLD
-        })
-
-    return {
-        "pheromone_channels": len(pheromone_levels),
-        "active_markers": len(markers),
-        "successful_markers": sum(1 for m in markers if m.success),
-        "failed_markers": sum(1 for m in markers if not m.success),
-        "pheromone_levels": pheromone_summary,
-        "stigmergic_markers": marker_summary,
-        "config": {
-            "pheromone_exploit_threshold": 2.0,
-            "marker_half_life_hours": 168,
-            "marker_min_strength": 0.1
-        }
-    }
+    return fee_coordination_mgr.get_coordination_status()
 @plugin.method("hive-get-peer-quality")
 def hive_get_peer_quality(plugin: Plugin, peer_id: str = None):
     """

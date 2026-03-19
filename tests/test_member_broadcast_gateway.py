@@ -669,34 +669,6 @@ class TestMemberBroadcastGateway:
             log_label="fee_intelligence",
         )
 
-    def test_stigmergic_markers_use_best_effort_direct_gateway(self):
-        cl_hive, our_pubkey, _sent_messages = self._configure_module()
-        cl_hive.fee_coordination_mgr = MagicMock()
-        cl_hive.background_loops.fee_coordination_mgr = cl_hive.fee_coordination_mgr
-        cl_hive.protocol_handlers.fee_coordination_mgr = MagicMock()
-        cl_hive.fee_coordination_mgr.stigmergic_coord.get_shareable_markers.return_value = [
-            {
-                "source": "02" + "d" * 64,
-                "destination": "02" + "e" * 64,
-                "fee_ppm": 100,
-                "success": True,
-                "strength": 0.6,
-            }
-        ]
-        cl_hive.plugin.rpc.signmessage.return_value = {"zbase": "marker-sig"}
-        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
-
-        cl_hive.background_loops._broadcast_our_stigmergic_markers()
-
-        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once()
-        call_kwargs = cl_hive.protocol_handlers._broadcast_member_message.call_args.kwargs
-        assert call_kwargs["reliability"] == "direct"
-        assert call_kwargs["failure_policy"] == "best_effort"
-        assert call_kwargs["log_label"] == "stigmergic_markers"
-        msg_type, payload = deserialize(call_kwargs["message_bytes"])
-        assert msg_type == HiveMessageType.STIGMERGIC_MARKER_BATCH
-        assert payload["reporter_id"] == our_pubkey
-
     def test_temporal_patterns_use_best_effort_direct_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
         cl_hive.anticipatory_liquidity_mgr = MagicMock()
@@ -773,43 +745,6 @@ class TestMemberBroadcastGateway:
         assert call_kwargs["failure_policy"] == "best_effort"
         assert call_kwargs["log_label"] == "intent_abort"
         assert call_kwargs["payload"]["target"] == "02" + "d" * 64
-
-    def test_pheromones_use_best_effort_direct_gateway(self):
-        cl_hive, our_pubkey, _sent_messages = self._configure_module()
-        cl_hive.fee_coordination_mgr = MagicMock()
-        cl_hive.background_loops.fee_coordination_mgr = cl_hive.fee_coordination_mgr
-        cl_hive.background_loops.anticipatory_liquidity_mgr = None
-        cl_hive.protocol_handlers.fee_coordination_mgr = MagicMock()
-        cl_hive.fee_coordination_mgr.adaptive_controller.get_shareable_pheromones.return_value = [
-            {
-                "peer_id": "02" + "d" * 64,
-                "channel_id": "1x1x1",
-                "level": 0.7,
-                "fee_ppm": 120,
-            }
-        ]
-        cl_hive.plugin.rpc.listfunds.return_value = {
-            "channels": [
-                {
-                    "state": "CHANNELD_NORMAL",
-                    "short_channel_id": "1x1x1",
-                    "peer_id": "02" + "d" * 64,
-                }
-            ]
-        }
-        cl_hive.plugin.rpc.signmessage.return_value = {"zbase": "pheromone-sig"}
-        cl_hive.protocol_handlers._broadcast_member_message = MagicMock(return_value={"ok": True, "sent": 1})
-
-        cl_hive.background_loops._broadcast_our_pheromones()
-
-        cl_hive.protocol_handlers._broadcast_member_message.assert_called_once()
-        call_kwargs = cl_hive.protocol_handlers._broadcast_member_message.call_args.kwargs
-        assert call_kwargs["reliability"] == "direct"
-        assert call_kwargs["failure_policy"] == "best_effort"
-        assert call_kwargs["log_label"] == "pheromones"
-        msg_type, payload = deserialize(call_kwargs["message_bytes"])
-        assert msg_type == HiveMessageType.PHEROMONE_BATCH
-        assert payload["reporter_id"] == our_pubkey
 
     def test_coverage_analysis_uses_best_effort_direct_gateway(self):
         cl_hive, our_pubkey, _sent_messages = self._configure_module()
