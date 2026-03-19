@@ -5181,8 +5181,9 @@ def did_get_reputation(ctx: HiveContext, subject_id: str,
 
 
 def did_list_profiles(ctx: HiveContext) -> Dict[str, Any]:
-    """List supported DID credential profiles."""
-    from modules.did_credentials import CREDENTIAL_PROFILES
+    """Removed — DID credentials deleted."""
+    return {"error": "DID credentials feature removed"}
+    # Dead code below — module deleted
 
     profiles = {}
     for domain, profile in CREDENTIAL_PROFILES.items():

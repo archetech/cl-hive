@@ -1338,11 +1338,10 @@ def _update_and_broadcast_fees(new_fee_sats: int):
             _local_fees_last_broadcast = now
             _local_fees_last_broadcast_amount = _local_fees_earned_sats
 
-    # Always save fee report to database for settlement (Bug fix #3).
-    # This must happen regardless of broadcast threshold to ensure low-traffic
-    # nodes report their fees for settlement calculations.
-    from modules.settlement import SettlementManager
-    period = SettlementManager.get_period_string(period_start_to_persist)
+    # Settlement removed — generate period string locally
+    import datetime
+    _dt = datetime.datetime.utcfromtimestamp(period_start_to_persist)
+    period = f"{_dt.year}-W{_dt.isocalendar()[1]:02d}"
     database.save_fee_report(
         peer_id=our_pubkey,
         period=period,
@@ -1446,9 +1445,10 @@ def _broadcast_fee_report(fees_earned: int, forward_count: int,
                 rebalance_costs_sats=rebalance_costs
             )
 
-        # Persist our own fee report to database for settlement
-        from modules.settlement import SettlementManager
-        period = SettlementManager.get_period_string(period_start)
+        # Settlement removed — generate period string locally
+        import datetime
+        _dt = datetime.datetime.utcfromtimestamp(period_start)
+        period = f"{_dt.year}-W{_dt.isocalendar()[1]:02d}"
         database.save_fee_report(
             peer_id=our_pubkey,
             period=period,
@@ -2574,9 +2574,10 @@ def _phase4b_common_checks(peer_id: str, payload: Dict, msg_type: str,
 
 
 def handle_settlement_receipt(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
-    """Handle SETTLEMENT_RECEIPT message."""
+    """Handle SETTLEMENT_RECEIPT message — settlement removed."""
+    return {"result": "continue"}  # Settlement module deleted
     from modules.protocol import validate_settlement_receipt, get_settlement_receipt_signing_payload
-    from modules.settlement import SettlementTypeRegistry
+    # Dead code below — module deleted
     if not validate_settlement_receipt(payload):
         plugin.log(f"cl-hive: invalid SETTLEMENT_RECEIPT from {peer_id[:16]}...", level='warn')
         return {"result": "continue"}
@@ -2669,6 +2670,8 @@ def handle_bond_posting(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
 
 def handle_bond_slash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """Removed — settlement module deleted."""
+    return {"result": "continue"}
     """Handle BOND_SLASH message."""
     from modules.protocol import (
         validate_bond_slash,
@@ -2812,9 +2815,10 @@ def handle_bond_slash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
 
 def handle_netting_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
-    """Handle NETTING_PROPOSAL message."""
+    """Removed — settlement module deleted."""
+    return {"result": "continue"}
     from modules.protocol import validate_netting_proposal, get_netting_proposal_signing_payload
-    from modules.settlement import NettingEngine
+    # Dead code below — module deleted
     if not validate_netting_proposal(payload):
         plugin.log(f"cl-hive: invalid NETTING_PROPOSAL from {peer_id[:16]}...", level='warn')
         return {"result": "continue"}
@@ -2910,9 +2914,10 @@ def handle_netting_ack(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
 
 def handle_violation_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
-    """Handle VIOLATION_REPORT message."""
+    """Removed — settlement module deleted."""
+    return {"result": "continue"}
     from modules.protocol import validate_violation_report, get_violation_report_signing_payload
-    from modules.settlement import DisputeResolver
+    # Dead code below — module deleted
     if not validate_violation_report(payload):
         plugin.log(f"cl-hive: invalid VIOLATION_REPORT from {peer_id[:16]}...", level='warn')
         return {"result": "continue"}
@@ -2949,9 +2954,10 @@ def handle_violation_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict
 
 
 def handle_arbitration_vote(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
-    """Handle ARBITRATION_VOTE message."""
+    """Removed — settlement module deleted."""
+    return {"result": "continue"}
     from modules.protocol import validate_arbitration_vote, get_arbitration_vote_signing_payload
-    from modules.settlement import DisputeResolver
+    # Dead code below — module deleted
     if not validate_arbitration_vote(payload):
         plugin.log(f"cl-hive: invalid ARBITRATION_VOTE from {peer_id[:16]}...", level='warn')
         return {"result": "continue"}
@@ -7036,9 +7042,10 @@ def handle_fee_report(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         rebalance_costs_sats=rebalance_costs_sats
     )
 
-    # Also persist to database for settlement calculations
-    from modules.settlement import SettlementManager
-    period = SettlementManager.get_period_string(period_start)
+    # Settlement removed — generate period string locally
+    import datetime
+    _dt = datetime.datetime.utcfromtimestamp(period_start)
+    period = f"{_dt.year}-W{_dt.isocalendar()[1]:02d}"
     database.save_fee_report(
         peer_id=report_peer_id,
         period=period,
@@ -8040,7 +8047,7 @@ def handle_mcf_solution_broadcast(peer_id: str, payload: Dict, plugin: Plugin) -
     assignments = payload.get("assignments", [])
 
     # Reject stale or replayed solutions
-    from modules.mcf_solver import MAX_SOLUTION_AGE as _MCF_MAX_SOL_AGE
+    _MCF_MAX_SOL_AGE = 7200  # 2 hours — was from mcf_solver (deleted)
     now = int(time.time())
     if timestamp > 0 and abs(now - timestamp) > _MCF_MAX_SOL_AGE:
         plugin.log(

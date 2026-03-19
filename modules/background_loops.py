@@ -1639,18 +1639,8 @@ def gossip_loop():
 # =============================================================================
 
 def mcf_optimization_loop():
-    """
-    Background thread for MCF (Min-Cost Max-Flow) optimization.
-
-    Runs periodically to:
-    1. Check if we're the elected coordinator
-    2. Run MCF optimization cycle if coordinator
-    3. Broadcast solution to fleet
-    4. Process our assignments from latest solution
-
-    Cycle interval: 30 minutes (MCF_CYCLE_INTERVAL)
-    """
-    from modules.mcf_solver import MCF_CYCLE_INTERVAL, MAX_SOLUTION_AGE
+    """Removed — MCF solver deleted."""
+    return  # Module deleted
 
     # Wait for initialization
     shutdown_event.wait(60)

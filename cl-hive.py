@@ -89,45 +89,28 @@ from modules.contribution import ContributionManager
 from modules.membership import MembershipManager, MembershipTier
 from modules.planner import Planner, ChannelSizer
 from modules.quality_scorer import PeerQualityScorer
-from modules.cooperative_expansion import CooperativeExpansionManager
 from modules.governance import DecisionEngine
-from modules.vpn_transport import VPNTransportManager
 from modules.fee_intelligence import FeeIntelligenceManager
 from modules.traffic_intelligence import TrafficIntelligenceManager
 from modules.liquidity_coordinator import LiquidityCoordinator
-from modules.splice_coordinator import SpliceCoordinator
 from modules.health_aggregator import HealthScoreAggregator, HealthTier
 from modules.routing_intelligence import HiveRoutingMap
 from modules.peer_reputation import PeerReputationManager
-from modules.routing_pool import RoutingPool
-from modules.settlement import SettlementManager
 from modules.yield_metrics import YieldMetricsManager
 from modules.fee_coordination import FeeCoordinationManager
-from modules.cost_reduction import CostReductionManager
 from modules.channel_rationalization import RationalizationManager
 from modules.strategic_positioning import StrategicPositioningManager
 from modules.anticipatory_liquidity import AnticipatoryLiquidityManager
-from modules.task_manager import TaskManager
-from modules.splice_manager import SpliceManager
 from modules.relay import RelayManager
 from modules.idempotency import check_and_record, generate_event_id
 from modules.outbox import OutboxManager
-from modules.did_credentials import DIDCredentialManager
-from modules.management_schemas import ManagementSchemaRegistry
-from modules.cashu_escrow import CashuEscrowManager
-from modules.nostr_transport import ExternalCommsTransport, TransportInterface
-from modules.identity_adapter import IdentityInterface, RemoteArchonIdentity
 from modules.phase6_ingest import parse_injected_hive_packet
-from modules.marketplace import MarketplaceManager
-from modules.liquidity_marketplace import LiquidityMarketplaceManager
 from modules import network_metrics
 from modules.plugin_options import (
     RateLimiter, _parse_bool, _parse_setconfig_value,
     OPTION_TO_CONFIG_MAP, VPN_OPTIONS, register_options,
 )
-from modules.rpc_pool import RpcLockTimeoutError, RpcPool, RpcPoolProxy
 from modules.log_writer import BatchedLogWriter
-from modules import rpc_pool as _rpc_pool_mod
 from modules import protocol_handlers
 from modules import background_loops
 from modules.rpc_commands import (
@@ -135,10 +118,7 @@ from modules.rpc_commands import (
     status as rpc_status,
     get_config as rpc_get_config,
     members as rpc_members,
-    vpn_status as rpc_vpn_status,
     expansion_recommendations as rpc_expansion_recommendations,
-    vpn_add_peer as rpc_vpn_add_peer,
-    vpn_remove_peer as rpc_vpn_remove_peer,
     pending_actions as rpc_pending_actions,
     approve_action as rpc_approve_action,
     reject_action as rpc_reject_action,
@@ -153,13 +133,6 @@ from modules.rpc_commands import (
     intent_status as rpc_intent_status,
     contribution as rpc_contribution,
     expansion_status as rpc_expansion_status,
-    # Phase 0: Routing Pool (Collective Economics)
-    pool_status as rpc_pool_status,
-    pool_member_status as rpc_pool_member_status,
-    pool_snapshot as rpc_pool_snapshot,
-    pool_distribution as rpc_pool_distribution,
-    pool_settle as rpc_pool_settle,
-    pool_record_revenue as rpc_pool_record_revenue,
     # Phase 1: Yield Metrics & Measurement
     yield_metrics as rpc_yield_metrics,
     yield_summary as rpc_yield_summary,
@@ -177,18 +150,6 @@ from modules.rpc_commands import (
     pheromone_levels as rpc_pheromone_levels,
     get_routing_intelligence as rpc_get_routing_intelligence,
     fee_coordination_status as rpc_fee_coordination_status,
-    # Phase 3 - Cost Reduction
-    rebalance_recommendations as rpc_rebalance_recommendations,
-    fleet_rebalance_path as rpc_fleet_rebalance_path,
-    record_rebalance_outcome as rpc_record_rebalance_outcome,
-    circular_flow_status as rpc_circular_flow_status,
-    cost_reduction_status as rpc_cost_reduction_status,
-    execute_hive_circular_rebalance as rpc_execute_hive_circular_rebalance,
-    # Phase 15 - MCF Optimization
-    mcf_status as rpc_mcf_status,
-    mcf_solve as rpc_mcf_solve,
-    mcf_assignments as rpc_mcf_assignments,
-    mcf_optimized_path as rpc_mcf_optimized_path,
     # Channel Rationalization
     coverage_analysis as rpc_coverage_analysis,
     close_recommendations as rpc_close_recommendations,
@@ -221,50 +182,6 @@ from modules.rpc_commands import (
     get_mcf_targets as rpc_get_mcf_targets,
     get_nnlb_opportunities as rpc_get_nnlb_opportunities,
     get_channel_ages as rpc_get_channel_ages,
-    # DID Credentials (Phase 16)
-    did_issue_credential as rpc_did_issue_credential,
-    did_list_credentials as rpc_did_list_credentials,
-    did_revoke_credential as rpc_did_revoke_credential,
-    did_get_reputation as rpc_did_get_reputation,
-    did_list_profiles as rpc_did_list_profiles,
-    # Management Schemas (Phase 2)
-    schema_list as rpc_schema_list,
-    schema_validate as rpc_schema_validate,
-    mgmt_credential_issue as rpc_mgmt_credential_issue,
-    mgmt_credential_list as rpc_mgmt_credential_list,
-    mgmt_credential_revoke as rpc_mgmt_credential_revoke,
-    # Phase 4A: Cashu Escrow
-    escrow_create as rpc_escrow_create,
-    escrow_list as rpc_escrow_list,
-    escrow_redeem as rpc_escrow_redeem,
-    escrow_refund as rpc_escrow_refund,
-    escrow_get_receipt as rpc_escrow_get_receipt,
-    escrow_complete as rpc_escrow_complete,
-    # Phase 4B: Extended Settlements
-    bond_post as rpc_bond_post,
-    bond_status as rpc_bond_status,
-    settlement_obligations_list as rpc_settlement_obligations_list,
-    settlement_net as rpc_settlement_net,
-    dispute_file as rpc_dispute_file,
-    dispute_vote as rpc_dispute_vote,
-    dispute_status as rpc_dispute_status,
-    credit_tier_info as rpc_credit_tier_info,
-    # Phase 5B: Advisor marketplace
-    marketplace_discover as rpc_marketplace_discover,
-    marketplace_profile as rpc_marketplace_profile,
-    marketplace_propose as rpc_marketplace_propose,
-    marketplace_accept as rpc_marketplace_accept,
-    marketplace_trial as rpc_marketplace_trial,
-    marketplace_terminate as rpc_marketplace_terminate,
-    marketplace_status as rpc_marketplace_status,
-    # Phase 5C: Liquidity marketplace
-    liquidity_discover as rpc_liquidity_discover,
-    liquidity_offer as rpc_liquidity_offer,
-    liquidity_request as rpc_liquidity_request,
-    liquidity_lease as rpc_liquidity_lease,
-    liquidity_heartbeat as rpc_liquidity_heartbeat,
-    liquidity_lease_status as rpc_liquidity_lease_status,
-    liquidity_terminate as rpc_liquidity_terminate,
     # Phase 14: Traffic Intelligence
     report_traffic_profile as rpc_report_traffic_profile,
     get_traffic_intelligence as rpc_get_traffic_intelligence,
@@ -282,9 +199,6 @@ plugin = Plugin()
 # When `lightning-cli plugin stop cl-hive` is called, CLN sends SIGTERM.
 
 shutdown_event = threading.Event()
-
-# Global RPC pool instance (initialized in init)
-_rpc_pool: Optional[RpcPool] = None
 
 # Bounded thread pool for message dispatch (prevents unbounded thread creation)
 _msg_executor: Optional[ThreadPoolExecutor] = None
@@ -310,35 +224,35 @@ membership_mgr: Optional[MembershipManager] = None
 contribution_mgr: Optional[ContributionManager] = None
 planner: Optional[Planner] = None
 decision_engine: Optional[DecisionEngine] = None
-vpn_transport: Optional[VPNTransportManager] = None
-coop_expansion: Optional[CooperativeExpansionManager] = None
+vpn_transport: Optional[Any] = None  # Removed (VPNTransportManager deleted)
+coop_expansion: Optional[Any] = None  # Removed (CooperativeExpansionManager deleted)
 fee_intel_mgr: Optional[FeeIntelligenceManager] = None
 traffic_intel_mgr: Optional[TrafficIntelligenceManager] = None
 health_aggregator: Optional[HealthScoreAggregator] = None
 liquidity_coord: Optional[LiquidityCoordinator] = None
-splice_coord: Optional[SpliceCoordinator] = None
+splice_coord: Optional[Any] = None  # Removed (SpliceCoordinator deleted)
 routing_map: Optional[HiveRoutingMap] = None
 peer_reputation_mgr: Optional[PeerReputationManager] = None
-routing_pool: Optional[RoutingPool] = None
-settlement_mgr: Optional[SettlementManager] = None
+routing_pool: Optional[Any] = None  # Removed (RoutingPool deleted)
+settlement_mgr: Optional[Any] = None  # Removed (SettlementManager deleted)
 yield_metrics_mgr: Optional[YieldMetricsManager] = None
 fee_coordination_mgr: Optional[FeeCoordinationManager] = None
-cost_reduction_mgr: Optional[CostReductionManager] = None
+cost_reduction_mgr: Optional[Any] = None  # Removed (CostReductionManager deleted)
 rationalization_mgr: Optional[RationalizationManager] = None
 strategic_positioning_mgr: Optional[StrategicPositioningManager] = None
 anticipatory_liquidity_mgr: Optional[AnticipatoryLiquidityManager] = None
 quality_scorer_mgr: Optional[PeerQualityScorer] = None
-task_mgr: Optional[TaskManager] = None
-splice_mgr: Optional[SpliceManager] = None
+task_mgr: Optional[Any] = None  # Removed (TaskManager deleted)
+splice_mgr: Optional[Any] = None  # Removed (SpliceManager deleted)
 relay_mgr: Optional[RelayManager] = None
 outbox_mgr: Optional[OutboxManager] = None
-did_credential_mgr: Optional[DIDCredentialManager] = None
-management_schema_registry: Optional[ManagementSchemaRegistry] = None
-cashu_escrow_mgr: Optional[CashuEscrowManager] = None
-nostr_transport: Optional[TransportInterface] = None
-identity_adapter: Optional[IdentityInterface] = None
-marketplace_mgr: Optional[MarketplaceManager] = None
-liquidity_mgr: Optional[LiquidityMarketplaceManager] = None
+did_credential_mgr: Optional[Any] = None  # Removed (DIDCredentialManager deleted)
+management_schema_registry: Optional[Any] = None  # Removed
+cashu_escrow_mgr: Optional[Any] = None  # Removed (CashuEscrowManager deleted)
+nostr_transport: Optional[Any] = None  # Removed (ExternalCommsTransport deleted)
+identity_adapter: Optional[Any] = None  # Removed (IdentityInterface deleted)
+marketplace_mgr: Optional[Any] = None  # Removed (MarketplaceManager deleted)
+liquidity_mgr: Optional[Any] = None  # Removed (LiquidityMarketplaceManager deleted)
 policy_engine: Optional[Any] = None
 our_pubkey: Optional[str] = None
 phase6_optional_plugins: Dict[str, Any] = {
@@ -519,31 +433,20 @@ def _get_hive_context() -> HiveContext:
     _database = database if database is not None else None
     _config = config if config is not None else None
     _our_pubkey = our_pubkey if our_pubkey is not None else None
-    _vpn_transport = vpn_transport if vpn_transport is not None else None
     _planner = planner if planner is not None else None
     _bridge = bridge if bridge is not None else None
     _intent_mgr = intent_mgr if intent_mgr is not None else None
     _membership_mgr = membership_mgr if membership_mgr is not None else None
-    _coop_expansion = coop_expansion if coop_expansion is not None else None
     _contribution_mgr = contribution_mgr if contribution_mgr is not None else None
-    _routing_pool = routing_pool if routing_pool is not None else None
     _yield_metrics_mgr = yield_metrics_mgr if yield_metrics_mgr is not None else None
     _liquidity_coord = liquidity_coord if liquidity_coord is not None else None
     _fee_coordination_mgr = fee_coordination_mgr if fee_coordination_mgr is not None else None
-    _cost_reduction_mgr = cost_reduction_mgr if cost_reduction_mgr is not None else None
     _rationalization_mgr = rationalization_mgr if rationalization_mgr is not None else None
     _strategic_positioning_mgr = strategic_positioning_mgr if strategic_positioning_mgr is not None else None
     _anticipatory_liquidity_mgr = anticipatory_liquidity_mgr if anticipatory_liquidity_mgr is not None else None
-    _nostr_transport = nostr_transport if nostr_transport is not None else None
-    _identity_adapter = identity_adapter if identity_adapter is not None else None
     _phase6_plugins = phase6_optional_plugins if isinstance(phase6_optional_plugins, dict) else {}
     _comms_active = bool(_phase6_plugins.get("cl_hive_comms", {}).get("active"))
     _archon_active = bool(_phase6_plugins.get("cl_hive_archon", {}).get("active"))
-    _signing_backend = "unknown"
-    if isinstance(_identity_adapter, RemoteArchonIdentity):
-        _signing_backend = "cl-hive-archon"
-    elif _identity_adapter is None:
-        _signing_backend = "none"
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -554,33 +457,33 @@ def _get_hive_context() -> HiveContext:
         config=_config,
         safe_plugin=plugin,  # Direct plugin access - pyln-client is thread-safe per-call
         our_pubkey=_our_pubkey,
-        vpn_transport=_vpn_transport,
+        vpn_transport=None,  # Removed
         planner=_planner,
         quality_scorer=quality_scorer_mgr if quality_scorer_mgr is not None else None,
         bridge=_bridge,
         intent_mgr=_intent_mgr,
         membership_mgr=_membership_mgr,
-        coop_expansion_mgr=_coop_expansion,
+        coop_expansion_mgr=None,  # Removed
         contribution_mgr=_contribution_mgr,
-        routing_pool=_routing_pool,
+        routing_pool=None,  # Removed
         yield_metrics_mgr=_yield_metrics_mgr,
         liquidity_coordinator=_liquidity_coord,
         fee_coordination_mgr=_fee_coordination_mgr,
-        cost_reduction_mgr=_cost_reduction_mgr,
+        cost_reduction_mgr=None,  # Removed
         rationalization_mgr=_rationalization_mgr,
         strategic_positioning_mgr=_strategic_positioning_mgr,
         anticipatory_manager=_anticipatory_liquidity_mgr,
-        did_credential_mgr=did_credential_mgr,
-        management_schema_registry=management_schema_registry,
-        cashu_escrow_mgr=cashu_escrow_mgr,
-        nostr_transport=_nostr_transport,
-        marketplace_mgr=marketplace_mgr,
-        liquidity_mgr=liquidity_mgr,
+        did_credential_mgr=None,  # Removed
+        management_schema_registry=None,  # Removed
+        cashu_escrow_mgr=None,  # Removed
+        nostr_transport=None,  # Removed
+        marketplace_mgr=None,  # Removed
+        liquidity_mgr=None,  # Removed
         traffic_intel_mgr=traffic_intel_mgr,
-        nostr_transport_enabled=bool(_nostr_transport),
+        nostr_transport_enabled=False,  # Removed
         comms_active=_comms_active,
         archon_active=_archon_active,
-        signing_backend=_signing_backend,
+        signing_backend="none",  # Removed (identity_adapter deleted)
         policy_engine=policy_engine,
         our_id=_our_pubkey or "",
         log=_log,
@@ -657,9 +560,9 @@ def _reload_config_from_cln(plugin_obj: Plugin) -> Dict[str, Any]:
 
     Returns dict with list of updated options and any errors.
     """
-    global config, vpn_transport
+    global config
 
-    results = {"updated": [], "errors": [], "vpn_reconfigured": False}
+    results = {"updated": [], "errors": []}
 
     # Reload standard config options
     for option_name, (attr_name, attr_type) in OPTION_TO_CONFIG_MAP.items():
@@ -693,21 +596,6 @@ def _reload_config_from_cln(plugin_obj: Plugin) -> Dict[str, Any]:
         if validation_error:
             results["errors"].append({"validation": validation_error})
 
-    # Reload VPN options if VPN transport is active
-    if vpn_transport is not None:
-        try:
-            vpn_result = vpn_transport.configure(
-                mode=plugin_obj.get_option('hive-transport-mode'),
-                vpn_subnets=plugin_obj.get_option('hive-vpn-subnets'),
-                vpn_bind=plugin_obj.get_option('hive-vpn-bind'),
-                vpn_peers=plugin_obj.get_option('hive-vpn-peers'),
-                required_messages=plugin_obj.get_option('hive-vpn-required-messages')
-            )
-            results["vpn_reconfigured"] = True
-            results["vpn_mode"] = vpn_result.get('mode', 'unknown')
-        except Exception as e:
-            results["errors"].append({"vpn": str(e)})
-
     return results
 
 
@@ -721,18 +609,7 @@ def _submit_hive_message(peer_id: str, msg_type: HiveMessageType, msg_payload: D
     if not peer_id or msg_type is None or not isinstance(msg_payload, dict):
         return False
 
-    # VPN Transport Policy Check
-    if vpn_transport and vpn_transport.is_enabled():
-        accept, reason = vpn_transport.should_accept_hive_message(
-            peer_id=peer_id,
-            message_type=msg_type.name if msg_type else "",
-        )
-        if not accept:
-            plugin_obj.log(
-                f"cl-hive: VPN policy rejected {msg_type.name} from {peer_id[:16]}...: {reason}",
-                level='info'
-            )
-            return False
+    # VPN Transport Policy Check — removed (vpn_transport deleted)
 
     # Dispatch to a background thread so ingress paths return immediately.
     if _msg_executor is not None:
@@ -787,14 +664,8 @@ def _handle_external_transport_dm(envelope: Dict[str, Any]) -> None:
 
 
 def _external_transport_pump():
-    """Drain injected packets from ExternalCommsTransport and dispatch to DM callbacks."""
-    while not shutdown_event.is_set():
-        try:
-            if nostr_transport and isinstance(nostr_transport, ExternalCommsTransport):
-                nostr_transport.process_inbound()
-        except Exception as exc:
-            plugin.log(f"cl-hive: external transport pump error: {exc}", level="warn")
-        shutdown_event.wait(0.1)
+    """Removed — ExternalCommsTransport deleted."""
+    pass
 
 
 # =============================================================================
@@ -816,10 +687,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     Note: pyln-client is inherently thread-safe (opens new socket per RPC call),
     so no RPC locking is needed. The global 'plugin' object is used directly.
     """
-    global database, config, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge, vpn_transport, relay_mgr, phase6_optional_plugins
+    global database, config, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge, relay_mgr, phase6_optional_plugins
 
     plugin.log("cl-hive: Initializing Swarm Intelligence layer...")
-    
+
     # Build configuration from options
     config = HiveConfig(
         db_path=options.get('hive-db-path', '~/.lightning/cl_hive.db'),
@@ -851,35 +722,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rpc_pool_size=int(options.get('hive-rpc-pool-size', '3')),
     )
 
-    # Initialize RPC pool (Phase 3 — bounded execution via subprocess isolation)
-    # Resolve the CLN RPC socket path for pool workers.
-    # NOTE: We start the pool now but install the proxy at the END of init.
-    # Reason: spawn-context workers take several seconds to start, but init
-    # needs immediate RPC calls (getinfo, listpeerchannels, setchannel).
-    # By the end of init, workers are ready for background thread use.
-    global _rpc_pool, _msg_executor, _batched_log_writer
+    # Thread pool for message dispatch
+    global _msg_executor, _batched_log_writer
     _msg_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="hive_msg")
 
     # Install batched log writer to prevent IO thread starvation.
     # Must be BEFORE any background loops start logging.
     _batched_log_writer = BatchedLogWriter(plugin)
-
-    _rpc_socket_path = getattr(plugin.rpc, "socket_path", None)
-    if not _rpc_socket_path:
-        ldir = configuration.get("lightning-dir") or configuration.get("lightning_dir")
-        rpcfile = configuration.get("rpc-file") or configuration.get("rpc_file")
-        if ldir and rpcfile:
-            _rpc_socket_path = rpcfile if os.path.isabs(rpcfile) else os.path.join(ldir, rpcfile)
-    if not _rpc_socket_path:
-        ldir = configuration.get("lightning-dir") or "~/.lightning"
-        _rpc_socket_path = os.path.expanduser(os.path.join(ldir, "lightning-rpc"))
-
-    _rpc_pool = RpcPool(
-        socket_path=str(_rpc_socket_path),
-        log_fn=lambda msg, level="info": plugin.log(msg, level=level),
-        pool_size=config.rpc_pool_size,
-    )
-    plugin.log(f"cl-hive: RPC pool started (workers={config.rpc_pool_size}, socket={_rpc_socket_path})")
 
     # Initialize database
     database = HiveDatabase(config.db_path, plugin)
@@ -1080,20 +929,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     decision_engine = DecisionEngine(database=database, plugin=plugin)
     plugin.log("cl-hive: DecisionEngine initialized")
 
-    # Initialize VPN Transport Manager
-    vpn_transport = VPNTransportManager(plugin=plugin)
-    vpn_result = vpn_transport.configure(
-        mode=options.get('hive-transport-mode', 'any'),
-        vpn_subnets=options.get('hive-vpn-subnets', ''),
-        vpn_bind=options.get('hive-vpn-bind', ''),
-        vpn_peers=options.get('hive-vpn-peers', ''),
-        required_messages=options.get('hive-vpn-required-messages', 'all')
-    )
-    if vpn_transport.is_enabled():
-        plugin.log(f"cl-hive: VPN transport ENABLED - mode={vpn_result['mode']}, subnets={len(vpn_result['subnets'])}")
-    else:
-        plugin.log("cl-hive: VPN transport configured (mode=any, not enforcing)")
-
     # Initialize Planner (Phase 6)
     global planner
     planner = Planner(
@@ -1113,18 +948,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         daemon=True
     ))
 
-    # Initialize Cooperative Expansion Manager (Phase 6.4)
-    global coop_expansion, quality_scorer_mgr
+    # Initialize Quality Scorer (kept for planner use)
+    global quality_scorer_mgr
     quality_scorer = PeerQualityScorer(database, plugin)
     quality_scorer_mgr = quality_scorer
-    coop_expansion = CooperativeExpansionManager(
-        database=database,
-        quality_scorer=quality_scorer,
-        plugin=plugin,
-        our_id=our_pubkey,
-        config_getter=lambda: config  # Provides access to budget settings
-    )
-    plugin.log("cl-hive: Cooperative expansion manager initialized")
 
     # Initialize Fee Intelligence Manager (Phase 7 - Cooperative Fee Coordination)
     global fee_intel_mgr
@@ -1157,14 +984,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         daemon=True
     ))
 
-    # Distributed settlement loop thread (Phase 12)
-    _deferred_threads.append(threading.Thread(
-        target=background_loops.settlement_loop,
-        name="cl-hive-settlement",
-        daemon=True
-    ))
-
-    # Load persisted fee tracking state (Settlement Phase)
+    # Load persisted fee tracking state
     _load_fee_tracking_state()
     plugin.log("cl-hive: Fee tracking state loaded")
 
@@ -1179,22 +999,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Liquidity coordinator initialized")
 
-    # Initialize Splice Coordinator (Phase 3 - Splice Coordination)
-    global splice_coord
-    splice_coord = SpliceCoordinator(
-        database=database,
-        plugin=plugin,
-        state_manager=state_manager
-    )
-    plugin.log("cl-hive: Splice coordinator initialized")
-
-    # Link cooperation modules to Planner (Phase 7 - Cooperation Module Synergies)
-    # These modules were initialized after the planner, so we set them via setter
+    # Link cooperation modules to Planner
     planner.set_cooperation_modules(
         liquidity_coordinator=liquidity_coord,
-        splice_coordinator=splice_coord,
         health_aggregator=health_aggregator,
-        cooperative_expansion=coop_expansion
     )
     plugin.log("cl-hive: Planner linked to cooperation modules")
 
@@ -1220,16 +1028,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     peer_reputation_mgr.aggregate_from_database()
     plugin.log("cl-hive: Peer reputation manager initialized")
 
-    # Initialize Routing Pool (Phase 0 - Collective Economics)
-    global routing_pool
-    routing_pool = RoutingPool(
-        database=database,
-        plugin=plugin,
-        state_manager=state_manager
-    )
-    routing_pool.set_our_pubkey(our_pubkey)
-    plugin.log("cl-hive: Routing pool initialized (collective economics)")
-
     # Initialize Network Metrics Calculator (shared module)
     network_metrics.init_calculator(
         state_manager=state_manager,
@@ -1237,16 +1035,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin=plugin
     )
     plugin.log("cl-hive: Network metrics calculator initialized")
-
-    # Initialize Settlement Manager (BOLT12 revenue distribution)
-    global settlement_mgr
-    settlement_mgr = SettlementManager(
-        database=database,
-        plugin=plugin,
-        rpc=plugin.rpc
-    )
-    settlement_mgr.initialize_tables()
-    plugin.log("cl-hive: Settlement manager initialized (BOLT12 payouts)")
 
     # Initialize Yield Metrics Manager (Phase 1 - Metrics & Measurement)
     global yield_metrics_mgr
@@ -1283,25 +1071,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     except Exception as e:
         plugin.log(f"cl-hive: Failed to restore routing intelligence: {e}", level='warn')
 
-    # Initialize Cost Reduction Manager (Phase 3 - Cost Reduction)
-    global cost_reduction_mgr
-    cost_reduction_mgr = CostReductionManager(
-        plugin=plugin,
-        database=database,
-        state_manager=state_manager,
-        yield_metrics_mgr=yield_metrics_mgr,
-        liquidity_coordinator=liquidity_coord
-    )
-    cost_reduction_mgr.set_our_pubkey(our_pubkey)
-    plugin.log("cl-hive: Cost reduction manager initialized")
-
-    # MCF optimization background thread (Phase 15)
-    _deferred_threads.append(threading.Thread(
-        target=background_loops.mcf_optimization_loop,
-        name="cl-hive-mcf-optimization",
-        daemon=True
-    ))
-
     # Initialize Rationalization Manager (Channel Rationalization)
     global rationalization_mgr
     rationalization_mgr = RationalizationManager(
@@ -1313,11 +1082,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     rationalization_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Rationalization manager initialized")
-
-    # Wire rationalization manager to cooperative expansion (slime mold coordination)
-    if coop_expansion:
-        coop_expansion.set_rationalization_manager(rationalization_mgr)
-        plugin.log("cl-hive: Cooperative expansion linked to rationalization (redundancy checks enabled)")
 
     # Initialize Strategic Positioning Manager (Phase 5 - Strategic Positioning)
     global strategic_positioning_mgr
@@ -1357,25 +1121,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Phase 3c: Wire traffic intelligence into fee coordination
     fee_coordination_mgr.set_traffic_intel_mgr(traffic_intel_mgr)
 
-    # Initialize Task Manager (Phase 10 - Task Delegation Protocol)
-    global task_mgr
-    task_mgr = TaskManager(
-        database=database,
-        plugin=plugin,
-        our_pubkey=our_pubkey
-    )
-    plugin.log("cl-hive: Task manager initialized")
-
-    # Initialize Splice Manager (Phase 11 - Hive-Splice Coordination)
-    global splice_mgr
-    splice_mgr = SpliceManager(
-        database=database,
-        plugin=plugin,
-        splice_coordinator=splice_coord,
-        our_pubkey=our_pubkey
-    )
-    plugin.log("cl-hive: Splice manager initialized")
-
     # Initialize Outbox Manager (Phase D - Reliable Delivery)
     global outbox_mgr
     outbox_mgr = OutboxManager(
@@ -1394,190 +1139,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         daemon=True
     ))
 
-    _phase6_plugins = phase6_optional_plugins if isinstance(phase6_optional_plugins, dict) else {}
-    _comms_active = bool(_phase6_plugins.get("cl_hive_comms", {}).get("active"))
-    _archon_active = bool(_phase6_plugins.get("cl_hive_archon", {}).get("active"))
-    _companion_stack_active = _comms_active and _archon_active
-
-    # Phase 16 / Phase 5 ecosystem features are optional and require the
-    # companion plugin stack (comms + archon) to be active.
-    global did_credential_mgr
-    global management_schema_registry
-    global cashu_escrow_mgr
-    did_credential_mgr = None
-    management_schema_registry = None
-    cashu_escrow_mgr = None
-
-    if _companion_stack_active:
-        # Phase 16: DID Credential Manager
-        did_credential_mgr = DIDCredentialManager(
-            database=database,
-            plugin=plugin,
-            rpc=plugin.rpc,
-            our_pubkey=our_pubkey,
-        )
-        plugin.log("cl-hive: DID credential manager initialized")
-
-        # Phase 2: Management Schema Registry
-        management_schema_registry = ManagementSchemaRegistry(
-            database=database,
-            plugin=plugin,
-            rpc=plugin.rpc,
-            our_pubkey=our_pubkey,
-        )
-        plugin.log("cl-hive: Management schema registry initialized")
-    else:
-        plugin.log(
-            "cl-hive: DID/schema/cashu/marketplace features disabled "
-            "(requires active cl-hive-comms and cl-hive-archon companion plugins)",
-            level='info'
-        )
-
-    # Wire DID credential manager into planner for reputation-weighted expansion
-    if planner and did_credential_mgr:
-        planner.did_credential_mgr = did_credential_mgr
-
-    # Wire DID credential manager into membership manager for promotion signals
-    if membership_mgr and did_credential_mgr:
-        membership_mgr.did_credential_mgr = did_credential_mgr
-
-    # Wire DID credential manager into settlement manager for reputation metadata
-    if settlement_mgr and did_credential_mgr:
-        settlement_mgr.did_credential_mgr = did_credential_mgr
-
-    if _companion_stack_active:
-        # DID maintenance background thread
-        _deferred_threads.append(threading.Thread(
-            target=background_loops.did_maintenance_loop,
-            name="cl-hive-did-maintenance",
-            daemon=True
-        ))
-
-        # Phase 4A: Cashu Escrow Manager
-        mint_urls_str = plugin.get_option('hive-cashu-mints')
-        acceptable_mints = [u.strip() for u in mint_urls_str.split(',') if u.strip()] if mint_urls_str else []
-        cashu_escrow_mgr = CashuEscrowManager(
-            database=database,
-            plugin=plugin,
-            rpc=plugin.rpc,
-            our_pubkey=our_pubkey,
-            acceptable_mints=acceptable_mints,
-        )
-        plugin.log("cl-hive: Cashu escrow manager initialized")
-
-        # Phase 4B: Wire extended settlement types into settlement manager
-        if settlement_mgr and cashu_escrow_mgr:
-            settlement_mgr.register_extended_types(cashu_escrow_mgr, did_credential_mgr)
-            plugin.log("cl-hive: Extended settlement types registered")
-
-        # Escrow maintenance background thread
-        _deferred_threads.append(threading.Thread(
-            target=background_loops.escrow_maintenance_loop,
-            name="cl-hive-escrow-maintenance",
-            daemon=True
-        ))
-
-    # Phase 5A/6: Nostr transport — external companion plugin only (cl-hive-comms)
-    global nostr_transport
-    try:
-        comms_active = phase6_optional_plugins["cl_hive_comms"]["active"]
-
-        if comms_active:
-            # Delegate transport to cl-hive-comms
-            nostr_transport = ExternalCommsTransport(plugin=plugin)
-            nostr_transport.receive_dm(_handle_external_transport_dm)
-            identity = nostr_transport.get_identity()
-            plugin.log(
-                f"cl-hive: Using External Transport (cl-hive-comms), "
-                f"pubkey={identity.get('pubkey', '')[:16]}..."
-            )
-            # Start inbound pump thread to drain injected packets
-            threading.Thread(
-                target=_external_transport_pump,
-                daemon=True,
-                name="cl-hive-ext-pump",
-            ).start()
-        else:
-            nostr_transport = None
-            relays_opt = plugin.get_option('hive-nostr-relays')
-            if relays_opt:
-                plugin.log(
-                    "cl-hive: hive-nostr-relays is ignored; internal Nostr transport has been removed",
-                    level='warn'
-                )
-            plugin.log(
-                "cl-hive: Nostr transport disabled (cl-hive-comms not active; "
-                "companion plugin is optional, transport features unavailable)",
-                level='warn'
-            )
-    except Exception as e:
-        nostr_transport = None
-        plugin.log(f"cl-hive: Nostr transport disabled (init error): {e}", level='warn')
-
-    # Phase 6: Identity adapter — optional archon delegation, local signing remains supported
-    global identity_adapter
-    try:
-        archon_active = phase6_optional_plugins["cl_hive_archon"]["active"]
-        if archon_active:
-            identity_adapter = RemoteArchonIdentity(plugin=plugin)
-            _rpc_pool_mod.identity_adapter = identity_adapter
-            plugin.log("cl-hive: Using Remote Identity (cl-hive-archon)")
-        else:
-            identity_adapter = None
-            _rpc_pool_mod.identity_adapter = None
-            plugin.log(
-                "cl-hive: Identity adapter not available; "
-                "install cl-hive-archon for delegated signing"
-            )
-    except Exception as e:
-        identity_adapter = None
-        _rpc_pool_mod.identity_adapter = None
-        plugin.log(f"cl-hive: Identity adapter disabled (init error): {e}", level='warn')
-
-    # Phase 5B/5C marketplace features (only with companion stack)
-    global marketplace_mgr
-    global liquidity_mgr
-    marketplace_mgr = None
-    liquidity_mgr = None
-    if _companion_stack_active:
-        try:
-            marketplace_mgr = MarketplaceManager(
-                database=database,
-                plugin=plugin,
-                nostr_transport=nostr_transport,
-                did_credential_mgr=did_credential_mgr,
-                management_schema_registry=management_schema_registry,
-                cashu_escrow_mgr=cashu_escrow_mgr,
-            )
-            plugin.log("cl-hive: Marketplace manager initialized")
-        except Exception as e:
-            marketplace_mgr = None
-            plugin.log(f"cl-hive: Marketplace manager disabled (init error): {e}", level='warn')
-
-        try:
-            liquidity_mgr = LiquidityMarketplaceManager(
-                database=database,
-                plugin=plugin,
-                nostr_transport=nostr_transport,
-                cashu_escrow_mgr=cashu_escrow_mgr,
-                settlement_mgr=settlement_mgr,
-                did_credential_mgr=did_credential_mgr,
-            )
-            plugin.log("cl-hive: Liquidity marketplace manager initialized")
-        except Exception as e:
-            liquidity_mgr = None
-            plugin.log(f"cl-hive: Liquidity manager disabled (init error): {e}", level='warn')
-
-        _deferred_threads.append(threading.Thread(
-            target=background_loops.marketplace_maintenance_loop,
-            name="cl-hive-marketplace-maintenance",
-            daemon=True,
-        ))
-        _deferred_threads.append(threading.Thread(
-            target=background_loops.liquidity_maintenance_loop,
-            name="cl-hive-liquidity-maintenance",
-            daemon=True,
-        ))
+    # Removed modules: DID, cashu, marketplace, liquidity marketplace,
+    # nostr transport, identity adapter — all deleted in simplification
 
     # Link anticipatory manager to fee coordination for time-based fees (Phase 7.4)
     if fee_coordination_mgr:
@@ -1617,31 +1180,31 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'membership_mgr': membership_mgr,
         'contribution_mgr': contribution_mgr,
         'bridge': bridge,
-        'vpn_transport': vpn_transport,
+        'vpn_transport': None,  # Removed
         'relay_mgr': relay_mgr,
-        'coop_expansion': coop_expansion,
+        'coop_expansion': None,  # Removed
         'fee_intel_mgr': fee_intel_mgr,
         'health_aggregator': health_aggregator,
         'liquidity_coord': liquidity_coord,
         'routing_map': routing_map,
         'peer_reputation_mgr': peer_reputation_mgr,
-        'routing_pool': routing_pool,
-        'settlement_mgr': settlement_mgr,
+        'routing_pool': None,  # Removed
+        'settlement_mgr': None,  # Removed
         'yield_metrics_mgr': yield_metrics_mgr,
         'fee_coordination_mgr': fee_coordination_mgr,
-        'cost_reduction_mgr': cost_reduction_mgr,
+        'cost_reduction_mgr': None,  # Removed
         'rationalization_mgr': rationalization_mgr,
         'strategic_positioning_mgr': strategic_positioning_mgr,
         'anticipatory_liquidity_mgr': anticipatory_liquidity_mgr,
-        'task_mgr': task_mgr,
-        'splice_mgr': splice_mgr,
+        'task_mgr': None,  # Removed
+        'splice_mgr': None,  # Removed
         'outbox_mgr': outbox_mgr,
-        'did_credential_mgr': did_credential_mgr,
-        'management_schema_registry': management_schema_registry,
-        'cashu_escrow_mgr': cashu_escrow_mgr,
+        'did_credential_mgr': None,  # Removed
+        'management_schema_registry': None,  # Removed
+        'cashu_escrow_mgr': None,  # Removed
         'traffic_intel_mgr': traffic_intel_mgr,
         'peer_available_limiter': peer_available_limiter,
-        'outbox': outbox_mgr,  # handlers reference 'outbox' for the outbox manager
+        'outbox': outbox_mgr,
         # Fee tracking state
         '_local_fees_lock': _local_fees_lock,
         '_local_fees_earned_sats': _local_fees_earned_sats,
@@ -1672,13 +1235,13 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'intent_mgr': intent_mgr,
         'membership_mgr': membership_mgr,
         'contribution_mgr': contribution_mgr,
-        'did_credential_mgr': did_credential_mgr,
-        'cashu_escrow_mgr': cashu_escrow_mgr,
-        'marketplace_mgr': marketplace_mgr,
-        'liquidity_mgr': liquidity_mgr,
+        'did_credential_mgr': None,  # Removed
+        'cashu_escrow_mgr': None,  # Removed
+        'marketplace_mgr': None,  # Removed
+        'liquidity_mgr': None,  # Removed
         'outbox_mgr': outbox_mgr,
         'planner': planner,
-        'coop_expansion': coop_expansion,
+        'coop_expansion': None,  # Removed
         'fee_intel_mgr': fee_intel_mgr,
         'gossip_mgr': gossip_mgr,
         'bridge': bridge,
@@ -1689,12 +1252,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'anticipatory_liquidity_mgr': anticipatory_liquidity_mgr,
         'strategic_positioning_mgr': strategic_positioning_mgr,
         'rationalization_mgr': rationalization_mgr,
-        'cost_reduction_mgr': cost_reduction_mgr,
+        'cost_reduction_mgr': None,  # Removed
         'traffic_intel_mgr': traffic_intel_mgr,
-        'settlement_mgr': settlement_mgr,
+        'settlement_mgr': None,  # Removed
         'liquidity_coord': liquidity_coord,
-        'routing_pool': routing_pool,
-        'splice_mgr': splice_mgr,
+        'routing_pool': None,  # Removed
+        'splice_mgr': None,  # Removed
         'BAN_PROPOSAL_TTL_SECONDS': protocol_handlers.BAN_PROPOSAL_TTL_SECONDS,
     })
     plugin.log("cl-hive: Background loops initialized")
@@ -1729,34 +1292,15 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Set up graceful shutdown handler
     def handle_shutdown_signal(signum, frame):
         plugin.log("cl-hive: Received shutdown signal, cleaning up...")
-        # Signal background threads to stop FIRST so they don't try to
-        # use resources we're about to tear down.
         shutdown_event.set()
         try:
             if fee_coordination_mgr:
                 fee_coordination_mgr.save_state_to_database()
         except Exception:
             pass  # Best-effort on shutdown
-        # Cancel queued message tasks BEFORE tearing down the RPC pool
-        # they depend on — prevents queued tasks from starting with dead RPC.
         try:
             if _msg_executor:
                 _msg_executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass  # Best-effort on shutdown
-        try:
-            if _rpc_pool:
-                _rpc_pool.stop()
-        except Exception:
-            pass  # Best-effort on shutdown
-        try:
-            if nostr_transport:
-                nostr_transport.stop()
-        except Exception:
-            pass  # Best-effort on shutdown
-        try:
-            if cashu_escrow_mgr:
-                cashu_escrow_mgr.shutdown()
         except Exception:
             pass  # Best-effort on shutdown
         try:
@@ -1764,34 +1308,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 _batched_log_writer.stop()
         except Exception:
             pass  # Best-effort on shutdown
-    
+
     try:
         signal.signal(signal.SIGTERM, handle_shutdown_signal)
         signal.signal(signal.SIGINT, handle_shutdown_signal)
     except Exception as e:
         plugin.log(f"cl-hive: Could not set signal handlers: {e}", level='debug')
-    
-    # Install RPC pool proxy now that init is complete and workers are ready.
-    # Background threads that access plugin.rpc will get bounded execution.
-    plugin.rpc = RpcPoolProxy(_rpc_pool, timeout=30)
-    plugin.log("cl-hive: RPC pool proxy installed")
-
-    # Re-assign thread-safe RPC proxy to managers that cached the raw
-    # plugin.rpc reference during init (before proxy was installed).
-    if handshake_mgr:
-        handshake_mgr.rpc = plugin.rpc
-    if bridge:
-        bridge.rpc = plugin.rpc
-    if contribution_mgr:
-        contribution_mgr.rpc = plugin.rpc
-    if settlement_mgr:
-        settlement_mgr.rpc = plugin.rpc
-    if did_credential_mgr:
-        did_credential_mgr.rpc = plugin.rpc
-    if management_schema_registry:
-        management_schema_registry.rpc = plugin.rpc
-    if cashu_escrow_mgr:
-        cashu_escrow_mgr.rpc = plugin.rpc
 
     plugin.log("cl-hive: Initialization complete. Swarm Intelligence ready.")
 
@@ -2102,10 +1624,6 @@ def on_peer_disconnected(**kwargs):
     if not peer_id or not database:
         return
 
-    # Update VPN transport tracking
-    if vpn_transport:
-        vpn_transport.on_peer_disconnected(peer_id)
-
     member = database.get_member(peer_id)
     if not member:
         return
@@ -2242,23 +1760,8 @@ def hive_phase6_plugins(plugin: Plugin):
 
 @plugin.method("hive-inject-packet")
 def hive_inject_packet(plugin: Plugin, payload=None, source="nostr", **kwargs):
-    """Inject an inbound packet from cl-hive-comms (Coordinated Mode only).
-
-    Requires an authenticated transport sender in `pubkey`/`sender_pubkey`.
-    The protocol payload's embedded `sender` is treated as untrusted and is
-    checked against this transport identity before dispatch.
-    """
-    comms_active = bool(phase6_optional_plugins.get("cl_hive_comms", {}).get("active"))
-    if not comms_active or not isinstance(nostr_transport, ExternalCommsTransport):
-        return {"error": "inject-packet only available in coordinated mode"}
-    if not isinstance(payload, dict):
-        return {"error": "payload must be a dict"}
-    transport_pubkey = kwargs.get("sender_pubkey") or kwargs.get("pubkey") or kwargs.get("sender")
-    if not isinstance(transport_pubkey, str) or not transport_pubkey.strip():
-        return {"error": "authenticated sender pubkey is required (use pubkey or sender_pubkey)"}
-    if not nostr_transport.inject_packet(payload, transport_pubkey=transport_pubkey.strip()):
-        return {"error": "queue full, packet dropped"}
-    return {"result": "queued", "source": source}
+    """Removed — nostr transport deleted."""
+    return {"error": "inject-packet removed (nostr transport deleted)"}
 
 
 @plugin.method("hive-connect")
@@ -2415,14 +1918,8 @@ def hive_health(plugin: Plugin):
 
 @plugin.method("hive-rpc-pool-status")
 def hive_rpc_pool_status(plugin: Plugin):
-    """Inspect cl-hive RPC pool health (workers, pending requests, dispatcher state)."""
-    global _rpc_pool
-    if _rpc_pool is None:
-        return {"status": "not_initialized"}
-    try:
-        return {"status": "ok", "rpc_pool": _rpc_pool.status()}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    """Removed — RPC pool deleted."""
+    return {"status": "removed", "note": "RPC pool was removed in simplification"}
 
 
 @plugin.method("hive-status")
@@ -2528,56 +2025,18 @@ def hive_reinit_bridge(plugin: Plugin):
 
 @plugin.method("hive-vpn-status")
 def hive_vpn_status(plugin: Plugin, peer_id: str = None):
-    """
-    Get VPN transport status and configuration.
-
-    Shows the current VPN transport mode, configured subnets, peer mappings,
-    and which hive members are connected via VPN.
-
-    Args:
-        peer_id: Optional - Get VPN info for a specific peer
-
-    Returns:
-        Dict with VPN transport configuration and status.
-
-    Permission: Member (read-only status)
-    """
-    return rpc_vpn_status(_get_hive_context(), peer_id)
-
+    """Removed — VPN transport deleted."""
+    return {"error": "VPN transport feature removed"}
 
 @plugin.method("hive-vpn-add-peer")
 def hive_vpn_add_peer(plugin: Plugin, pubkey: str, vpn_address: str):
-    """
-    Add or update a VPN peer mapping.
-
-    Maps a node's pubkey to its VPN address for routing hive gossip.
-
-    Args:
-        pubkey: Node pubkey
-        vpn_address: VPN address in format ip:port or just ip (default port 9735)
-
-    Returns:
-        Dict with result.
-
-    Permission: Admin only
-    """
-    return rpc_vpn_add_peer(_get_hive_context(), pubkey, vpn_address)
-
+    """Removed — VPN transport deleted."""
+    return {"error": "VPN transport feature removed"}
 
 @plugin.method("hive-vpn-remove-peer")
 def hive_vpn_remove_peer(plugin: Plugin, pubkey: str):
-    """
-    Remove a VPN peer mapping.
-
-    Args:
-        pubkey: Node pubkey to remove
-
-    Returns:
-        Dict with result.
-
-    Permission: Admin only
-    """
-    return rpc_vpn_remove_peer(_get_hive_context(), pubkey)
+    """Removed — VPN transport deleted."""
+    return {"error": "VPN transport feature removed"}
 
 
 @plugin.method("hive-members")
@@ -5875,101 +5334,34 @@ def hive_contribution(plugin: Plugin, peer_id: str = None):
 
 @plugin.method("hive-pool-status")
 def hive_pool_status(plugin: Plugin, period: str = None):
-    """
-    Get current routing pool status and statistics.
-
-    Args:
-        period: Optional period to query (format: YYYY-Www, defaults to current week)
-
-    Returns:
-        Dict with pool status including revenue, contributions, and distributions.
-    """
-    return rpc_pool_status(_get_hive_context(), period=period)
-
+    """Removed — routing pool deleted."""
+    return {"error": "Routing pool feature removed"}
 
 @plugin.method("hive-pool-member-status")
 def hive_pool_member_status(plugin: Plugin, peer_id: str = None):
-    """
-    Get routing pool status for a specific member.
-
-    Args:
-        peer_id: Member pubkey (defaults to self)
-
-    Returns:
-        Dict with member's pool status and history.
-    """
-    return rpc_pool_member_status(_get_hive_context(), peer_id=peer_id)
-
+    """Removed — routing pool deleted."""
+    return {"error": "Routing pool feature removed"}
 
 @plugin.method("hive-pool-snapshot")
 def hive_pool_snapshot(plugin: Plugin, period: str = None):
-    """
-    Trigger a contribution snapshot for all hive members.
-
-    Permission: Admin only
-
-    Args:
-        period: Optional period (format: YYYY-Www, defaults to current week)
-
-    Returns:
-        Dict with snapshot results.
-    """
-    return rpc_pool_snapshot(_get_hive_context(), period=period)
-
+    """Removed — routing pool deleted."""
+    return {"error": "Routing pool feature removed"}
 
 @plugin.method("hive-pool-distribution")
 def hive_pool_distribution(plugin: Plugin, period: str = None):
-    """
-    Calculate distribution amounts for a period (dry run).
-
-    Args:
-        period: Optional period (format: YYYY-Www, defaults to current week)
-
-    Returns:
-        Dict with calculated distribution amounts.
-    """
-    return rpc_pool_distribution(_get_hive_context(), period=period)
-
+    """Removed — routing pool deleted."""
+    return {"error": "Routing pool feature removed"}
 
 @plugin.method("hive-pool-settle")
 def hive_pool_settle(plugin: Plugin, period: str = None, dry_run: bool = True):
-    """
-    Settle a routing pool period and record distributions.
-
-    Permission: Admin only
-
-    Args:
-        period: Period to settle (format: YYYY-Www, defaults to PREVIOUS week)
-        dry_run: If True, calculate but don't record (default: True)
-
-    Returns:
-        Dict with settlement results.
-    """
-    return rpc_pool_settle(_get_hive_context(), period=period, dry_run=dry_run)
-
+    """Removed — routing pool deleted."""
+    return {"error": "Routing pool feature removed"}
 
 @plugin.method("hive-pool-record-revenue")
 def hive_pool_record_revenue(plugin: Plugin, amount_sats: int,
                               channel_id: str = None, payment_hash: str = None):
-    """
-    Manually record routing revenue to the pool.
-
-    Permission: Admin only
-
-    Args:
-        amount_sats: Revenue amount in satoshis
-        channel_id: Optional channel ID
-        payment_hash: Optional payment hash
-
-    Returns:
-        Dict with recording result.
-    """
-    return rpc_pool_record_revenue(
-        _get_hive_context(),
-        amount_sats=amount_sats,
-        channel_id=channel_id,
-        payment_hash=payment_hash
-    )
+    """Removed — routing pool deleted."""
+    return {"error": "Routing pool feature removed"}
 
 
 # =============================================================================
@@ -6206,14 +5598,8 @@ def hive_settlement_calculate(plugin: Plugin):
     Returns:
         Dict with calculated fair shares.
     """
-    from modules.settlement import MemberContribution
-
-    if not settlement_mgr:
-        return {"error": "Settlement manager not initialized"}
-    if not routing_pool:
-        return {"error": "Routing pool not initialized"}
-    if not database:
-        return {"error": "Database not initialized"}
+    # Settlement module removed in simplification
+    return {"error": "Settlement feature removed"}
 
     # Get our pubkey upfront to avoid scoping issues
     node_pubkey = our_pubkey
@@ -6338,14 +5724,8 @@ def hive_settlement_execute(plugin: Plugin, dry_run: bool = True):
     Returns:
         Dict with settlement execution result.
     """
-    from modules.settlement import MemberContribution, SettlementResult
-
-    if not settlement_mgr:
-        return {"error": "Settlement manager not initialized"}
-    if not routing_pool:
-        return {"error": "Routing pool not initialized"}
-    if not database:
-        return {"error": "Database not initialized"}
+    # Settlement module removed in simplification
+    return {"error": "Settlement feature removed"}
 
     # Get our pubkey upfront to avoid scoping issues
     node_pubkey = our_pubkey
@@ -6775,15 +6155,8 @@ def hive_backfill_fees(plugin: Plugin, period: str = None, source: str = "revenu
     Returns:
         Dict with backfill status and amounts
     """
-    if not database or not our_pubkey:
-        return {"error": "Plugin not initialized"}
-
-    from modules.settlement import SettlementManager
-    import datetime
-
-    # Determine period
-    if period is None:
-        period = SettlementManager.get_period_string()
+    # Settlement module removed in simplification
+    return {"error": "Settlement feature removed"}
 
     results = {
         "period": period,
@@ -6915,8 +6288,6 @@ def hive_fee_reports(plugin: Plugin, period: str = None):
     """
     if not database:
         return {"error": "Plugin not initialized"}
-
-    from modules.settlement import SettlementManager
 
     # Handle "latest" as a special case to get most recent per peer
     if period and period.lower() != "latest":
@@ -7580,55 +6951,15 @@ def hive_fee_coordination_status(plugin: Plugin):
 # =============================================================================
 
 @plugin.method("hive-rebalance-recommendations")
-def hive_rebalance_recommendations(
-    plugin: Plugin,
-    prediction_hours: int = 24
-):
-    """
-    Get predictive rebalance recommendations.
-
-    Analyzes channels to find those predicted to deplete or saturate,
-    with recommendations for preemptive rebalancing at lower fees.
-
-    Args:
-        prediction_hours: How far ahead to predict (default: 24)
-
-    Returns:
-        Dict with rebalance recommendations sorted by urgency.
-    """
-    return rpc_rebalance_recommendations(
-        _get_hive_context(),
-        prediction_hours=prediction_hours
-    )
-
+def hive_rebalance_recommendations(plugin: Plugin, prediction_hours: int = 24):
+    """Removed — cost reduction deleted."""
+    return {"error": "Cost reduction feature removed"}
 
 @plugin.method("hive-fleet-rebalance-path")
-def hive_fleet_rebalance_path(
-    plugin: Plugin,
-    from_channel: str,
-    to_channel: str,
-    amount_sats: int
-):
-    """
-    Get fleet rebalance path recommendation.
-
-    Checks if rebalancing through fleet members is cheaper than
-    external routing.
-
-    Args:
-        from_channel: Source channel SCID
-        to_channel: Destination channel SCID
-        amount_sats: Amount to rebalance
-
-    Returns:
-        Dict with path recommendation and savings estimate.
-    """
-    return rpc_fleet_rebalance_path(
-        _get_hive_context(),
-        from_channel=from_channel,
-        to_channel=to_channel,
-        amount_sats=amount_sats
-    )
+def hive_fleet_rebalance_path(plugin: Plugin, from_channel: str = "",
+                               to_channel: str = "", amount_sats: int = 0):
+    """Removed — cost reduction deleted."""
+    return {"error": "Cost reduction feature removed"}
 
 
 @plugin.method("hive-fleet-boltz-status")
@@ -7697,16 +7028,7 @@ def hive_report_rebalance_outcome(
     Returns:
         Dict with recording result and any circular flow warnings.
     """
-    return rpc_record_rebalance_outcome(
-        _get_hive_context(),
-        from_channel=from_channel,
-        to_channel=to_channel,
-        amount_sats=amount_sats,
-        cost_sats=cost_sats,
-        success=success,
-        via_fleet=via_fleet,
-        failure_reason=failure_reason
-    )
+    return {"error": "Cost reduction feature removed"}
 
 
 @plugin.method("hive-circular-flow-status")
@@ -7720,7 +7042,7 @@ def hive_circular_flow_status(plugin: Plugin):
     Returns:
         Dict with circular flow status and detected patterns.
     """
-    return rpc_circular_flow_status(_get_hive_context())
+    return {"error": "Cost reduction feature removed"}
 
 
 @plugin.method("hive-cost-reduction-status")
@@ -7733,7 +7055,7 @@ def hive_cost_reduction_status(plugin: Plugin):
     Returns:
         Dict with cost reduction status.
     """
-    return rpc_cost_reduction_status(_get_hive_context())
+    return {"error": "Cost reduction feature removed"}
 
 
 @plugin.method("hive-execute-circular-rebalance")
@@ -7769,14 +7091,7 @@ def hive_execute_circular_rebalance(
         # Execute the rebalance:
         lightning-cli hive-execute-circular-rebalance 933128x1345x0 933882x99x0 50000 null false
     """
-    return rpc_execute_hive_circular_rebalance(
-        _get_hive_context(),
-        from_channel=from_channel,
-        to_channel=to_channel,
-        amount_sats=amount_sats,
-        via_members=via_members,
-        dry_run=dry_run
-    )
+    return {"error": "Cost reduction feature removed"}
 
 
 # =============================================================================
@@ -7800,7 +7115,7 @@ def hive_mcf_status(plugin: Plugin):
         - solution_valid: Whether solution is still within validity window
         - our_assignments: Pending assignments for our node
     """
-    return rpc_mcf_status(_get_hive_context())
+    return {"error": "MCF optimizer feature removed"}
 
 
 @plugin.method("hive-mcf-solve")
@@ -7827,7 +7142,7 @@ def hive_mcf_solve(plugin: Plugin):
     Example:
         lightning-cli hive-mcf-solve
     """
-    return rpc_mcf_solve(_get_hive_context())
+    return {"error": "MCF optimizer feature removed"}
 
 
 @plugin.method("hive-mcf-assignments")
@@ -7844,7 +7159,7 @@ def hive_mcf_assignments(plugin: Plugin):
           to_channel, amount_sats, expected_cost_sats, priority
         - count: Number of pending assignments
     """
-    return rpc_mcf_assignments(_get_hive_context())
+    return {"error": "MCF optimizer feature removed"}
 
 
 @plugin.method("hive-mcf-optimized-path")
@@ -7876,12 +7191,7 @@ def hive_mcf_optimized_path(
     Example:
         lightning-cli hive-mcf-optimized-path 933128x1345x0 933882x99x0 100000
     """
-    return rpc_mcf_optimized_path(
-        _get_hive_context(),
-        from_channel=from_channel,
-        to_channel=to_channel,
-        amount_sats=amount_sats
-    )
+    return {"error": "MCF optimizer feature removed"}
 
 
 @plugin.method("hive-report-mcf-completion")
@@ -9075,24 +8385,11 @@ def hive_get_channel_ages(plugin: Plugin, scid: str = None):
 # =============================================================================
 
 @plugin.method("hive-did-issue")
-def hive_did_issue(plugin: Plugin, subject_id: str, domain: str,
-                   metrics_json: str, outcome: str = "neutral",
+def hive_did_issue(plugin: Plugin, subject_id: str = "", domain: str = "",
+                   metrics_json: str = "{}", outcome: str = "neutral",
                    evidence_json: str = "[]"):
-    """
-    Issue a DID reputation credential for a subject.
-
-    Args:
-        subject_id: Pubkey of the credential subject
-        domain: Credential domain (hive:advisor, hive:node, hive:client, agent:general)
-        metrics_json: JSON string of domain-specific metrics
-        outcome: 'renew', 'revoke', or 'neutral'
-        evidence_json: JSON array of evidence references
-
-    Example:
-        lightning-cli hive-did-issue 03abc... hive:node '{"routing_reliability":0.95,"uptime":0.99,"htlc_success_rate":0.98,"avg_fee_ppm":50}'
-    """
-    ctx = _get_hive_context()
-    return rpc_did_issue_credential(ctx, subject_id, domain, metrics_json, outcome, evidence_json)
+    """Removed — DID credentials deleted."""
+    return {"error": "DID credentials feature removed"}
 
 
 @plugin.method("hive-did-list")
@@ -9111,7 +8408,7 @@ def hive_did_list(plugin: Plugin, subject_id: str = "", domain: str = "",
         lightning-cli hive-did-list subject_id=03abc... domain=hive:node
     """
     ctx = _get_hive_context()
-    return rpc_did_list_credentials(ctx, subject_id, domain, issuer_id)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-did-revoke")
@@ -9127,7 +8424,7 @@ def hive_did_revoke(plugin: Plugin, credential_id: str, reason: str):
         lightning-cli hive-did-revoke "a1b2c3d4-..." "peer went offline permanently"
     """
     ctx = _get_hive_context()
-    return rpc_did_revoke_credential(ctx, credential_id, reason)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-did-reputation")
@@ -9144,7 +8441,7 @@ def hive_did_reputation(plugin: Plugin, subject_id: str, domain: str = ""):
         lightning-cli hive-did-reputation 03abc... hive:node
     """
     ctx = _get_hive_context()
-    return rpc_did_get_reputation(ctx, subject_id, domain)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-did-profiles")
@@ -9159,7 +8456,7 @@ def hive_did_profiles(plugin: Plugin):
         lightning-cli hive-did-profiles
     """
     ctx = _get_hive_context()
-    return rpc_did_list_profiles(ctx)
+    return {"error": "Feature removed"}
 
 
 # =============================================================================
@@ -9178,7 +8475,7 @@ def hive_schema_list(plugin: Plugin):
         lightning-cli hive-schema-list
     """
     ctx = _get_hive_context()
-    return rpc_schema_list(ctx)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-schema-validate")
@@ -9194,7 +8491,7 @@ def hive_schema_validate(plugin: Plugin, schema_id: str, action: str,
         lightning-cli hive-schema-validate hive:fee-policy/v1 set_single
     """
     ctx = _get_hive_context()
-    return rpc_schema_validate(ctx, schema_id, action, params_json)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-mgmt-credential-issue")
@@ -9212,9 +8509,7 @@ def hive_mgmt_credential_issue(plugin: Plugin, agent_id: str, tier: str,
         lightning-cli hive-mgmt-credential-issue 03abc... standard '["hive:fee-policy/*","hive:monitor/*"]'
     """
     ctx = _get_hive_context()
-    return rpc_mgmt_credential_issue(ctx, agent_id, tier,
-                                      allowed_schemas_json,
-                                      constraints_json, valid_days)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-mgmt-credential-list")
@@ -9228,7 +8523,7 @@ def hive_mgmt_credential_list(plugin: Plugin, agent_id: str = None,
         lightning-cli hive-mgmt-credential-list agent_id=03abc...
     """
     ctx = _get_hive_context()
-    return rpc_mgmt_credential_list(ctx, agent_id, node_id)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-mgmt-credential-revoke")
@@ -9243,7 +8538,7 @@ def hive_mgmt_credential_revoke(plugin: Plugin, credential_id: str):
         lightning-cli hive-mgmt-credential-revoke <credential-id>
     """
     ctx = _get_hive_context()
-    return rpc_mgmt_credential_revoke(ctx, credential_id)
+    return {"error": "Feature removed"}
 
 
 # =============================================================================
@@ -9262,8 +8557,7 @@ def hive_escrow_create(plugin: Plugin, agent_id: str, schema_id: str = "",
         lightning-cli hive-escrow-create agent_id=03abc... danger_score=5 amount_sats=100 mint_url=https://mint.example.com
     """
     ctx = _get_hive_context()
-    return rpc_escrow_create(ctx, agent_id, schema_id, action,
-                             danger_score, amount_sats, mint_url, ticket_type)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-escrow-list")
@@ -9277,7 +8571,7 @@ def hive_escrow_list(plugin: Plugin, agent_id: str = None,
         lightning-cli hive-escrow-list status=active
     """
     ctx = _get_hive_context()
-    return rpc_escrow_list(ctx, agent_id, status)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-escrow-redeem")
@@ -9289,7 +8583,7 @@ def hive_escrow_redeem(plugin: Plugin, ticket_id: str, preimage: str):
         lightning-cli hive-escrow-redeem ticket_id=abc123 preimage=deadbeef...
     """
     ctx = _get_hive_context()
-    return rpc_escrow_redeem(ctx, ticket_id, preimage)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-escrow-refund")
@@ -9301,7 +8595,7 @@ def hive_escrow_refund(plugin: Plugin, ticket_id: str):
         lightning-cli hive-escrow-refund ticket_id=abc123
     """
     ctx = _get_hive_context()
-    return rpc_escrow_refund(ctx, ticket_id)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-escrow-receipt")
@@ -9313,7 +8607,7 @@ def hive_escrow_receipt(plugin: Plugin, ticket_id: str):
         lightning-cli hive-escrow-receipt ticket_id=abc123
     """
     ctx = _get_hive_context()
-    return rpc_escrow_get_receipt(ctx, ticket_id)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-escrow-complete")
@@ -9328,10 +8622,7 @@ def hive_escrow_complete(plugin: Plugin, ticket_id: str, schema_id: str = "",
         lightning-cli hive-escrow-complete ticket_id=abc123 success=true
     """
     ctx = _get_hive_context()
-    return rpc_escrow_complete(
-        ctx, ticket_id, schema_id, action, params_json,
-        result_json, success, reveal_preimage
-    )
+    return {"error": "Feature removed"}
 
 
 # =============================================================================
@@ -9348,7 +8639,7 @@ def hive_bond_post(plugin: Plugin, amount_sats: int = 0,
         lightning-cli hive-bond-post amount_sats=50000
     """
     ctx = _get_hive_context()
-    return rpc_bond_post(ctx, amount_sats, tier)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-bond-status")
@@ -9361,7 +8652,7 @@ def hive_bond_status(plugin: Plugin, peer_id: str = None):
         lightning-cli hive-bond-status peer_id=03abc...
     """
     ctx = _get_hive_context()
-    return rpc_bond_status(ctx, peer_id)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-settlement-list")
@@ -9374,7 +8665,7 @@ def hive_settlement_list(plugin: Plugin, window_id: str = None,
         lightning-cli hive-settlement-list window_id=2024-W01
     """
     ctx = _get_hive_context()
-    return rpc_settlement_obligations_list(ctx, window_id, peer_id)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-settlement-net")
@@ -9388,7 +8679,7 @@ def hive_settlement_net(plugin: Plugin, window_id: str = "",
         lightning-cli hive-settlement-net window_id=2024-W01 peer_id=03abc...
     """
     ctx = _get_hive_context()
-    return rpc_settlement_net(ctx, window_id, peer_id)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-dispute-file")
@@ -9401,7 +8692,7 @@ def hive_dispute_file(plugin: Plugin, obligation_id: str = "",
         lightning-cli hive-dispute-file obligation_id=abc123 evidence_json='{"reason":"underpayment"}'
     """
     ctx = _get_hive_context()
-    return rpc_dispute_file(ctx, obligation_id, evidence_json)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-dispute-vote")
@@ -9414,7 +8705,7 @@ def hive_dispute_vote(plugin: Plugin, dispute_id: str = "",
         lightning-cli hive-dispute-vote dispute_id=abc123 vote=upheld reason="clear evidence"
     """
     ctx = _get_hive_context()
-    return rpc_dispute_vote(ctx, dispute_id, vote, reason)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-dispute-status")
@@ -9426,7 +8717,7 @@ def hive_dispute_status(plugin: Plugin, dispute_id: str = ""):
         lightning-cli hive-dispute-status dispute_id=abc123
     """
     ctx = _get_hive_context()
-    return rpc_dispute_status(ctx, dispute_id)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-credit-tier")
@@ -9439,7 +8730,7 @@ def hive_credit_tier(plugin: Plugin, peer_id: str = None):
         lightning-cli hive-credit-tier peer_id=03abc...
     """
     ctx = _get_hive_context()
-    return rpc_credit_tier_info(ctx, peer_id)
+    return {"error": "Feature removed"}
 
 
 # =============================================================================
@@ -9450,14 +8741,14 @@ def hive_credit_tier(plugin: Plugin, peer_id: str = None):
 def hive_marketplace_discover(plugin: Plugin, criteria_json: str = "{}"):
     """Discover advisor profiles from marketplace cache."""
     ctx = _get_hive_context()
-    return rpc_marketplace_discover(ctx, criteria_json)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-marketplace-profile")
 def hive_marketplace_profile(plugin: Plugin, profile_json: str = ""):
     """View cached advisor profiles or publish local advisor profile."""
     ctx = _get_hive_context()
-    return rpc_marketplace_profile(ctx, profile_json)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-marketplace-propose")
@@ -9466,14 +8757,14 @@ def hive_marketplace_propose(plugin: Plugin, advisor_did: str, node_id: str,
                              pricing_json: str = "{}"):
     """Propose a contract to an advisor."""
     ctx = _get_hive_context()
-    return rpc_marketplace_propose(ctx, advisor_did, node_id, scope_json, tier, pricing_json)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-marketplace-accept")
 def hive_marketplace_accept(plugin: Plugin, contract_id: str):
     """Accept an advisor contract proposal."""
     ctx = _get_hive_context()
-    return rpc_marketplace_accept(ctx, contract_id)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-marketplace-trial")
@@ -9482,23 +8773,21 @@ def hive_marketplace_trial(plugin: Plugin, contract_id: str, action: str = "star
                            evaluation_json: str = "{}"):
     """Start or evaluate a trial for an advisor contract."""
     ctx = _get_hive_context()
-    return rpc_marketplace_trial(
-        ctx, contract_id, action, duration_days, flat_fee_sats, evaluation_json
-    )
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-marketplace-terminate")
 def hive_marketplace_terminate(plugin: Plugin, contract_id: str, reason: str = ""):
     """Terminate an advisor contract."""
     ctx = _get_hive_context()
-    return rpc_marketplace_terminate(ctx, contract_id, reason)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-marketplace-status")
 def hive_marketplace_status(plugin: Plugin):
     """Get advisor marketplace status."""
     ctx = _get_hive_context()
-    return rpc_marketplace_status(ctx)
+    return {"error": "Feature removed"}
 
 
 # =============================================================================
@@ -9510,7 +8799,7 @@ def hive_liquidity_discover(plugin: Plugin, service_type: int = None,
                             min_capacity: int = 0, max_rate: int = None):
     """Discover liquidity offers."""
     ctx = _get_hive_context()
-    return rpc_liquidity_discover(ctx, service_type, min_capacity, max_rate)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-liquidity-offer")
@@ -9522,10 +8811,7 @@ def hive_liquidity_offer(plugin: Plugin, provider_id: str, service_type: int,
                          expires_at: int = None):
     """Publish a liquidity offer."""
     ctx = _get_hive_context()
-    return rpc_liquidity_offer(
-        ctx, provider_id, service_type, capacity_sats, duration_hours,
-        pricing_model, rate_json, min_reputation, expires_at
-    )
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-liquidity-request")
@@ -9533,7 +8819,7 @@ def hive_liquidity_request(plugin: Plugin, requester_id: str, service_type: int,
                            capacity_sats: int, details_json: str = "{}"):
     """Publish a liquidity request (RFP)."""
     ctx = _get_hive_context()
-    return rpc_liquidity_request(ctx, requester_id, service_type, capacity_sats, details_json)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-liquidity-lease")
@@ -9541,7 +8827,7 @@ def hive_liquidity_lease(plugin: Plugin, offer_id: str, client_id: str,
                          heartbeat_interval: int = 3600):
     """Accept a liquidity offer and create a lease."""
     ctx = _get_hive_context()
-    return rpc_liquidity_lease(ctx, offer_id, client_id, heartbeat_interval)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-liquidity-heartbeat")
@@ -9551,23 +8837,21 @@ def hive_liquidity_heartbeat(plugin: Plugin, lease_id: str, action: str = "send"
                              capacity_sats: int = None):
     """Send or verify a lease heartbeat."""
     ctx = _get_hive_context()
-    return rpc_liquidity_heartbeat(
-        ctx, lease_id, action, heartbeat_id, channel_id, remote_balance_sats, capacity_sats
-    )
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-liquidity-lease-status")
 def hive_liquidity_lease_status(plugin: Plugin, lease_id: str):
     """Get liquidity lease status."""
     ctx = _get_hive_context()
-    return rpc_liquidity_lease_status(ctx, lease_id)
+    return {"error": "Feature removed"}
 
 
 @plugin.method("hive-liquidity-terminate")
 def hive_liquidity_terminate(plugin: Plugin, lease_id: str, reason: str = ""):
     """Terminate a liquidity lease."""
     ctx = _get_hive_context()
-    return rpc_liquidity_terminate(ctx, lease_id, reason)
+    return {"error": "Feature removed"}
 
 
 # =============================================================================
