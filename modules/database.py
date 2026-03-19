@@ -147,7 +147,7 @@ class HiveDatabase:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS hive_members (
                 peer_id TEXT PRIMARY KEY,
-                tier TEXT NOT NULL DEFAULT 'neophyte',
+                tier TEXT NOT NULL DEFAULT 'member',
                 joined_at INTEGER NOT NULL,
                 promoted_at INTEGER,
                 contribution_ratio REAL DEFAULT 0.0,
@@ -647,7 +647,7 @@ class HiveDatabase:
             CREATE INDEX IF NOT EXISTS idx_proto_outbox_peer
             ON proto_outbox(peer_id, status)
         """)
-    def add_member(self, peer_id: str, tier: str = 'neophyte', 
+    def add_member(self, peer_id: str, tier: str = 'member',
                    joined_at: Optional[int] = None,
                    promoted_at: Optional[int] = None) -> bool:
         """
@@ -655,10 +655,10 @@ class HiveDatabase:
 
         Args:
             peer_id: 66-character hex public key
-            tier: 'member' or 'neophyte'
+            tier: 'admin' or 'member'
             joined_at: Unix timestamp (defaults to now)
-            promoted_at: Unix timestamp if promoted (None for neophytes)
-            
+            promoted_at: Unix timestamp if promoted to admin (None for members)
+
         Returns:
             True if successful, False if member already exists
         """

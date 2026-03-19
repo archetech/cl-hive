@@ -182,7 +182,6 @@ def membership_maintenance_loop():
 
     Runs hourly to clean up:
     - Old contribution records (> 45 days)
-    - Old vouches (> VOUCH_TTL)
     - Stale presence data
     - Old planner logs (> 30 days)
     - Expired/completed pending actions (> 7 days)
@@ -202,9 +201,8 @@ def membership_maintenance_loop():
     while not shutdown_event.is_set():
         try:
             if database:
-                # Phase 5: Membership data pruning
+                # Membership data pruning
                 database.prune_old_contributions(older_than_days=45)
-                database.prune_old_vouches(older_than_seconds=VOUCH_TTL_SECONDS)
                 database.prune_presence(window_seconds=PRESENCE_WINDOW_SECONDS)
 
                 # Sync uptime from presence data to hive_members

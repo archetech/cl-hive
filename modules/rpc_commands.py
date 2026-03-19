@@ -221,15 +221,15 @@ def check_permission(ctx: HiveContext, required_tier: str) -> Optional[Dict[str,
     if not member:
         return {"error": "Not a Hive member", "required_tier": required_tier}
 
-    current_tier = member.get('tier', 'neophyte')
+    current_tier = member.get('tier', 'member')
 
-    if required_tier == 'member':
-        if current_tier != 'member':
+    if required_tier == 'admin':
+        if current_tier != 'admin':
             return {
                 "error": "permission_denied",
-                "message": "This command requires member privileges",
+                "message": "This command requires admin privileges",
                 "current_tier": current_tier,
-                "required_tier": "member"
+                "required_tier": "admin"
             }
 
     return None  # Permission granted
@@ -256,8 +256,8 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
         return {"error": "Hive not initialized"}
 
     members = ctx.database.get_all_members()
+    admin_count = len([m for m in members if m['tier'] == 'admin'])
     member_count = len([m for m in members if m['tier'] == 'member'])
-    neophyte_count = len([m for m in members if m['tier'] == 'neophyte'])
 
     # Get our own membership status (used by cl-revenue-ops to detect hive mode)
     our_membership = {"tier": None, "joined_at": None}
@@ -286,8 +286,8 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
         "membership": our_membership,  # Our own membership for cl-revenue-ops detection
         "members": {
             "total": len(members),
+            "admin": admin_count,
             "member": member_count,
-            "neophyte": neophyte_count,
         },
         "limits": {
             "max_members": ctx.config.max_members if ctx.config else 50,
@@ -327,15 +327,8 @@ def get_config(ctx: HiveContext) -> Dict[str, Any]:
         "membership": {
             "membership_enabled": ctx.config.membership_enabled,
             "auto_join_enabled": ctx.config.auto_join_enabled,
-            "auto_vouch_enabled": ctx.config.auto_vouch_enabled,
-            "auto_promote_enabled": ctx.config.auto_promote_enabled,
             "ban_autotrigger_enabled": ctx.config.ban_autotrigger_enabled,
-            "neophyte_fee_discount_pct": ctx.config.neophyte_fee_discount_pct,
             "member_fee_ppm": ctx.config.member_fee_ppm,
-            "probation_days": ctx.config.probation_days,
-            "min_contribution_ratio": ctx.config.min_contribution_ratio,
-            "min_uptime_pct": ctx.config.min_uptime_pct,
-            "min_unique_peers": ctx.config.min_unique_peers,
             "max_members": ctx.config.max_members,
         },
         "protocol": {

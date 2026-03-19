@@ -318,13 +318,12 @@ def _check_permission(required_tier: str) -> Optional[Dict[str, Any]]:
     """
     Check if the local node has the required tier for an RPC command.
 
-    Permission model (from IMPLEMENTATION_PLAN.md Section 8.5):
+    Permission model:
     - Admin Only: hive-genesis, hive-invite, hive-ban, hive-set-mode
-    - Member Only: hive-vouch, hive-approve, hive-reject
-    - Any Tier: hive-status, hive-members, hive-contribution, hive-topology
+    - Any Member: hive-status, hive-members, hive-contribution, hive-topology
 
     Args:
-        required_tier: 'member' (full member) or 'neophyte' (any member)
+        required_tier: 'admin' or 'member' (any member)
 
     Returns:
         None if permission granted, or error dict if denied
@@ -336,17 +335,17 @@ def _check_permission(required_tier: str) -> Optional[Dict[str, Any]]:
     if not member:
         return {"error": "Not a Hive member", "required_tier": required_tier}
 
-    current_tier = member.get('tier', 'neophyte')
+    current_tier = member.get('tier', 'member')
 
-    if required_tier == 'member':
-        if current_tier != 'member':
+    if required_tier == 'admin':
+        if current_tier != 'admin':
             return {
                 "error": "permission_denied",
-                "message": "This command requires full member privileges",
+                "message": "This command requires admin privileges",
                 "current_tier": current_tier,
-                "required_tier": "member"
+                "required_tier": "admin"
             }
-    # 'neophyte' tier means any member (including neophytes) can use the command
+    # 'member' tier means any member (including admins) can use the command
 
     return None  # Permission granted
 
@@ -688,7 +687,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return []
         return [
             m["peer_id"] for m in database.get_all_members()
-            if m.get("tier") == MembershipTier.MEMBER.value
+            if m.get("tier") in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value)
             and not database.is_banned(m["peer_id"])
         ]
 
@@ -3621,9 +3620,9 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     if not member:
         return {"error": "peer_not_member", "peer_id": peer_id}
 
-    # Cannot direct-ban full members; use hive-propose-ban + vote instead
-    if member.get("tier") == MembershipTier.MEMBER.value:
-        return {"error": "cannot_ban_member", "message": "Full members require proposal/vote via hive-propose-ban", "peer_id": peer_id}
+    # Cannot direct-ban admins; use hive-propose-ban + vote instead
+    if member.get("tier") == MembershipTier.ADMIN.value:
+        return {"error": "cannot_ban_admin", "message": "Admins require proposal/vote via hive-propose-ban", "peer_id": peer_id}
 
     # Sign the ban reason
     now = int(time.time())
@@ -3664,15 +3663,34 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
 @plugin.method("hive-promote-admin")
 def hive_promote_admin(plugin: Plugin, peer_id: str):
     """
-    DEPRECATED: Admin tier has been removed from the 2-tier membership system.
+    Promote a member to admin tier.
 
-    The current system uses only NEOPHYTE and MEMBER tiers.
-    Use hive-propose-promotion to promote neophytes to member.
+    Only admins can promote other members to admin.
+
+    Args:
+        peer_id: The member to promote
+
+    Permission: Admin only
     """
-    return {
-        "error": "deprecated",
-        "message": "Admin tier removed. Use hive-propose-promotion for neophyte->member promotions."
-    }
+    perm = _check_permission('admin')
+    if perm:
+        return perm
+
+    if not membership_mgr:
+        return {"error": "Hive not initialized"}
+
+    member = database.get_member(peer_id)
+    if not member:
+        return {"error": "peer_not_member", "peer_id": peer_id}
+
+    if member.get("tier") == MembershipTier.ADMIN.value:
+        return {"error": "already_admin", "peer_id": peer_id}
+
+    success = membership_mgr.set_tier(peer_id, MembershipTier.ADMIN.value)
+    if not success:
+        return {"error": "promotion_failed"}
+
+    return {"success": True, "peer_id": peer_id, "new_tier": "admin"}
 
 
 @plugin.method("hive-leave")
@@ -3684,8 +3702,7 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
     Your fee policies will be reverted to dynamic.
 
     Restrictions:
-    - The last full member cannot leave (would make hive headless)
-    - Promote a neophyte to member before leaving if you're the last one
+    - The last member cannot leave (would make hive headless)
 
     Args:
         reason: Optional reason for leaving (default: "voluntary")
@@ -3705,15 +3722,14 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
 
     our_tier = member.get("tier")
 
-    # Check if we're the last full member
-    if our_tier == MembershipTier.MEMBER.value:
-        all_members = database.get_all_members()
-        member_count = sum(1 for m in all_members if m.get("tier") == MembershipTier.MEMBER.value)
-        if member_count <= 1:
-            return {
-                "error": "cannot_leave",
-                "message": "Cannot leave: you are the only full member. Promote a neophyte first, or the hive will become headless."
-            }
+    # Check if we're the last member
+    all_members = database.get_all_members()
+    member_count = sum(1 for m in all_members if m.get("tier") in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value))
+    if member_count <= 1:
+        return {
+            "error": "cannot_leave",
+            "message": "Cannot leave: you are the only member. The hive would become headless."
+        }
 
     # Create signed leave message
     timestamp = int(time.time())
@@ -4683,24 +4699,23 @@ def hive_genesis(plugin: Plugin, hive_id: str = None):
 
 @plugin.method("hive-invite")
 def hive_invite(plugin: Plugin, valid_hours: int = 24, requirements: int = 0,
-                tier: str = 'neophyte'):
+                tier: str = 'member'):
     """
     Generate an invitation ticket for a new member.
 
-    Only full members can generate invite tickets. New members join as neophytes
-    and can be promoted to member after meeting the promotion criteria.
+    Any member can generate invite tickets. New members join as 'member' tier.
 
     Args:
         valid_hours: Hours until ticket expires (default: 24)
         requirements: Bitmask of required features (default: 0 = none)
-        tier: Starting tier - 'neophyte' (default) or 'member' (bootstrap only)
+        tier: Starting tier - 'member' (default)
 
     Returns:
         Dict with base64-encoded ticket
 
-    Permission: Member only
+    Permission: Any member
     """
-    # Permission check: Member only
+    # Permission check: Any member
     perm_error = _check_permission('member')
     if perm_error:
         return perm_error
@@ -4708,9 +4723,9 @@ def hive_invite(plugin: Plugin, valid_hours: int = 24, requirements: int = 0,
     if not handshake_mgr:
         return {"error": "Hive not initialized"}
 
-    # Validate tier (2-tier system: member or neophyte)
-    if tier not in ('neophyte', 'member'):
-        return {"error": f"Invalid tier: {tier}. Use 'neophyte' (default) or 'member' (bootstrap)"}
+    # Validate tier (admin/member system)
+    if tier not in ('admin', 'member'):
+        return {"error": f"Invalid tier: {tier}. Use 'member' (default) or 'admin'"}
 
     try:
         ticket = handshake_mgr.generate_invite_ticket(valid_hours, requirements, tier)

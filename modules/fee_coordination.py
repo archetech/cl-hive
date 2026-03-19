@@ -2306,11 +2306,11 @@ class FeeCoordinationManager:
         self.traffic_intel_mgr = mgr
 
     def _is_hive_member_peer(self, peer_id: str) -> bool:
-        """Return True when the peer is a hive member/neophyte."""
+        """Return True when the peer is a hive member."""
         if not self.database or not peer_id:
             return False
         member = self.database.get_member(peer_id)
-        return bool(member and member.get("tier") in ("member", "neophyte"))
+        return bool(member and member.get("tier") in ("admin", "member"))
 
     def _resolve_peer_id_from_channel(self, channel_id: Optional[str]) -> str:
         """Resolve peer_id from a short_channel_id when available."""
@@ -2612,7 +2612,7 @@ class FeeCoordinationManager:
         # Safety: hive member channels MUST always have 0 fees
         if self.database and peer_id:
             member = self.database.get_member(peer_id)
-            if member and member.get("tier") in ("member", "neophyte"):
+            if member and member.get("tier") in ("admin", "member"):
                 return FeeRecommendation(
                     channel_id=channel_id,
                     peer_id=peer_id,

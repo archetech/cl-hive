@@ -20,15 +20,8 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'governance_mode': str,
     'membership_enabled': bool,
     'auto_join_enabled': bool,
-    'auto_vouch_enabled': bool,
-    'auto_promote_enabled': bool,
     'ban_autotrigger_enabled': bool,
-    'neophyte_fee_discount_pct': float,
     'member_fee_ppm': int,
-    'probation_days': int,
-    'min_contribution_ratio': float,
-    'min_uptime_pct': float,
-    'min_unique_peers': int,
     'max_members': int,
     'market_share_cap_pct': float,
     'intent_hold_seconds': int,
@@ -52,12 +45,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
 
 # Range constraints for numeric fields
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {
-    'neophyte_fee_discount_pct': (0.0, 1.0),
     'member_fee_ppm': (0, 100000),
-    'probation_days': (1, 365),
-    'min_contribution_ratio': (0.0, 10.0),
-    'min_uptime_pct': (50.0, 100.0),
-    'min_unique_peers': (0, 10),
     'max_members': (2, 100),
     'market_share_cap_pct': (0.01, 1.0),
     'intent_hold_seconds': (10, 600),
@@ -104,22 +92,13 @@ class HiveConfig:
     # Governance Mode (advisor is primary, failsafe is emergency backup)
     governance_mode: str = 'advisor'  # 'advisor' (AI-driven), 'failsafe' (emergency)
 
-    # Phase 5 safety knobs
+    # Membership
     membership_enabled: bool = True
     auto_join_enabled: bool = False       # Auto-send HELLO on peer_connected (disabled: CLN crash bug)
-    auto_vouch_enabled: bool = True
-    auto_promote_enabled: bool = True
     ban_autotrigger_enabled: bool = False
-    
-    # Membership Economics
-    neophyte_fee_discount_pct: float = 0.5    # NOT YET APPLIED — set_hive_policy treats all tiers identically
-    member_fee_ppm: int = 0                    # 0-fee for full members
-    probation_days: int = 90                   # 90 days probation before auto-promotion
 
-    # Auto-Promotion Criteria (no vouching required - meritocratic)
-    min_contribution_ratio: float = 1.0        # Must forward at least as much as received
-    min_uptime_pct: float = 99.5               # 99.5% uptime required per spec
-    min_unique_peers: int = 1                  # Must bring at least 1 unique peer
+    # Membership Economics
+    member_fee_ppm: int = 0                    # 0-fee for members
     
     # Ecological Limits
     max_members: int = 50                      # Dunbar cap for gossip efficiency
@@ -232,15 +211,8 @@ class HiveConfigSnapshot:
     governance_mode: str
     membership_enabled: bool
     auto_join_enabled: bool
-    auto_vouch_enabled: bool
-    auto_promote_enabled: bool
     ban_autotrigger_enabled: bool
-    neophyte_fee_discount_pct: float
     member_fee_ppm: int
-    probation_days: int
-    min_contribution_ratio: float
-    min_uptime_pct: float
-    min_unique_peers: int
     max_members: int
     market_share_cap_pct: float
     intent_hold_seconds: int
@@ -270,15 +242,8 @@ class HiveConfigSnapshot:
             governance_mode=config.governance_mode,
             membership_enabled=config.membership_enabled,
             auto_join_enabled=config.auto_join_enabled,
-            auto_vouch_enabled=config.auto_vouch_enabled,
-            auto_promote_enabled=config.auto_promote_enabled,
             ban_autotrigger_enabled=config.ban_autotrigger_enabled,
-            neophyte_fee_discount_pct=config.neophyte_fee_discount_pct,
             member_fee_ppm=config.member_fee_ppm,
-            probation_days=config.probation_days,
-            min_contribution_ratio=config.min_contribution_ratio,
-            min_uptime_pct=config.min_uptime_pct,
-            min_unique_peers=config.min_unique_peers,
             max_members=config.max_members,
             market_share_cap_pct=config.market_share_cap_pct,
             intent_hold_seconds=config.intent_hold_seconds,

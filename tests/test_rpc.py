@@ -66,8 +66,6 @@ def config():
         db_path=':memory:',
         governance_mode='advisor',
         membership_enabled=True,
-        auto_vouch_enabled=True,
-        auto_promote_enabled=True,
     )
 
 
@@ -90,12 +88,12 @@ class TestGenesisRPC:
 
         assert result['status'] == 'genesis_complete'
         assert result['hive_id'] == 'test-hive'
-        assert 'admin_pubkey' in result  # Note: key still named admin_pubkey for backward compat
+        assert 'admin_pubkey' in result
 
-        # Verify founding member was created in DB (admin tier removed, uses member tier)
+        # Verify founding admin was created in DB
         founder = database.get_member(result['admin_pubkey'])
         assert founder is not None
-        assert founder['tier'] == 'member'
+        assert founder['tier'] == 'admin'
 
     def test_genesis_auto_generates_hive_id(self, handshake_mgr, database):
         """Genesis without hive_id should auto-generate one."""
@@ -165,22 +163,21 @@ class TestStatusRPC:
     def test_status_returns_correct_structure(self, database, config):
         """Status should return all required fields with correct types."""
         # Add some members
-        database.add_member('02' + 'a' * 64, tier='member', joined_at=int(time.time()))
+        database.add_member('02' + 'a' * 64, tier='admin', joined_at=int(time.time()))
         database.add_member('02' + 'b' * 64, tier='member', joined_at=int(time.time()))
-        database.add_member('02' + 'c' * 64, tier='neophyte', joined_at=int(time.time()))
+        database.add_member('02' + 'c' * 64, tier='member', joined_at=int(time.time()))
 
-        # Simulate status response (admin tier removed)
         members = database.get_all_members()
+        admin_count = len([m for m in members if m['tier'] == 'admin'])
         member_count = len([m for m in members if m['tier'] == 'member'])
-        neophyte_count = len([m for m in members if m['tier'] == 'neophyte'])
 
         status = {
             "status": "active",
             "governance_mode": config.governance_mode,
             "members": {
                 "total": len(members),
+                "admin": admin_count,
                 "member": member_count,
-                "neophyte": neophyte_count,
             },
             "limits": {
                 "max_members": config.max_members,
@@ -195,8 +192,8 @@ class TestStatusRPC:
         assert isinstance(status['members'], dict)
         assert isinstance(status['members']['total'], int)
         assert status['members']['total'] == 3
-        assert status['members']['member'] == 2  # 1 member + 1 converted from admin
-        assert status['members']['neophyte'] == 1
+        assert status['members']['admin'] == 1
+        assert status['members']['member'] == 2
 
     def test_status_genesis_required_when_empty(self, database, config):
         """Status should indicate genesis_required when no members."""
@@ -277,17 +274,16 @@ class TestMembersRPC:
 
     def test_members_list_returned(self, database):
         """Members list should include all tiers."""
-        database.add_member('02' + 'a' * 64, tier='member', joined_at=int(time.time()))
+        database.add_member('02' + 'a' * 64, tier='admin', joined_at=int(time.time()))
         database.add_member('02' + 'b' * 64, tier='member', joined_at=int(time.time()))
-        database.add_member('02' + 'c' * 64, tier='neophyte', joined_at=int(time.time()))
+        database.add_member('02' + 'c' * 64, tier='member', joined_at=int(time.time()))
 
         members = database.get_all_members()
 
         assert len(members) == 3
         tiers = [m['tier'] for m in members]
-        # Admin tier removed - only member and neophyte tiers exist
+        assert 'admin' in tiers
         assert 'member' in tiers
-        assert 'neophyte' in tiers
 
 
 # =============================================================================
@@ -341,24 +337,22 @@ class TestPermissionModel:
         member = database.get_member(member_pubkey)
         assert member['tier'] == 'member'
 
-    def test_neophyte_permission_denied_for_member_command(self, database):
-        """Neophyte should be denied for member-only commands."""
-        # Add neophyte
-        neophyte_pubkey = '02' + 'c' * 64
-        database.add_member(neophyte_pubkey, tier='neophyte', joined_at=int(time.time()))
-
-        member = database.get_member(neophyte_pubkey)
-        assert member['tier'] == 'neophyte'
-        # In real RPC, _check_permission('member') would return error
-
-    def test_member_has_full_permissions(self, database):
-        """Member tier has full permissions (admin tier removed)."""
-        member_pubkey = '02' + 'a' * 64
+    def test_member_permission_denied_for_admin_command(self, database):
+        """Regular member should be denied for admin-only commands."""
+        member_pubkey = '02' + 'c' * 64
         database.add_member(member_pubkey, tier='member', joined_at=int(time.time()))
 
         member = database.get_member(member_pubkey)
-        # Only two tiers: member and neophyte
         assert member['tier'] == 'member'
+        # In real RPC, _check_permission('admin') would return error for non-admins
+
+    def test_admin_has_full_permissions(self, database):
+        """Admin tier has full permissions."""
+        admin_pubkey = '02' + 'a' * 64
+        database.add_member(admin_pubkey, tier='admin', joined_at=int(time.time()))
+
+        member = database.get_member(admin_pubkey)
+        assert member['tier'] == 'admin'
 
 
 if __name__ == "__main__":

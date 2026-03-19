@@ -209,7 +209,7 @@ class TestChallengeTTLEnforcement:
         mgr._pending_challenges[peer_id] = {
             "nonce": "abc123",
             "requirements": 0,
-            "initial_tier": "neophyte",
+            "initial_tier": "member",
             "issued_at": int(time.time()) - 10,  # 10 seconds ago
         }
 
@@ -226,7 +226,7 @@ class TestChallengeTTLEnforcement:
         mgr._pending_challenges[peer_id] = {
             "nonce": "expired_nonce",
             "requirements": 0,
-            "initial_tier": "neophyte",
+            "initial_tier": "member",
             "issued_at": int(time.time()) - CHALLENGE_TTL_SECONDS - 10,
         }
 
@@ -244,7 +244,7 @@ class TestChallengeTTLEnforcement:
         mgr._pending_challenges[peer_id] = {
             "nonce": "boundary_nonce",
             "requirements": 0,
-            "initial_tier": "neophyte",
+            "initial_tier": "member",
             "issued_at": int(time.time()) - CHALLENGE_TTL_SECONDS + 1,
         }
 

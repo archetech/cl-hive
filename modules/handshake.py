@@ -16,7 +16,7 @@ Join Flow (Channel-as-Proof-of-Stake):
     2. B checks for existing channel with A
     3. B -> A (CHALLENGE): Member sends random Nonce
     4. A -> B (ATTEST): Candidate sends signed Manifest + Nonce
-    5. B -> A (WELCOME): New member joins as neophyte
+    5. B -> A (WELCOME): New member joins as member
 
 Note: Tickets are deprecated. Channel existence serves as proof of stake.
 Having a channel demonstrates economic commitment to the network.
@@ -77,7 +77,7 @@ class Ticket:
     issued_at: int          # Unix timestamp
     expires_at: int         # Unix timestamp
     signature: str          # signmessage result
-    initial_tier: str = 'neophyte'  # Starting tier: always 'neophyte' (member tier via promotion only)
+    initial_tier: str = 'member'  # Starting tier for new members
     
     def to_json(self) -> str:
         """Serialize to JSON (excluding signature for signing)."""
@@ -172,7 +172,7 @@ class HandshakeManager:
             rpc_proxy: ThreadSafeRpcProxy for CLN RPC calls
             db: HiveDatabase instance
             plugin: Plugin reference for logging
-            min_vouch_count: Minimum vouches for promotion (for bootstrap check)
+            min_vouch_count: Unused (kept for interface compatibility)
         """
         self.rpc = rpc_proxy
         self.db = db
@@ -233,7 +233,7 @@ class HandshakeManager:
             "requirements": Requirements.NONE,
             "issued_at": now,
             "expires_at": now + (365 * 24 * 3600),  # 1 year validity
-            "initial_tier": "neophyte",  # Must be in signed data for verification
+            "initial_tier": "member",  # Must be in signed data for verification
         }
         
         # Sign the ticket
@@ -247,11 +247,10 @@ class HandshakeManager:
             signature=signature
         )
 
-        # Store ourselves as founding member
-        # NOTE: Admin tier removed - genesis creates a member directly
+        # Store ourselves as founding admin
         self.db.add_member(
             peer_id=our_pubkey,
-            tier='member',
+            tier='admin',
             joined_at=now,
             promoted_at=now
         )
@@ -281,37 +280,34 @@ class HandshakeManager:
     def generate_invite_ticket(self,
                                 valid_hours: int = DEFAULT_TICKET_HOURS,
                                 requirements: int = Requirements.NONE,
-                                initial_tier: str = 'neophyte') -> str:
+                                initial_tier: str = 'member') -> str:
         """
         Generate an invitation ticket for a new member.
 
-        DEPRECATED: Prefer JOIN_INTENT flow where nodes join by opening a
-        channel to any hive member and broadcasting intent.
-
-        Only Members can generate invite tickets. All new members start as neophytes.
+        Any member can generate invite tickets. New members start as 'member' tier.
 
         Args:
             valid_hours: Hours until ticket expires
             requirements: Bitmask of required features
-            initial_tier: Starting tier (always 'neophyte')
+            initial_tier: Starting tier ('member' default)
 
         Returns:
             Base64-encoded signed ticket
 
         Raises:
-            PermissionError: If caller is not a Member
+            PermissionError: If caller is not a member
             ValueError: If invalid initial_tier requested
         """
         our_pubkey = self.get_our_pubkey()
 
-        # Verify we're a Member
+        # Verify we're a member
         member = self.db.get_member(our_pubkey)
-        if not member or member['tier'] != 'member':
-            raise PermissionError("Only Members can generate invite tickets")
+        if not member or member['tier'] not in ('admin', 'member'):
+            raise PermissionError("Only members can generate invite tickets")
 
-        # All new members start as neophytes - no more bootstrap/admin tier
-        if initial_tier != 'neophyte':
-            raise ValueError(f"Invalid initial_tier: {initial_tier}. All new members start as 'neophyte'")
+        # Validate tier
+        if initial_tier not in ('admin', 'member'):
+            raise ValueError(f"Invalid initial_tier: {initial_tier}. Use 'member' (default) or 'admin'")
 
         # Get Hive ID from metadata
         metadata = json.loads(member.get('metadata', '{}'))
@@ -377,9 +373,9 @@ class HandshakeManager:
         except Exception as e:
             return (False, ticket, f"Signature verification failed: {e}")
         
-        # Verify issuer is a known member
+        # Verify issuer is a known member (admin or member)
         issuer = self.db.get_member(ticket.admin_pubkey)
-        if not issuer or issuer['tier'] != 'member':
+        if not issuer or issuer['tier'] not in ('admin', 'member'):
             return (False, ticket, "Unknown or non-member issuer")
         
         return (True, ticket, "")
@@ -468,14 +464,14 @@ class HandshakeManager:
     # =========================================================================
     
     def generate_challenge(self, peer_id: str, requirements: int,
-                            initial_tier: str = 'neophyte') -> str:
+                            initial_tier: str = 'member') -> str:
         """
         Generate a challenge nonce for a peer.
 
         Args:
             peer_id: Peer's public key
             requirements: Bitmask requirements from the invite ticket
-            initial_tier: Starting tier for new member ('neophyte' or 'member')
+            initial_tier: Starting tier for new member ('admin' or 'member')
 
         Returns:
             Hex-encoded random nonce

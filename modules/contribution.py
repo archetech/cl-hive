@@ -202,14 +202,14 @@ class ContributionManager:
 
         if in_peer and in_peer != out_peer:
             member = self.db.get_member(in_peer)
-            if member and member.get("tier") in ("member", "neophyte"):
+            if member and member.get("tier") in ("admin", "member"):
                 if self._allow_record(in_peer):
                     self.db.record_contribution(in_peer, "forwarded", amount_sats)
                     self.check_leech_status(in_peer)
 
         if out_peer and out_peer != in_peer:
             member = self.db.get_member(out_peer)
-            if member and member.get("tier") in ("member", "neophyte"):
+            if member and member.get("tier") in ("admin", "member"):
                 if self._allow_record(out_peer):
                     self.db.record_contribution(out_peer, "received", amount_sats)
                     self.check_leech_status(out_peer)

@@ -130,16 +130,16 @@ class TestSerialization:
         """WELCOME message should survive serialize -> deserialize."""
         original_payload = {
             "hive_id": "hive_test",
-            "tier": "neophyte",
+            "tier": "member",
             "member_count": 5,
             "state_hash": "0" * 64
         }
-        
+
         data = serialize(HiveMessageType.WELCOME, original_payload)
         msg_type, payload = deserialize(data)
-        
+
         assert msg_type == HiveMessageType.WELCOME
-        assert payload['tier'] == "neophyte"
+        assert payload['tier'] == "member"
         assert payload['member_count'] == 5
     
     def test_complex_payload(self):

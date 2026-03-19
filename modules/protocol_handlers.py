@@ -134,8 +134,8 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     # All checks passed - generate challenge
-    # No requirements for autodiscovery join, tier is always neophyte
-    nonce = handshake_mgr.generate_challenge(peer_id, requirements=0, initial_tier='neophyte')
+    # No requirements for autodiscovery join, tier is always member
+    nonce = handshake_mgr.generate_challenge(peer_id, requirements=0, initial_tier='member')
 
     # Get Hive ID from metadata
     members = database.get_all_members()
@@ -292,10 +292,10 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         handshake_mgr.clear_challenge(peer_id)
         return {"result": "continue"}
 
-    # Get initial tier from pending challenge (always neophyte for autodiscovery)
-    initial_tier = pending.get('initial_tier', 'neophyte')
+    # Get initial tier from pending challenge (always member for autodiscovery)
+    initial_tier = pending.get('initial_tier', 'member')
 
-    # Verification passed! Add member as neophyte
+    # Verification passed! Add member
     database.add_member(
         peer_id=peer_id,
         tier=initial_tier,
@@ -420,17 +420,14 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Store Hive membership info for ourselves
     if database and our_pubkey:
         now = int(time.time())
-        # Always start as neophyte regardless of what the remote peer claims —
-        # our tier should be determined by local governance, not trusted from
-        # an untrusted remote payload.
-        database.add_member(our_pubkey, tier='neophyte', joined_at=now)
+        # Start as member — admin promotion is done via RPC by the fleet operator.
+        database.add_member(our_pubkey, tier='member', joined_at=now)
         # Store hive_id in metadata
         database.update_member(our_pubkey, metadata=json.dumps({"hive_id": hive_id}))
-        plugin.log(f"cl-hive: Stored membership (tier=neophyte, hive_id={hive_id})")
+        plugin.log(f"cl-hive: Stored membership (tier=member, hive_id={hive_id})")
 
-        # Add the peer that welcomed us as neophyte — their actual tier
-        # will be resolved via state sync rather than trusted from WELCOME.
-        database.add_member(peer_id, tier='neophyte', joined_at=now)
+        # Add the peer that welcomed us as member.
+        database.add_member(peer_id, tier='member', joined_at=now)
 
     # Initiate state sync with the peer that welcomed us
     if gossip_mgr and plugin:
@@ -754,31 +751,19 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
         if not member_peer_id or not isinstance(member_peer_id, str):
             continue
 
-        tier = member_info.get("tier", "neophyte")
+        tier = member_info.get("tier", "member")
         joined_at = member_info.get("joined_at", int(time.time()))
         addresses = member_info.get("addresses", [])
 
-        # Validate tier value (2-tier system: member or neophyte)
-        if tier not in ("member", "neophyte"):
-            tier = "neophyte"
+        # Validate tier value (admin/member system)
+        if tier not in ("admin", "member"):
+            tier = "member"
 
         # Check if we already know this member
         existing = database.get_member(member_peer_id)
         if existing:
-            # Update tier if remote has higher privilege (neophyte -> member)
-            # Never demote via sync (member -> neophyte requires proper protocol)
-            existing_tier = existing.get("tier", "neophyte")
+            existing_tier = existing.get("tier", "member")
             needs_update = False
-
-            if existing_tier == "neophyte" and tier == "member":
-                # Tier upgrades via sync are no longer accepted.
-                # Promotions must go through the vouch/quorum protocol
-                # to prevent a single compromised member from unilateral promotion.
-                plugin.log(
-                    f"cl-hive: Ignoring tier upgrade for {member_peer_id[:16]}... from sync "
-                    f"(requires vouch/quorum protocol)",
-                    level='debug'
-                )
 
             # Update addresses if provided and we don't have them
             if addresses:
@@ -837,7 +822,7 @@ def _create_membership_payload() -> list:
             continue
         member_dict = {
             "peer_id": m["peer_id"],
-            "tier": m.get("tier", "neophyte"),
+            "tier": m.get("tier", "member"),
             "joined_at": m.get("joined_at", 0)
         }
         # Include addresses if available (Issue #38)
@@ -1415,7 +1400,7 @@ def _get_broadcast_targets() -> List[Dict[str, Any]]:
         return []
     return [
         m for m in database.get_all_members()
-        if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value)
+        if m.get("tier") in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value)
         and m["peer_id"] != our_pubkey
         and not database.is_banned(m["peer_id"])
     ]
@@ -1631,7 +1616,7 @@ def _outbox_get_member_ids() -> List[str]:
         return []
     return [
         m["peer_id"] for m in database.get_all_members()
-        if m.get("tier") in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value)
+        if m.get("tier") in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value)
         and not database.is_banned(m["peer_id"])
     ]
 
@@ -1708,10 +1693,9 @@ def _validate_relay_sender(peer_id: str, sender_id: str, payload: Dict[str, Any]
         return False
 
     if _is_relayed_message(payload):
-        # Relayed message: verify peer_id is a known member or neophyte (they're relaying)
-        # M-15 audit fix: Allow neophyte relay to avoid message delivery failures
+        # Relayed message: verify peer_id is a known member (they're relaying)
         relay_peer = database.get_member(peer_id)
-        if not relay_peer or relay_peer.get("tier") not in (MembershipTier.MEMBER.value, MembershipTier.NEOPHYTE.value):
+        if not relay_peer or relay_peer.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
             return False
         # P5R3-L-1 fix: Reject relayed messages from banned relay peers
         if database.is_banned(peer_id):
@@ -1926,9 +1910,8 @@ def _sync_member_policies(plugin: Plugin) -> None:
             continue
 
         # Determine if this peer should have HIVE strategy
-        # P5-M-1 fix: Only full member tier gets HIVE strategy (0-fee)
-        # Neophytes should NOT get hive fees — they use dynamic strategy
-        is_hive_member = tier in (MembershipTier.MEMBER.value,)
+        # All members (admin or member) get HIVE strategy (0-fee)
+        is_hive_member = tier in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value)
 
         try:
             # Use bypass_rate_limit=True for startup sync
@@ -2078,11 +2061,11 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         except Exception as e:
             plugin.log(f"cl-hive: Failed to revert policy for {leaving_peer_id[:16]}...: {e}", level='debug')
 
-    # Check if hive is now headless (no full members)
+    # Check if hive is now headless (no members)
     all_members = database.get_all_members()
-    member_count = sum(1 for m in all_members if m.get("tier") == MembershipTier.MEMBER.value)
+    member_count = sum(1 for m in all_members if m.get("tier") in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value))
     if member_count == 0 and len(all_members) > 0:
-        plugin.log("cl-hive: WARNING - Hive has no full members (only neophytes). Promote neophytes to restore governance.", level='warn')
+        plugin.log("cl-hive: WARNING - Hive has no members remaining.", level='warn')
 
     # Relay to other members
     _relay_message(HiveMessageType.MEMBER_LEFT, payload, peer_id)
@@ -2518,7 +2501,7 @@ def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2589,7 +2572,7 @@ def handle_route_probe_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2661,7 +2644,7 @@ def handle_peer_reputation_snapshot(peer_id: str, payload: Dict, plugin: Plugin)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2731,7 +2714,7 @@ def handle_yield_metrics_batch(peer_id: str, payload: Dict, plugin: Plugin) -> D
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2820,7 +2803,7 @@ def handle_temporal_pattern_batch(peer_id: str, payload: Dict, plugin: Plugin) -
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2913,7 +2896,7 @@ def handle_corridor_value_batch(peer_id: str, payload: Dict, plugin: Plugin) -> 
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -3001,7 +2984,7 @@ def handle_positioning_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> 
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -3083,7 +3066,7 @@ def handle_coverage_analysis_batch(peer_id: str, payload: Dict, plugin: Plugin) 
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.MEMBER.value,):
+        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)

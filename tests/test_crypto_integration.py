@@ -178,7 +178,7 @@ class MockDatabase:
     def __init__(self):
         self._members = {}
 
-    def add_member(self, peer_id: str, tier: str = 'neophyte',
+    def add_member(self, peer_id: str, tier: str = 'member',
                    joined_at: int = None, promoted_at: int = None) -> bool:
         if peer_id in self._members:
             return False

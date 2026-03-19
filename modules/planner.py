@@ -1254,11 +1254,11 @@ class Planner:
     # =========================================================================
 
     def _get_hive_members(self) -> List[str]:
-        """Get list of Hive member pubkeys (full members only, not neophytes)."""
+        """Get list of Hive member pubkeys (admin + member tiers)."""
         if not self.db:
             return []
         members = self.db.get_all_members()
-        return [m['peer_id'] for m in members if m.get('tier') == 'member']
+        return [m['peer_id'] for m in members if m.get('tier') in ('admin', 'member')]
 
     def _has_existing_or_pending_channel(self, target: str) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
         """

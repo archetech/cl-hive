@@ -55,8 +55,6 @@ def config():
         db_path=':memory:',
         governance_mode='advisor',
         membership_enabled=True,
-        auto_vouch_enabled=True,
-        auto_promote_enabled=True,
     )
 
 
@@ -226,13 +224,13 @@ class TestAddressCapture:
 
     def test_addresses_null_by_default(self, database):
         """New member should have null addresses by default."""
-        database.add_member(PEER_A, tier="neophyte", joined_at=int(time.time()))
+        database.add_member(PEER_A, tier="member", joined_at=int(time.time()))
         member = database.get_member(PEER_A)
         assert member["addresses"] is None
 
     def test_addresses_populated_via_update_member(self, database):
         """update_member should accept addresses field."""
-        database.add_member(PEER_A, tier="neophyte", joined_at=int(time.time()))
+        database.add_member(PEER_A, tier="member", joined_at=int(time.time()))
 
         addrs = ["127.0.0.1:9735", "[::1]:9735"]
         database.update_member(PEER_A, addresses=json.dumps(addrs))
@@ -287,7 +285,7 @@ class TestPresenceAtJoin:
     def test_presence_created_at_join(self, database):
         """After add_member + update_presence, presence data should exist."""
         now = int(time.time())
-        database.add_member(PEER_A, tier="neophyte", joined_at=now)
+        database.add_member(PEER_A, tier="member", joined_at=now)
 
         # Simulate what handle_attest now does
         database.update_presence(PEER_A, is_online=True, now_ts=now, window_seconds=30 * 86400)

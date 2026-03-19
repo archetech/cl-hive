@@ -1,5 +1,5 @@
 """
-Tests for Phase 5: Governance & Membership.
+Tests for membership module: admin/member model.
 """
 
 import time
@@ -11,12 +11,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.membership import MembershipManager, MembershipTier
 from modules.contribution import ContributionManager, LEECH_WINDOW_DAYS
-from modules.protocol import (
-    validate_promotion_request,
-    validate_vouch,
-    validate_promotion,
-    MAX_VOUCHES_IN_PROMOTION
-)
 
 
 class DummyState:
@@ -25,10 +19,14 @@ class DummyState:
 
 
 class DummyConfig:
-    probation_days = 30
-    vouch_threshold_pct = 0.51
-    min_vouch_count = 3
     ban_autotrigger_enabled = False
+
+
+def test_membership_tier_values():
+    """Verify MembershipTier enum has only ADMIN and MEMBER."""
+    assert MembershipTier.ADMIN.value == "admin"
+    assert MembershipTier.MEMBER.value == "member"
+    assert len(MembershipTier) == 2
 
 
 def test_uptime_thresholds():
@@ -93,7 +91,7 @@ def test_uniqueness_check():
     ]
 
     mgr = MembershipManager(db, state_manager, contribution_mgr, None, config)
-    unique = mgr.get_unique_peers("neophyte")
+    unique = mgr.get_unique_peers("candidate")
     assert "peer_unique" in unique
 
 
@@ -105,6 +103,8 @@ def test_quorum_calculation():
     mgr = MembershipManager(db, state_manager, contribution_mgr, None, config)
 
     assert mgr.calculate_quorum(5) == 3
+    assert mgr.calculate_quorum(1) == 1
+    assert mgr.calculate_quorum(2) == 2
 
 
 def test_leech_trigger():
@@ -124,26 +124,72 @@ def test_leech_trigger():
     db.set_leech_flag.assert_called()
 
 
-def test_promotion_validation_caps():
-    payload = {
-        "target_pubkey": "02" + "a" * 64,
-        "request_id": "a" * 32,
-        "vouches": [
-            {
-                "target_pubkey": "02" + "a" * 64,
-                "request_id": "a" * 32,
-                "timestamp": 1,
-                "voucher_pubkey": "02" + "b" * 64,
-                "sig": "sig"
-            }
-        ] * (MAX_VOUCHES_IN_PROMOTION + 1)
-    }
-    assert validate_promotion(payload) is False
+def test_is_member():
+    db = MagicMock()
+    contribution_mgr = MagicMock()
+    state_manager = MagicMock()
+    config = DummyConfig()
+    mgr = MembershipManager(db, state_manager, contribution_mgr, None, config)
+
+    db.get_member.return_value = {"peer_id": "abc", "tier": "member"}
+    assert mgr.is_member("abc") is True
+
+    db.get_member.return_value = None
+    assert mgr.is_member("xyz") is False
 
 
-def test_vouch_validation_missing_fields():
-    assert validate_vouch({"target_pubkey": "x"}) is False
+def test_is_admin():
+    db = MagicMock()
+    contribution_mgr = MagicMock()
+    state_manager = MagicMock()
+    config = DummyConfig()
+    mgr = MembershipManager(db, state_manager, contribution_mgr, None, config)
+
+    db.get_member.return_value = {"peer_id": "abc", "tier": "admin"}
+    assert mgr.is_admin("abc") is True
+
+    db.get_member.return_value = {"peer_id": "abc", "tier": "member"}
+    assert mgr.is_admin("abc") is False
 
 
-def test_request_validation_missing_fields():
-    assert validate_promotion_request({"target_pubkey": "x"}) is False
+def test_get_active_members():
+    db = MagicMock()
+    contribution_mgr = MagicMock()
+    state_manager = MagicMock()
+    config = DummyConfig()
+    mgr = MembershipManager(db, state_manager, contribution_mgr, None, config)
+
+    now = int(time.time())
+    db.get_all_members.return_value = [
+        {"peer_id": "a", "tier": "admin", "last_seen": now - 100},
+        {"peer_id": "b", "tier": "member", "last_seen": now - 100},
+        {"peer_id": "c", "tier": "member", "last_seen": now - 100000},  # stale
+    ]
+    db.is_banned.return_value = False
+
+    active = mgr.get_active_members()
+    assert "a" in active
+    assert "b" in active
+    assert "c" not in active
+
+
+def test_sync_bridge_policies():
+    db = MagicMock()
+    contribution_mgr = MagicMock()
+    state_manager = MagicMock()
+    config = DummyConfig()
+    bridge = MagicMock()
+    bridge.status = MagicMock()
+    bridge.status.value = "enabled"
+    bridge.set_hive_policy.return_value = True
+
+    mgr = MembershipManager(db, state_manager, contribution_mgr, bridge, config)
+
+    db.get_all_members.return_value = [
+        {"peer_id": "a", "tier": "admin"},
+        {"peer_id": "b", "tier": "member"},
+    ]
+
+    synced = mgr.sync_bridge_policies()
+    assert synced == 2
+    assert bridge.set_hive_policy.call_count == 2
