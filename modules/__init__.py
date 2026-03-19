@@ -14,7 +14,7 @@ This package contains the core modules for the Hive swarm intelligence layer:
 - contribution: Contribution ratio tracking
 - planner: Topology optimization
 - quality_scorer: Peer quality scoring
-- governance: Decision engine modes
+- governance: Recommendation logging
 """
 
 __version__ = "2.2.6"

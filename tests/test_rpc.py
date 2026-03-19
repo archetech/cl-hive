@@ -25,7 +25,7 @@ from modules.config import HiveConfig
 from modules.handshake import HandshakeManager, Ticket
 from modules.membership import MembershipManager, MembershipTier
 from modules.contribution import ContributionManager
-from modules.governance import DecisionEngine, GovernanceMode, DecisionResult
+from modules.governance import RecommendationLogger
 
 
 # =============================================================================
@@ -64,7 +64,6 @@ def config():
     """Create a test config."""
     return HiveConfig(
         db_path=':memory:',
-        governance_mode='advisor',
         membership_enabled=True,
     )
 
@@ -173,7 +172,7 @@ class TestStatusRPC:
 
         status = {
             "status": "active",
-            "governance_mode": config.governance_mode,
+            "governance": "recommendation_only",
             "members": {
                 "total": len(members),
                 "admin": admin_count,
@@ -188,7 +187,7 @@ class TestStatusRPC:
 
         # Verify structure
         assert isinstance(status['status'], str)
-        assert isinstance(status['governance_mode'], str)
+        assert isinstance(status['governance'], str)
         assert isinstance(status['members'], dict)
         assert isinstance(status['members']['total'], int)
         assert status['members']['total'] == 3

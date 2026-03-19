@@ -2,10 +2,10 @@
 Tests for P2/P3 bug fixes (hardening phase).
 
 Covers:
-- governance.py: negative amount_sats, action_type/target bounds, frozenset
+- governance.py: simplified recommendation logger
 - bridge.py: daily rebalance budget atomicity, policy cache eviction
 - protocol.py: pubkey prefix validation, reason string bounds
-- config.py: feerate range with 0, governance_mode normalization
+- config.py: feerate range with 0
 - state_manager.py: available > capacity clamp, from_dict None peer_id, hash atomicity
 - membership.py: JSON-safe contribution ratio (no float inf)
 - contribution.py: rate_limits bounded growth
@@ -45,7 +45,7 @@ from modules.config import HiveConfig
 from modules.state_manager import HivePeerState
 from modules.membership import CONTRIBUTION_RATIO_NO_DATA
 from modules.contribution import ContributionManager, MAX_RATE_LIMIT_ENTRIES
-from modules.governance import MAX_ACTION_TYPE_LEN, MAX_TARGET_LEN, DecisionEngine
+from modules.governance import RecommendationLogger
 from modules.bridge import Bridge, BridgeStatus, MAX_POLICY_CACHE
 from modules.gossip import GossipManager
 from modules.intent_manager import IntentManager, Intent
@@ -82,23 +82,21 @@ def mock_state_manager():
 
 
 # =============================================================================
-# governance.py — negative amount_sats, string bounds, frozenset
+# governance.py — simplified recommendation logger
 # =============================================================================
 
-class TestGovernanceValidation:
-    """P2: Governance input validation."""
+class TestGovernanceSimplified:
+    """P2: Governance is now a simple recommendation logger."""
 
-    def test_failsafe_action_types_is_frozenset(self):
-        """FAILSAFE_ACTION_TYPES should be immutable."""
-        assert isinstance(DecisionEngine.FAILSAFE_ACTION_TYPES, frozenset)
+    def test_recommendation_logger_exists(self):
+        """RecommendationLogger should be importable."""
+        assert RecommendationLogger is not None
 
-    def test_max_action_type_len_defined(self):
-        """MAX_ACTION_TYPE_LEN constant should be defined."""
-        assert MAX_ACTION_TYPE_LEN == 64
-
-    def test_max_target_len_defined(self):
-        """MAX_TARGET_LEN constant should be defined."""
-        assert MAX_TARGET_LEN == 256
+    def test_recommendation_logger_no_database(self):
+        """RecommendationLogger should work without database."""
+        logger = RecommendationLogger(database=None, plugin=None)
+        rec = logger.log_recommendation('test', 'target')
+        assert rec.action_type == 'test'
 
 
 # =============================================================================
@@ -146,7 +144,7 @@ class TestProtocolStringBounds:
 
 
 # =============================================================================
-# config.py — feerate 0 allowed, governance_mode normalization
+# config.py — feerate 0 allowed
 # =============================================================================
 
 class TestConfigFeerateValidation:
@@ -170,36 +168,6 @@ class TestConfigFeerateValidation:
         error = config.validate()
         assert error is not None
         assert "max_expansion_feerate_perkb" in error
-
-
-class TestConfigGovernanceMode:
-    """P2: Governance mode normalization."""
-
-    def test_advisor_mode_passes(self):
-        """'advisor' should pass."""
-        config = HiveConfig(governance_mode='advisor')
-        error = config.validate()
-        assert error is None
-
-    def test_failsafe_mode_passes(self):
-        """'failsafe' should pass."""
-        config = HiveConfig(governance_mode='failsafe')
-        error = config.validate()
-        assert error is None
-
-    def test_invalid_mode_fails(self):
-        """Invalid mode should fail validation."""
-        config = HiveConfig(governance_mode='yolo')
-        error = config.validate()
-        assert error is not None
-        assert "governance_mode" in error
-
-    def test_mode_normalized(self):
-        """Mode with whitespace/caps should be normalized."""
-        config = HiveConfig(governance_mode='  Advisor  ')
-        error = config.validate()
-        assert error is None
-        assert config.governance_mode == 'advisor'
 
 
 # =============================================================================

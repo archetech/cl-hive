@@ -717,27 +717,22 @@ class TestMarkerDepositorSpoofing:
 # =============================================================================
 
 class TestConfigSnapshot:
-    """Tests for config snapshot usage in process_ready_intents."""
+    """Tests for config snapshot immutability."""
 
-    def test_config_snapshot_called(self):
-        """process_ready_intents should use config.snapshot() not direct config access."""
-        # Verify the pattern: cfg = config.snapshot() should be used
+    def test_config_snapshot_is_immutable(self):
+        """Snapshot should be frozen and not reflect later mutations."""
         from modules.config import HiveConfig
 
-        mock_plugin = Mock()
-        mock_plugin.log = Mock()
-        config = HiveConfig(mock_plugin)
-        config.governance_mode = "advisor"
+        config = HiveConfig()
         config.intent_hold_seconds = 30
 
         snapshot = config.snapshot()
-        assert snapshot.governance_mode == "advisor"
         assert snapshot.intent_hold_seconds == 30
 
         # Mutate original after snapshot
-        config.governance_mode = "failsafe"
+        config.intent_hold_seconds = 90
         # Snapshot should retain original value
-        assert snapshot.governance_mode == "advisor"
+        assert snapshot.intent_hold_seconds == 30
 
 
 # =============================================================================

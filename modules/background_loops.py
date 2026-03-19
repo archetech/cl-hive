@@ -103,20 +103,7 @@ def process_ready_intents():
         intent_type = intent_row.get('intent_type')
         target = intent_row.get('target')
 
-        # SECURITY (Issue #12): Check governance mode BEFORE committing
-        # to prevent state inconsistency where intents are COMMITTED but never executed
-        # In advisor mode, intents wait for AI/human approval
-        # In failsafe mode, only emergency actions auto-execute (not intents)
-        if cfg.governance_mode != "failsafe":
-            if plugin:
-                plugin.log(
-                    f"cl-hive: Intent {intent_id} ready but not committing "
-                    f"(mode={cfg.governance_mode})",
-                    level='debug'
-                )
-            continue
-
-        # Commit the intent (only in failsafe mode for backwards compatibility)
+        # Commit the intent after hold period
         if intent_mgr.commit_intent(intent_id):
             if plugin:
                 plugin.log(f"cl-hive: Committed intent {intent_id}: {intent_type} -> {target[:16]}...")
@@ -219,33 +206,10 @@ def membership_maintenance_loop():
                             ratio = membership_mgr.calculate_contribution_ratio(pid)
                             database.update_member(pid, contribution_ratio=ratio)
 
-                # Phase 9: Planner and governance data pruning
-                database.cleanup_expired_actions()  # Mark expired as 'expired'
+                # Data pruning
                 database.prune_planner_logs(older_than_days=30)
-                database.prune_old_actions(older_than_days=7)
-
-                # Phase C: Proto events cleanup (30-day retention)
                 database.cleanup_proto_events(max_age_seconds=30 * 86400)
-
-                # Prune old peer events (180-day retention)
-                database.prune_peer_events(older_than_days=180)
-
-                # Prune old budget tracking (90-day retention)
-                database.prune_budget_tracking(older_than_days=90)
-
-                # Prune old flow samples (30-day retention)
                 database.prune_old_flow_samples(days_to_keep=30)
-
-                # Prune old pool revenue (90-day retention)
-                database.cleanup_old_pool_revenue(days_to_keep=90)
-
-                # Prune old pool contributions (keep 12 most recent periods)
-                database.cleanup_old_pool_contributions(periods_to_keep=12)
-
-                # Prune old pool distributions (365-day retention)
-                database.cleanup_old_pool_distributions(days_to_keep=365)
-
-                # Prune old ban proposals and votes (180-day retention)
                 database.prune_old_ban_data(older_than_days=180)
 
                 # Issue #38: Auto-connect to hive members we're not connected to

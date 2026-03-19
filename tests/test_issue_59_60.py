@@ -53,7 +53,6 @@ def database(mock_plugin, tmp_path):
 def config():
     return HiveConfig(
         db_path=':memory:',
-        governance_mode='advisor',
         membership_enabled=True,
     )
 

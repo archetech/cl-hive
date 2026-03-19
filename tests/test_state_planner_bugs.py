@@ -8,7 +8,7 @@ Covers:
 - Bug: Gossip process_gossip() missing timestamp freshness check
 - Bug: Planner _propose_expansion() missing feerate gate
 - Bug: Planner cfg.market_share_cap_pct crash (direct attribute access)
-- Bug: Planner cfg.governance_mode crash (direct attribute access)
+- Config: governance_mode removed in trusted fleet simplification
 """
 
 import pytest
@@ -384,7 +384,6 @@ class TestPlannerFeerateGate:
         class FakeCfg:
             max_expansion_feerate_perkb: int = 5000
             market_share_cap_pct: float = 0.20
-            governance_mode: str = 'advisor'
             planner_enable_expansions: bool = True
             planner_min_channel_sats: int = 1000000
             planner_safety_reserve_sats: int = 500000
@@ -493,21 +492,6 @@ class TestPlannerConfigSafety:
             stripped = line.strip()
             if 'cfg.market_share_cap_pct' in stripped and 'getattr' not in stripped:
                 pytest.fail(f"Direct cfg.market_share_cap_pct access: {stripped}")
-
-    def test_governance_mode_uses_getattr(self):
-        """governance_mode should use getattr with default 'advisor' in source."""
-        import inspect
-        from modules.planner import Planner
-
-        source = inspect.getsource(Planner)
-        # Verify the source uses getattr for governance_mode
-        assert "getattr(cfg, 'governance_mode'" in source
-        # Check no direct access
-        lines = source.split('\n')
-        for line in lines:
-            stripped = line.strip()
-            if 'cfg.governance_mode' in stripped and 'getattr' not in stripped:
-                pytest.fail(f"Direct cfg.governance_mode access: {stripped}")
 
     def test_feerate_config_uses_getattr(self):
         """max_expansion_feerate_perkb should use getattr in source."""

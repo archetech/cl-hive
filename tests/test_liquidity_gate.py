@@ -112,7 +112,7 @@ def test_expansion_blocked_by_pending():
     # pending = 1M from existing proposal
     # net available = 1M - 1M = 0 < min_channel_size (1M) -> BLOCKED
     mock_config = MagicMock()
-    mock_config.failsafe_budget_per_day = 2_000_000
+    mock_config.daily_expansion_budget_sats = 2_000_000
     mock_config.budget_reserve_pct = 0.20
     mock_config.budget_max_per_channel_pct = 0.50
     mock_config.planner_enable_expansions = True
@@ -121,7 +121,6 @@ def test_expansion_blocked_by_pending():
     mock_config.planner_default_channel_sats = 5_000_000
     mock_config.planner_max_active_channels = 50
     mock_config.max_expansion_feerate_perkb = 5000
-    mock_config.governance_mode = 'advisor'
     mock_config.market_share_cap = 0.20
     mock_config.planner_safety_reserve_sats = 500_000
     mock_config.planner_fee_buffer_sats = 100_000

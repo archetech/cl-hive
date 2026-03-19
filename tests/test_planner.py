@@ -105,7 +105,7 @@ def mock_config():
     """Create a mock config snapshot."""
     cfg = MagicMock()
     cfg.market_share_cap_pct = 0.20  # 20%
-    cfg.governance_mode = 'advisor'
+    # governance_mode removed in trusted fleet simplification
     # Channel size options (new)
     cfg.planner_min_channel_sats = 1_000_000  # 1M sats
     cfg.planner_max_channel_sats = 50_000_000  # 50M sats
@@ -115,7 +115,7 @@ def mock_config():
     cfg.planner_safety_reserve_sats = 500_000  # 500k sats safety reserve
     cfg.planner_fee_buffer_sats = 100_000  # 100k sats for on-chain fees
     # Budget constraints (ensures proposals are within executable limits)
-    cfg.failsafe_budget_per_day = 2_000_000  # 2M sats daily budget
+    cfg.daily_expansion_budget_sats = 2_000_000  # 2M sats daily budget
     cfg.budget_reserve_pct = 0.20  # 20% reserve
     cfg.budget_max_per_channel_pct = 0.50  # 50% of daily budget per channel (= 1M)
     return cfg
@@ -517,19 +517,14 @@ class TestFailClosed:
 
 
 # =============================================================================
-# GOVERNANCE MODE TESTS
+# RECOMMENDATION LOGGING TESTS
 # =============================================================================
 
-class TestGovernanceMode:
-    """Test governance mode behavior."""
+class TestRecommendationLogging:
+    """Test recommendation logging behavior."""
 
-    def test_advisor_mode_queues_only(self, planner, mock_config):
-        """In advisor mode, actions should be logged but not necessarily blocked."""
-        mock_config.governance_mode = 'advisor'
-
-        # The current implementation still performs ignores in advisor mode
-        # (ignoring is defensive, not fund-moving)
-        # This test documents the expected behavior
+    def test_planner_stats_include_ignored_peers(self, planner, mock_config):
+        """Planner stats should include ignored_peers_count."""
         stats = planner.get_planner_stats()
         assert 'ignored_peers_count' in stats
 
@@ -822,10 +817,9 @@ class TestExpansionLogic:
         assert decisions == []
         mock_intent_mgr.create_intent.assert_not_called()
 
-    def test_expansion_advisor_mode_no_broadcast(self, planner, mock_config, mock_plugin, mock_database):
-        """In advisor mode, intent should be queued to pending_actions but not broadcast."""
+    def test_expansion_broadcasts_intent(self, planner, mock_config, mock_plugin, mock_database):
+        """Expansion should always broadcast intent in trusted fleet model."""
         mock_config.planner_enable_expansions = True
-        mock_config.governance_mode = 'advisor'
 
         target = '02' + 'w' * 64
 
@@ -841,9 +835,6 @@ class TestExpansionLogic:
             'outputs': [{'status': 'confirmed', 'amount_msat': 10000000000}]
         }
 
-        # Mock add_pending_action to return an action ID
-        mock_database.add_pending_action.return_value = 99
-
         from modules.planner import UnderservedResult
         with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:
             mock_get_underserved.return_value = [
@@ -857,47 +848,32 @@ class TestExpansionLogic:
 
             mock_database.get_pending_intents.return_value = []
 
-            decisions = planner._propose_expansion(mock_config, 'test-advisor')
+            decisions = planner._propose_expansion(mock_config, 'test-broadcast')
 
         assert len(decisions) == 1
-        assert decisions[0]['broadcast'] is False
-        assert decisions[0]['pending_action_id'] == 99
-
-        # Verify add_pending_action was called with correct args
-        mock_database.add_pending_action.assert_called_once()
-        call_args = mock_database.add_pending_action.call_args
-        assert call_args[1]['action_type'] == 'channel_open'
-        assert call_args[1]['payload']['intent_id'] == 456
-        assert call_args[1]['payload']['target'] == target
+        assert decisions[0]['broadcast'] is True
 
 
-class TestPlannerGovernanceIntegration:
-    """Test Planner-Governance integration (Issue #14)."""
+class TestPlannerRecommendationIntegration:
+    """Test Planner-RecommendationLogger integration."""
 
-    def test_expansion_with_decision_engine_advisor(self, mock_config, mock_plugin, mock_database, mock_state_manager):
-        """Planner should use DecisionEngine for governance in advisor mode."""
-        from modules.governance import DecisionEngine, DecisionResult
+    def test_expansion_logs_recommendation(self, mock_config, mock_plugin, mock_database, mock_state_manager):
+        """Planner should log recommendation and broadcast intent."""
+        from modules.governance import RecommendationLogger
 
         mock_config.planner_enable_expansions = True
-        mock_config.governance_mode = 'advisor'
 
-        # Create mock decision engine
-        mock_decision_engine = MagicMock(spec=DecisionEngine)
-        mock_response = MagicMock()
-        mock_response.result = DecisionResult.APPROVED
-        mock_response.action_id = None
-        mock_response.reason = "Within limits"
-        mock_decision_engine.propose_action.return_value = mock_response
+        # Create mock recommendation logger
+        mock_logger = MagicMock(spec=RecommendationLogger)
 
-        # Create planner with decision engine
+        # Create planner with recommendation logger
         planner = Planner(
             state_manager=mock_state_manager,
             database=mock_database,
             bridge=MagicMock(),
-
             plugin=mock_plugin,
             intent_manager=MagicMock(),
-            decision_engine=mock_decision_engine
+            recommendation_logger=mock_logger
         )
 
         target = '02' + 'g' * 64
@@ -910,10 +886,7 @@ class TestPlannerGovernanceIntegration:
         mock_plugin.rpc.listfunds.return_value = {
             'outputs': [{'status': 'confirmed', 'amount_msat': 10000000000}]
         }
-        # Mock budget check to allow channel opens (needs to be > min_channel_sats after per-channel limit)
-        # With default budget_max_per_channel_pct=0.5, we need daily budget of 2M to get 1M per-channel limit
         mock_database.get_available_budget.return_value = 2_000_000
-        mock_config.failsafe_budget_per_day = 2_000_000  # Results in max_per_channel = 1M
 
         from modules.planner import UnderservedResult
         with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:
@@ -927,74 +900,16 @@ class TestPlannerGovernanceIntegration:
             ]
             mock_database.get_pending_intents.return_value = []
 
-            decisions = planner._propose_expansion(mock_config, 'test-gov-integration')
+            decisions = planner._propose_expansion(mock_config, 'test-rec-integration')
 
         assert len(decisions) == 1
         assert decisions[0]['broadcast'] is True
-        assert decisions[0]['governance_result'] == 'approved'
 
-        # Verify DecisionEngine was called
-        mock_decision_engine.propose_action.assert_called_once()
-
-    def test_expansion_with_decision_engine_queued(self, mock_config, mock_plugin, mock_database, mock_state_manager):
-        """Planner should handle QUEUED result from DecisionEngine."""
-        from modules.governance import DecisionEngine, DecisionResult
-
-        mock_config.planner_enable_expansions = True
-        mock_config.governance_mode = 'advisor'
-
-        # Create mock decision engine that returns QUEUED
-        mock_decision_engine = MagicMock(spec=DecisionEngine)
-        mock_response = MagicMock()
-        mock_response.result = DecisionResult.QUEUED
-        mock_response.action_id = 42
-        mock_response.reason = "Queued for approval"
-        mock_decision_engine.propose_action.return_value = mock_response
-
-        # Create planner with decision engine
-        planner = Planner(
-            state_manager=mock_state_manager,
-            database=mock_database,
-            bridge=MagicMock(),
-
-            plugin=mock_plugin,
-            intent_manager=MagicMock(),
-            decision_engine=mock_decision_engine
-        )
-
-        target = '02' + 'h' * 64
-
-        # Setup mocks
-        mock_intent = MagicMock()
-        mock_intent.intent_id = 999
-        planner.intent_manager.create_intent.return_value = mock_intent
-
-        mock_plugin.rpc.listfunds.return_value = {
-            'outputs': [{'status': 'confirmed', 'amount_msat': 10000000000}]
-        }
-        # Mock budget check to allow channel opens (needs to be > min_channel_sats after per-channel limit)
-        # With default budget_max_per_channel_pct=0.5, we need daily budget of 2M to get 1M per-channel limit
-        mock_database.get_available_budget.return_value = 2_000_000
-        mock_config.failsafe_budget_per_day = 2_000_000  # Results in max_per_channel = 1M
-
-        from modules.planner import UnderservedResult
-        with patch.object(planner, 'get_underserved_targets') as mock_get_underserved:
-            mock_get_underserved.return_value = [
-                UnderservedResult(
-                    target=target,
-                    public_capacity_sats=200_000_000,
-                    hive_share_pct=0.03,
-                    score=1.9
-                )
-            ]
-            mock_database.get_pending_intents.return_value = []
-
-            decisions = planner._propose_expansion(mock_config, 'test-gov-queued')
-
-        assert len(decisions) == 1
-        assert decisions[0]['broadcast'] is False
-        assert decisions[0]['governance_result'] == 'queued'
-        assert decisions[0]['pending_action_id'] == 42
+        # Verify RecommendationLogger was called
+        mock_logger.log_recommendation.assert_called_once()
+        call_kwargs = mock_logger.log_recommendation.call_args[1]
+        assert call_kwargs['action_type'] == 'channel_open'
+        assert call_kwargs['target'] == target
 
 
 class TestUnderservedTargets:

@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 
 # Type mapping for config fields (for validation)
 CONFIG_FIELD_TYPES: Dict[str, type] = {
-    'governance_mode': str,
     'membership_enabled': bool,
     'auto_join_enabled': bool,
     'ban_autotrigger_enabled': bool,
@@ -34,9 +33,7 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'planner_max_channel_sats': int,
     'planner_default_channel_sats': int,
     'planner_max_active_channels': int,
-    # Governance (Phase 7) - Failsafe mode limits
-    'failsafe_budget_per_day': int,
-    'failsafe_actions_per_hour': int,
+    'daily_expansion_budget_sats': int,
     'budget_reserve_pct': float,
     'budget_max_per_channel_pct': float,
     # Feerate gate
@@ -57,24 +54,13 @@ CONFIG_FIELD_RANGES: Dict[str, tuple] = {
     'planner_max_channel_sats': (1_000_000, 1_000_000_000),  # 1M to 1B sats (10 BTC)
     'planner_default_channel_sats': (100_000, 500_000_000),  # 100k to 500M sats (5 BTC)
     'planner_max_active_channels': (10, 500),  # Max channels before auto-expansion is gated
-    # Governance (Phase 7) - Failsafe mode limits (tighter than old autonomous)
-    'failsafe_budget_per_day': (100_000, 10_000_000),  # 100k to 10M sats (reduced max)
-    'failsafe_actions_per_hour': (1, 5),  # 1 to 5 actions per hour (reduced max)
+    'daily_expansion_budget_sats': (100_000, 100_000_000),  # 100k to 100M sats
     'budget_reserve_pct': (0.05, 0.50),  # 5% to 50% reserve
     'budget_max_per_channel_pct': (0.10, 1.0),  # 10% to 100% of daily budget per channel
     # Feerate gate for expansions
     'max_expansion_feerate_perkb': (1000, 100000),  # 1-100 sat/vB (perkb = 4x perkw)
     # RPC Pool (Phase 3)
     'rpc_pool_size': (1, 8),
-}
-
-# Valid governance modes
-# - advisor: Primary mode - AI (via MCP server) reviews pending_actions
-# - failsafe: Emergency mode - auto-execute critical safety actions when AI unavailable
-VALID_GOVERNANCE_MODES = {'advisor', 'failsafe'}
-LEGACY_GOVERNANCE_ALIASES: Dict[str, str] = {
-    # Backward compatibility for older deployments/configs.
-    'autonomous': 'failsafe',
 }
 
 
@@ -88,9 +74,6 @@ class HiveConfig:
     
     # Database path
     db_path: str = '~/.lightning/cl_hive.db'
-    
-    # Governance Mode (advisor is primary, failsafe is emergency backup)
-    governance_mode: str = 'advisor'  # 'advisor' (AI-driven), 'failsafe' (emergency)
 
     # Membership
     membership_enabled: bool = True
@@ -120,11 +103,10 @@ class HiveConfig:
     planner_default_channel_sats: int = 5_000_000  # 5M sats default channel size
     planner_max_active_channels: int = 50      # Gate expansion auto-approve above this channel count
 
-    # Governance (Phase 7) - Failsafe mode limits
-    failsafe_budget_per_day: int = 10_000_000    # 10M sats daily budget (5M per channel at 50%)
-    failsafe_actions_per_hour: int = 2           # Max 2 emergency actions per hour
-    budget_reserve_pct: float = 0.20             # Reserve 20% of onchain for future expansion
-    budget_max_per_channel_pct: float = 0.50     # Max 50% of daily budget per single channel
+    # Budget controls
+    daily_expansion_budget_sats: int = 10_000_000  # 10M sats daily expansion budget
+    budget_reserve_pct: float = 0.20               # Reserve 20% of onchain for future expansion
+    budget_max_per_channel_pct: float = 0.50       # Max 50% of daily budget per single channel
 
     # Feerate gate for expansions (sat/kB, where 1 sat/vB = 4 sat/kB approx)
     # Default 5000 sat/kB = ~1.25 sat/vB - conservative low-fee threshold
@@ -138,12 +120,7 @@ class HiveConfig:
 
     def __post_init__(self):
         """Normalize fields on construction."""
-        self._normalize()
-
-    def _normalize(self):
-        """Normalize field values (case, whitespace, etc.)."""
-        mode = str(self.governance_mode).strip().lower()
-        self.governance_mode = LEGACY_GOVERNANCE_ALIASES.get(mode, mode)
+        pass
 
     def snapshot(self) -> 'HiveConfigSnapshot':
         """
@@ -162,10 +139,6 @@ class HiveConfig:
         Returns:
             Error message if invalid, None if valid
         """
-        if hasattr(self, 'governance_mode'):
-            if self.governance_mode not in VALID_GOVERNANCE_MODES:
-                return f"governance_mode must be one of {sorted(VALID_GOVERNANCE_MODES)}, got '{self.governance_mode}'"
-
         # Type validation
         for key, expected_type in CONFIG_FIELD_TYPES.items():
             value = getattr(self, key, None)
@@ -208,7 +181,6 @@ class HiveConfigSnapshot:
     
     # Core settings (immutable snapshot)
     db_path: str
-    governance_mode: str
     membership_enabled: bool
     auto_join_enabled: bool
     ban_autotrigger_enabled: bool
@@ -225,9 +197,7 @@ class HiveConfigSnapshot:
     planner_max_channel_sats: int
     planner_default_channel_sats: int
     planner_max_active_channels: int
-    # Governance (Phase 7) - Failsafe mode limits
-    failsafe_budget_per_day: int
-    failsafe_actions_per_hour: int
+    daily_expansion_budget_sats: int
     budget_reserve_pct: float
     budget_max_per_channel_pct: float
     max_expansion_feerate_perkb: int
@@ -239,7 +209,6 @@ class HiveConfigSnapshot:
         """Create a frozen snapshot from mutable config."""
         return cls(
             db_path=config.db_path,
-            governance_mode=config.governance_mode,
             membership_enabled=config.membership_enabled,
             auto_join_enabled=config.auto_join_enabled,
             ban_autotrigger_enabled=config.ban_autotrigger_enabled,
@@ -256,8 +225,7 @@ class HiveConfigSnapshot:
             planner_max_channel_sats=config.planner_max_channel_sats,
             planner_default_channel_sats=config.planner_default_channel_sats,
             planner_max_active_channels=config.planner_max_active_channels,
-            failsafe_budget_per_day=config.failsafe_budget_per_day,
-            failsafe_actions_per_hour=config.failsafe_actions_per_hour,
+            daily_expansion_budget_sats=config.daily_expansion_budget_sats,
             budget_reserve_pct=config.budget_reserve_pct,
             budget_max_per_channel_pct=config.budget_max_per_channel_pct,
             max_expansion_feerate_perkb=config.max_expansion_feerate_perkb,

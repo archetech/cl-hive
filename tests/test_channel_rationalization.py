@@ -98,17 +98,17 @@ class MockStigmergy:
         self.markers.append(marker)
 
 
-class MockGovernance:
-    """Mock governance for testing."""
+class MockRecommendationLogger:
+    """Mock recommendation logger for testing."""
 
     def __init__(self):
-        self.pending_actions = []
+        self.recommendations = []
 
-    def create_pending_action(self, action_type, data, source):
-        self.pending_actions.append({
+    def log_recommendation(self, action_type, target, context=None):
+        self.recommendations.append({
             "action_type": action_type,
-            "data": data,
-            "source": source
+            "target": target,
+            "context": context or {}
         })
 
 
@@ -579,14 +579,14 @@ class TestChannelRationalizer:
         for rec in my_recs:
             assert rec.member_id == our_pubkey
 
-    def test_create_pending_actions(self):
-        """Test creating pending actions for recommendations."""
+    def test_log_close_recommendations(self):
+        """Test logging close recommendations."""
         plugin = MockPlugin()
-        governance = MockGovernance()
+        logger = MockRecommendationLogger()
 
         rationalizer = ChannelRationalizer(
             plugin=plugin,
-            governance=governance
+            recommendation_logger=logger
         )
 
         recommendations = [
@@ -601,11 +601,11 @@ class TestChannelRationalizer:
             )
         ]
 
-        created = rationalizer.create_pending_actions(recommendations)
+        logged = rationalizer.log_close_recommendations(recommendations)
 
-        assert created == 1
-        assert len(governance.pending_actions) == 1
-        assert governance.pending_actions[0]["action_type"] == "close_recommendation"
+        assert logged == 1
+        assert len(logger.recommendations) == 1
+        assert logger.recommendations[0]["action_type"] == "close_channel"
 
 
 # =============================================================================

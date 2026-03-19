@@ -67,7 +67,6 @@ class TestStatusCapabilityFields:
     def test_status_includes_transport_and_signing_capabilities(self, database):
         pubkey = "02" + "dd" * 32
         ctx = _make_ctx(database, pubkey, tier='member')
-        ctx.config.governance_mode = "advisor"
         ctx.config.max_members = 50
         ctx.config.market_share_cap_pct = 0.20
         ctx.nostr_transport_enabled = True

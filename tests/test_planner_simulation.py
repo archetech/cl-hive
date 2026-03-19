@@ -115,7 +115,6 @@ def mock_config():
     """Mock config snapshot."""
     cfg = MagicMock()
     cfg.market_share_cap_pct = 0.20
-    cfg.governance_mode = 'advisor'
     cfg.planner_enable_expansions = True
     # Channel size options
     cfg.planner_min_channel_sats = 1_000_000  # 1M sats
@@ -126,7 +125,7 @@ def mock_config():
     cfg.planner_safety_reserve_sats = 500_000  # 500k sats safety reserve
     cfg.planner_fee_buffer_sats = 100_000  # 100k sats for on-chain fees
     # Budget constraints (needed for pre-intent budget validation)
-    cfg.failsafe_budget_per_day = 10_000_000  # 10M sats daily budget
+    cfg.daily_expansion_budget_sats = 10_000_000  # 10M sats daily budget
     cfg.budget_reserve_pct = 0.20  # 20% reserve
     cfg.budget_max_per_channel_pct = 0.50  # 50% of daily budget per channel
     return cfg

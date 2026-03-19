@@ -619,7 +619,7 @@ class Planner:
     """
 
     def __init__(self, state_manager, database, bridge, plugin=None,
-                 intent_manager=None, decision_engine=None,
+                 intent_manager=None, recommendation_logger=None,
                  liquidity_coordinator=None, splice_coordinator=None,
                  health_aggregator=None, rationalization_mgr=None,
                  strategic_positioning_mgr=None, cooperative_expansion=None):
@@ -632,10 +632,10 @@ class Planner:
             bridge: Integration Bridge for cl-revenue-ops
             plugin: Plugin reference for RPC and logging
             intent_manager: IntentManager for coordinated channel opens
-            decision_engine: DecisionEngine for governance decisions (Phase 7)
-            liquidity_coordinator: LiquidityCoordinator for bottleneck detection (Phase 7)
-            splice_coordinator: SpliceCoordinator for splice recommendations (Phase 7)
-            health_aggregator: HealthScoreAggregator for fleet health (Phase 7)
+            recommendation_logger: RecommendationLogger for logging decisions
+            liquidity_coordinator: LiquidityCoordinator for bottleneck detection
+            splice_coordinator: SpliceCoordinator for splice recommendations
+            health_aggregator: HealthScoreAggregator for fleet health
             rationalization_mgr: RationalizationManager for redundancy detection
             strategic_positioning_mgr: StrategicPositioningManager for corridor value
         """
@@ -644,7 +644,7 @@ class Planner:
         self.bridge = bridge
         self.plugin = plugin
         self.intent_manager = intent_manager
-        self.decision_engine = decision_engine
+        self.recommendation_logger = recommendation_logger
 
         # Cooperation modules (Phase 7) - can be set after init via setter
         self.liquidity_coordinator = liquidity_coordinator
@@ -2175,7 +2175,7 @@ class Planner:
             return decisions
 
         # Budget validation BEFORE intent creation to avoid wasting intent slots
-        daily_budget = getattr(cfg, 'failsafe_budget_per_day', 1_000_000)
+        daily_budget = getattr(cfg, 'daily_expansion_budget_sats', 10_000_000)
         budget_reserve_pct = getattr(cfg, 'budget_reserve_pct', 0.20)
         budget_max_per_channel_pct = getattr(cfg, 'budget_max_per_channel_pct', 0.50)
 
@@ -2289,121 +2289,64 @@ class Planner:
 
             # node_summary already computed above (profitability gate)
 
-            # Use DecisionEngine for governance decision if available
-            if self.decision_engine:
-                # Calculate proposed channel size using intelligent sizing algorithm
-                default_size = getattr(cfg, 'planner_default_channel_sats', 5_000_000)
-                max_size = getattr(cfg, 'planner_max_channel_sats', 50_000_000)
-                market_share_cap = getattr(cfg, 'market_share_cap_pct', 0.20)
+            # Calculate proposed channel size using intelligent sizing algorithm
+            default_size = getattr(cfg, 'planner_default_channel_sats', 5_000_000)
+            max_size = getattr(cfg, 'planner_max_channel_sats', 50_000_000)
+            market_share_cap = getattr(cfg, 'market_share_cap_pct', 0.20)
 
-                # Get target's channel count for routing potential calculation
-                target_channel_count = self._get_target_channel_count(selected_target.target)
-                avg_fee_rate = self._get_avg_fee_rate()
+            # Get target's channel count for routing potential calculation
+            target_channel_count = self._get_target_channel_count(selected_target.target)
+            avg_fee_rate = self._get_avg_fee_rate()
 
-                # Phase 6.3: Use intelligent channel sizer with quality scoring
-                sizer = ChannelSizer(plugin=self.plugin, quality_scorer=self.quality_scorer)
-                sizing_result = sizer.calculate_size(
-                    target=selected_target.target,
-                    target_capacity_sats=selected_target.public_capacity_sats,
-                    target_channel_count=target_channel_count,
-                    hive_share_pct=selected_target.hive_share_pct,
-                    target_share_cap=market_share_cap * 0.5,  # Aim for half of cap
-                    onchain_balance_sats=onchain_balance,
-                    min_channel_sats=min_channel_size,
-                    max_channel_sats=max_size,
-                    default_channel_sats=default_size,
-                    avg_fee_rate_ppm=avg_fee_rate,
-                    # Phase 6.3: Pass quality data from UnderservedResult
-                    quality_score=selected_target.quality_score,
-                    quality_confidence=selected_target.quality_confidence,
-                    quality_recommendation=selected_target.quality_recommendation,
-                    # Pass budget constraint so sizer can cap appropriately
-                    available_budget_sats=available_budget,
-                )
+            # Use intelligent channel sizer with quality scoring
+            sizer = ChannelSizer(plugin=self.plugin, quality_scorer=self.quality_scorer)
+            sizing_result = sizer.calculate_size(
+                target=selected_target.target,
+                target_capacity_sats=selected_target.public_capacity_sats,
+                target_channel_count=target_channel_count,
+                hive_share_pct=selected_target.hive_share_pct,
+                target_share_cap=market_share_cap * 0.5,  # Aim for half of cap
+                onchain_balance_sats=onchain_balance,
+                min_channel_sats=min_channel_size,
+                max_channel_sats=max_size,
+                default_channel_sats=default_size,
+                avg_fee_rate_ppm=avg_fee_rate,
+                quality_score=selected_target.quality_score,
+                quality_confidence=selected_target.quality_confidence,
+                quality_recommendation=selected_target.quality_recommendation,
+                available_budget_sats=available_budget,
+            )
 
-                proposed_size = sizing_result.recommended_size_sats
+            proposed_size = sizing_result.recommended_size_sats
 
-                # Build context for governance decision (includes sizing factors)
-                context = {
-                    'intent_id': intent.intent_id,
-                    'public_capacity_sats': selected_target.public_capacity_sats,
-                    'hive_share_pct': round(selected_target.hive_share_pct, 4),
-                    'onchain_balance': onchain_balance,
-                    'amount_sats': proposed_size,  # For budget tracking
-                    'channel_size_sats': proposed_size,  # Recommended channel size
-                    'min_channel_sats': min_channel_size,
-                    'max_channel_sats': max_size,
-                    'sizing_factors': sizing_result.factors,
-                    'sizing_reasoning': sizing_result.reasoning,
-                    'target_channel_count': target_channel_count,
-                    # Phase 6.3: Include quality information
-                    'quality_score': round(selected_target.quality_score, 3),
-                    'quality_confidence': round(selected_target.quality_confidence, 3),
-                    'quality_recommendation': selected_target.quality_recommendation,
-                    'node_summary': node_summary,
-                }
+            # Build context for recommendation logging
+            context = {
+                'intent_id': intent.intent_id,
+                'public_capacity_sats': selected_target.public_capacity_sats,
+                'hive_share_pct': round(selected_target.hive_share_pct, 4),
+                'onchain_balance': onchain_balance,
+                'amount_sats': proposed_size,
+                'channel_size_sats': proposed_size,
+                'sizing_factors': sizing_result.factors,
+                'sizing_reasoning': sizing_result.reasoning,
+                'target_channel_count': target_channel_count,
+                'quality_score': round(selected_target.quality_score, 3),
+                'quality_confidence': round(selected_target.quality_confidence, 3),
+                'quality_recommendation': selected_target.quality_recommendation,
+                'node_summary': node_summary,
+            }
 
-                # Define executor for channel_open (broadcasts intent)
-                # Pass intent via default arg to capture current value, not mutable closure
-                def channel_open_executor(target, ctx, _intent=intent):
-                    self._broadcast_intent(_intent)
-
-                self.decision_engine.register_executor('channel_open', channel_open_executor)
-
-                # Propose action through governance
-                gov_response = self.decision_engine.propose_action(
+            # Log the recommendation
+            if self.recommendation_logger:
+                self.recommendation_logger.log_recommendation(
                     action_type='channel_open',
                     target=selected_target.target,
                     context=context,
-                    cfg=cfg
                 )
 
-                # Record governance decision in decisions list
-                from modules.governance import DecisionResult
-                if gov_response.result == DecisionResult.APPROVED:
-                    decisions[-1]['broadcast'] = True
-                    decisions[-1]['governance_result'] = 'approved'
-                elif gov_response.result == DecisionResult.QUEUED:
-                    decisions[-1]['broadcast'] = False
-                    decisions[-1]['pending_action_id'] = gov_response.action_id
-                    decisions[-1]['governance_result'] = 'queued'
-                elif gov_response.result == DecisionResult.DENIED:
-                    decisions[-1]['broadcast'] = False
-                    decisions[-1]['governance_result'] = 'denied'
-                    decisions[-1]['governance_reason'] = gov_response.reason
-                else:
-                    decisions[-1]['broadcast'] = False
-                    decisions[-1]['governance_result'] = 'error'
-            else:
-                # Fallback: Manual governance handling (backwards compatibility)
-                if getattr(cfg, 'governance_mode', 'advisor') == 'failsafe':
-                    self._log("WARNING: Failsafe fallback broadcast (no decision_engine) — intent only, no fund action")
-                    self._broadcast_intent(intent)
-                    decisions[-1]['broadcast'] = True
-                    decisions[-1]['governance_result'] = 'failsafe_fallback'
-                else:
-                    # In advisor mode, queue to pending_actions for AI/human approval
-                    action_id = self.db.add_pending_action(
-                        action_type='channel_open',
-                        payload={
-                            'intent_id': intent.intent_id,
-                            'target': selected_target.target,
-                            'public_capacity_sats': selected_target.public_capacity_sats,
-                            'hive_share_pct': round(selected_target.hive_share_pct, 4),
-                            'onchain_balance': onchain_balance,
-                            'target_channel_count': self._get_target_channel_count(selected_target.target),
-                            'quality_score': round(selected_target.quality_score, 3),
-                            'quality_recommendation': selected_target.quality_recommendation,
-                            'node_summary': node_summary,
-                        },
-                        expires_hours=24
-                    )
-                    self._log(
-                        f"Action queued for approval (id={action_id}, mode={getattr(cfg, 'governance_mode', 'advisor')})",
-                        level='info'
-                    )
-                    decisions[-1]['broadcast'] = False
-                    decisions[-1]['pending_action_id'] = action_id
+            # Broadcast the intent to the fleet
+            self._broadcast_intent(intent)
+            decisions[-1]['broadcast'] = True
 
         except Exception as e:
             self._log(f"Failed to create expansion intent: {e}", level='warn')

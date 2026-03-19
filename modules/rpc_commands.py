@@ -282,7 +282,7 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
 
     return {
         "status": "active" if members else "no_members",
-        "governance_mode": ctx.config.governance_mode if ctx.config else "unknown",
+        "governance": "recommendation_only",
         "membership": our_membership,  # Our own membership for cl-revenue-ops detection
         "members": {
             "total": len(members),
@@ -319,11 +319,7 @@ def get_config(ctx: HiveContext) -> Dict[str, Any]:
         "immutable": {
             "db_path": ctx.config.db_path,
         },
-        "governance": {
-            "governance_mode": ctx.config.governance_mode,
-            "failsafe_budget_per_day": ctx.config.failsafe_budget_per_day,
-            "failsafe_actions_per_hour": ctx.config.failsafe_actions_per_hour,
-        },
+        "governance": "recommendation_only",
         "membership": {
             "membership_enabled": ctx.config.membership_enabled,
             "auto_join_enabled": ctx.config.auto_join_enabled,
@@ -461,7 +457,7 @@ def topology(ctx: HiveContext) -> Dict[str, Any]:
             "market_share_cap_pct": cfg.market_share_cap_pct,
             "planner_interval_seconds": cfg.planner_interval,
             "expansions_enabled": cfg.planner_enable_expansions,
-            "governance_mode": cfg.governance_mode,
+            "governance": "recommendation_only",
         }
     }
 

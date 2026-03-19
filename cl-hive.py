@@ -74,7 +74,7 @@ from modules.contribution import ContributionManager
 from modules.membership import MembershipManager, MembershipTier
 from modules.planner import Planner, ChannelSizer
 from modules.quality_scorer import PeerQualityScorer
-from modules.governance import DecisionEngine
+from modules.governance import RecommendationLogger
 from modules.fee_intelligence import FeeIntelligenceManager
 from modules.traffic_intelligence import TrafficIntelligenceManager
 from modules.liquidity_coordinator import LiquidityCoordinator
@@ -187,7 +187,7 @@ bridge: Optional[Bridge] = None
 membership_mgr: Optional[MembershipManager] = None
 contribution_mgr: Optional[ContributionManager] = None
 planner: Optional[Planner] = None
-decision_engine: Optional[DecisionEngine] = None
+recommendation_logger: Optional[RecommendationLogger] = None
 fee_intel_mgr: Optional[FeeIntelligenceManager] = None
 traffic_intel_mgr: Optional[TrafficIntelligenceManager] = None
 health_aggregator: Optional[HealthScoreAggregator] = None
@@ -818,10 +818,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     except Exception as e:
         plugin.log(f"cl-hive: HIVE_SAFETY startup scan failed: {e}", level="warn")
 
-    # Initialize DecisionEngine (Phase 7)
-    global decision_engine
-    decision_engine = DecisionEngine(database=database, plugin=plugin)
-    plugin.log("cl-hive: DecisionEngine initialized")
+    # Initialize RecommendationLogger (simplified governance)
+    global recommendation_logger
+    recommendation_logger = RecommendationLogger(database=database, plugin=plugin)
+    plugin.log("cl-hive: RecommendationLogger initialized")
 
     # Initialize Planner (Phase 6)
     global planner
@@ -831,7 +831,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         bridge=bridge,
         plugin=plugin,
         intent_manager=intent_mgr,
-        decision_engine=decision_engine
+        recommendation_logger=recommendation_logger
     )
     plugin.log("cl-hive: Planner initialized")
 
@@ -972,7 +972,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         database=database,
         state_manager=state_manager,
         fee_coordination_mgr=fee_coordination_mgr,
-        governance=decision_engine
+        recommendation_logger=recommendation_logger
     )
     rationalization_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Rationalization manager initialized")
@@ -1657,7 +1657,7 @@ def hive_reload_config(plugin: Plugin):
     internal config object with CLN's current option values.
 
     Example:
-        lightning-cli setconfig hive-governance-mode failsafe
+        lightning-cli setconfig hive-planner-interval 1800
         lightning-cli hive-reload-config
 
     Returns:
@@ -2161,8 +2161,8 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
         onchain_balance = cfg.planner_default_channel_sats * 10  # Assume adequate
 
     # Get available budget (considering all constraints)
-    daily_remaining = database.get_available_budget(cfg.failsafe_budget_per_day)
-    max_per_channel = int(cfg.failsafe_budget_per_day * cfg.budget_max_per_channel_pct)
+    daily_remaining = database.get_available_budget(cfg.daily_expansion_budget_sats)
+    max_per_channel = int(cfg.daily_expansion_budget_sats * cfg.budget_max_per_channel_pct)
     spendable_onchain = int(onchain_balance * (1.0 - cfg.budget_reserve_pct))
     available_budget = min(daily_remaining, max_per_channel, spendable_onchain)
 
@@ -2185,7 +2185,7 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
     )
 
     # Get budget summary
-    budget_info = database.get_budget_summary(cfg.failsafe_budget_per_day, days=1)
+    budget_info = database.get_budget_summary(cfg.daily_expansion_budget_sats, days=1)
 
     return {
         "peer_id": peer_id,
@@ -2200,7 +2200,7 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
             "onchain_balance_sats": onchain_balance,
         },
         "budget": {
-            "daily_budget_sats": cfg.failsafe_budget_per_day,
+            "daily_budget_sats": cfg.daily_expansion_budget_sats,
             "spent_today_sats": budget_info['today']['spent_sats'],
             "daily_remaining_sats": daily_remaining,
             "max_per_channel_sats": max_per_channel,
