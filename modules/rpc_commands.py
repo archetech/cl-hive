@@ -1146,7 +1146,6 @@ def rationalization_status(ctx: HiveContext) -> Dict[str, Any]:
 # Position fleet on critical network paths:
 # - RouteValueAnalyzer: High-value corridors with limited competition
 # - FleetPositioningStrategy: Coordinated channel opens (max 2 per target)
-# - PhysarumChannelManager: Flow-based channel lifecycle (strengthen/atrophy)
 
 def valuable_corridors(
     ctx: HiveContext,

@@ -33,17 +33,10 @@ except ImportError:
 
 try:
     from modules.intent_manager import IntentType
-    from modules.protocol import serialize, HiveMessageType, get_intent_signing_payload
 except ImportError:
     # For testing - define stubs
     class IntentType:
         CHANNEL_OPEN = 'channel_open'
-    class HiveMessageType:
-        INTENT = 'intent'
-    def serialize(msg_type, payload):
-        return b''
-    def get_intent_signing_payload(payload):
-        return ''
 
 try:
     from modules.quality_scorer import PeerQualityScorer
@@ -88,7 +81,7 @@ QUALITY_SCORE_DAYS = 90   # Days of history to consider for quality scoring
 
 # Hive coverage diversity thresholds
 HIVE_COVERAGE_HIGH_PCT = 0.60        # >60% of hive has channels = well covered
-HIVE_COVERAGE_MAJORITY_PCT = 0.50    # >50% = majority covered, consider splice
+HIVE_COVERAGE_MAJORITY_PCT = 0.50    # >50% = majority covered
 
 # Network competition thresholds (peer's total channel count)
 LOW_COMPETITION_CHANNELS = 30         # <30 channels = low competition, good target
@@ -162,11 +155,10 @@ class ExpansionRecommendation:
     """
     Recommendation for expanding capacity to a peer.
 
-    Can recommend either a new channel open or a splice to existing.
     Integrates cooperation module data for smarter topology decisions.
     """
     target: str
-    recommendation_type: str  # "open_channel" | "splice_in" | "no_action"
+    recommendation_type: str  # "open_channel" | "no_action"
     score: float
     reasoning: str
     details: Dict[str, Any]
@@ -620,21 +612,23 @@ class Planner:
 
     def __init__(self, state_manager, database, bridge, plugin=None,
                  intent_manager=None, recommendation_logger=None,
-                 liquidity_coordinator=None, splice_coordinator=None,
+                 liquidity_coordinator=None,
                  health_aggregator=None, rationalization_mgr=None,
-                 strategic_positioning_mgr=None, cooperative_expansion=None):
+                 strategic_positioning_mgr=None):
         """
-        Initialize the Planner.
+        Initialize the Planner (recommendation-only).
+
+        The planner generates expansion recommendations and detects saturation
+        but does NOT execute channel opens or broadcasts directly.
 
         Args:
             state_manager: StateManager for accessing Hive peer states
             database: HiveDatabase for logging and membership data
             bridge: Integration Bridge for cl-revenue-ops
             plugin: Plugin reference for RPC and logging
-            intent_manager: IntentManager for coordinated channel opens
+            intent_manager: IntentManager for checking pending intents
             recommendation_logger: RecommendationLogger for logging decisions
             liquidity_coordinator: LiquidityCoordinator for bottleneck detection
-            splice_coordinator: SpliceCoordinator for splice recommendations
             health_aggregator: HealthScoreAggregator for fleet health
             rationalization_mgr: RationalizationManager for redundancy detection
             strategic_positioning_mgr: StrategicPositioningManager for corridor value
@@ -646,25 +640,21 @@ class Planner:
         self.intent_manager = intent_manager
         self.recommendation_logger = recommendation_logger
 
-        # Cooperation modules (Phase 7) - can be set after init via setter
+        # Cooperation modules - can be set after init via setter
         self.liquidity_coordinator = liquidity_coordinator
-        self.splice_coordinator = splice_coordinator
         self.health_aggregator = health_aggregator
 
-        # Cooperative expansion manager (Phase 6.4)
-        self.cooperative_expansion = cooperative_expansion
-
-        # Yield optimization modules - slime mold coordination
+        # Yield optimization modules
         self.rationalization_mgr = rationalization_mgr
         self.strategic_positioning_mgr = strategic_positioning_mgr
 
-        # Quality scorer for peer evaluation (Phase 6.2)
+        # Quality scorer for peer evaluation
         if PeerQualityScorer and database:
             self.quality_scorer = PeerQualityScorer(database, plugin)
         else:
             self.quality_scorer = None
 
-        # DID credential manager for reputation checks (Phase 16)
+        # DID credential manager for reputation checks
         self.did_credential_mgr = None
 
         # Network cache (refreshed each cycle).
@@ -675,9 +665,6 @@ class Planner:
         # Track currently ignored peers (to avoid duplicate ignores)
         self._ignored_peers: Set[str] = set()
 
-        # Track expansion proposals this cycle (rate limiting)
-        self._expansions_this_cycle: int = 0
-
     def _log(self, msg: str, level: str = "info") -> None:
         """Log a message if plugin is available."""
         if self.plugin:
@@ -686,11 +673,9 @@ class Planner:
     def set_cooperation_modules(
         self,
         liquidity_coordinator=None,
-        splice_coordinator=None,
         health_aggregator=None,
         rationalization_mgr=None,
         strategic_positioning_mgr=None,
-        cooperative_expansion=None
     ) -> None:
         """
         Set cooperation modules after initialization.
@@ -700,28 +685,21 @@ class Planner:
 
         Args:
             liquidity_coordinator: LiquidityCoordinator for bottleneck detection
-            splice_coordinator: SpliceCoordinator for splice recommendations
             health_aggregator: HealthScoreAggregator for fleet health
             rationalization_mgr: RationalizationManager for redundancy detection
             strategic_positioning_mgr: StrategicPositioningManager for corridor value
-            cooperative_expansion: CooperativeExpansionManager for fleet-wide elections
         """
         if liquidity_coordinator is not None:
             self.liquidity_coordinator = liquidity_coordinator
-        if splice_coordinator is not None:
-            self.splice_coordinator = splice_coordinator
         if health_aggregator is not None:
             self.health_aggregator = health_aggregator
         if rationalization_mgr is not None:
             self.rationalization_mgr = rationalization_mgr
         if strategic_positioning_mgr is not None:
             self.strategic_positioning_mgr = strategic_positioning_mgr
-        if cooperative_expansion is not None:
-            self.cooperative_expansion = cooperative_expansion
 
         self._log(
             f"Cooperation modules set: liquidity={liquidity_coordinator is not None}, "
-            f"splice={splice_coordinator is not None}, "
             f"health={health_aggregator is not None}, "
             f"rationalization={rationalization_mgr is not None}, "
             f"positioning={strategic_positioning_mgr is not None}",
@@ -917,8 +895,7 @@ class Planner:
 
         Integrates all cooperation modules to determine:
         1. Should we expand at all?
-        2. If yes, open new channel or splice into existing?
-        3. What's the priority score?
+        2. What's the priority score?
 
         This provides richer analysis than get_underserved_targets()
         for individual peer evaluation.
@@ -939,14 +916,6 @@ class Planner:
 
         is_bottleneck = self._is_bottleneck_peer(target)
 
-        # Check splice recommendations from splice_coordinator
-        splice_rec = None
-        if self.splice_coordinator and members_with > 0:
-            try:
-                splice_rec = self.splice_coordinator.get_splice_recommendations(target)
-            except Exception as e:
-                self._log(f"Error getting splice recommendations: {e}", level='debug')
-
         # Calculate hive share using existing method
         result = self._calculate_hive_share(target, cfg)
 
@@ -966,22 +935,14 @@ class Planner:
         reasoning_parts = []
         recommendation_type = "open_channel"
 
-        # Check 1: Majority coverage - recommend splice instead of open
+        # Check 1: Majority coverage - sufficient coverage exists
         if hive_coverage_pct >= HIVE_COVERAGE_MAJORITY_PCT:
-            if splice_rec and splice_rec.get("has_fleet_coverage"):
-                recommendation_type = "splice_in"
-                adjusted_score *= 0.7  # Reduce priority vs. true gaps
-                reasoning_parts.append(
-                    f"{members_with}/{total_members} hive members already have channels; "
-                    f"recommend splice-in to existing channel"
-                )
-            else:
-                recommendation_type = "no_action"
-                adjusted_score = 0
-                reasoning_parts.append(
-                    f"{members_with}/{total_members} hive members already have channels; "
-                    f"sufficient coverage exists"
-                )
+            recommendation_type = "no_action"
+            adjusted_score = 0
+            reasoning_parts.append(
+                f"{members_with}/{total_members} hive members already have channels; "
+                f"sufficient coverage exists"
+            )
 
         # Check 2: High competition - deprioritize
         if competition_level in ["high", "very_high"]:
@@ -1901,529 +1862,6 @@ class Planner:
                 return True
         return False
 
-    def _should_skip_target(self, target: str, cooldown_seconds: int = 86400) -> tuple[bool, str]:
-        """
-        Check if a target should be skipped due to existing proposals or rejections.
-
-        This consolidates all the checks for whether we should skip proposing
-        a channel to this target.
-
-        Args:
-            target: Target pubkey to check
-            cooldown_seconds: Cooldown period after rejection (default: 24 hours)
-
-        Returns:
-            Tuple of (should_skip, reason)
-        """
-        if not self.db:
-            return False, ""
-
-        # Check if peer is manually ignored (persistent)
-        if self.db.is_peer_ignored(target):
-            return True, "manually_ignored"
-
-        # Check runtime ignore set (in-memory, includes saturation ignores)
-        if target in self._ignored_peers:
-            return True, "runtime_ignored"
-
-        # Check for pending intent
-        if self._has_pending_intent(target):
-            return True, "pending_intent"
-
-        # Check for pending action in pending_actions table
-        if self.db.has_pending_action_for_target(target):
-            return True, "pending_action"
-
-        # Check for recent rejection
-        if self.db.was_recently_rejected(target, cooldown_seconds):
-            return True, "recently_rejected"
-
-        return False, ""
-
-    # Hard cap: after this many consecutive rejections, disable expansions
-    # entirely until an approval occurs or operator intervenes
-    MAX_CONSECUTIVE_REJECTIONS = 50
-
-    def _should_pause_expansions_globally(self, cfg) -> tuple[bool, str]:
-        """
-        Check if expansions should be paused due to global constraints.
-
-        This prevents the planner from cycling through different targets when
-        the rejection reason is global (e.g., insufficient on-chain liquidity)
-        rather than target-specific.
-
-        The planner will pause expansions if:
-        1. There have been N consecutive rejections without any approvals
-        2. Uses exponential backoff based on rejection count
-        3. Hard cap at MAX_CONSECUTIVE_REJECTIONS disables entirely
-
-        Args:
-            cfg: Config snapshot
-
-        Returns:
-            Tuple of (should_pause, reason)
-        """
-        if not self.db:
-            return False, ""
-
-        # Get consecutive rejection count
-        consecutive_rejections = self.db.count_consecutive_expansion_rejections()
-
-        # Hard cap: too many rejections means manual intervention needed
-        if consecutive_rejections >= self.MAX_CONSECUTIVE_REJECTIONS:
-            return True, (
-                f"expansion_disabled ({consecutive_rejections} consecutive rejections, "
-                f"manual intervention needed)"
-            )
-
-        # Configurable threshold (default: 3 consecutive rejections triggers pause)
-        pause_threshold = getattr(cfg, 'expansion_pause_threshold', 3)
-
-        if consecutive_rejections >= pause_threshold:
-            # Calculate backoff: after threshold, wait exponentially longer
-            # 3 rejections = 1 hour, 6 = 2 hours, 9 = 4 hours, etc.
-            backoff_hours = 2 ** ((consecutive_rejections - pause_threshold) // 3)
-            # Use the rejection lookback window as natural ceiling.
-            # Previous 24h cap caused permanent stalls because hourly planner
-            # cycles kept adding rejections within the capped window.
-            max_backoff_hours = getattr(self.db, 'REJECTION_LOOKBACK_HOURS', 168)
-
-            backoff_hours = min(backoff_hours, max_backoff_hours)
-
-            # Check if enough time has passed since last rejection
-            recent_rejections = self.db.get_recent_expansion_rejections(hours=backoff_hours)
-
-            if len(recent_rejections) >= pause_threshold:
-                return True, f"global_constraint_backoff ({consecutive_rejections} consecutive rejections, {backoff_hours}h cooldown)"
-
-        return False, ""
-
-    def _propose_expansion(self, cfg, run_id: str) -> List[Dict[str, Any]]:
-        """
-        Propose channel expansions to underserved targets.
-
-        Security constraints:
-        - Only when planner_enable_expansions is True
-        - Max 1 expansion per cycle
-        - Must have sufficient onchain funds (> 2 * MIN_CHANNEL_SIZE)
-        - Target must exist in public graph
-        - No existing pending intent for target
-        - In advisor mode, actions are queued for AI/human approval
-
-        Args:
-            cfg: Config snapshot
-            run_id: Unique identifier for this cycle
-
-        Returns:
-            List of decision records
-        """
-        decisions = []
-
-        # Check if expansions are enabled
-        if not cfg.planner_enable_expansions:
-            return decisions
-
-        # Check rate limit
-        if self._expansions_this_cycle >= MAX_EXPANSIONS_PER_CYCLE:
-            self._log("Expansion rate limit reached for this cycle", level='debug')
-            return decisions
-
-        # Check if we have an intent manager
-        if not self.intent_manager:
-            self._log("IntentManager not available, skipping expansions", level='debug')
-            return decisions
-
-        # Check for global constraints (e.g., consecutive rejections due to liquidity)
-        should_pause, pause_reason = self._should_pause_expansions_globally(cfg)
-        if should_pause:
-            # Include recent rejection reasons for operator visibility
-            recent = self.db.get_recent_expansion_rejections(hours=24)
-            reasons = [r.get('rejection_reason', 'unknown') for r in recent[:5]]
-            self._log(
-                f"Expansions paused: {pause_reason}. Recent reasons: {reasons}",
-                level='info'
-            )
-            self.db.log_planner_action(
-                action_type='expansion',
-                result='skipped',
-                details={
-                    'reason': 'global_constraint',
-                    'detail': pause_reason,
-                    'recent_rejection_reasons': reasons,
-                    'run_id': run_id
-                }
-            )
-            return decisions
-
-        # Profitability gate: skip expansion when too many channels are underwater.
-        # Matches approval_criteria.md DEFER: >40% underwater.
-        node_summary = self.compute_node_summary()
-        if node_summary and node_summary.get('underwater_pct', 0) > 40:
-            self._log(
-                f"Profitability gate: skipping expansion, "
-                f"{node_summary['underwater_pct']}% underwater channels "
-                f"({node_summary['underwater_count']}/{node_summary['active_channels']}). "
-                f"Fix existing channels before expanding.",
-                level='info'
-            )
-            self.db.log_planner_action(
-                action_type='expansion',
-                result='skipped',
-                details={
-                    'reason': 'profitability_gate',
-                    'underwater_pct': node_summary['underwater_pct'],
-                    'underwater_count': node_summary['underwater_count'],
-                    'active_channels': node_summary['active_channels'],
-                    'run_id': run_id
-                }
-            )
-            return decisions
-
-        # Feerate gate: block expansions when on-chain fees are too high
-        max_feerate = getattr(cfg, 'max_expansion_feerate_perkb', 5000)
-        if max_feerate != 0 and self.plugin:
-            try:
-                feerates = self.plugin.rpc.feerates("perkb")
-                opening_feerate = feerates.get("perkb", {}).get("opening")
-                if opening_feerate is None:
-                    opening_feerate = feerates.get("perkb", {}).get("min_acceptable", 0)
-
-                if opening_feerate > 0 and opening_feerate > max_feerate:
-                    self._log(
-                        f"Feerate gate: expansion blocked, opening feerate "
-                        f"{opening_feerate} sat/kB > max {max_feerate} sat/kB",
-                        level='info'
-                    )
-                    self.db.log_planner_action(
-                        action_type='expansion',
-                        result='skipped',
-                        details={
-                            'reason': 'feerate_too_high',
-                            'opening_feerate': opening_feerate,
-                            'max_feerate': max_feerate,
-                            'run_id': run_id
-                        }
-                    )
-                    return decisions
-            except Exception as e:
-                self._log(f"Feerate check failed, allowing expansion: {e}", level='debug')
-
-        # Check onchain balance with realistic threshold
-        # The threshold includes: channel size + safety reserve + on-chain fee buffer
-        onchain_balance = self._get_local_onchain_balance()
-        min_channel_size = getattr(cfg, 'planner_min_channel_sats', MIN_CHANNEL_SIZE_SATS_FALLBACK)
-
-        # Configurable safety reserve (default: 500k sats to match AI advisor criteria)
-        safety_reserve = getattr(cfg, 'planner_safety_reserve_sats', 500_000)
-
-        # Fee buffer for on-chain tx (default: 100k sats for worst-case fees)
-        fee_buffer = getattr(cfg, 'planner_fee_buffer_sats', 100_000)
-
-        # Total minimum required = channel + reserve + fees
-        min_required = min_channel_size + safety_reserve + fee_buffer
-
-        if onchain_balance < min_required:
-            self._log(
-                f"Insufficient onchain funds for expansion: "
-                f"{onchain_balance} < {min_required} sats "
-                f"(channel: {min_channel_size}, reserve: {safety_reserve}, fees: {fee_buffer})",
-                level='debug'
-            )
-            self.db.log_planner_action(
-                action_type='expansion',
-                result='skipped',
-                details={
-                    'reason': 'insufficient_funds',
-                    'onchain_balance': onchain_balance,
-                    'min_required': min_required,
-                    'min_channel_size': min_channel_size,
-                    'safety_reserve': safety_reserve,
-                    'fee_buffer': fee_buffer,
-                    'run_id': run_id
-                }
-            )
-            return decisions
-
-        # Get underserved targets
-        underserved = self.get_underserved_targets(cfg)
-        if not underserved:
-            self._log("No underserved targets found", level='debug')
-            return decisions
-
-        # Get rejection cooldown from config (default 24 hours)
-        rejection_cooldown = getattr(cfg, 'rejection_cooldown_seconds', 86400)
-
-        # Find a target without pending intent, pending action, or recent rejection
-        selected_target = None
-        skipped_reasons = {}
-        for candidate in underserved:
-            should_skip, reason = self._should_skip_target(candidate.target, rejection_cooldown)
-            if not should_skip:
-                selected_target = candidate
-                break
-            else:
-                skipped_reasons[candidate.target[:16]] = reason
-
-        if not selected_target:
-            if skipped_reasons:
-                self._log(
-                    f"All underserved targets skipped: {skipped_reasons}",
-                    level='debug'
-                )
-            else:
-                self._log("All underserved targets have pending intents", level='debug')
-            return decisions
-
-        # Budget validation BEFORE intent creation to avoid wasting intent slots
-        daily_budget = getattr(cfg, 'daily_expansion_budget_sats', 10_000_000)
-        budget_reserve_pct = getattr(cfg, 'budget_reserve_pct', 0.20)
-        budget_max_per_channel_pct = getattr(cfg, 'budget_max_per_channel_pct', 0.50)
-
-        daily_remaining = self.db.get_available_budget(daily_budget)
-        spendable_onchain = int(onchain_balance * (1.0 - budget_reserve_pct))
-        max_per_channel = int(daily_budget * budget_max_per_channel_pct)
-
-        pending_committed = self.db.get_pending_channel_open_total()
-        gross_available = min(daily_remaining, spendable_onchain, max_per_channel)
-        available_budget = max(0, gross_available - pending_committed)
-
-        if available_budget < min_channel_size:
-            self._log(
-                f"Skipping expansion to {selected_target.target[:16]}... - "
-                f"insufficient budget ({available_budget:,} < {min_channel_size:,} min). "
-                f"gross={gross_available:,}, pending_committed={pending_committed:,}, "
-                f"daily_remaining={daily_remaining:,}, spendable={spendable_onchain:,}, "
-                f"max_per_channel={max_per_channel:,}",
-                level='info'
-            )
-            decisions.append({
-                'action': 'expansion_skipped',
-                'target': selected_target.target,
-                'reason': 'insufficient_budget',
-                'available_budget': available_budget,
-                'min_channel_sats': min_channel_size
-            })
-            return decisions
-
-        # Delegate to cooperative expansion if available
-        if self.cooperative_expansion:
-            try:
-                round_id = self.cooperative_expansion.evaluate_expansion(
-                    target_peer_id=selected_target.target,
-                    event_type='planner_underserved',
-                    reporter_id=self.intent_manager.our_pubkey or '',
-                    capacity_sats=selected_target.public_capacity_sats,
-                    quality_score=selected_target.quality_score
-                )
-                if round_id:
-                    self._expansions_this_cycle += 1
-                    self.db.log_planner_action(
-                        action_type='expansion',
-                        result='delegated',
-                        target=selected_target.target,
-                        details={
-                            'round_id': round_id,
-                            'method': 'cooperative_expansion',
-                            'run_id': run_id
-                        }
-                    )
-                    decisions.append({
-                        'action': 'expansion_delegated',
-                        'target': selected_target.target,
-                        'round_id': round_id,
-                        'hive_share_pct': selected_target.hive_share_pct
-                    })
-                    return decisions
-                # else: cooperative expansion declined (cooldown/active round/quality),
-                # fall through to direct intent path
-            except Exception as e:
-                self._log(f"Cooperative expansion failed, falling back to direct intent: {e}", level='debug')
-
-        # Create intent and potentially broadcast
-        # Phase 6.2: Include quality information in log
-        self._log(
-            f"Proposing expansion to {selected_target.target[:16]}... "
-            f"(share={selected_target.hive_share_pct:.1%}, "
-            f"capacity={selected_target.public_capacity_sats} sats, "
-            f"quality={selected_target.quality_score:.2f}/{selected_target.quality_recommendation})"
-        )
-
-        try:
-            # Create the intent
-            intent = self.intent_manager.create_intent(
-                intent_type=IntentType.CHANNEL_OPEN.value if hasattr(IntentType.CHANNEL_OPEN, 'value') else IntentType.CHANNEL_OPEN,
-                target=selected_target.target
-            )
-
-            if intent is None:
-                self._log("create_intent returned None (pubkey not set?)", level='warn')
-                return decisions
-
-            self._expansions_this_cycle += 1
-
-            # Log the decision with quality information (Phase 6.2)
-            self.db.log_planner_action(
-                action_type='expansion',
-                result='proposed',
-                target=selected_target.target,
-                details={
-                    'intent_id': intent.intent_id,
-                    'public_capacity_sats': selected_target.public_capacity_sats,
-                    'hive_share_pct': round(selected_target.hive_share_pct, 4),
-                    'score': round(selected_target.score, 4),
-                    'quality_score': round(selected_target.quality_score, 3),
-                    'quality_confidence': round(selected_target.quality_confidence, 3),
-                    'quality_recommendation': selected_target.quality_recommendation,
-                    'reputation_tier': selected_target.reputation_tier,
-                    'onchain_balance': onchain_balance,
-                    'run_id': run_id
-                }
-            )
-
-            decisions.append({
-                'action': 'expansion_proposed',
-                'target': selected_target.target,
-                'intent_id': intent.intent_id,
-                'hive_share_pct': selected_target.hive_share_pct
-            })
-
-            # node_summary already computed above (profitability gate)
-
-            # Calculate proposed channel size using intelligent sizing algorithm
-            default_size = getattr(cfg, 'planner_default_channel_sats', 5_000_000)
-            max_size = getattr(cfg, 'planner_max_channel_sats', 50_000_000)
-            market_share_cap = getattr(cfg, 'market_share_cap_pct', 0.20)
-
-            # Get target's channel count for routing potential calculation
-            target_channel_count = self._get_target_channel_count(selected_target.target)
-            avg_fee_rate = self._get_avg_fee_rate()
-
-            # Use intelligent channel sizer with quality scoring
-            sizer = ChannelSizer(plugin=self.plugin, quality_scorer=self.quality_scorer)
-            sizing_result = sizer.calculate_size(
-                target=selected_target.target,
-                target_capacity_sats=selected_target.public_capacity_sats,
-                target_channel_count=target_channel_count,
-                hive_share_pct=selected_target.hive_share_pct,
-                target_share_cap=market_share_cap * 0.5,  # Aim for half of cap
-                onchain_balance_sats=onchain_balance,
-                min_channel_sats=min_channel_size,
-                max_channel_sats=max_size,
-                default_channel_sats=default_size,
-                avg_fee_rate_ppm=avg_fee_rate,
-                quality_score=selected_target.quality_score,
-                quality_confidence=selected_target.quality_confidence,
-                quality_recommendation=selected_target.quality_recommendation,
-                available_budget_sats=available_budget,
-            )
-
-            proposed_size = sizing_result.recommended_size_sats
-
-            # Build context for recommendation logging
-            context = {
-                'intent_id': intent.intent_id,
-                'public_capacity_sats': selected_target.public_capacity_sats,
-                'hive_share_pct': round(selected_target.hive_share_pct, 4),
-                'onchain_balance': onchain_balance,
-                'amount_sats': proposed_size,
-                'channel_size_sats': proposed_size,
-                'sizing_factors': sizing_result.factors,
-                'sizing_reasoning': sizing_result.reasoning,
-                'target_channel_count': target_channel_count,
-                'quality_score': round(selected_target.quality_score, 3),
-                'quality_confidence': round(selected_target.quality_confidence, 3),
-                'quality_recommendation': selected_target.quality_recommendation,
-                'node_summary': node_summary,
-            }
-
-            # Log the recommendation
-            if self.recommendation_logger:
-                self.recommendation_logger.log_recommendation(
-                    action_type='channel_open',
-                    target=selected_target.target,
-                    context=context,
-                )
-
-            # Broadcast the intent to the fleet
-            self._broadcast_intent(intent)
-            decisions[-1]['broadcast'] = True
-
-        except Exception as e:
-            self._log(f"Failed to create expansion intent: {e}", level='warn')
-            self.db.log_planner_action(
-                action_type='expansion',
-                result='failed',
-                target=selected_target.target,
-                details={
-                    'error': str(e),
-                    'run_id': run_id
-                }
-            )
-            decisions.append({
-                'action': 'expansion_failed',
-                'target': selected_target.target,
-                'error': str(e)
-            })
-
-        return decisions
-
-    def _broadcast_intent(self, intent) -> bool:
-        """
-        Broadcast an intent to all Hive members.
-
-        Args:
-            intent: Intent object to broadcast
-
-        Returns:
-            True if broadcast was successful, False otherwise
-        """
-        if not self.plugin or not self.db or not self.intent_manager:
-            return False
-
-        try:
-            # Create intent message payload
-            payload = self.intent_manager.create_intent_message(intent)
-
-            # Sign the intent payload
-            try:
-                signing_payload = get_intent_signing_payload(payload)
-                sig_result = self.plugin.rpc.signmessage(signing_payload)
-                payload['signature'] = sig_result.get('signature', sig_result.get('zbase', ''))
-            except Exception as e:
-                self._log(f"Failed to sign intent: {e}", level='warn')
-                return False
-
-            msg_bytes = serialize(HiveMessageType.INTENT, payload)
-
-            # Get all Hive members
-            members = self.db.get_all_members()
-            our_pubkey = self.intent_manager.our_pubkey
-
-            broadcast_count = 0
-            for member in members:
-                member_id = member.get('peer_id')
-                if not member_id or member_id == our_pubkey:
-                    continue
-
-                try:
-                    self.plugin.rpc.call("sendcustommsg", {
-                        "node_id": member_id,
-                        "msg": msg_bytes.hex()
-                    })
-                    broadcast_count += 1
-                except Exception as e:
-                    self._log(
-                        f"Failed to send INTENT to {member_id[:16]}...: {e}",
-                        level='debug'
-                    )
-
-            self._log(f"Broadcast INTENT to {broadcast_count} peers")
-            return broadcast_count > 0
-
-        except Exception as e:
-            self._log(f"Broadcast failed: {e}", level='warn')
-            return False
-
     # =========================================================================
     # RUN CYCLE
     # =========================================================================
@@ -2455,9 +1893,6 @@ class Planner:
         self._log(f"Starting planner cycle (run_id={run_id})")
         decisions = []
 
-        # Reset per-cycle counters
-        self._expansions_this_cycle = 0
-
         try:
             # Refresh network cache first
             if not self._refresh_network_cache(force=True):
@@ -2476,10 +1911,6 @@ class Planner:
             # Release over-ignored peers (best effort)
             release_decisions = self._release_saturation(cfg, run_id)
             decisions.extend(release_decisions)
-
-            # Propose channel expansions (Ticket 6-02)
-            expansion_decisions = self._propose_expansion(cfg, run_id)
-            decisions.extend(expansion_decisions)
 
             self._log(f"Planner cycle complete (run_id={run_id}): {len(decisions)} decisions")
             self.db.log_planner_action(

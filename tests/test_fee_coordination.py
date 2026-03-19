@@ -92,21 +92,18 @@ class MockLiquidityCoordinator:
     """Mock liquidity coordinator for testing."""
 
     def __init__(self):
-        self.competitions = []
+        self.needs = []
         self._lock = threading.Lock()
         self._member_liquidity_state = {}
 
-    def detect_internal_competition(self):
-        return self.competitions
+    def get_fleet_liquidity_needs(self):
+        return self.needs
 
-    def add_competition(self, source, dest, members):
-        self.competitions.append({
-            "source_peer_id": source,
-            "destination_peer_id": dest,
-            "source_alias": f"alias_{source[:8]}",
-            "destination_alias": f"alias_{dest[:8]}",
-            "competing_members": members,
-            "total_fleet_capacity_sats": 10_000_000 * len(members)
+    def add_need(self, target_peer_id, reporter_id, amount_sats=1_000_000):
+        self.needs.append({
+            "target_peer_id": target_peer_id,
+            "reporter_id": reporter_id,
+            "amount_sats": amount_sats,
         })
 
     def set_local_saturated_channels(self, member_id, channels):
@@ -192,11 +189,10 @@ class TestFlowCorridorManager:
         corridors = self.manager.identify_corridors()
         assert len(corridors) == 0
 
-    def test_identify_corridors_with_competition(self):
-        """Test identifying corridors with competition data."""
-        self.liquidity_coord.add_competition(
-            "peer1", "peer2",
-            ["02" + "a" * 64, "02" + "b" * 64]
+    def test_identify_corridors_with_needs(self):
+        """Test identifying corridors with liquidity needs."""
+        self.liquidity_coord.add_need(
+            "peer1", "02" + "a" * 64, amount_sats=5_000_000
         )
 
         corridors = self.manager.identify_corridors()

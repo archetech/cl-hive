@@ -1,22 +1,16 @@
 """
-Tests for 13 anticipatory liquidity fixes.
+Tests for anticipatory liquidity fixes (pattern and Kalman features).
 
 Covers:
-- Fix 1: Monthly pattern detection loads 30 days of history
-- Fix 2: Pattern matcher handles day_of_month patterns
-- Fix 3: Intra-day velocity uses actual capacity instead of hardcoded 10M
-- Fix 4: Fleet coordination uses remote patterns instead of stub
-- Fix 5: total_predicted_demand_sats uses velocity-based estimate
-- Fix 6: Pattern adjustment works when base_velocity is zero
-- Fix 7: receive_pattern_from_fleet uses single lock block
-- Fix 8: Kalman weight uses 1/sigma^2 (inverse variance)
-- Fix 9: Risk combination uses weighted sum instead of max()
-- Fix 10: Long-horizon predictions step through patterns
-- Fix 11: Flow history eviction uses tracker dict
-- Fix 12: Flow history trims by window before limit
-- Fix 13: Kalman velocity status batches consensus in single lock
-
-Author: Lightning Goats Team
+- Monthly pattern detection loads 30 days of history
+- Intra-day velocity uses actual capacity instead of hardcoded 10M
+- receive_pattern_from_fleet uses single lock block
+- Kalman weight uses 1/sigma^2 (inverse variance)
+- Flow history eviction uses tracker dict
+- Flow history trims by window before limit
+- Kalman velocity status batches consensus in single lock
+- get_patterns_summary counts monthly patterns
+- Regime change uses INTRADAY_REGIME_CHANGE_THRESHOLD constant
 """
 
 import math
@@ -36,10 +30,7 @@ from modules.anticipatory_liquidity import (
     HourlyFlowSample,
     KalmanVelocityReport,
     TemporalPattern,
-    LiquidityPrediction,
     FlowDirection,
-    PredictionUrgency,
-    RecommendedAction,
     PATTERN_WINDOW_DAYS,
     MONTHLY_PATTERN_WINDOW_DAYS,
     MONTHLY_PATTERNS_ENABLED,
@@ -50,10 +41,7 @@ from modules.anticipatory_liquidity import (
     KALMAN_VELOCITY_TTL_SECONDS,
     KALMAN_MIN_CONFIDENCE,
     KALMAN_MIN_REPORTERS,
-    DEPLETION_PCT_THRESHOLD,
-    SATURATION_PCT_THRESHOLD,
 )
-
 
 # =============================================================================
 # FIXTURES
@@ -112,7 +100,6 @@ def _make_manager(db=None, plugin=None, state_manager=None, our_id="our_node_abc
         our_id=our_id,
     )
 
-
 # =============================================================================
 # FIX 1: Monthly pattern detection loads 30 days
 # =============================================================================
@@ -138,74 +125,6 @@ class TestMonthlyPatternHistoryWindow:
         """MONTHLY_PATTERN_WINDOW_DAYS should be 30."""
         assert MONTHLY_PATTERN_WINDOW_DAYS == 30
         assert MONTHLY_PATTERN_WINDOW_DAYS > PATTERN_WINDOW_DAYS
-
-
-# =============================================================================
-# FIX 2: Pattern matcher handles day_of_month
-# =============================================================================
-
-class TestPatternMatcherDayOfMonth:
-    """Fix 2: _find_best_pattern_match handles monthly patterns."""
-
-    def setup_method(self):
-        self.mgr = _make_manager()
-
-    def test_exact_day_of_month_match(self):
-        """Should match pattern with exact day_of_month."""
-        pattern = TemporalPattern(
-            channel_id="c1", hour_of_day=None, direction=FlowDirection.OUTBOUND,
-            intensity=1.5, confidence=0.8, samples=10, avg_flow_sats=50000,
-            day_of_month=15,
-        )
-        match = self.mgr._find_best_pattern_match([pattern], target_hour=10, target_day=2, target_day_of_month=15)
-        assert match is pattern
-
-    def test_day_of_month_no_match(self):
-        """Should not match when day_of_month differs."""
-        pattern = TemporalPattern(
-            channel_id="c1", hour_of_day=None, direction=FlowDirection.OUTBOUND,
-            intensity=1.5, confidence=0.8, samples=10, avg_flow_sats=50000,
-            day_of_month=15,
-        )
-        match = self.mgr._find_best_pattern_match([pattern], target_hour=10, target_day=2, target_day_of_month=20)
-        assert match is None
-
-    def test_eom_cluster_matches_day_28(self):
-        """EOM cluster (day_of_month=31) should match day 28."""
-        pattern = TemporalPattern(
-            channel_id="c1", hour_of_day=None, direction=FlowDirection.INBOUND,
-            intensity=2.0, confidence=0.7, samples=15, avg_flow_sats=80000,
-            day_of_month=31,  # EOM cluster marker
-        )
-        match = self.mgr._find_best_pattern_match([pattern], target_hour=10, target_day=2, target_day_of_month=28)
-        assert match is pattern
-
-    def test_eom_cluster_matches_day_1(self):
-        """EOM cluster should also match day 1 (beginning of next month)."""
-        pattern = TemporalPattern(
-            channel_id="c1", hour_of_day=None, direction=FlowDirection.INBOUND,
-            intensity=2.0, confidence=0.7, samples=15, avg_flow_sats=80000,
-            day_of_month=31,
-        )
-        match = self.mgr._find_best_pattern_match([pattern], target_hour=10, target_day=2, target_day_of_month=1)
-        assert match is pattern
-
-    def test_hourly_beats_monthly(self):
-        """Hour+day match (score 3) should beat monthly match (score 1.5)."""
-        monthly = TemporalPattern(
-            channel_id="c1", hour_of_day=None, direction=FlowDirection.OUTBOUND,
-            intensity=2.0, confidence=0.9, samples=20, avg_flow_sats=80000,
-            day_of_month=15,
-        )
-        hourly_daily = TemporalPattern(
-            channel_id="c1", hour_of_day=10, day_of_week=2,
-            direction=FlowDirection.INBOUND,
-            intensity=1.5, confidence=0.8, samples=10, avg_flow_sats=50000,
-        )
-        match = self.mgr._find_best_pattern_match(
-            [monthly, hourly_daily], target_hour=10, target_day=2, target_day_of_month=15
-        )
-        assert match is hourly_daily
 
 
 # =============================================================================
@@ -258,131 +177,6 @@ class TestIntradayCapacity:
         # So velocity ~ 100_000 / 1M = 0.10
         assert result.avg_velocity > 0
 
-
-# =============================================================================
-# FIX 4: Fleet coordination uses remote patterns
-# =============================================================================
-
-class TestFleetCoordinationRemotePatterns:
-    """Fix 4: get_fleet_recommendations uses _remote_patterns instead of stub."""
-
-    def test_remote_patterns_included_in_depletion(self):
-        """Remote outbound patterns should add members to depleting list."""
-        sm = MockStateManager()
-        mgr = _make_manager(state_manager=sm, our_id="our_node")
-
-        # Set up a prediction for peer_abc
-        pred = LiquidityPrediction(
-            channel_id="c1", peer_id="peer_abc",
-            current_local_pct=0.15, predicted_local_pct=0.05,
-            hours_ahead=12, velocity_pct_per_hour=-0.008,
-            depletion_risk=0.7, saturation_risk=0.0,
-            hours_to_critical=5.0,
-            recommended_action=RecommendedAction.PREEMPTIVE_REBALANCE,
-            urgency=PredictionUrgency.URGENT,
-            confidence=0.8, pattern_match=None,
-        )
-
-        # Add remote pattern from another member
-        mgr.receive_pattern_from_fleet(
-            reporter_id="member_xyz",
-            pattern_data={
-                "peer_id": "peer_abc",
-                "direction": "outbound",
-                "intensity": 1.5,
-                "confidence": 0.8,
-                "samples": 20,
-            },
-        )
-
-        # Mock get_all_predictions to return our prediction
-        with patch.object(mgr, 'get_all_predictions', return_value=[pred]):
-            with patch.object(mgr, '_get_channel_info', return_value={
-                "capacity_sats": 5_000_000, "channel_id": "c1"
-            }):
-                recs = mgr.get_fleet_recommendations()
-
-        assert len(recs) == 1
-        rec = recs[0]
-        assert "member_xyz" in rec.members_predicting_depletion
-        assert "our_node" in rec.members_predicting_depletion
-
-
-# =============================================================================
-# FIX 5: Demand calculation uses velocity
-# =============================================================================
-
-class TestDemandCalculation:
-    """Fix 5: total_predicted_demand_sats uses velocity-based estimate."""
-
-    def test_demand_based_on_velocity(self):
-        """Demand should be velocity * hours * capacity, not pct * 1M."""
-        sm = MockStateManager()
-        mgr = _make_manager(state_manager=sm)
-
-        pred = LiquidityPrediction(
-            channel_id="c1", peer_id="peer_abc",
-            current_local_pct=0.15, predicted_local_pct=0.05,
-            hours_ahead=12, velocity_pct_per_hour=-0.01,
-            depletion_risk=0.7, saturation_risk=0.0,
-            hours_to_critical=5.0,
-            recommended_action=RecommendedAction.PREEMPTIVE_REBALANCE,
-            urgency=PredictionUrgency.URGENT,
-            confidence=0.8, pattern_match=None,
-        )
-
-        with patch.object(mgr, 'get_all_predictions', return_value=[pred]):
-            with patch.object(mgr, '_get_channel_info', return_value={
-                "capacity_sats": 10_000_000, "channel_id": "c1"
-            }):
-                recs = mgr.get_fleet_recommendations()
-
-        assert len(recs) == 1
-        # velocity=0.01, hours=12, capacity=10M => demand = 0.01 * 12 * 10M = 1.2M
-        assert recs[0].total_predicted_demand_sats == 1_200_000
-
-
-# =============================================================================
-# FIX 6: Pattern adjustment works when base_velocity is zero
-# =============================================================================
-
-class TestPatternVelocityFloor:
-    """Fix 6: Pattern adjustment has effect even when base_velocity=0."""
-
-    def test_outbound_pattern_with_zero_velocity(self):
-        """Outbound pattern should reduce velocity below zero even from base=0."""
-        mgr = _make_manager()
-
-        # Compute what hour the prediction will target (1h from now)
-        target_time = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc)
-        target_hour = target_time.hour
-        target_day = target_time.weekday()
-
-        pattern = TemporalPattern(
-            channel_id="c1", hour_of_day=target_hour, day_of_week=target_day,
-            direction=FlowDirection.OUTBOUND,
-            intensity=1.5, confidence=0.8, samples=15, avg_flow_sats=100_000,
-        )
-
-        # Mock the methods
-        with patch.object(mgr, 'detect_patterns', return_value=[pattern]):
-            with patch.object(mgr, '_calculate_velocity', return_value=0.0):
-                with patch.object(mgr, '_get_channel_info', return_value=None):
-                    pred = mgr.predict_liquidity(
-                        channel_id="c1",
-                        hours_ahead=1,
-                        current_local_pct=0.5,
-                        capacity_sats=2_000_000,
-                        peer_id="peer1",
-                    )
-
-        assert pred is not None
-        # Pattern floor = 100_000 / 2_000_000 = 0.05
-        # adjusted = 0.0 - (1.5 * 0.05 * 0.5) = -0.0375
-        assert pred.velocity_pct_per_hour < 0
-        assert pred.predicted_local_pct < 0.5
-
-
 # =============================================================================
 # FIX 7: receive_pattern_from_fleet single lock block
 # =============================================================================
@@ -423,7 +217,6 @@ class TestReceivePatternThreadSafety:
         assert not errors
         # All 5 unique peers should be tracked
         assert len(mgr._remote_patterns) == 5
-
 
 # =============================================================================
 # FIX 8: Kalman inverse-variance weighting (1/sigma^2)
@@ -475,97 +268,6 @@ class TestKalmanInverseVarianceWeighting:
         assert consensus is not None
         # Equal uncertainty + equal confidence => simple average ≈ 0.05
         assert abs(consensus - 0.05) < 0.01
-
-
-# =============================================================================
-# FIX 9: Risk combination weighted sum
-# =============================================================================
-
-class TestRiskWeightedSum:
-    """Fix 9: Risk uses weighted sum instead of max()."""
-
-    def setup_method(self):
-        self.mgr = _make_manager()
-
-    def test_all_factors_contribute(self):
-        """All risk factors should contribute to combined risk."""
-        # High base (20% local), high velocity (-1.5%/hr), predicted 5%
-        risk = self.mgr._calculate_depletion_risk(
-            current_pct=0.20, predicted_pct=0.05, velocity=-0.015
-        )
-        # base_risk=0.8, velocity_risk=0.8, predicted_risk=0.9
-        # weighted = 0.8*0.4 + 0.8*0.3 + 0.9*0.3 = 0.32 + 0.24 + 0.27 = 0.83
-        assert 0.8 <= risk <= 0.9
-
-    def test_low_base_with_bad_velocity(self):
-        """Bad velocity should increase risk even when level seems safe."""
-        # 50% local (safe level), but draining fast
-        risk = self.mgr._calculate_depletion_risk(
-            current_pct=0.50, predicted_pct=0.30, velocity=-0.015
-        )
-        # base_risk=0.0, velocity_risk=0.8, predicted_risk=0.1
-        # weighted = 0.0*0.4 + 0.8*0.3 + 0.1*0.3 = 0.0 + 0.24 + 0.03 = 0.27
-        assert risk > 0.2  # Should be non-trivial, not 0
-
-    def test_saturation_all_factors(self):
-        """Saturation risk should also compound all factors."""
-        risk = self.mgr._calculate_saturation_risk(
-            current_pct=0.80, predicted_pct=0.90, velocity=0.015
-        )
-        # base_risk=0.8, velocity_risk=0.8, predicted_risk=0.9
-        assert 0.8 <= risk <= 0.9
-
-
-# =============================================================================
-# FIX 10: Multi-bucket long-horizon prediction
-# =============================================================================
-
-class TestMultiBucketPrediction:
-    """Fix 10: Long predictions step through hourly patterns."""
-
-    def test_short_prediction_uses_simple_linear(self):
-        """Predictions <= 6 hours should use simple linear projection."""
-        mgr = _make_manager()
-
-        with patch.object(mgr, 'detect_patterns', return_value=[]):
-            with patch.object(mgr, '_calculate_velocity', return_value=-0.01):
-                pred = mgr.predict_liquidity(
-                    channel_id="c1", hours_ahead=4,
-                    current_local_pct=0.5, capacity_sats=5_000_000, peer_id="p1",
-                )
-        assert pred is not None
-        # Simple: 0.5 + (-0.01 * 4) = 0.46
-        assert abs(pred.predicted_local_pct - 0.46) < 0.01
-
-    def test_long_prediction_steps_through_patterns(self):
-        """24h prediction should step through different patterns."""
-        mgr = _make_manager()
-
-        # Pattern: hour 9 = outbound drain
-        pattern_drain = TemporalPattern(
-            channel_id="c1", hour_of_day=9, direction=FlowDirection.OUTBOUND,
-            intensity=2.0, confidence=0.9, samples=20, avg_flow_sats=200_000,
-        )
-        # Pattern: hour 22 = inbound surge
-        pattern_surge = TemporalPattern(
-            channel_id="c1", hour_of_day=22, direction=FlowDirection.INBOUND,
-            intensity=2.0, confidence=0.9, samples=20, avg_flow_sats=200_000,
-        )
-
-        with patch.object(mgr, 'detect_patterns', return_value=[pattern_drain, pattern_surge]):
-            with patch.object(mgr, '_calculate_velocity', return_value=0.0):
-                pred = mgr.predict_liquidity(
-                    channel_id="c1", hours_ahead=24,
-                    current_local_pct=0.5, capacity_sats=5_000_000, peer_id="p1",
-                )
-
-        # With patterns: drain at hour 9, surge at hour 22, neutral otherwise
-        # Should not just be 0.5 (which it would be with zero velocity and no patterns)
-        assert pred is not None
-        # The exact value depends on current time, but the prediction should differ
-        # from 0.5 since patterns provide velocity floors
-
-
 # =============================================================================
 # FIX 11: Flow history eviction uses tracker
 # =============================================================================
@@ -605,7 +307,6 @@ class TestFlowHistoryEviction:
         if "chan_0" not in mgr._flow_history:
             assert "chan_0" not in mgr._flow_history_last_ts
 
-
 # =============================================================================
 # FIX 12: Window trim before limit
 # =============================================================================
@@ -629,7 +330,6 @@ class TestFlowHistoryTrimOrder:
             samples = mgr._flow_history["chan1"]
         # Old sample should have been trimmed
         assert all(s.timestamp > now - (MONTHLY_PATTERN_WINDOW_DAYS * 24 * 3600) for s in samples)
-
 
 # =============================================================================
 # FIX 13: Kalman velocity status batched in single lock
@@ -671,52 +371,6 @@ class TestKalmanStatusBatched:
         else:
             assert status["channels_with_consensus"] == 0
 
-
-# =============================================================================
-# FOLLOW-UP FIX 1: _pattern_name handles day_of_month
-# =============================================================================
-
-class TestPatternNameMonthly:
-    """_pattern_name should include day_of_month in the name."""
-
-    def setup_method(self):
-        self.mgr = _make_manager()
-
-    def test_day_of_month_pattern_name(self):
-        """Monthly pattern should include day number."""
-        pattern = TemporalPattern(
-            channel_id="c1", hour_of_day=None, direction=FlowDirection.OUTBOUND,
-            intensity=1.5, confidence=0.8, samples=10, avg_flow_sats=50000,
-            day_of_month=15,
-        )
-        name = self.mgr._pattern_name(pattern)
-        assert "day15" in name
-        assert "drain" in name
-
-    def test_eom_cluster_pattern_name(self):
-        """EOM cluster (day_of_month=31) should show 'eom'."""
-        pattern = TemporalPattern(
-            channel_id="c1", hour_of_day=None, direction=FlowDirection.INBOUND,
-            intensity=2.0, confidence=0.7, samples=15, avg_flow_sats=80000,
-            day_of_month=31,
-        )
-        name = self.mgr._pattern_name(pattern)
-        assert "eom" in name
-        assert "inflow" in name
-
-    def test_hourly_pattern_name_unchanged(self):
-        """Hourly patterns without day_of_month should be unaffected."""
-        pattern = TemporalPattern(
-            channel_id="c1", hour_of_day=14, direction=FlowDirection.OUTBOUND,
-            intensity=1.5, confidence=0.8, samples=10, avg_flow_sats=50000,
-        )
-        name = self.mgr._pattern_name(pattern)
-        assert "14:00" in name
-        assert "drain" in name
-        assert "day" not in name
-        assert "eom" not in name
-
-
 # =============================================================================
 # FOLLOW-UP FIX 2: get_patterns_summary counts monthly patterns
 # =============================================================================
@@ -746,7 +400,6 @@ class TestPatternsSummaryMonthly:
         assert summary["monthly_patterns"] == 1
         assert summary["hourly_patterns"] == 1
         assert summary["total_patterns"] == 2
-
 
 # =============================================================================
 # FOLLOW-UP FIX 6: Regime detection uses INTRADAY_REGIME_CHANGE_THRESHOLD

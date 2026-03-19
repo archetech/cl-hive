@@ -638,19 +638,3 @@ class TestBug9RouteProbeDedup:
         count = conn.execute("SELECT COUNT(*) FROM route_probes").fetchone()[0]
         assert count == 2
         conn.close()
-
-
-# =========================================================================
-# Bug 10: cost_reduction.py documents routing_map integration gap
-# =========================================================================
-
-class TestBug10IntegrationGapDocumented:
-    """cost_reduction.py should have a TODO comment about routing_map integration."""
-
-    def test_todo_comment_exists(self):
-        """Verify the TODO comment exists in cost_reduction.py."""
-        with open("modules/cost_reduction.py", "r") as f:
-            content = f.read()
-        assert "TODO" in content
-        assert "routing_intelligence" in content or "routing_map" in content
-        assert "cost_reduction" in content or "MCF" in content or "BFS" in content

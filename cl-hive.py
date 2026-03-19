@@ -60,8 +60,7 @@ from modules.protocol import (
     get_gossip_signing_payload, get_state_hash_signing_payload,
     get_full_sync_signing_payload, get_intent_signing_payload, get_intent_abort_signing_payload,
     compute_states_hash,
-    # Phase D: Reliable delivery
-    create_msg_ack, validate_msg_ack,
+    # Reliable delivery
     IMPLICIT_ACK_MAP, IMPLICIT_ACK_MATCH_FIELD,
     RELIABLE_MESSAGE_TYPES,
 )
@@ -978,7 +977,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         database=database,
         state_manager=state_manager,
         fee_coordination_mgr=fee_coordination_mgr,
-        yield_metrics_mgr=yield_metrics_mgr,
         planner=planner
     )
     strategic_positioning_mgr.set_our_pubkey(our_pubkey)
@@ -4799,21 +4797,13 @@ def hive_fleet_anticipation(plugin: Plugin):
     """
     Get fleet-wide anticipatory positioning recommendations.
 
-    Coordinates predictions across hive members to avoid competing
-    for the same rebalance routes.
-
     Returns:
-        Dict with fleet coordination recommendations.
+        Dict with fleet pattern sharing status.
     """
     if not anticipatory_liquidity_mgr:
         return {"error": "Anticipatory liquidity manager not initialized"}
 
-    recommendations = anticipatory_liquidity_mgr.get_fleet_recommendations()
-
-    return {
-        "recommendation_count": len(recommendations),
-        "recommendations": [r.to_dict() for r in recommendations]
-    }
+    return anticipatory_liquidity_mgr.get_patterns_summary()
 
 
 @plugin.method("hive-anticipatory-status")

@@ -1,20 +1,18 @@
 """
-Anticipatory Liquidity Module (Phase 7.1)
+Anticipatory Liquidity Module
 
-Predicts liquidity needs before they occur using temporal pattern recognition.
-Like mycelium nutrient pre-positioning - move resources to where they'll be
-needed before the demand spike.
+Detects temporal flow patterns for proactive liquidity awareness.
 
 Key Features:
 - Time-of-day pattern detection (hour 0-23)
 - Day-of-week pattern detection (Mon-Sun)
-- Predictive rebalancing recommendations
-- Fleet-wide coordination to avoid competing for same routes
+- Monthly and end-of-month pattern detection
+- Intra-day phase detection (morning surge, evening peak, etc.)
+- Kalman velocity integration from fleet members
+- Pattern sharing across fleet
 
-This module is INFORMATION ONLY - it recommends actions but doesn't execute.
-Actual rebalancing is done by cl-revenue-ops based on these predictions.
-
-Author: Lightning Goats Team
+This module is INFORMATION ONLY - it detects patterns and shares them
+but does not execute any rebalancing or fee changes.
 """
 
 import math
@@ -51,18 +49,10 @@ KALMAN_MIN_CONFIDENCE = 0.3           # Minimum confidence to use Kalman data
 KALMAN_MIN_REPORTERS = 1              # Minimum reporters for consensus
 KALMAN_UNCERTAINTY_SCALING = 1.5      # Scale factor for uncertainty in confidence
 
-# Prediction settings
-DEFAULT_PREDICTION_HOURS = 12         # Default prediction window
 
-# Urgency thresholds
-URGENT_HOURS_THRESHOLD = 6            # <6 hours = urgent
-PREEMPTIVE_HOURS_THRESHOLD = 24       # 6-24 hours = preemptive window
-DEPLETION_PCT_THRESHOLD = 0.20        # <20% local = depletion risk
-SATURATION_PCT_THRESHOLD = 0.80       # >80% local = saturation risk
-
-# Fleet coordination
-MAX_PREDICTIONS_PER_CHANNEL = 5       # Max predictions cached per channel
+# Cache staleness
 PREDICTION_STALE_HOURS = 1            # Refresh predictions hourly
+# Flow history limits
 MAX_FLOW_HISTORY_CHANNELS = 500
 MAX_FLOW_SAMPLES_PER_CHANNEL = 2000  # ~83 days at 1 sample/hour
 
@@ -106,21 +96,6 @@ class FlowDirection(Enum):
     BALANCED = "balanced"    # Roughly equal
 
 
-class PredictionUrgency(Enum):
-    """Urgency level for rebalancing action."""
-    CRITICAL = "critical"      # <6 hours to depletion
-    URGENT = "urgent"          # 6-12 hours
-    PREEMPTIVE = "preemptive"  # 12-24 hours (ideal window)
-    LOW = "low"                # >24 hours
-    NONE = "none"              # No action needed
-
-
-class RecommendedAction(Enum):
-    """Recommended action based on prediction."""
-    PREEMPTIVE_REBALANCE = "preemptive_rebalance"
-    FEE_ADJUSTMENT = "fee_adjustment"
-    MONITOR = "monitor"
-    NO_ACTION = "no_action"
 
 
 # =============================================================================
@@ -179,97 +154,6 @@ class TemporalPattern:
         days = ["Monday", "Tuesday", "Wednesday", "Thursday",
                 "Friday", "Saturday", "Sunday"]
         return days[self.day_of_week] if 0 <= self.day_of_week <= 6 else None
-
-
-@dataclass
-class LiquidityPrediction:
-    """
-    Prediction of future liquidity state for a channel.
-
-    Used to recommend preemptive rebalancing before depletion or saturation.
-    """
-    channel_id: str
-    peer_id: str
-    current_local_pct: float
-    predicted_local_pct: float
-    hours_ahead: int
-    velocity_pct_per_hour: float
-
-    # Risk assessment
-    depletion_risk: float         # 0.0-1.0, higher = more likely to deplete
-    saturation_risk: float        # 0.0-1.0, higher = more likely to saturate
-    hours_to_critical: Optional[float]  # Hours until depletion/saturation
-
-    # Recommendation
-    recommended_action: RecommendedAction
-    urgency: PredictionUrgency
-    confidence: float
-
-    # Pattern match
-    pattern_match: Optional[str]  # Name of matched pattern
-    pattern_intensity: float = 1.0
-
-    # Timestamps
-    predicted_at: int = 0
-
-    def __post_init__(self):
-        if self.predicted_at == 0:
-            self.predicted_at = int(time.time())
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization."""
-        return {
-            "channel_id": self.channel_id,
-            "peer_id": self.peer_id,
-            "current_local_pct": round(self.current_local_pct, 3),
-            "predicted_local_pct": round(self.predicted_local_pct, 3),
-            "hours_ahead": self.hours_ahead,
-            "velocity_pct_per_hour": round(self.velocity_pct_per_hour, 4),
-            "depletion_risk": round(self.depletion_risk, 2),
-            "saturation_risk": round(self.saturation_risk, 2),
-            "hours_to_critical": round(self.hours_to_critical, 1) if self.hours_to_critical else None,
-            "recommended_action": self.recommended_action.value,
-            "urgency": self.urgency.value,
-            "confidence": round(self.confidence, 2),
-            "pattern_match": self.pattern_match,
-            "pattern_intensity": round(self.pattern_intensity, 2),
-            "predicted_at": self.predicted_at
-        }
-
-
-@dataclass
-class FleetAnticipation:
-    """
-    Fleet-wide anticipatory positioning recommendation.
-
-    Coordinates predictions across members to avoid competing for
-    the same rebalance routes.
-    """
-    target_peer: str
-    members_predicting_depletion: List[str]
-    members_predicting_saturation: List[str]
-    recommended_coordinator: str      # Member best positioned to act
-    total_predicted_demand_sats: int
-    coordination_window_hours: int
-    recommendation: str
-    timestamp: int = 0
-
-    def __post_init__(self):
-        if self.timestamp == 0:
-            self.timestamp = int(time.time())
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
-        return {
-            "target_peer": self.target_peer[:16] + "..." if len(self.target_peer) > 16 else self.target_peer,
-            "members_predicting_depletion": len(self.members_predicting_depletion),
-            "members_predicting_saturation": len(self.members_predicting_saturation),
-            "recommended_coordinator": self.recommended_coordinator[:16] + "..." if self.recommended_coordinator else None,
-            "total_predicted_demand_sats": self.total_predicted_demand_sats,
-            "coordination_window_hours": self.coordination_window_hours,
-            "recommendation": self.recommendation,
-            "timestamp": self.timestamp
-        }
 
 
 @dataclass
@@ -487,16 +371,13 @@ class IntraDayForecast:
 
 class AnticipatoryLiquidityManager:
     """
-    Predicts liquidity needs before they occur.
-
-    Like mycelium nutrient pre-positioning - move resources to where
-    they'll be needed before the demand spike.
+    Detects temporal flow patterns for proactive liquidity awareness.
 
     Key capabilities:
-    1. Temporal pattern detection (hour/day cycles)
-    2. Flow velocity prediction
-    3. Preemptive rebalancing recommendations
-    4. Fleet-wide coordination to avoid competition
+    1. Temporal pattern detection (hour/day/month cycles)
+    2. Intra-day phase detection with Kalman velocity
+    3. Flow velocity calculation (Kalman + simple fallback)
+    4. Pattern sharing across fleet members
 
     Usage:
         manager = AnticipatoryLiquidityManager(database, plugin)
@@ -504,11 +385,11 @@ class AnticipatoryLiquidityManager:
         # Detect patterns from history
         patterns = manager.detect_patterns(channel_id)
 
-        # Get prediction for next 12 hours
-        prediction = manager.predict_liquidity(channel_id, hours=12)
+        # Detect intra-day patterns
+        intraday = manager.detect_intraday_patterns(channel_id)
 
-        # Get fleet-wide recommendations
-        fleet_recs = manager.get_fleet_recommendations()
+        # Get intra-day forecast
+        forecast = manager.get_intraday_forecast(channel_id)
     """
 
     def __init__(
@@ -537,7 +418,6 @@ class AnticipatoryLiquidityManager:
 
         # In-memory caches
         self._pattern_cache: Dict[str, List[TemporalPattern]] = {}
-        self._prediction_cache: Dict[str, LiquidityPrediction] = {}
         self._flow_history: Dict[str, List[HourlyFlowSample]] = defaultdict(list)
         # Track last-update timestamp per channel for O(1) eviction
         self._flow_history_last_ts: Dict[str, int] = {}
@@ -1613,226 +1493,10 @@ class AnticipatoryLiquidityManager:
             "forecasts": [f.to_dict() for f in forecasts[:5]]
         }
 
+
     # =========================================================================
-    # PREDICTION
+    # VELOCITY CALCULATION
     # =========================================================================
-
-    def predict_liquidity(
-        self,
-        channel_id: str,
-        hours_ahead: int = DEFAULT_PREDICTION_HOURS,
-        current_local_pct: float = None,
-        capacity_sats: int = None,
-        peer_id: str = None
-    ) -> Optional[LiquidityPrediction]:
-        """
-        Predict liquidity state N hours from now.
-
-        Combines:
-        1. Current velocity (point-in-time extrapolation)
-        2. Temporal patterns (historical cycles)
-        3. Recent trend analysis
-
-        Args:
-            channel_id: Channel SCID
-            hours_ahead: Hours to predict ahead
-            current_local_pct: Current local balance percentage (0.0-1.0)
-            capacity_sats: Channel capacity in satoshis
-            peer_id: Peer pubkey
-
-        Returns:
-            LiquidityPrediction or None if insufficient data
-        """
-        # Get current state if not provided
-        if current_local_pct is None or capacity_sats is None:
-            channel_info = self._get_channel_info(channel_id)
-            if not channel_info:
-                return None
-            current_local_pct = channel_info.get("local_pct", 0.5)
-            capacity_sats = channel_info.get("capacity_sats", 0)
-            peer_id = peer_id or channel_info.get("peer_id", "")
-
-        # Get patterns
-        patterns = self.detect_patterns(channel_id)
-
-        # Find matching pattern for prediction window
-        target_time = datetime.fromtimestamp(time.time() + hours_ahead * 3600, tz=timezone.utc)
-        target_hour = target_time.hour
-        target_day = target_time.weekday()
-        target_day_of_month = target_time.day
-
-        matched_pattern = self._find_best_pattern_match(
-            patterns, target_hour, target_day, target_day_of_month
-        )
-
-        # Calculate base velocity from recent samples
-        base_velocity = self._calculate_velocity(channel_id, capacity_sats)
-
-        # Adjust velocity based on pattern
-        if matched_pattern and matched_pattern.confidence >= PATTERN_CONFIDENCE_THRESHOLD:
-            # Pattern-derived velocity floor: use pattern's avg flow as independent signal
-            # so patterns have effect even when current base_velocity is zero
-            pattern_velocity_floor = 0.0
-            if capacity_sats > 0 and matched_pattern.avg_flow_sats > 0:
-                pattern_velocity_floor = matched_pattern.avg_flow_sats / capacity_sats
-            velocity_magnitude = max(abs(base_velocity), pattern_velocity_floor)
-
-            if matched_pattern.direction == FlowDirection.OUTBOUND:
-                adjusted_velocity = base_velocity - (
-                    matched_pattern.intensity * velocity_magnitude * 0.5
-                )
-            elif matched_pattern.direction == FlowDirection.INBOUND:
-                adjusted_velocity = base_velocity + (
-                    matched_pattern.intensity * velocity_magnitude * 0.5
-                )
-            else:
-                adjusted_velocity = base_velocity
-
-            pattern_name = self._pattern_name(matched_pattern)
-            pattern_intensity = matched_pattern.intensity
-            confidence = matched_pattern.confidence
-        else:
-            adjusted_velocity = base_velocity
-            pattern_name = None
-            pattern_intensity = 1.0
-            confidence = 0.5  # Lower confidence without pattern match
-
-        # Project forward: step through hours to account for changing patterns
-        if hours_ahead <= 6 or not patterns:
-            # Short horizon or no patterns: simple linear projection
-            predicted_local_pct = current_local_pct + (adjusted_velocity * hours_ahead)
-        else:
-            # Long horizon: step hour-by-hour, re-matching patterns each hour
-            predicted_local_pct = current_local_pct
-            now_ts = time.time()
-            for h in range(hours_ahead):
-                step_time = datetime.fromtimestamp(now_ts + (h + 1) * 3600, tz=timezone.utc)
-                step_pattern = self._find_best_pattern_match(
-                    patterns, step_time.hour, step_time.weekday(), step_time.day
-                )
-                if step_pattern and step_pattern.confidence >= PATTERN_CONFIDENCE_THRESHOLD:
-                    step_floor = 0.0
-                    if capacity_sats > 0 and step_pattern.avg_flow_sats > 0:
-                        step_floor = step_pattern.avg_flow_sats / capacity_sats
-                    step_mag = max(abs(base_velocity), step_floor)
-                    if step_pattern.direction == FlowDirection.OUTBOUND:
-                        step_v = base_velocity - step_pattern.intensity * step_mag * 0.5
-                    elif step_pattern.direction == FlowDirection.INBOUND:
-                        step_v = base_velocity + step_pattern.intensity * step_mag * 0.5
-                    else:
-                        step_v = base_velocity
-                else:
-                    step_v = base_velocity
-                predicted_local_pct += step_v
-            # adjusted_velocity represents the average over the window
-            adjusted_velocity = (predicted_local_pct - current_local_pct) / hours_ahead if hours_ahead > 0 else adjusted_velocity
-        predicted_local_pct = max(0.0, min(1.0, predicted_local_pct))
-
-        # Calculate risks
-        depletion_risk = self._calculate_depletion_risk(
-            current_local_pct, predicted_local_pct, adjusted_velocity
-        )
-        saturation_risk = self._calculate_saturation_risk(
-            current_local_pct, predicted_local_pct, adjusted_velocity
-        )
-
-        # Calculate hours to critical
-        hours_to_critical = self._hours_to_critical(
-            current_local_pct, adjusted_velocity
-        )
-
-        # Determine urgency and action
-        urgency = self._determine_urgency(hours_to_critical, depletion_risk, saturation_risk)
-        action = self._determine_action(urgency, depletion_risk, saturation_risk)
-
-        prediction = LiquidityPrediction(
-            channel_id=channel_id,
-            peer_id=peer_id or "",
-            current_local_pct=current_local_pct,
-            predicted_local_pct=predicted_local_pct,
-            hours_ahead=hours_ahead,
-            velocity_pct_per_hour=adjusted_velocity,
-            depletion_risk=depletion_risk,
-            saturation_risk=saturation_risk,
-            hours_to_critical=hours_to_critical,
-            recommended_action=action,
-            urgency=urgency,
-            confidence=confidence,
-            pattern_match=pattern_name,
-            pattern_intensity=pattern_intensity
-        )
-
-        # Cache prediction and evict stale entries
-        with self._lock:
-            self._prediction_cache[channel_id] = prediction
-
-            # Evict stale predictions older than PREDICTION_STALE_HOURS
-            stale_cutoff = time.time() - PREDICTION_STALE_HOURS * 3600
-            stale_keys = [k for k, v in self._prediction_cache.items() if v.predicted_at < stale_cutoff]
-            for k in stale_keys:
-                del self._prediction_cache[k]
-
-        return prediction
-
-    def _find_best_pattern_match(
-        self,
-        patterns: List[TemporalPattern],
-        target_hour: int,
-        target_day: int,
-        target_day_of_month: int = None
-    ) -> Optional[TemporalPattern]:
-        """
-        Find the best matching pattern for a target time.
-
-        Priority:
-        1. Exact hour+day_of_week match (score 3)
-        2. Hour match (any day) (score 2)
-        3. Day-of-month match (score 1.5) — includes EOM cluster (day 31 matches days 28-31,1-3)
-        4. Day-of-week match (any hour) (score 1)
-        """
-        best_match = None
-        best_score = 0.0
-
-        # Days considered part of end-of-month cluster (marker day_of_month=31)
-        EOM_DAYS = {28, 29, 30, 31, 1, 2, 3}
-
-        for pattern in patterns:
-            score = 0.0
-
-            # Monthly patterns (day_of_month set, hour/day_of_week are None)
-            if pattern.day_of_month is not None:
-                if target_day_of_month is None:
-                    continue
-                # EOM cluster marker (day_of_month=31) matches any EOM day
-                if pattern.day_of_month == 31 and target_day_of_month in EOM_DAYS:
-                    score = 1.5
-                elif pattern.day_of_month == target_day_of_month:
-                    score = 1.5
-                else:
-                    continue  # Day of month doesn't match
-            else:
-                # Check hour match
-                if pattern.hour_of_day is not None:
-                    if pattern.hour_of_day == target_hour:
-                        score += 2
-                    else:
-                        continue  # Hour specified but doesn't match
-
-                # Check day match
-                if pattern.day_of_week is not None:
-                    if pattern.day_of_week == target_day:
-                        score += 1
-                    else:
-                        continue  # Day specified but doesn't match
-
-            # Weight by confidence
-            weighted_score = score * pattern.confidence
-
-            if weighted_score > best_score:
-                best_score = weighted_score
-                best_match = pattern
-
-        return best_match
 
     def _calculate_velocity(
         self,
@@ -1950,179 +1614,6 @@ class AnticipatoryLiquidityManager:
 
         return consensus_velocity
 
-    def _calculate_depletion_risk(
-        self,
-        current_pct: float,
-        predicted_pct: float,
-        velocity: float
-    ) -> float:
-        """Calculate risk of channel depletion (0.0-1.0)."""
-        # Base risk from current level
-        if current_pct <= DEPLETION_PCT_THRESHOLD:
-            base_risk = 0.8
-        elif current_pct <= DEPLETION_PCT_THRESHOLD * 1.5:
-            base_risk = 0.5
-        elif current_pct <= DEPLETION_PCT_THRESHOLD * 2:
-            base_risk = 0.2
-        else:
-            base_risk = 0.0
-
-        # Velocity risk (negative velocity = depleting)
-        if velocity < -0.01:  # >1% per hour outbound
-            velocity_risk = 0.8
-        elif velocity < -0.005:
-            velocity_risk = 0.5
-        elif velocity < 0:
-            velocity_risk = 0.2
-        else:
-            velocity_risk = 0.0
-
-        # Predicted state risk
-        if predicted_pct <= DEPLETION_PCT_THRESHOLD:
-            predicted_risk = 0.9
-        elif predicted_pct <= DEPLETION_PCT_THRESHOLD * 1.5:
-            predicted_risk = 0.5
-        else:
-            predicted_risk = 0.1
-
-        # Combine risks: weighted sum so all factors contribute
-        combined = base_risk * 0.4 + velocity_risk * 0.3 + predicted_risk * 0.3
-        return min(1.0, combined)
-
-    def _calculate_saturation_risk(
-        self,
-        current_pct: float,
-        predicted_pct: float,
-        velocity: float
-    ) -> float:
-        """Calculate risk of channel saturation (0.0-1.0)."""
-        # Base risk from current level
-        if current_pct >= SATURATION_PCT_THRESHOLD:
-            base_risk = 0.8
-        elif current_pct >= SATURATION_PCT_THRESHOLD - 0.1:
-            base_risk = 0.5
-        elif current_pct >= SATURATION_PCT_THRESHOLD - 0.2:
-            base_risk = 0.2
-        else:
-            base_risk = 0.0
-
-        # Velocity risk (positive velocity = saturating)
-        if velocity > 0.01:  # >1% per hour inbound
-            velocity_risk = 0.8
-        elif velocity > 0.005:
-            velocity_risk = 0.5
-        elif velocity > 0:
-            velocity_risk = 0.2
-        else:
-            velocity_risk = 0.0
-
-        # Predicted state risk
-        if predicted_pct >= SATURATION_PCT_THRESHOLD:
-            predicted_risk = 0.9
-        elif predicted_pct >= SATURATION_PCT_THRESHOLD - 0.1:
-            predicted_risk = 0.5
-        else:
-            predicted_risk = 0.1
-
-        # Combine risks: weighted sum so all factors contribute
-        combined = base_risk * 0.4 + velocity_risk * 0.3 + predicted_risk * 0.3
-        return min(1.0, combined)
-
-    def _hours_to_critical(
-        self,
-        current_pct: float,
-        velocity: float
-    ) -> Optional[float]:
-        """Calculate hours until depletion or saturation."""
-        if velocity == 0:
-            return None
-
-        if velocity < 0:
-            # Depleting - hours until DEPLETION_PCT_THRESHOLD
-            pct_to_threshold = current_pct - DEPLETION_PCT_THRESHOLD
-            if pct_to_threshold <= 0:
-                return 0  # Already critical
-            hours = pct_to_threshold / abs(velocity)
-        else:
-            # Saturating - hours until SATURATION_PCT_THRESHOLD
-            pct_to_threshold = SATURATION_PCT_THRESHOLD - current_pct
-            if pct_to_threshold <= 0:
-                return 0  # Already critical
-            hours = pct_to_threshold / velocity
-
-        return max(0, hours)
-
-    def _determine_urgency(
-        self,
-        hours_to_critical: Optional[float],
-        depletion_risk: float,
-        saturation_risk: float
-    ) -> PredictionUrgency:
-        """Determine urgency level from prediction."""
-        max_risk = max(depletion_risk, saturation_risk)
-
-        if hours_to_critical is not None:
-            if hours_to_critical <= 0:
-                return PredictionUrgency.CRITICAL
-            elif hours_to_critical <= URGENT_HOURS_THRESHOLD:
-                return PredictionUrgency.CRITICAL if max_risk > 0.7 else PredictionUrgency.URGENT
-            elif hours_to_critical <= 12:
-                return PredictionUrgency.URGENT if max_risk > 0.5 else PredictionUrgency.PREEMPTIVE
-            elif hours_to_critical <= PREEMPTIVE_HOURS_THRESHOLD:
-                return PredictionUrgency.PREEMPTIVE if max_risk > 0.3 else PredictionUrgency.LOW
-
-        if max_risk > 0.7:
-            return PredictionUrgency.URGENT
-        elif max_risk > 0.4:
-            return PredictionUrgency.PREEMPTIVE
-        elif max_risk > 0.2:
-            return PredictionUrgency.LOW
-
-        return PredictionUrgency.NONE
-
-    def _determine_action(
-        self,
-        urgency: PredictionUrgency,
-        depletion_risk: float,
-        saturation_risk: float
-    ) -> RecommendedAction:
-        """Determine recommended action from urgency and risks."""
-        if urgency == PredictionUrgency.NONE:
-            return RecommendedAction.NO_ACTION
-
-        if urgency in [PredictionUrgency.CRITICAL, PredictionUrgency.URGENT]:
-            return RecommendedAction.PREEMPTIVE_REBALANCE
-
-        if urgency == PredictionUrgency.PREEMPTIVE:
-            if depletion_risk > 0.5 or saturation_risk > 0.5:
-                return RecommendedAction.PREEMPTIVE_REBALANCE
-            else:
-                return RecommendedAction.FEE_ADJUSTMENT
-
-        return RecommendedAction.MONITOR
-
-    def _pattern_name(self, pattern: TemporalPattern) -> str:
-        """Generate human-readable pattern name."""
-        parts = []
-
-        if pattern.day_of_month is not None:
-            if pattern.day_of_month == 31:
-                parts.append("eom")
-            else:
-                parts.append(f"day{pattern.day_of_month}")
-
-        if pattern.day_of_week is not None:
-            days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-            parts.append(days[pattern.day_of_week])
-
-        if pattern.hour_of_day is not None:
-            parts.append(f"{pattern.hour_of_day:02d}:00")
-
-        direction = "drain" if pattern.direction == FlowDirection.OUTBOUND else "inflow"
-        parts.append(direction)
-
-        return "_".join(parts) if parts else "unknown"
-
     def _get_channel_info(self, channel_id: str, peer_id: str = None) -> Optional[Dict]:
         """Get channel info from RPC. Uses peer_id filter when available."""
         if not self.plugin:
@@ -2160,196 +1651,6 @@ class AnticipatoryLiquidityManager:
         return None
 
     # =========================================================================
-    # FLEET COORDINATION
-    # =========================================================================
-
-    def get_all_predictions(
-        self,
-        hours_ahead: int = DEFAULT_PREDICTION_HOURS,
-        min_risk: float = 0.3
-    ) -> List[LiquidityPrediction]:
-        """
-        Get predictions for all channels.
-
-        Args:
-            hours_ahead: Hours to predict ahead
-            min_risk: Minimum depletion/saturation risk to include
-
-        Returns:
-            List of predictions with risk >= min_risk
-        """
-        predictions = []
-
-        if not self.plugin:
-            return predictions
-
-        try:
-            channels = self.plugin.rpc.listpeerchannels()
-            for ch in channels.get("channels", []):
-                scid = ch.get("short_channel_id")
-                if not scid:
-                    continue
-
-                # Skip non-normal channels
-                if ch.get("state") != "CHANNELD_NORMAL":
-                    continue
-
-                # Extract channel data to avoid per-channel RPC calls
-                total = ch.get("total_msat", 0)
-                if isinstance(total, str):
-                    total = int(total.replace("msat", ""))
-                total_sats = total // 1000
-
-                local = ch.get("to_us_msat", 0)
-                if isinstance(local, str):
-                    local = int(local.replace("msat", ""))
-                local_sats = local // 1000
-
-                local_pct = local_sats / total_sats if total_sats > 0 else 0.5
-
-                pred = self.predict_liquidity(
-                    scid,
-                    hours_ahead=hours_ahead,
-                    current_local_pct=local_pct,
-                    capacity_sats=total_sats,
-                    peer_id=ch.get("peer_id", ""),
-                )
-                if pred:
-                    max_risk = max(pred.depletion_risk, pred.saturation_risk)
-                    if max_risk >= min_risk:
-                        predictions.append(pred)
-
-        except Exception as e:
-            self._log(f"Failed to get all predictions: {e}", level="debug")
-
-        # Sort by risk
-        predictions.sort(
-            key=lambda p: max(p.depletion_risk, p.saturation_risk),
-            reverse=True
-        )
-
-        return predictions
-
-    def get_fleet_recommendations(self) -> List[FleetAnticipation]:
-        """
-        Get fleet-wide anticipatory positioning recommendations.
-
-        Coordinates predictions across members to avoid competing
-        for the same rebalance routes.
-
-        Returns:
-            List of FleetAnticipation recommendations
-        """
-        if not self.state_manager:
-            return []
-
-        recommendations = []
-
-        try:
-            # Get our predictions
-            our_predictions = self.get_all_predictions(min_risk=0.4)
-
-            # Group by peer
-            peer_predictions: Dict[str, List[LiquidityPrediction]] = defaultdict(list)
-            for pred in our_predictions:
-                peer_predictions[pred.peer_id].append(pred)
-
-            # For each peer, check if other members also predict issues
-            all_states = self.state_manager.get_all_peer_states()
-
-            for peer_id, preds in peer_predictions.items():
-                members_depleting = []
-                members_saturating = []
-
-                # Check our predictions
-                for pred in preds:
-                    if pred.depletion_risk > 0.5:
-                        members_depleting.append(self._get_our_id())
-                    if pred.saturation_risk > 0.5:
-                        members_saturating.append(self._get_our_id())
-
-                # Check other members using shared remote patterns
-                our_id = self._get_our_id()
-                with self._lock:
-                    remote = list(self._remote_patterns.get(peer_id, []))
-                if remote:
-                    # Aggregate remote reporter signals for this peer
-                    seen_reporters = set()
-                    now_ts = time.time()
-                    for rp in remote:
-                        reporter = rp.get("reporter_id", "")
-                        if not reporter or reporter == our_id or reporter in seen_reporters:
-                            continue
-                        # Only use recent reports (last 24 hours)
-                        if now_ts - rp.get("timestamp", 0) > 86400:
-                            continue
-                        seen_reporters.add(reporter)
-                        direction = rp.get("direction", "balanced")
-                        intensity = rp.get("intensity", 0)
-                        if direction == "outbound" and intensity >= PATTERN_STRENGTH_THRESHOLD:
-                            members_depleting.append(reporter)
-                        elif direction == "inbound" and intensity >= PATTERN_STRENGTH_THRESHOLD:
-                            members_saturating.append(reporter)
-
-                if members_depleting or members_saturating:
-                    # Determine recommended coordinator: member with highest
-                    # available capacity (from state) or default to us
-                    coordinator = our_id
-                    best_capacity = 0
-                    for state in all_states:
-                        sid = getattr(state, 'peer_id', None)
-                        if sid and sid in (members_depleting + members_saturating):
-                            cap = getattr(state, 'available_sats', 0) or 0
-                            if cap > best_capacity:
-                                best_capacity = cap
-                                coordinator = sid
-
-                    # Estimate demand from velocity and prediction horizon
-                    total_demand = 0
-                    for p in preds:
-                        if p.depletion_risk > 0.5 and p.velocity_pct_per_hour < 0:
-                            # Demand = velocity * hours * capacity (rough)
-                            channel_info = self._get_channel_info(p.channel_id, peer_id=peer_id)
-                            cap = channel_info.get("capacity_sats", 0) if channel_info else 0
-                            total_demand += int(abs(p.velocity_pct_per_hour) * p.hours_ahead * cap)
-
-                    recommendations.append(FleetAnticipation(
-                        target_peer=peer_id,
-                        members_predicting_depletion=members_depleting,
-                        members_predicting_saturation=members_saturating,
-                        recommended_coordinator=coordinator,
-                        total_predicted_demand_sats=total_demand,
-                        coordination_window_hours=12,
-                        recommendation=self._fleet_recommendation(
-                            len(members_depleting), len(members_saturating)
-                        )
-                    ))
-
-        except Exception as e:
-            self._log(f"Failed to get fleet recommendations: {e}", level="debug")
-
-        return recommendations
-
-    def _fleet_recommendation(
-        self,
-        depleting_count: int,
-        saturating_count: int
-    ) -> str:
-        """Generate fleet coordination recommendation."""
-        if depleting_count > 1 and saturating_count > 1:
-            return "Multiple members depleting AND saturating - internal rebalance opportunity"
-        elif depleting_count > 1:
-            return "Multiple members depleting - coordinate to avoid competing for inbound"
-        elif saturating_count > 1:
-            return "Multiple members saturating - coordinate to avoid competing for outbound"
-        elif depleting_count == 1:
-            return "Single member depleting - proceed with preemptive rebalance"
-        elif saturating_count == 1:
-            return "Single member saturating - lower fees to attract outbound"
-        else:
-            return "Monitor situation"
-
-    # =========================================================================
     # STATUS / DIAGNOSTICS
     # =========================================================================
 
@@ -2357,15 +1658,12 @@ class AnticipatoryLiquidityManager:
         """Get manager status for diagnostics."""
         with self._lock:
             channels_with_patterns = len(self._pattern_cache)
-            channels_with_predictions = len(self._prediction_cache)
             total_flow_samples = sum(len(s) for s in self._flow_history.values())
         return {
             "active": True,
             "channels_with_patterns": channels_with_patterns,
-            "channels_with_predictions": channels_with_predictions,
             "total_flow_samples": total_flow_samples,
             "pattern_window_days": PATTERN_WINDOW_DAYS,
-            "prediction_stale_hours": PREDICTION_STALE_HOURS,
             "min_pattern_samples": MIN_PATTERN_SAMPLES,
             "confidence_threshold": PATTERN_CONFIDENCE_THRESHOLD
         }

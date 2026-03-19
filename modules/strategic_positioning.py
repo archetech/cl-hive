@@ -1,21 +1,16 @@
 """
-Phase 5: Strategic Positioning Module for Yield Optimization.
+Strategic Positioning Module for Fleet Yield Optimization.
 
 Positions the fleet on critical network paths to maximize routing opportunities:
 
 1. RouteValueAnalyzer: Identify high-value corridors with volume and limited competition
 2. FleetPositioningStrategy: Coordinate channel opens without duplication
-3. PhysarumChannelManager: Flow-based channel lifecycle (strengthen/atrophy)
 
 The goal is strategic capital deployment - position on high-value routes where
 the fleet can capture significant routing fees.
-
-Author: Lightning Goats Team
 """
 
-import json
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -30,30 +25,6 @@ HIGH_VALUE_VOLUME_SATS_DAILY = 10_000_000   # 10M sats/day = high value
 MEDIUM_VALUE_VOLUME_SATS_DAILY = 1_000_000  # 1M sats/day = medium value
 LOW_COMPETITION_THRESHOLD = 5               # <5 competitors = low competition
 MEDIUM_COMPETITION_THRESHOLD = 15           # <15 competitors = medium
-
-# Physarum flow thresholds
-STRENGTHEN_FLOW_THRESHOLD = 0.02            # 2% daily turn rate → splice in
-ATROPHY_FLOW_THRESHOLD = 0.001              # 0.1% daily turn rate → close
-STIMULATE_GRACE_DAYS = 90                   # Young channels get fee reduction
-MIN_CHANNEL_AGE_FOR_ATROPHY_DAYS = 180      # Must be >6 months to recommend close
-
-# Physarum auto-trigger configuration (Phase 7.2)
-AUTO_STRENGTHEN_ENABLED = True              # Enable auto splice-in for high-flow channels
-AUTO_ATROPHY_ENABLED = False                # Atrophy always requires human approval
-AUTO_STIMULATE_ENABLED = True               # Enable auto fee reduction for young channels
-
-# Auto-trigger thresholds
-MIN_AUTO_STRENGTHEN_FLOW = 0.025            # 2.5% flow for auto-strengthen (above base)
-AUTO_STRENGTHEN_MIN_SATS = 1_000_000        # Minimum 1M sats for auto splice-in
-AUTO_STRENGTHEN_MAX_SATS = 5_000_000        # Maximum 5M sats for auto splice-in
-
-# Rate limits for auto-triggers
-MAX_AUTO_STRENGTHEN_PER_DAY = 2             # Max 2 splice-in recommendations per day
-MAX_AUTO_ATROPHY_PER_WEEK = 1               # Max 1 atrophy recommendation per week
-MIN_STRENGTHEN_INTERVAL_HOURS = 24          # Minimum 24h between strengthen for same channel
-
-# Safety constraints
-AUTO_TRIGGER_MIN_ON_CHAIN_SATS = 500_000    # Minimum 500k sats on-chain reserve
 
 # Positioning priorities
 EXCHANGE_PRIORITY_BONUS = 1.5               # 50% bonus for exchange channels
@@ -203,57 +174,6 @@ class PositionRecommendation:
 
 
 @dataclass
-class FlowRecommendation:
-    """
-    Physarum-inspired recommendation for channel lifecycle.
-    """
-    channel_id: str
-    peer_id: str
-    peer_alias: Optional[str] = None
-
-    # Flow metrics
-    flow_intensity: float = 0.0  # Volume / Capacity per day
-    turn_rate: float = 0.0       # How many times capacity turns over
-
-    # Channel state
-    capacity_sats: int = 0
-    age_days: int = 0
-    revenue_sats: int = 0
-
-    # Recommendation
-    action: str = "hold"  # "strengthen", "stimulate", "atrophy", "hold"
-    method: str = ""      # "splice_in", "fee_reduction", "cooperative_close"
-    reason: str = ""
-
-    # For strengthen
-    splice_amount_sats: int = 0
-
-    # For atrophy
-    capital_to_redeploy_sats: int = 0
-
-    # Expected impact
-    expected_yield_change_pct: float = 0.0
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "channel_id": self.channel_id,
-            "peer_id": self.peer_id,
-            "peer_alias": self.peer_alias,
-            "flow_intensity": round(self.flow_intensity, 4),
-            "turn_rate": round(self.turn_rate, 4),
-            "capacity_sats": self.capacity_sats,
-            "age_days": self.age_days,
-            "revenue_sats": self.revenue_sats,
-            "action": self.action,
-            "method": self.method,
-            "reason": self.reason,
-            "splice_amount_sats": self.splice_amount_sats,
-            "capital_to_redeploy_sats": self.capital_to_redeploy_sats,
-            "expected_yield_change_pct": round(self.expected_yield_change_pct, 2)
-        }
-
-
-@dataclass
 class PositioningSummary:
     """
     Summary of fleet strategic positioning.
@@ -261,36 +181,20 @@ class PositioningSummary:
     total_targets_analyzed: int = 0
     high_value_corridors: int = 0
     exchange_coverage_pct: float = 0.0
-    bridge_positions: int = 0
 
     # Recommendations
     open_recommendations: int = 0
-    strengthen_recommendations: int = 0
-    atrophy_recommendations: int = 0
 
     # Fleet coverage
-    well_positioned_targets: int = 0
     underserved_targets: int = 0
-    over_positioned_targets: int = 0
-
-    # Capital allocation
-    capital_to_redeploy_sats: int = 0
-    recommended_new_capacity_sats: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "total_targets_analyzed": self.total_targets_analyzed,
             "high_value_corridors": self.high_value_corridors,
             "exchange_coverage_pct": round(self.exchange_coverage_pct, 1),
-            "bridge_positions": self.bridge_positions,
             "open_recommendations": self.open_recommendations,
-            "strengthen_recommendations": self.strengthen_recommendations,
-            "atrophy_recommendations": self.atrophy_recommendations,
-            "well_positioned_targets": self.well_positioned_targets,
             "underserved_targets": self.underserved_targets,
-            "over_positioned_targets": self.over_positioned_targets,
-            "capital_to_redeploy_sats": self.capital_to_redeploy_sats,
-            "recommended_new_capacity_sats": self.recommended_new_capacity_sats
         }
 
 
@@ -1080,705 +984,16 @@ class FleetPositioningStrategy:
 
 
 # =============================================================================
-# PHYSARUM CHANNEL MANAGER
-# =============================================================================
-
-class PhysarumChannelManager:
-    """
-    Channels evolve based on flow, like slime mold tubes.
-
-    High flow → strengthen (splice in capacity)
-    Low flow → atrophy (reduce capacity or close)
-
-    This naturally optimizes capital allocation without central planning.
-    """
-
-    def __init__(self, plugin, yield_metrics_mgr=None):
-        """
-        Initialize the Physarum channel manager.
-
-        Args:
-            plugin: Plugin reference
-            yield_metrics_mgr: YieldMetricsManager for flow data
-        """
-        self.plugin = plugin
-        self.yield_metrics = yield_metrics_mgr
-        self._our_pubkey: Optional[str] = None
-
-        # Channel flow history (bounded: max 500 channels, TTL 7 days)
-        self._flow_history: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
-        self._max_flow_channels = 500
-
-    def set_our_pubkey(self, pubkey: str) -> None:
-        """Set our node's pubkey."""
-        self._our_pubkey = pubkey
-
-    def _log(self, message: str, level: str = "debug") -> None:
-        """Log a message if plugin is available."""
-        if self.plugin:
-            self.plugin.log(f"PHYSARUM: {message}", level=level)
-
-    def _get_channel_data(self, channel_id: str = None) -> List[Dict]:
-        """Get channel data from RPC."""
-        if not self.plugin:
-            return []
-
-        try:
-            channels = self.plugin.rpc.listpeerchannels()
-            all_channels = channels.get("channels", [])
-
-            if channel_id:
-                # Normalize channel ID format
-                normalized = channel_id.replace(":", "x")
-                return [
-                    ch for ch in all_channels
-                    if ch.get("short_channel_id", "").replace(":", "x") == normalized
-                ]
-            return all_channels
-        except Exception as e:
-            self._log(f"Error getting channel data: {e}", level="debug")
-            return []
-
-    def calculate_flow_intensity(self, channel_id: str) -> float:
-        """
-        Calculate flow intensity for a channel.
-
-        Flow intensity = Daily volume / Capacity
-
-        Uses actual channel age from SCID block height for accurate
-        daily volume estimation instead of assuming 30 days.
-        """
-        channels = self._get_channel_data(channel_id)
-        if not channels:
-            return 0.0
-
-        channel = channels[0]
-
-        # Get capacity
-        capacity_msat = channel.get("total_msat", 0)
-        if isinstance(capacity_msat, str):
-            capacity_msat = int(capacity_msat.replace("msat", ""))
-        capacity_sats = capacity_msat // 1000
-
-        if capacity_sats == 0:
-            return 0.0
-
-        # Get volume from in/out fulfilled
-        in_fulfilled_msat = channel.get("in_fulfilled_msat", 0)
-        out_fulfilled_msat = channel.get("out_fulfilled_msat", 0)
-
-        if isinstance(in_fulfilled_msat, str):
-            in_fulfilled_msat = int(in_fulfilled_msat.replace("msat", ""))
-        if isinstance(out_fulfilled_msat, str):
-            out_fulfilled_msat = int(out_fulfilled_msat.replace("msat", ""))
-
-        total_volume_sats = (in_fulfilled_msat + out_fulfilled_msat) // 1000
-
-        # Get actual channel age for accurate daily volume calculation
-        age_days = self._get_channel_age_days(channel_id)
-        if age_days <= 0:
-            age_days = 30  # Fallback to 30 days if age unknown
-
-        # Calculate daily volume using actual channel lifetime
-        daily_volume_sats = total_volume_sats / age_days
-
-        # Flow intensity = daily volume / capacity
-        flow_intensity = daily_volume_sats / capacity_sats
-
-        return flow_intensity
-
-    def _get_channel_age_days(self, channel_id: str) -> int:
-        """
-        Get channel age in days from funding block height.
-
-        Extracts block height from SCID (format: block_height x tx_index x output_index)
-        and compares to current block height to get age.
-
-        Returns:
-            Channel age in days, or 0 if unable to determine
-        """
-        try:
-            # Normalize SCID format
-            normalized = channel_id.replace(":", "x")
-            parts = normalized.split("x")
-            if len(parts) != 3:
-                return 0
-
-            funding_block = int(parts[0])
-
-            # Get current block height
-            if self.plugin:
-                info = self.plugin.rpc.getinfo()
-                current_block = info.get("blockheight", 0)
-                if current_block > funding_block:
-                    # Approximate: 144 blocks per day on average
-                    blocks_elapsed = current_block - funding_block
-                    age_days = max(1, blocks_elapsed // 144)
-                    return age_days
-
-            return 0
-        except Exception:
-            return 0
-
-    def _get_channel_revenue(self, channel_id: str) -> int:
-        """Get channel revenue in sats."""
-        if not self.yield_metrics:
-            return 0
-
-        try:
-            metrics = self.yield_metrics.get_channel_yield_metrics(channel_id=channel_id)
-            if metrics:
-                return metrics[0].routing_revenue_sats
-            return 0
-        except Exception:
-            return 0
-
-    def _calculate_splice_amount(self, channel_id: str, flow: float) -> int:
-        """Calculate recommended splice-in amount based on flow."""
-        channels = self._get_channel_data(channel_id)
-        if not channels:
-            return 0
-
-        channel = channels[0]
-        capacity_msat = channel.get("total_msat", 0)
-        if isinstance(capacity_msat, str):
-            capacity_msat = int(capacity_msat.replace("msat", ""))
-        capacity_sats = capacity_msat // 1000
-
-        # Splice amount proportional to flow intensity
-        # High flow → bigger splice
-        base_splice_pct = 0.25  # Base: 25% capacity increase
-        flow_multiplier = min(3.0, flow / STRENGTHEN_FLOW_THRESHOLD)
-
-        splice_amount = int(capacity_sats * base_splice_pct * flow_multiplier)
-
-        # Clamp to reasonable range
-        splice_amount = max(500_000, min(splice_amount, 10_000_000))
-
-        return splice_amount
-
-    def get_channel_recommendation(self, channel_id: str) -> FlowRecommendation:
-        """
-        Get Physarum-inspired recommendation for a channel.
-
-        Args:
-            channel_id: Channel to analyze
-
-        Returns:
-            FlowRecommendation with action and reasoning
-        """
-        channels = self._get_channel_data(channel_id)
-        if not channels:
-            return FlowRecommendation(
-                channel_id=channel_id,
-                peer_id="",
-                action="hold",
-                reason="Channel not found"
-            )
-
-        channel = channels[0]
-        peer_id = channel.get("peer_id", "")
-
-        # Get metrics
-        flow = self.calculate_flow_intensity(channel_id)
-        age_days = self._get_channel_age_days(channel_id)
-        revenue = self._get_channel_revenue(channel_id)
-
-        capacity_msat = channel.get("total_msat", 0)
-        if isinstance(capacity_msat, str):
-            capacity_msat = int(capacity_msat.replace("msat", ""))
-        capacity_sats = capacity_msat // 1000
-
-        # Calculate turn rate
-        turn_rate = flow  # They're equivalent in our model
-
-        # Create base recommendation
-        rec = FlowRecommendation(
-            channel_id=channel_id,
-            peer_id=peer_id,
-            flow_intensity=flow,
-            turn_rate=turn_rate,
-            capacity_sats=capacity_sats,
-            age_days=age_days,
-            revenue_sats=revenue
-        )
-
-        # Physarum decision logic
-        if flow >= STRENGTHEN_FLOW_THRESHOLD:
-            # High flow - this tube should grow
-            splice_amount = self._calculate_splice_amount(channel_id, flow)
-            rec.action = "strengthen"
-            rec.method = "splice_in"
-            rec.splice_amount_sats = splice_amount
-            rec.reason = f"Flow intensity {flow:.3f} exceeds threshold {STRENGTHEN_FLOW_THRESHOLD}"
-            rec.expected_yield_change_pct = flow * 0.5  # Rough estimate
-
-        elif flow < ATROPHY_FLOW_THRESHOLD:
-            # Low flow - potential atrophy candidate
-            if age_days < STIMULATE_GRACE_DAYS:
-                # Young channel - try fee reduction to stimulate
-                rec.action = "stimulate"
-                rec.method = "fee_reduction"
-                rec.reason = f"Young channel ({age_days} days) with low flow, attempting stimulation"
-                rec.expected_yield_change_pct = 0.1
-
-            elif age_days >= MIN_CHANNEL_AGE_FOR_ATROPHY_DAYS:
-                # Mature channel with no flow - let it go
-                rec.action = "atrophy"
-                rec.method = "cooperative_close"
-                rec.capital_to_redeploy_sats = capacity_sats
-                rec.reason = f"Mature channel ({age_days} days) with flow {flow:.4f} below threshold"
-                rec.expected_yield_change_pct = -0.1  # Short term loss
-
-            else:
-                # Middle-aged, low flow - hold and monitor
-                rec.action = "hold"
-                rec.reason = f"Low flow but not yet mature enough for atrophy"
-
-        else:
-            # Normal flow - hold
-            rec.action = "hold"
-            rec.reason = f"Flow intensity {flow:.4f} is within normal range"
-
-        return rec
-
-    def get_all_recommendations(self) -> List[FlowRecommendation]:
-        """
-        Get flow recommendations for all channels.
-
-        Returns:
-            List of FlowRecommendation sorted by action priority
-        """
-        recommendations = []
-
-        channels = self._get_channel_data()
-
-        for channel in channels:
-            if channel.get("state") != "CHANNELD_NORMAL":
-                continue
-
-            channel_id = channel.get("short_channel_id", "").replace(":", "x")
-            if not channel_id:
-                continue
-
-            rec = self.get_channel_recommendation(channel_id)
-            if rec.action != "hold":
-                recommendations.append(rec)
-
-        # Sort by action priority: strengthen > stimulate > atrophy
-        action_priority = {"strengthen": 0, "stimulate": 1, "atrophy": 2, "hold": 3}
-        recommendations.sort(key=lambda r: action_priority.get(r.action, 4))
-
-        return recommendations
-
-    # =========================================================================
-    # AUTO-TRIGGER METHODS (Phase 7.2)
-    # =========================================================================
-
-    def set_database(self, database) -> None:
-        """Set database reference for pending_actions."""
-        self._database = database
-
-    def execute_physarum_cycle(self) -> Dict[str, Any]:
-        """
-        Execute one Physarum optimization cycle.
-
-        Evaluates all channels and creates pending_actions for:
-        - High-flow channels that should be strengthened (splice-in)
-        - Old low-flow channels that should atrophy (close recommendation)
-        - Young low-flow channels that need stimulation (fee reduction)
-
-        All actions go through governance approval (pending_actions) - nothing
-        is executed directly.
-
-        Returns:
-            Dict with cycle results:
-            {
-                "evaluated_channels": 25,
-                "strengthen_proposals": 1,
-                "atrophy_proposals": 0,
-                "stimulate_proposals": 2,
-                "skipped_rate_limit": 0,
-                "actions_created": [...]
-            }
-        """
-        result = {
-            "evaluated_channels": 0,
-            "strengthen_proposals": 0,
-            "atrophy_proposals": 0,
-            "stimulate_proposals": 0,
-            "skipped_rate_limit": 0,
-            "actions_created": []
-        }
-
-        # Check if we have required dependencies
-        if not hasattr(self, '_database') or not self._database:
-            self._log("Physarum cycle skipped: no database", level="debug")
-            return result
-
-        now = int(time.time())
-
-        # Periodic cleanup: remove flow history entries not seen in > 7 days
-        seven_days_ago = now - 7 * 86400
-        stale_channels = [
-            cid for cid, entries in self._flow_history.items()
-            if not entries or max(ts for ts, _ in entries) < seven_days_ago
-        ]
-        for cid in stale_channels:
-            del self._flow_history[cid]
-
-        # Get all recommendations
-        recommendations = self.get_all_recommendations()
-        result["evaluated_channels"] = len(self._get_channel_data())
-
-        for rec in recommendations:
-            action_created = None
-
-            if rec.action == "strengthen" and AUTO_STRENGTHEN_ENABLED:
-                # Check if meets auto-strengthen criteria
-                if rec.flow_intensity >= MIN_AUTO_STRENGTHEN_FLOW:
-                    action_created = self._create_strengthen_action(rec, now)
-                    if action_created:
-                        result["strengthen_proposals"] += 1
-                    else:
-                        result["skipped_rate_limit"] += 1
-
-            elif rec.action == "atrophy":
-                # Atrophy always creates action for human review (never auto)
-                action_created = self._create_atrophy_action(rec, now)
-                if action_created:
-                    result["atrophy_proposals"] += 1
-
-            elif rec.action == "stimulate" and AUTO_STIMULATE_ENABLED:
-                action_created = self._create_stimulate_action(rec, now)
-                if action_created:
-                    result["stimulate_proposals"] += 1
-
-            if action_created:
-                result["actions_created"].append(action_created)
-
-        self._log(
-            f"Physarum cycle: {result['evaluated_channels']} channels, "
-            f"{result['strengthen_proposals']} strengthen, "
-            f"{result['atrophy_proposals']} atrophy, "
-            f"{result['stimulate_proposals']} stimulate",
-            level="info"
-        )
-
-        return result
-
-    def _create_strengthen_action(
-        self,
-        rec: 'FlowRecommendation',
-        now: int
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Create pending_action for splice-in (strengthen).
-
-        Safety checks:
-        - Rate limit not exceeded
-        - On-chain balance sufficient
-        - Channel hasn't been strengthened recently
-        - Splice amount within bounds
-
-        Returns:
-            Action dict if created, None if skipped
-        """
-        if not self._check_strengthen_rate_limit(now):
-            self._log(f"Strengthen rate limit reached", level="debug")
-            return None
-
-        if not self._check_on_chain_reserve():
-            self._log(f"Insufficient on-chain reserve for strengthen", level="debug")
-            return None
-
-        # Check channel cooldown
-        if self._check_recent_strengthen(rec.channel_id, now):
-            self._log(f"Channel {rec.channel_id[:12]}... strengthened recently", level="debug")
-            return None
-
-        # Clamp splice amount to safe range
-        splice_amount = max(AUTO_STRENGTHEN_MIN_SATS, min(
-            rec.splice_amount_sats or AUTO_STRENGTHEN_MIN_SATS,
-            AUTO_STRENGTHEN_MAX_SATS
-        ))
-
-        action = {
-            "action_type": "physarum_strengthen",
-            "channel_id": rec.channel_id,
-            "peer_id": rec.peer_id,
-            "splice_amount_sats": splice_amount,
-            "flow_intensity": rec.flow_intensity,
-            "turn_rate": rec.turn_rate,
-            "reason": rec.reason,
-            "method": "splice_in",
-            "timestamp": now
-        }
-
-        # Create pending action via database
-        action_id = self._create_pending_action(
-            action_type="physarum_strengthen",
-            payload=action,
-            expires_hours=72  # 3 days to approve
-        )
-
-        if action_id:
-            action["action_id"] = action_id
-            self._log(
-                f"Created strengthen action for {rec.channel_id[:12]}... "
-                f"({splice_amount:,} sats, flow={rec.flow_intensity:.3f})",
-                level="info"
-            )
-            return action
-
-        return None
-
-    def _create_atrophy_action(
-        self,
-        rec: 'FlowRecommendation',
-        now: int
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Create pending_action for close recommendation (atrophy).
-
-        Always creates action (never auto-executes closes).
-        Rate limit checked to avoid spam.
-
-        Returns:
-            Action dict if created, None if skipped
-        """
-        if not self._check_atrophy_rate_limit(now):
-            self._log(f"Atrophy rate limit reached", level="debug")
-            return None
-
-        action = {
-            "action_type": "physarum_atrophy",
-            "channel_id": rec.channel_id,
-            "peer_id": rec.peer_id,
-            "capacity_sats": rec.capacity_sats,
-            "capital_to_redeploy_sats": rec.capital_to_redeploy_sats,
-            "flow_intensity": rec.flow_intensity,
-            "age_days": rec.age_days,
-            "revenue_sats": rec.revenue_sats,
-            "reason": rec.reason,
-            "method": "cooperative_close",
-            "timestamp": now,
-            "requires_human_approval": True  # Always
-        }
-
-        # Create pending action
-        action_id = self._create_pending_action(
-            action_type="physarum_atrophy",
-            payload=action,
-            expires_hours=168  # 7 days to review
-        )
-
-        if action_id:
-            action["action_id"] = action_id
-            self._log(
-                f"Created atrophy action for {rec.channel_id[:12]}... "
-                f"({rec.capacity_sats:,} sats, age={rec.age_days}d, flow={rec.flow_intensity:.4f})",
-                level="info"
-            )
-            return action
-
-        return None
-
-    def _create_stimulate_action(
-        self,
-        rec: 'FlowRecommendation',
-        now: int
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Create pending_action for fee reduction (stimulate young channel).
-
-        Returns:
-            Action dict if created, None if skipped
-        """
-        action = {
-            "action_type": "physarum_stimulate",
-            "channel_id": rec.channel_id,
-            "peer_id": rec.peer_id,
-            "capacity_sats": rec.capacity_sats,
-            "flow_intensity": rec.flow_intensity,
-            "age_days": rec.age_days,
-            "reason": rec.reason,
-            "method": "fee_reduction",
-            "recommended_fee_ppm": 50,  # Stimulate with low fee
-            "timestamp": now
-        }
-
-        # Create pending action
-        action_id = self._create_pending_action(
-            action_type="physarum_stimulate",
-            payload=action,
-            expires_hours=48  # 2 days to approve
-        )
-
-        if action_id:
-            action["action_id"] = action_id
-            self._log(
-                f"Created stimulate action for {rec.channel_id[:12]}... "
-                f"(young channel, age={rec.age_days}d)",
-                level="info"
-            )
-            return action
-
-        return None
-
-    def _create_pending_action(
-        self,
-        action_type: str,
-        payload: Dict,
-        expires_hours: int = 72
-    ) -> Optional[int]:
-        """Create a pending action in the database."""
-        if not hasattr(self, '_database') or not self._database:
-            return None
-
-        try:
-            now = int(time.time())
-            expires_at = now + (expires_hours * 3600)
-
-            return self._database.create_pending_action(
-                action_type=action_type,
-                payload=json.dumps(payload),
-                proposed_at=now,
-                expires_at=expires_at
-            )
-        except Exception as e:
-            self._log(f"Failed to create pending action: {e}", level="debug")
-            return None
-
-    def _check_strengthen_rate_limit(self, now: int) -> bool:
-        """Check if we can create another strengthen action today."""
-        if not hasattr(self, '_database') or not self._database:
-            return True
-
-        try:
-            # Count today's strengthen actions
-            day_start = now - (now % 86400)
-            count = self._database.count_pending_actions_since(
-                action_type="physarum_strengthen",
-                since_timestamp=day_start
-            )
-            return count < MAX_AUTO_STRENGTHEN_PER_DAY
-        except Exception:
-            return True  # Allow on error
-
-    def _check_atrophy_rate_limit(self, now: int) -> bool:
-        """Check if we can create another atrophy action this week."""
-        if not hasattr(self, '_database') or not self._database:
-            return True
-
-        try:
-            week_start = now - (7 * 86400)
-            count = self._database.count_pending_actions_since(
-                action_type="physarum_atrophy",
-                since_timestamp=week_start
-            )
-            return count < MAX_AUTO_ATROPHY_PER_WEEK
-        except Exception:
-            return True
-
-    def _check_recent_strengthen(self, channel_id: str, now: int) -> bool:
-        """Check if channel was strengthened recently."""
-        if not hasattr(self, '_database') or not self._database:
-            return False
-
-        try:
-            cutoff = now - (MIN_STRENGTHEN_INTERVAL_HOURS * 3600)
-            return self._database.has_recent_action_for_channel(
-                channel_id=channel_id,
-                action_type="physarum_strengthen",
-                since_timestamp=cutoff
-            )
-        except Exception:
-            return False
-
-    def _check_on_chain_reserve(self) -> bool:
-        """Check if on-chain balance is sufficient for splice-in."""
-        if not self.plugin:
-            return False
-
-        try:
-            funds = self.plugin.rpc.listfunds()
-            confirmed = sum(
-                o.get("amount_msat", 0)
-                for o in funds.get("outputs", [])
-                if o.get("status") == "confirmed"
-            )
-            if isinstance(confirmed, str):
-                confirmed = int(confirmed.replace("msat", ""))
-            confirmed_sats = confirmed // 1000
-
-            return confirmed_sats >= (AUTO_TRIGGER_MIN_ON_CHAIN_SATS + AUTO_STRENGTHEN_MIN_SATS)
-        except Exception:
-            return False
-
-    def get_auto_trigger_status(self) -> Dict[str, Any]:
-        """
-        Get status of auto-trigger configuration and limits.
-
-        Returns:
-            Dict with auto-trigger status
-        """
-        now = int(time.time())
-
-        status = {
-            "auto_strengthen_enabled": AUTO_STRENGTHEN_ENABLED,
-            "auto_atrophy_enabled": AUTO_ATROPHY_ENABLED,
-            "auto_stimulate_enabled": AUTO_STIMULATE_ENABLED,
-            "thresholds": {
-                "strengthen_flow": STRENGTHEN_FLOW_THRESHOLD,
-                "auto_strengthen_flow": MIN_AUTO_STRENGTHEN_FLOW,
-                "atrophy_flow": ATROPHY_FLOW_THRESHOLD,
-                "min_channel_age_days": MIN_CHANNEL_AGE_FOR_ATROPHY_DAYS
-            },
-            "limits": {
-                "max_strengthen_per_day": MAX_AUTO_STRENGTHEN_PER_DAY,
-                "max_atrophy_per_week": MAX_AUTO_ATROPHY_PER_WEEK,
-                "min_strengthen_interval_hours": MIN_STRENGTHEN_INTERVAL_HOURS
-            },
-            "safety": {
-                "min_on_chain_reserve_sats": AUTO_TRIGGER_MIN_ON_CHAIN_SATS,
-                "splice_min_sats": AUTO_STRENGTHEN_MIN_SATS,
-                "splice_max_sats": AUTO_STRENGTHEN_MAX_SATS
-            }
-        }
-
-        # Add current usage if database available
-        if hasattr(self, '_database') and self._database:
-            try:
-                day_start = now - (now % 86400)
-                week_start = now - (7 * 86400)
-
-                status["current_usage"] = {
-                    "strengthen_today": self._database.count_pending_actions_since(
-                        "physarum_strengthen", day_start
-                    ),
-                    "atrophy_this_week": self._database.count_pending_actions_since(
-                        "physarum_atrophy", week_start
-                    )
-                }
-            except Exception:
-                pass
-
-        return status
-
-
-# =============================================================================
 # STRATEGIC POSITIONING MANAGER
 # =============================================================================
 
 class StrategicPositioningManager:
     """
-    Main interface for Phase 5 strategic positioning.
+    Main interface for strategic positioning.
 
     Coordinates:
-    - Route value analysis
-    - Fleet positioning strategy
-    - Physarum-based channel lifecycle
+    - Route value analysis (corridor identification)
+    - Fleet positioning strategy (channel open recommendations)
     """
 
     def __init__(
@@ -1787,8 +1002,9 @@ class StrategicPositioningManager:
         database=None,
         state_manager=None,
         fee_coordination_mgr=None,
+        planner=None,
+        # Legacy kwargs accepted but ignored for backwards compatibility
         yield_metrics_mgr=None,
-        planner=None
     ):
         """
         Initialize the strategic positioning manager.
@@ -1798,7 +1014,6 @@ class StrategicPositioningManager:
             database: Database for persistence
             state_manager: StateManager for fleet state
             fee_coordination_mgr: FeeCoordinationManager for corridor data
-            yield_metrics_mgr: YieldMetricsManager for flow data
             planner: Planner for underserved targets
         """
         self.plugin = plugin
@@ -1818,21 +1033,17 @@ class StrategicPositioningManager:
             planner=planner
         )
 
-        self.physarum_mgr = PhysarumChannelManager(
-            plugin=plugin,
-            yield_metrics_mgr=yield_metrics_mgr
-        )
-        # Pass database reference for pending_actions
-        self.physarum_mgr.set_database(database)
-
         self._our_pubkey: Optional[str] = None
+
+        # Remote corridor/proposal storage for fleet sharing
+        self._remote_corridors: Dict[str, List[Dict[str, Any]]] = {}
+        self._remote_proposals: List[Dict[str, Any]] = []
 
     def set_our_pubkey(self, pubkey: str) -> None:
         """Set our node's pubkey."""
         self._our_pubkey = pubkey
         self.route_analyzer.set_our_pubkey(pubkey)
         self.positioning_strategy.set_our_pubkey(pubkey)
-        self.physarum_mgr.set_our_pubkey(pubkey)
 
     def _log(self, message: str, level: str = "debug") -> None:
         """Log a message if plugin is available."""
@@ -1884,74 +1095,6 @@ class StrategicPositioningManager:
         recs = self.positioning_strategy.get_positioning_recommendations(count=count)
         return [r.to_dict() for r in recs]
 
-    def get_flow_recommendations(
-        self,
-        channel_id: str = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Get Physarum-inspired flow recommendations.
-
-        Args:
-            channel_id: Specific channel, or None for all
-
-        Returns:
-            List of flow recommendation dicts
-        """
-        if channel_id:
-            rec = self.physarum_mgr.get_channel_recommendation(channel_id)
-            return [rec.to_dict()]
-        else:
-            recs = self.physarum_mgr.get_all_recommendations()
-            return [r.to_dict() for r in recs]
-
-    def report_flow_intensity(
-        self,
-        channel_id: str,
-        peer_id: str,
-        intensity: float
-    ) -> Dict[str, Any]:
-        """
-        Report flow intensity for a channel.
-
-        This updates the Physarum model with observed flow.
-
-        Args:
-            channel_id: Channel ID
-            peer_id: Peer ID
-            intensity: Observed flow intensity
-
-        Returns:
-            Dict with acknowledgment
-        """
-        # Store in flow history
-        fh = self.physarum_mgr._flow_history
-        fh[channel_id].append((time.time(), intensity))
-
-        # Trim old entries
-        cutoff = time.time() - (7 * 24 * 3600)  # Keep 7 days
-        fh[channel_id] = [
-            (t, i) for t, i in fh[channel_id]
-            if t >= cutoff
-        ]
-
-        # Evict oldest channel if dict exceeds limit
-        max_ch = getattr(self.physarum_mgr, '_max_flow_channels', 500)
-        if len(fh) > max_ch:
-            oldest_cid = min(
-                (c for c in fh if c != channel_id),
-                key=lambda c: fh[c][-1][0] if fh[c] else 0,
-                default=None
-            )
-            if oldest_cid:
-                del fh[oldest_cid]
-
-        return {
-            "recorded": True,
-            "channel_id": channel_id,
-            "intensity": intensity,
-            "history_entries": len(self.physarum_mgr._flow_history[channel_id])
-        }
-
     def get_positioning_summary(self) -> Dict[str, Any]:
         """
         Get summary of strategic positioning.
@@ -1975,14 +1118,6 @@ class StrategicPositioningManager:
         summary.open_recommendations = len(position_recs)
         summary.underserved_targets = sum(1 for r in position_recs if r.is_underserved)
 
-        # Get flow recommendations
-        flow_recs = self.physarum_mgr.get_all_recommendations()
-        summary.strengthen_recommendations = sum(1 for r in flow_recs if r.action == "strengthen")
-        summary.atrophy_recommendations = sum(1 for r in flow_recs if r.action == "atrophy")
-        summary.capital_to_redeploy_sats = sum(
-            r.capital_to_redeploy_sats for r in flow_recs if r.action == "atrophy"
-        )
-
         return summary.to_dict()
 
     def get_status(self) -> Dict[str, Any]:
@@ -1998,8 +1133,6 @@ class StrategicPositioningManager:
             "enabled": True,
             "summary": summary,
             "thresholds": {
-                "strengthen_flow_threshold": STRENGTHEN_FLOW_THRESHOLD,
-                "atrophy_flow_threshold": ATROPHY_FLOW_THRESHOLD,
                 "high_value_volume_daily": HIGH_VALUE_VOLUME_SATS_DAILY,
                 "max_members_per_target": MAX_MEMBERS_PER_TARGET
             },
@@ -2007,7 +1140,7 @@ class StrategicPositioningManager:
         }
 
     # =========================================================================
-    # FLEET INTELLIGENCE SHARING (Phase 14.2)
+    # FLEET INTELLIGENCE SHARING
     # =========================================================================
 
     def get_shareable_corridors(
@@ -2084,44 +1217,6 @@ class StrategicPositioningManager:
 
         return shareable
 
-    def get_shareable_physarum_recommendations(
-        self,
-        exclude_hold: bool = True
-    ) -> List[Dict[str, Any]]:
-        """
-        Get Physarum flow recommendations suitable for sharing.
-
-        Args:
-            exclude_hold: Whether to exclude "hold" recommendations
-
-        Returns:
-            List of Physarum recommendation dicts
-        """
-        shareable = []
-
-        try:
-            recs = self.physarum_mgr.get_all_recommendations()
-
-            for r in recs:
-                if exclude_hold and r.action == "hold":
-                    continue
-
-                shareable.append({
-                    "channel_id": r.channel_id,
-                    "peer_id": r.peer_id,
-                    "action": r.action,
-                    "flow_intensity": round(r.flow_intensity, 4),
-                    "reason": r.reason,
-                    "expected_yield_change_pct": round(r.expected_yield_change_pct, 2),
-                    "splice_amount_sats": r.splice_amount_sats,
-                    "capital_to_redeploy_sats": r.capital_to_redeploy_sats
-                })
-
-        except Exception as e:
-            self._log(f"Error collecting Physarum recommendations: {e}", level="debug")
-
-        return shareable
-
     def receive_corridor_from_fleet(
         self,
         reporter_id: str,
@@ -2141,10 +1236,6 @@ class StrategicPositioningManager:
         dest = corridor_data.get("destination_peer_id")
         if not source or not dest:
             return False
-
-        # Initialize remote corridors storage
-        if not hasattr(self, "_remote_corridors"):
-            self._remote_corridors: Dict[str, List[Dict[str, Any]]] = {}
 
         key = f"{source}:{dest}"
         entry = {
@@ -2185,10 +1276,6 @@ class StrategicPositioningManager:
         if not target:
             return False
 
-        # Initialize remote proposals storage
-        if not hasattr(self, "_remote_proposals"):
-            self._remote_proposals: List[Dict[str, Any]] = []
-
         entry = {
             "reporter_id": reporter_id,
             "target_peer_id": target,
@@ -2208,55 +1295,8 @@ class StrategicPositioningManager:
 
         return True
 
-    def receive_physarum_recommendation_from_fleet(
-        self,
-        reporter_id: str,
-        recommendation_data: Dict[str, Any]
-    ) -> bool:
-        """
-        Receive a Physarum recommendation from another fleet member.
-
-        Args:
-            reporter_id: The fleet member who recommended this
-            recommendation_data: Dict with recommendation details
-
-        Returns:
-            True if stored successfully
-        """
-        channel_id = recommendation_data.get("channel_id")
-        peer_id = recommendation_data.get("peer_id")
-        if not channel_id or not peer_id:
-            return False
-
-        # Initialize remote recommendations storage
-        if not hasattr(self, "_remote_physarum"):
-            self._remote_physarum: Dict[str, List[Dict[str, Any]]] = {}
-
-        entry = {
-            "reporter_id": reporter_id,
-            "action": recommendation_data.get("action", "hold"),
-            "flow_intensity": recommendation_data.get("flow_intensity", 0),
-            "reason": recommendation_data.get("reason", ""),
-            "expected_yield_change_pct": recommendation_data.get("expected_yield_change_pct", 0),
-            "timestamp": time.time()
-        }
-
-        if peer_id not in self._remote_physarum:
-            self._remote_physarum[peer_id] = []
-
-        self._remote_physarum[peer_id].append(entry)
-
-        # Keep only last 10 recommendations per peer
-        if len(self._remote_physarum[peer_id]) > 10:
-            self._remote_physarum[peer_id] = self._remote_physarum[peer_id][-10:]
-
-        return True
-
     def get_fleet_corridor_consensus(self, source: str, dest: str) -> Optional[Dict[str, Any]]:
         """Get consensus corridor value from fleet reports."""
-        if not hasattr(self, "_remote_corridors"):
-            return None
-
         key = f"{source}:{dest}"
         reports = self._remote_corridors.get(key, [])
         if not reports:
@@ -2284,36 +1324,22 @@ class StrategicPositioningManager:
         cleaned = 0
 
         # Cleanup corridors
-        if hasattr(self, "_remote_corridors"):
-            for key in list(self._remote_corridors.keys()):
-                before = len(self._remote_corridors[key])
-                self._remote_corridors[key] = [
-                    r for r in self._remote_corridors[key]
-                    if r.get("timestamp", 0) > cutoff
-                ]
-                cleaned += before - len(self._remote_corridors[key])
-                if not self._remote_corridors[key]:
-                    del self._remote_corridors[key]
+        for key in list(self._remote_corridors.keys()):
+            before = len(self._remote_corridors[key])
+            self._remote_corridors[key] = [
+                r for r in self._remote_corridors[key]
+                if r.get("timestamp", 0) > cutoff
+            ]
+            cleaned += before - len(self._remote_corridors[key])
+            if not self._remote_corridors[key]:
+                del self._remote_corridors[key]
 
         # Cleanup proposals
-        if hasattr(self, "_remote_proposals"):
-            before = len(self._remote_proposals)
-            self._remote_proposals = [
-                p for p in self._remote_proposals
-                if p.get("timestamp", 0) > cutoff
-            ]
-            cleaned += before - len(self._remote_proposals)
-
-        # Cleanup physarum
-        if hasattr(self, "_remote_physarum"):
-            for peer_id in list(self._remote_physarum.keys()):
-                before = len(self._remote_physarum[peer_id])
-                self._remote_physarum[peer_id] = [
-                    r for r in self._remote_physarum[peer_id]
-                    if r.get("timestamp", 0) > cutoff
-                ]
-                cleaned += before - len(self._remote_physarum[peer_id])
-                if not self._remote_physarum[peer_id]:
-                    del self._remote_physarum[peer_id]
+        before = len(self._remote_proposals)
+        self._remote_proposals = [
+            p for p in self._remote_proposals
+            if p.get("timestamp", 0) > cutoff
+        ]
+        cleaned += before - len(self._remote_proposals)
 
         return cleaned

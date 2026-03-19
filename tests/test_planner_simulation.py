@@ -281,84 +281,7 @@ class TestTheStalemate:
         assert has_conflict is True
         assert alice_wins is True  # Alice wins (lower pubkey)
 
-    def test_stalemate_no_double_action(self, mock_database, mock_plugin, mock_state_manager,
-                                         mock_bridge, mock_config):
-        """
-        When two planners identify the same target, only one should proceed.
 
-        After tie-breaker resolution, only the winner should take action.
-        """
-        alice_pubkey = '02' + 'a' * 64
-        bob_pubkey = '02' + 'b' * 64
-        target = '02' + 't' * 64
-
-        # Track actions taken
-        actions_taken = []
-
-        # Setup Alice's planner
-        alice_intent_mgr = IntentManager(
-            database=mock_database,
-            plugin=mock_plugin,
-            our_pubkey=alice_pubkey,
-            hold_seconds=60
-        )
-
-        alice_planner = Planner(
-            state_manager=mock_state_manager,
-            database=mock_database,
-            bridge=mock_bridge,
-            plugin=mock_plugin,
-            intent_manager=alice_intent_mgr
-        )
-
-        # Setup Bob's planner
-        bob_intent_mgr = IntentManager(
-            database=mock_database,
-            plugin=mock_plugin,
-            our_pubkey=bob_pubkey,
-            hold_seconds=60
-        )
-
-        bob_planner = Planner(
-            state_manager=mock_state_manager,
-            database=mock_database,
-            bridge=mock_bridge,
-            plugin=mock_plugin,
-            intent_manager=bob_intent_mgr
-        )
-
-        # Both planners identify the same underserved target
-        # Mock listfunds for sufficient balance (need 2x min_channel_sats = 2M sats)
-        mock_plugin.rpc.listfunds.return_value = {
-            'outputs': [{'status': 'confirmed', 'amount_msat': 5_000_000_000}]  # 5M sats
-        }
-
-        # Mock get_underserved_targets for both
-        underserved_result = UnderservedResult(
-            target=target,
-            public_capacity_sats=200_000_000,
-            hive_share_pct=0.02,
-            score=2.0
-        )
-
-        with patch.object(alice_planner, 'get_underserved_targets', return_value=[underserved_result]):
-            with patch.object(bob_planner, 'get_underserved_targets', return_value=[underserved_result]):
-                # Alice proposes first
-                alice_decisions = alice_planner._propose_expansion(mock_config, 'alice-run')
-
-                # Now Bob checks - should find Alice's pending intent
-                mock_database.get_pending_intents.return_value = [
-                    {'target': target, 'status': 'pending', 'initiator': alice_pubkey}
-                ]
-
-                bob_decisions = bob_planner._propose_expansion(mock_config, 'bob-run')
-
-        # Alice should have proposed
-        assert len(alice_decisions) == 1
-        assert alice_decisions[0]['action'] == 'expansion_proposed'
-
-        # Bob should NOT have proposed (existing pending intent)
-        assert len(bob_decisions) == 0
 
 
 # =============================================================================
@@ -639,49 +562,6 @@ class TestGameTheory:
         has_conflict, bob_wins_vs_carol = bob_mgr.check_conflicts(carol_intent)
         assert has_conflict is True
         assert bob_wins_vs_carol is True  # Bob wins against Carol
-
-    def test_expansion_respects_max_per_cycle(self, mock_state_manager, mock_database,
-                                               mock_bridge, mock_plugin,
-                                               mock_config):
-        """
-        Even with multiple underserved targets, only MAX_EXPANSIONS_PER_CYCLE should be proposed.
-        """
-        target1 = '02' + '1' * 64
-        target2 = '02' + '2' * 64
-        target3 = '02' + '3' * 64
-
-        mock_intent_mgr = MagicMock()
-        mock_intent = MagicMock()
-        mock_intent.intent_id = 1
-        mock_intent_mgr.create_intent.return_value = mock_intent
-
-        planner = Planner(
-            state_manager=mock_state_manager,
-            database=mock_database,
-            bridge=mock_bridge,
-            plugin=mock_plugin,
-            intent_manager=mock_intent_mgr
-        )
-
-        mock_plugin.rpc.listfunds.return_value = {
-            'outputs': [{'status': 'confirmed', 'amount_msat': 10000000000}]
-        }
-
-        # Multiple underserved targets
-        with patch.object(planner, 'get_underserved_targets') as mock_get:
-            mock_get.return_value = [
-                UnderservedResult(target1, 200_000_000, 0.01, 2.0),
-                UnderservedResult(target2, 200_000_000, 0.02, 1.9),
-                UnderservedResult(target3, 200_000_000, 0.03, 1.8),
-            ]
-
-            mock_database.get_pending_intents.return_value = []
-
-            decisions = planner._propose_expansion(mock_config, 'test-multi')
-
-        # Should only have proposed 1 (MAX_EXPANSIONS_PER_CYCLE = 1)
-        assert len(decisions) == 1
-        assert mock_intent_mgr.create_intent.call_count == 1
 
 
 if __name__ == "__main__":

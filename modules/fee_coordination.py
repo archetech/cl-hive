@@ -259,21 +259,24 @@ class FlowCorridorManager:
         if not self.liquidity_coordinator:
             return []
 
-        # Use internal competition detection to find overlapping routes
-        competitions = self.liquidity_coordinator.detect_internal_competition()
-
+        # Build corridors from fleet liquidity needs
+        needs = self.liquidity_coordinator.get_fleet_liquidity_needs()
         corridors = []
-        for comp in competitions:
+        seen = set()
+        for need in needs:
+            peer_id = need.get("target_peer_id", "")
+            if not peer_id or peer_id in seen:
+                continue
+            seen.add(peer_id)
+            members = [need.get("reporter_id", "")]
             corridor = FlowCorridor(
-                source_peer_id=comp.get("source_peer_id", ""),
-                destination_peer_id=comp.get("destination_peer_id", ""),
-                source_alias=comp.get("source_alias"),
-                destination_alias=comp.get("destination_alias"),
-                capable_members=comp.get("competing_members", []),
-                total_volume_sats=comp.get("total_fleet_capacity_sats", 0),
-                competition_level=self._assess_competition_level(
-                    len(comp.get("competing_members", []))
-                )
+                source_peer_id=peer_id,
+                destination_peer_id=peer_id,
+                source_alias=None,
+                destination_alias=None,
+                capable_members=members,
+                total_volume_sats=need.get("amount_sats", 0),
+                competition_level=self._assess_competition_level(len(members))
             )
             corridors.append(corridor)
 

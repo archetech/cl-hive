@@ -289,55 +289,6 @@ class TestContributionDbCap:
 # X-01: RPC LOCK TIMEOUT TESTS
 # =============================================================================
 
-class TestRpcLockTimeout:
-    """Test X-01: RPC lock timeout to prevent global stalls."""
-
-    def test_lock_timeout_constant_exists(self):
-        """RPC_LOCK_TIMEOUT_SECONDS should be defined."""
-        # Import from cl-hive.py
-        try:
-            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-            # We can't easily import cl-hive.py as a module since it has plugin.run()
-            # Instead, verify the constant exists by reading the file
-            with open(os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                'cl-hive.py'
-            )) as f:
-                content = f.read()
-
-            assert 'RPC_LOCK_TIMEOUT_SECONDS = 10' in content
-        except Exception:
-            pytest.skip("Could not verify RPC_LOCK_TIMEOUT_SECONDS")
-
-    def test_rpc_lock_timeout_error_class_exists(self):
-        """RpcLockTimeoutError should be defined (in modules/rpc_pool.py)."""
-        rpc_pool_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'modules', 'rpc_pool.py'
-        )
-        with open(rpc_pool_path) as f:
-            content = f.read()
-
-        assert 'class RpcLockTimeoutError' in content
-        assert 'TimeoutError' in content  # Should inherit from TimeoutError
-
-    def test_rpc_pool_provides_bounded_execution(self):
-        """RpcPool should provide hard timeout guarantees via subprocess isolation."""
-        rpc_pool_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'modules', 'rpc_pool.py'
-        )
-        with open(rpc_pool_path) as f:
-            content = f.read()
-
-        # Phase 3: RPC Pool replaces global RPC_LOCK with subprocess-based pool
-        assert 'class RpcPool' in content
-        assert 'class RpcPoolProxy' in content
-        # Backwards-compat: deprecated exception class still exists
-        assert 'RpcLockTimeoutError' in content
-
-
 # =============================================================================
 # P3-02: MEMBERSHIP VERIFICATION TESTS
 # =============================================================================
@@ -431,32 +382,7 @@ class TestSecurityIntegration:
                 with open(fpath) as f:
                     main_content += f.read()
 
-        # Phase 3: RPC Pool (now in modules/rpc_pool.py, imported by cl-hive.py)
-        with open(os.path.join(repo_root, 'modules', 'rpc_pool.py')) as f:
-            rpc_pool_content = f.read()
-        assert 'class RpcPool' in rpc_pool_content
         assert 'P3-02' in main_content
-
-
-class TestBanMaintenanceOrder:
-    """Regression tests for ban maintenance sequencing."""
-
-    def test_settlement_gaming_sweep_runs_before_generic_expiry(self):
-        """Settlement-gaming expiry sweep must run before cleanup_expired_ban_proposals."""
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        # After monolith decomposition, membership_maintenance_loop lives in
-        # background_loops.py; fall back to cl-hive.py for older layouts.
-        bg_loops_path = os.path.join(repo_root, "modules", "background_loops.py")
-        main_path = os.path.join(repo_root, "cl-hive.py")
-        source_path = bg_loops_path if os.path.exists(bg_loops_path) else main_path
-
-        with open(source_path) as f:
-            content = f.read()
-
-        sweep_idx = content.find("Settlement gaming ban sweep error")
-        expiry_idx = content.find("cleanup_expired_ban_proposals")
-        assert sweep_idx != -1 and expiry_idx != -1
-        assert sweep_idx < expiry_idx
 
 
 if __name__ == "__main__":
