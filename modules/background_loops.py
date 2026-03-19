@@ -18,8 +18,6 @@ from typing import Dict, Optional, Any, List
 from modules import protocol_handlers
 from modules.protocol import (
     HiveMessageType, serialize,
-    VOUCH_TTL_SECONDS,
-    create_mcf_needs_batch,
 )
 
 # Phase 3b: MCF assignment defer tracking

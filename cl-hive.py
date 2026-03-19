@@ -1433,6 +1433,7 @@ def on_custommsg(peer_id: str, payload: str, plugin: Plugin, **kwargs):
 def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Plugin):
     """Process a validated Hive message on a background thread."""
     try:
+        # Phase 1: Handshake
         if msg_type == HiveMessageType.HELLO:
             protocol_handlers.handle_hello(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.CHALLENGE:
@@ -1453,34 +1454,16 @@ def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Pl
             protocol_handlers.handle_intent(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.INTENT_ABORT:
             protocol_handlers.handle_intent_abort(peer_id, msg_payload, plugin)
-        # Phase 5: Membership Promotion
-        elif msg_type == HiveMessageType.PROMOTION_REQUEST:
-            protocol_handlers.handle_promotion_request(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.VOUCH:
-            protocol_handlers.handle_vouch(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.PROMOTION:
-            protocol_handlers.handle_promotion(peer_id, msg_payload, plugin)
+        # Membership
         elif msg_type == HiveMessageType.MEMBER_LEFT:
             protocol_handlers.handle_member_left(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.BAN_PROPOSAL:
-            protocol_handlers.handle_ban_proposal(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.BAN_VOTE:
-            protocol_handlers.handle_ban_vote(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.BAN:
             protocol_handlers.handle_ban(peer_id, msg_payload, plugin)
-        # Phase 6: Channel Coordination
-        elif msg_type == HiveMessageType.PEER_AVAILABLE:
-            protocol_handlers.handle_peer_available(peer_id, msg_payload, plugin)
-        # Phase 6.4: Cooperative Expansion
-        elif msg_type == HiveMessageType.EXPANSION_NOMINATE:
-            protocol_handlers.handle_expansion_nominate(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.EXPANSION_ELECT:
-            protocol_handlers.handle_expansion_elect(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.EXPANSION_DECLINE:
-            protocol_handlers.handle_expansion_decline(peer_id, msg_payload, plugin)
-        # Phase 7: Cooperative Fee Coordination
+        # Fee Intelligence
         elif msg_type == HiveMessageType.FEE_INTELLIGENCE_SNAPSHOT:
             protocol_handlers.handle_fee_intelligence_snapshot(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.TRAFFIC_INTELLIGENCE_BATCH:
+            protocol_handlers.handle_traffic_intelligence_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.HEALTH_REPORT:
             protocol_handlers.handle_health_report(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.LIQUIDITY_NEED:
@@ -1493,98 +1476,19 @@ def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Pl
             protocol_handlers.handle_route_probe_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.PEER_REPUTATION_SNAPSHOT:
             protocol_handlers.handle_peer_reputation_snapshot(peer_id, msg_payload, plugin)
-        # Phase 13: Stigmergic Marker Sharing
-        elif msg_type == HiveMessageType.STIGMERGIC_MARKER_BATCH:
-            protocol_handlers.handle_stigmergic_marker_batch(peer_id, msg_payload, plugin)
-        # Phase 13: Pheromone Sharing
-        elif msg_type == HiveMessageType.PHEROMONE_BATCH:
-            protocol_handlers.handle_pheromone_batch(peer_id, msg_payload, plugin)
-        # Phase 14: Fleet-Wide Intelligence Sharing
+        # Fleet-Wide Intelligence
         elif msg_type == HiveMessageType.YIELD_METRICS_BATCH:
             protocol_handlers.handle_yield_metrics_batch(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.CIRCULAR_FLOW_ALERT:
-            protocol_handlers.handle_circular_flow_alert(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.TEMPORAL_PATTERN_BATCH:
             protocol_handlers.handle_temporal_pattern_batch(peer_id, msg_payload, plugin)
-        # Phase 14.2: Strategic Positioning & Rationalization
         elif msg_type == HiveMessageType.CORRIDOR_VALUE_BATCH:
             protocol_handlers.handle_corridor_value_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.POSITIONING_PROPOSAL:
             protocol_handlers.handle_positioning_proposal(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.PHYSARUM_RECOMMENDATION:
-            protocol_handlers.handle_physarum_recommendation(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.COVERAGE_ANALYSIS_BATCH:
             protocol_handlers.handle_coverage_analysis_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.CLOSE_PROPOSAL:
             protocol_handlers.handle_close_proposal(peer_id, msg_payload, plugin)
-        # Phase 9: Settlement
-        elif msg_type == HiveMessageType.SETTLEMENT_OFFER:
-            protocol_handlers.handle_settlement_offer(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.FEE_REPORT:
-            protocol_handlers.handle_fee_report(peer_id, msg_payload, plugin)
-        # Phase 12: Distributed Settlement
-        elif msg_type == HiveMessageType.SETTLEMENT_PROPOSE:
-            protocol_handlers.handle_settlement_propose(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.SETTLEMENT_READY:
-            protocol_handlers.handle_settlement_ready(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.SETTLEMENT_EXECUTED:
-            protocol_handlers.handle_settlement_executed(peer_id, msg_payload, plugin)
-        # Phase 10: Task Delegation
-        elif msg_type == HiveMessageType.TASK_REQUEST:
-            protocol_handlers.handle_task_request(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.TASK_RESPONSE:
-            protocol_handlers.handle_task_response(peer_id, msg_payload, plugin)
-        # Phase 11: Hive-Splice Coordination
-        elif msg_type == HiveMessageType.SPLICE_INIT_REQUEST:
-            protocol_handlers.handle_splice_init_request(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.SPLICE_INIT_RESPONSE:
-            protocol_handlers.handle_splice_init_response(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.SPLICE_UPDATE:
-            protocol_handlers.handle_splice_update(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.SPLICE_SIGNED:
-            protocol_handlers.handle_splice_signed(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.SPLICE_ABORT:
-            protocol_handlers.handle_splice_abort(peer_id, msg_payload, plugin)
-        # Phase 15: MCF (Min-Cost Max-Flow) Optimization
-        elif msg_type == HiveMessageType.MCF_NEEDS_BATCH:
-            protocol_handlers.handle_mcf_needs_batch(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.MCF_SOLUTION_BROADCAST:
-            protocol_handlers.handle_mcf_solution_broadcast(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.MCF_ASSIGNMENT_ACK:
-            protocol_handlers.handle_mcf_assignment_ack(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.MCF_COMPLETION_REPORT:
-            protocol_handlers.handle_mcf_completion_report(peer_id, msg_payload, plugin)
-        # Phase D: Reliable Delivery
-        elif msg_type == HiveMessageType.MSG_ACK:
-            protocol_handlers.handle_msg_ack(peer_id, msg_payload, plugin)
-        # Phase 16: DID Credentials
-        elif msg_type == HiveMessageType.DID_CREDENTIAL_PRESENT:
-            protocol_handlers.handle_did_credential_present(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.DID_CREDENTIAL_REVOKE:
-            protocol_handlers.handle_did_credential_revoke(peer_id, msg_payload, plugin)
-        # Phase 16: Management Credentials
-        elif msg_type == HiveMessageType.MGMT_CREDENTIAL_PRESENT:
-            protocol_handlers.handle_mgmt_credential_present(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.MGMT_CREDENTIAL_REVOKE:
-            protocol_handlers.handle_mgmt_credential_revoke(peer_id, msg_payload, plugin)
-        # Phase 4: Extended Settlements
-        elif msg_type == HiveMessageType.SETTLEMENT_RECEIPT:
-            protocol_handlers.handle_settlement_receipt(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.BOND_POSTING:
-            protocol_handlers.handle_bond_posting(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.BOND_SLASH:
-            protocol_handlers.handle_bond_slash(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.NETTING_PROPOSAL:
-            protocol_handlers.handle_netting_proposal(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.NETTING_ACK:
-            protocol_handlers.handle_netting_ack(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.VIOLATION_REPORT:
-            protocol_handlers.handle_violation_report(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.ARBITRATION_VOTE:
-            protocol_handlers.handle_arbitration_vote(peer_id, msg_payload, plugin)
-        # Phase 16: Traffic Intelligence
-        elif msg_type == HiveMessageType.TRAFFIC_INTELLIGENCE_BATCH:
-            protocol_handlers.handle_traffic_intelligence_batch(peer_id, msg_payload, plugin)
         else:
             plugin.log(f"cl-hive: Unhandled message type {msg_type.name} from {peer_id[:16]}...", level='debug')
 
@@ -2280,29 +2184,9 @@ def hive_channel_closed(plugin: Plugin, peer_id: str, channel_id: str,
     else:
         event_type = 'channel_close'
 
-    # Broadcast to all hive members for topology awareness
-    broadcast_count = protocol_handlers.broadcast_peer_available(
-        target_peer_id=peer_id,
-        event_type=event_type,
-        channel_id=channel_id,
-        capacity_sats=capacity_sats,
-        routing_score=routing_score,
-        profitability_score=profitability_score,
-        duration_days=duration_days,
-        total_revenue_sats=total_revenue_sats,
-        total_rebalance_cost_sats=total_rebalance_cost_sats,
-        net_pnl_sats=net_pnl_sats,
-        forward_count=forward_count,
-        forward_volume_sats=forward_volume_sats,
-        our_fee_ppm=our_fee_ppm,
-        their_fee_ppm=their_fee_ppm,
-        reason=f"Channel {channel_id} closed ({closer})"
-    )
-
-    result["action"] = "notified_hive"
-    result["broadcast_count"] = broadcast_count
+    result["action"] = "channel_closed"
     result["event_type"] = event_type
-    result["message"] = f"Notified {broadcast_count} hive members about channel closure"
+    result["message"] = f"Channel {channel_id} closed ({closer})"
 
     plugin.log(
         f"cl-hive: Channel {channel_id} closed by {closer}, "
@@ -2371,22 +2255,9 @@ def hive_channel_opened(plugin: Plugin, peer_id: str, channel_id: str,
             )
             result["fee_action"] = f"failed: {e}"
 
-    # Broadcast to all hive members
-    broadcast_count = protocol_handlers.broadcast_peer_available(
-        target_peer_id=peer_id,
-        event_type='channel_open',
-        channel_id=channel_id,
-        capacity_sats=capacity_sats,
-        our_funding_sats=our_funding_sats,
-        their_funding_sats=their_funding_sats,
-        opener=opener,
-        reason=f"Channel {channel_id} opened ({opener})"
-    )
-
-    result["action"] = "notified_hive"
-    result["broadcast_count"] = broadcast_count
+    result["action"] = "channel_opened"
     result["is_hive_internal"] = is_hive_internal
-    result["message"] = f"Notified {broadcast_count} hive members about new channel"
+    result["message"] = f"Channel {channel_id} opened ({opener})"
 
     plugin.log(
         f"cl-hive: Channel {channel_id} opened with {peer_id[:16]}... ({opener}), "

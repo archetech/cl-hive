@@ -33,9 +33,6 @@ from .protocol import (
     LIQUIDITY_NEED_RATE_LIMIT,
     LIQUIDITY_SNAPSHOT_RATE_LIMIT,
     MAX_NEEDS_IN_SNAPSHOT,
-    # MCF message functions (Phase 15)
-    create_mcf_assignment_ack,
-    create_mcf_completion_report,
 )
 
 
@@ -1748,20 +1745,8 @@ class LiquidityCoordinator:
         pending = self.get_pending_mcf_assignments()
         assignment_count = len(pending)
 
-        try:
-            msg = create_mcf_assignment_ack(
-                solution_timestamp=solution_ts,
-                assignment_count=assignment_count,
-                rpc=self.plugin.rpc,
-                our_pubkey=self.our_pubkey
-            )
-            if msg:
-                with self._lock:
-                    self._mcf_ack_sent = True
-            return msg
-        except Exception as e:
-            self._log(f"Error creating MCF ACK: {e}", "warn")
-            return None
+        # MCF messaging removed — return None
+        return None
 
     def create_mcf_completion_message(
         self,
@@ -1788,19 +1773,8 @@ class LiquidityCoordinator:
             actual_cost = assignment.actual_cost_sats
             error_msg = assignment.error_message
 
-        try:
-            return create_mcf_completion_report(
-                assignment_id=assignment_id,
-                success=success,
-                actual_amount_sats=actual_amount,
-                actual_cost_sats=actual_cost,
-                error_message=error_msg,
-                rpc=self.plugin.rpc,
-                our_pubkey=self.our_pubkey
-            )
-        except Exception as e:
-            self._log(f"Error creating MCF completion report: {e}", "warn")
-            return None
+        # MCF messaging removed — return None
+        return None
 
     def get_mcf_status(self) -> Dict[str, Any]:
         """
