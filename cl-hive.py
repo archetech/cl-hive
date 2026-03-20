@@ -1114,7 +1114,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'rationalization_mgr': rationalization_mgr,
         'traffic_intel_mgr': traffic_intel_mgr,
         'liquidity_coord': liquidity_coord,
-        'BAN_PROPOSAL_TTL_SECONDS': protocol_handlers.BAN_PROPOSAL_TTL_SECONDS,
     })
     plugin.log("cl-hive: Background loops initialized")
 

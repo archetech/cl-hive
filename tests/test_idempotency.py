@@ -57,10 +57,12 @@ class TestGenerateEventId:
 
     def test_different_types_different_ids(self):
         """Different message types with overlapping fields produce different IDs."""
-        payload = {"target_pubkey": "abc", "request_id": "req1"}
-        id_promo_req = generate_event_id("PROMOTION_REQUEST", payload)
-        id_promo = generate_event_id("PROMOTION", payload)
-        assert id_promo_req != id_promo
+        # MEMBER_LEFT and TRAFFIC_INTELLIGENCE_BATCH both use timestamp-based fields
+        payload_ml = {"peer_id": "abc", "timestamp": 1234}
+        payload_ti = {"reporter_id": "abc", "timestamp": 1234}
+        id_ml = generate_event_id("MEMBER_LEFT", payload_ml)
+        id_ti = generate_event_id("TRAFFIC_INTELLIGENCE_BATCH", payload_ti)
+        assert id_ml != id_ti
 
     def test_returns_none_for_untracked_type(self):
         """Returns None for message types not in EVENT_ID_FIELDS."""
@@ -85,31 +87,17 @@ class TestGenerateEventId:
         for event_type, fields in EVENT_ID_FIELDS.items():
             assert len(fields) > 0, f"{event_type} has no identity fields"
 
-    def test_ban_proposal_uses_proposal_id(self):
-        """BAN_PROPOSAL event ID is based on proposal_id."""
-        id1 = generate_event_id("BAN_PROPOSAL", {"proposal_id": "prop1"})
-        id2 = generate_event_id("BAN_PROPOSAL", {"proposal_id": "prop2"})
+    def test_traffic_intelligence_uses_reporter_and_timestamp(self):
+        """TRAFFIC_INTELLIGENCE_BATCH event ID is based on reporter_id and timestamp."""
+        id1 = generate_event_id("TRAFFIC_INTELLIGENCE_BATCH", {"reporter_id": "r1", "timestamp": 1000})
+        id2 = generate_event_id("TRAFFIC_INTELLIGENCE_BATCH", {"reporter_id": "r2", "timestamp": 1000})
         assert id1 != id2
 
-    def test_ban_vote_includes_voter(self):
-        """BAN_VOTE event ID includes voter_peer_id for uniqueness."""
-        id1 = generate_event_id("BAN_VOTE", {"proposal_id": "p1", "voter_peer_id": "v1"})
-        id2 = generate_event_id("BAN_VOTE", {"proposal_id": "p1", "voter_peer_id": "v2"})
+    def test_member_left_uses_peer_and_timestamp(self):
+        """MEMBER_LEFT event ID is based on peer_id and timestamp."""
+        id1 = generate_event_id("MEMBER_LEFT", {"peer_id": "p1", "timestamp": 1000})
+        id2 = generate_event_id("MEMBER_LEFT", {"peer_id": "p1", "timestamp": 2000})
         assert id1 != id2
-
-    def test_vouch_includes_all_three_fields(self):
-        """VOUCH needs target, request_id, and voucher."""
-        payload = {"target_pubkey": "t", "request_id": "r", "voucher_pubkey": "v"}
-        eid = generate_event_id("VOUCH", payload)
-        assert eid is not None
-        # Missing one field
-        assert generate_event_id("VOUCH", {"target_pubkey": "t", "request_id": "r"}) is None
-
-    def test_settlement_types(self):
-        """Settlement message types produce valid event IDs."""
-        assert generate_event_id("SETTLEMENT_PROPOSE", {"proposal_id": "sp1"}) is not None
-        assert generate_event_id("SETTLEMENT_READY", {"proposal_id": "sp1", "voter_peer_id": "v1"}) is not None
-        assert generate_event_id("SETTLEMENT_EXECUTED", {"proposal_id": "sp1", "executor_peer_id": "e1"}) is not None
 
 
 # =============================================================================
@@ -152,8 +140,8 @@ class TestCheckAndRecord:
 
     def test_has_proto_event(self, db):
         """has_proto_event returns True after recording."""
-        payload = {"proposal_id": "ban1"}
-        _, event_id = check_and_record(db, "BAN_PROPOSAL", payload, "peer1")
+        payload = {"peer_id": "abc", "timestamp": 9999}
+        _, event_id = check_and_record(db, "MEMBER_LEFT", payload, "peer1")
         assert db.has_proto_event(event_id) is True
         assert db.has_proto_event("nonexistent") is False
 

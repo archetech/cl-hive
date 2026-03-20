@@ -100,9 +100,6 @@ BOTTLENECK_BONUS_MULTIPLIER = 1.5     # 50% bonus for bottleneck peers
 CORRIDOR_VALUE_BONUS_HIGH = 1.4       # 40% bonus for high-value corridors
 CORRIDOR_VALUE_BONUS_MEDIUM = 1.15    # 15% bonus for medium-value corridors
 
-# Redundancy penalty from rationalization (stigmergic marker-based)
-REDUNDANCY_PENALTY_OVERSERVED = 0.3   # 70% penalty if already well-owned by another member
-
 
 # =============================================================================
 # DATA CLASSES
@@ -798,48 +795,6 @@ class Planner:
         except Exception as e:
             self._log(f"Error checking bottleneck status: {e}", level='debug')
             return False
-
-    def _check_stigmergic_redundancy(self, target: str) -> tuple:
-        """
-        Check stigmergic marker-based redundancy for a target.
-
-        Uses rationalization manager to determine if another member
-        already "owns" this route based on routing success (markers).
-
-        Slime mold principle: Don't over-cover routes that another
-        tendril (member) is already successfully exploiting.
-
-        Args:
-            target: Target node pubkey
-
-        Returns:
-            Tuple of (is_overserved: bool, owner_pubkey: str or None, owner_strength: float)
-        """
-        if not self.rationalization_mgr:
-            return False, None, 0.0
-
-        try:
-            coverage = self.rationalization_mgr.analyze_coverage(peer_id=target)
-            if "error" in coverage:
-                return False, None, 0.0
-
-            # Check if this peer is covered
-            coverages = coverage.get("coverages", [])
-            for cov in coverages:
-                if cov.get("peer_id") == target:
-                    owner = cov.get("owner_pubkey")
-                    owner_strength = cov.get("owner_marker_strength", 0)
-                    redundancy_count = cov.get("redundancy_count", 0)
-
-                    # If owner exists and we're not the owner, this is overserved territory
-                    if owner and redundancy_count >= 2:  # MAX_HEALTHY_REDUNDANCY
-                        return True, owner, owner_strength
-
-            return False, None, 0.0
-
-        except Exception as e:
-            self._log(f"Error checking stigmergic redundancy: {e}", level='debug')
-            return False, None, 0.0
 
     def _get_corridor_value_bonus(self, target: str) -> tuple:
         """
@@ -1693,17 +1648,6 @@ class Planner:
                 adjusted_score *= BOTTLENECK_BONUS_MULTIPLIER
                 self._log(
                     f"Boosting {target[:16]}... - bottleneck peer (+50%)",
-                    level='debug'
-                )
-
-            # Physarum/Slime mold: Check stigmergic redundancy
-            # Avoid expanding to routes already "owned" by another member
-            is_overserved, owner, owner_strength = self._check_stigmergic_redundancy(target)
-            if is_overserved and owner:
-                adjusted_score *= REDUNDANCY_PENALTY_OVERSERVED
-                self._log(
-                    f"Penalizing {target[:16]}... - already owned by {owner[:16]}... "
-                    f"(strength={owner_strength:.1f}, -{int((1-REDUNDANCY_PENALTY_OVERSERVED)*100)}%)",
                     level='debug'
                 )
 

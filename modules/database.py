@@ -2997,8 +2997,8 @@ class HiveDatabase:
         """
         Acknowledge outbox entries by type and payload field match.
 
-        Used for implicit acks: e.g. receiving SETTLEMENT_READY clears the
-        SETTLEMENT_PROPOSE outbox entries for that peer+proposal_id.
+        Used for implicit acks: a domain response clears the
+        corresponding request outbox entries for that peer.
 
         Args:
             peer_id: Peer that implicitly acknowledged
