@@ -2076,7 +2076,6 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 MAX_GOSSIP_AGE_SECONDS = 3600           # 1 hour for gossip
 MAX_INTENT_AGE_SECONDS = 600            # 10 minutes for intents (time-sensitive)
 MAX_STATE_HASH_AGE_SECONDS = 3600       # 1 hour for state hash / full sync
-MAX_SETTLEMENT_AGE_SECONDS = 86400      # 24 hours for settlement messages
 MAX_INTELLIGENCE_AGE_SECONDS = 7200     # 2 hours for fee/health/liquidity reports
 MAX_CLOCK_SKEW_SECONDS = 300            # 5 minutes future tolerance
 

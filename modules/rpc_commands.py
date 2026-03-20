@@ -492,7 +492,7 @@ def expansion_recommendations(ctx: HiveContext, limit: int = 10) -> Dict[str, An
     - Hive coverage diversity (% of members with channels)
     - Network competition (peer channel count)
     - Bottleneck detection (from liquidity_coordinator)
-    - Splice recommendations (from splice_coordinator)
+    - Channel rationalization recommendations
 
     Args:
         limit: Maximum number of recommendations to return (default: 10)
@@ -577,7 +577,6 @@ def expansion_recommendations(ctx: HiveContext, limit: int = 10) -> Dict[str, An
         "coverage_summary": coverage_stats,
         "cooperation_modules": {
             "liquidity_coordinator": ctx.planner.liquidity_coordinator is not None,
-            "splice_coordinator": ctx.planner.splice_coordinator is not None,
             "health_aggregator": ctx.planner.health_aggregator is not None
         }
     }

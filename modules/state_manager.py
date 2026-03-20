@@ -58,11 +58,7 @@ class HivePeerState:
         budget_available_sats: Current budget-constrained spendable liquidity
         budget_reserved_until: Unix timestamp when any active budget hold expires
         budget_last_update: Unix timestamp when budget was last calculated
-        fees_earned_sats: Routing fees earned in current settlement period
-        fees_forward_count: Number of forwards in current period
-        fees_period_start: Start of current fee reporting period
-        fees_last_report: Timestamp of last fee report received
-        capabilities: List of supported capabilities (e.g., ["mcf"] for MCF optimization)
+        capabilities: List of supported capabilities
     """
     peer_id: str
     capacity_sats: int
@@ -75,13 +71,7 @@ class HivePeerState:
     budget_available_sats: int = 0
     budget_reserved_until: int = 0
     budget_last_update: int = 0
-    # Fee reporting fields for settlement
-    fees_earned_sats: int = 0
-    fees_forward_count: int = 0
-    fees_period_start: int = 0
-    fees_last_report: int = 0
-    fees_costs_sats: int = 0  # Rebalance costs in period (for net profit settlement)
-    # Capabilities for version-aware feature negotiation (e.g., ["mcf"])
+    # Capabilities for feature negotiation
     capabilities: List[str] = field(default_factory=list)
     # Boltz swap activity for fleet coordination (F1)
     boltz_activity: Dict[str, Any] = field(default_factory=dict)
@@ -124,13 +114,6 @@ class HivePeerState:
         budget_reserved_until = _safe_int(data.get("budget_reserved_until", 0))
         budget_last_update = _safe_int(data.get("budget_last_update", 0))
 
-        # Fee reporting fields (optional, backward compatible defaults)
-        fees_earned_sats = _safe_int(data.get("fees_earned_sats", 0))
-        fees_forward_count = _safe_int(data.get("fees_forward_count", 0))
-        fees_period_start = _safe_int(data.get("fees_period_start", 0))
-        fees_last_report = _safe_int(data.get("fees_last_report", 0))
-        fees_costs_sats = _safe_int(data.get("fees_costs_sats", 0))
-
         # Capabilities (optional, backward compatible - old nodes have no capabilities)
         capabilities = data.get("capabilities", [])
 
@@ -149,11 +132,6 @@ class HivePeerState:
             budget_available_sats=budget_available_sats,
             budget_reserved_until=budget_reserved_until,
             budget_last_update=budget_last_update,
-            fees_earned_sats=fees_earned_sats,
-            fees_forward_count=fees_forward_count,
-            fees_period_start=fees_period_start,
-            fees_last_report=fees_last_report,
-            fees_costs_sats=fees_costs_sats,
             capabilities=list(capabilities),   # defensive copy
             boltz_activity=dict(boltz_activity) if isinstance(boltz_activity, dict) else {},
         )
@@ -358,13 +336,7 @@ class StateManager:
                 budget_available_sats=gossip_data.get('budget_available_sats', 0),
                 budget_reserved_until=gossip_data.get('budget_reserved_until', 0),
                 budget_last_update=gossip_data.get('budget_last_update', 0),
-                # Preserve fee fields from existing state (set via update_peer_fees)
-                fees_earned_sats=existing.fees_earned_sats if existing else 0,
-                fees_forward_count=existing.fees_forward_count if existing else 0,
-                fees_period_start=existing.fees_period_start if existing else 0,
-                fees_last_report=existing.fees_last_report if existing else 0,
-                fees_costs_sats=existing.fees_costs_sats if existing else 0,
-                # Capabilities (MCF support, etc. - backward compatible, defaults to empty)
+                # Capabilities (backward compatible, defaults to empty)
                 capabilities=list(gossip_data.get('capabilities', [])),  # defensive copy
                 # Boltz activity for fleet coordination (F1 - backward compatible, defaults to empty)
                 boltz_activity=dict(gossip_data.get('boltz_activity', {})),  # defensive copy
@@ -386,102 +358,6 @@ class StateManager:
 
         self._log(f"Updated state for {peer_id[:16]}... to v{remote_version}")
         return True
-
-    def update_peer_fees(self, peer_id: str, fees_earned_sats: int,
-                         forward_count: int, period_start: int,
-                         period_end: int, rebalance_costs_sats: int = 0) -> bool:
-        """
-        Update fee reporting data for a peer from FEE_REPORT message.
-
-        This is called when we receive a FEE_REPORT gossip message from
-        another hive member, allowing settlement calculations to use
-        accurate fee data from all members.
-
-        Args:
-            peer_id: The peer's public key
-            fees_earned_sats: Cumulative fees earned in the period
-            forward_count: Number of forwards in the period
-            period_start: Period start timestamp
-            period_end: Period end timestamp (report time)
-            rebalance_costs_sats: Rebalancing costs in the period
-
-        Returns:
-            True if fee data was updated, False if rejected
-        """
-        now = int(time.time())
-
-        # Basic validation (before lock)
-        if not peer_id or fees_earned_sats < 0 or forward_count < 0:
-            return False
-        if rebalance_costs_sats < 0:
-            rebalance_costs_sats = 0
-
-        with self._lock:
-            # Get or create peer state
-            existing = self._local_state.get(peer_id)
-
-            if existing:
-                # Only update if this report is newer
-                if existing.fees_last_report >= period_end:
-                    self._log(f"Rejected stale fee report from {peer_id[:16]}...")
-                    return False
-
-                # Update fee fields while preserving other state
-                existing.fees_earned_sats = fees_earned_sats
-                existing.fees_forward_count = forward_count
-                existing.fees_period_start = period_start
-                existing.fees_last_report = period_end
-                existing.fees_costs_sats = rebalance_costs_sats
-            else:
-                # Create minimal state entry with just fee data
-                new_state = HivePeerState(
-                    peer_id=peer_id,
-                    capacity_sats=0,
-                    available_sats=0,
-                    fee_policy={},
-                    topology=[],
-                    version=0,
-                    last_update=now,
-                    fees_earned_sats=fees_earned_sats,
-                    fees_forward_count=forward_count,
-                    fees_period_start=period_start,
-                    fees_last_report=period_end,
-                    fees_costs_sats=rebalance_costs_sats
-                )
-                self._local_state[peer_id] = new_state
-
-        self._log(f"Updated fees for {peer_id[:16]}...: {fees_earned_sats} sats, "
-                 f"{forward_count} forwards, costs={rebalance_costs_sats}")
-        return True
-
-    def get_peer_fees(self, peer_id: str) -> Dict[str, int]:
-        """
-        Get fee reporting data for a peer.
-
-        Args:
-            peer_id: The peer's public key
-
-        Returns:
-            Dict with fees_earned_sats, forward_count, period_start, last_report, rebalance_costs_sats
-        """
-        with self._lock:
-            state = self._local_state.get(peer_id)
-            if not state:
-                return {
-                    "fees_earned_sats": 0,
-                    "forward_count": 0,
-                    "period_start": 0,
-                    "last_report": 0,
-                    "rebalance_costs_sats": 0
-                }
-
-            return {
-                "fees_earned_sats": state.fees_earned_sats,
-                "forward_count": state.fees_forward_count,
-                "period_start": state.fees_period_start,
-                "last_report": state.fees_last_report,
-                "rebalance_costs_sats": state.fees_costs_sats
-            }
 
     def update_local_state(self, capacity_sats: int, available_sats: int,
                            fee_policy: Dict[str, Any], topology: List[str],

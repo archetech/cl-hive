@@ -307,8 +307,6 @@ def _save_fee_tracking_state() -> None:
 # =============================================================================
 # RateLimiter class moved to modules/plugin_options.py
 
-# Global rate limiter for PEER_AVAILABLE messages
-peer_available_limiter: Optional[RateLimiter] = None
 
 
 
@@ -1022,11 +1020,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Planner linked to yield optimization modules (slime mold mode)")
 
-    # Initialize rate limiter for PEER_AVAILABLE messages (Security Enhancement)
-    global peer_available_limiter
-    peer_available_limiter = RateLimiter(max_per_minute=10, window_seconds=60)
-    plugin.log("cl-hive: Rate limiter initialized (10 msg/min per peer)")
-
     # Inject all globals into the protocol_handlers module so that moved
     # handler functions can reference the same variable names they always did.
     protocol_handlers.init_protocol_handlers({
@@ -1055,7 +1048,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'anticipatory_liquidity_mgr': anticipatory_liquidity_mgr,
         'outbox_mgr': outbox_mgr,
         'traffic_intel_mgr': traffic_intel_mgr,
-        'peer_available_limiter': peer_available_limiter,
         'outbox': outbox_mgr,
         # Fee tracking state
         '_local_fees_lock': _local_fees_lock,

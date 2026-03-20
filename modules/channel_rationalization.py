@@ -263,27 +263,8 @@ class RedundancyAnalyzer:
             return set()
 
     def _get_markers_for_peer(self, peer_id: str) -> List[Any]:
-        """
-        Get all stigmergic markers involving this peer.
-
-        Markers where peer is either source or destination.
-        """
-        if not self.fee_coordination_mgr:
-            return []
-
-        try:
-            stigmergy = self.fee_coordination_mgr.stigmergy
-            if not stigmergy:
-                return []
-
-            all_markers = stigmergy.get_all_markers()
-            return [
-                m for m in all_markers
-                if m.source_peer_id == peer_id or m.destination_peer_id == peer_id
-            ]
-        except Exception as e:
-            self._log(f"Error getting markers for peer: {e}", level="debug")
-            return []
+        """Get coordination markers involving this peer (currently none)."""
+        return []
 
     def analyze_peer_coverage(self, peer_id: str) -> PeerCoverage:
         """

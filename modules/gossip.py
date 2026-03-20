@@ -248,9 +248,8 @@ class GossipManager:
         """
         now = int(time.time())
 
-        # Default capabilities include MCF support (this node has it)
         if capabilities is None:
-            capabilities = ["mcf"]
+            capabilities = []
 
         with self._lock:
             new_version = self._last_broadcast_state.version + 1

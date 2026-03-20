@@ -1,15 +1,15 @@
 """
 OutboxManager for cl-hive (Phase D: Reliable Delivery).
 
-Provides durable, per-peer message delivery with exponential backoff,
-explicit MSG_ACK handling, and implicit ack resolution via domain responses.
+Provides durable, per-peer message delivery with exponential backoff
+and implicit ack resolution via domain responses.
 
 Design:
 - Each critical broadcast creates N outbox rows (one per target peer).
 - Unicast messages create a single row.
 - The outbox_retry_loop calls retry_pending() every 30 seconds.
 - Messages are retried with exponential backoff (30s -> 1h cap).
-- Explicit MSG_ACK or implicit domain responses clear entries.
+- Implicit domain responses clear entries.
 - Backpressure: MAX_INFLIGHT_PER_PEER limits per-peer queue depth.
 """
 
@@ -91,26 +91,6 @@ class OutboxManager:
                 targeted_peers.append(pid)
 
         return enqueued
-
-    def process_ack(self, peer_id: str, ack_msg_id: str, status: str) -> bool:
-        """
-        Handle explicit MSG_ACK from a peer.
-
-        Args:
-            peer_id: Peer that sent the ack
-            ack_msg_id: The msg_id being acknowledged
-            status: "ok", "invalid", or "retry_later"
-
-        Returns:
-            True if an outbox entry was found and updated.
-        """
-        if status == "ok":
-            return self._db.ack_outbox(ack_msg_id, peer_id)
-        elif status == "invalid":
-            return self._db.fail_outbox(ack_msg_id, peer_id,
-                                        "remote_invalid")
-        # "retry_later" - leave as-is, will retry on schedule
-        return False
 
     def process_implicit_ack(self, peer_id: str,
                              response_type: HiveMessageType,
