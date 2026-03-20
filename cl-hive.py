@@ -204,7 +204,6 @@ outbox_mgr: Optional[OutboxManager] = None
 our_pubkey: Optional[str] = None
 phase6_optional_plugins: Dict[str, Any] = {
     "cl_hive_comms": {"installed": False, "active": False, "name": ""},
-    "cl_hive_archon": {"installed": False, "active": False, "name": ""},
     "warnings": [],
 }
 
@@ -376,7 +375,6 @@ def _get_hive_context() -> HiveContext:
     _anticipatory_liquidity_mgr = anticipatory_liquidity_mgr if anticipatory_liquidity_mgr is not None else None
     _phase6_plugins = phase6_optional_plugins if isinstance(phase6_optional_plugins, dict) else {}
     _comms_active = bool(_phase6_plugins.get("cl_hive_comms", {}).get("active"))
-    _archon_active = bool(_phase6_plugins.get("cl_hive_archon", {}).get("active"))
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -401,7 +399,6 @@ def _get_hive_context() -> HiveContext:
         anticipatory_manager=_anticipatory_liquidity_mgr,
         traffic_intel_mgr=traffic_intel_mgr,
         comms_active=_comms_active,
-        archon_active=_archon_active,
         signing_backend="none",
         our_id=_our_pubkey or "",
         log=_log,
@@ -425,7 +422,6 @@ def _detect_phase6_optional_plugins(plugin_obj: Plugin) -> Dict[str, Any]:
     """
     result: Dict[str, Any] = {
         "cl_hive_comms": {"installed": False, "active": False, "name": ""},
-        "cl_hive_archon": {"installed": False, "active": False, "name": ""},
         "warnings": [],
     }
 
@@ -451,18 +447,6 @@ def _detect_phase6_optional_plugins(plugin_obj: Plugin) -> Dict[str, Any]:
                     "active": is_active,
                     "name": raw_name,
                 }
-            elif "cl-hive-archon" in normalized:
-                result["cl_hive_archon"] = {
-                    "installed": True,
-                    "active": is_active,
-                    "name": raw_name,
-                }
-
-        if result["cl_hive_archon"]["active"] and not result["cl_hive_comms"]["active"]:
-            result["warnings"].append(
-                "cl-hive-archon is active while cl-hive-comms is inactive; "
-                "this is not a supported Phase 6 stack."
-            )
     except Exception as e:
         result["warnings"].append(f"optional plugin detection failed: {e}")
 
@@ -656,11 +640,9 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Detect Phase 6 sibling plugins (used for runtime capability selection)
     phase6_optional_plugins = _detect_phase6_optional_plugins(plugin)
     comms = phase6_optional_plugins["cl_hive_comms"]
-    archon = phase6_optional_plugins["cl_hive_archon"]
     plugin.log(
         "cl-hive: Sibling plugins - "
-        f"cl-hive-comms(active={comms['active']}, installed={comms['installed']}), "
-        f"cl-hive-archon(active={archon['active']}, installed={archon['installed']})"
+        f"cl-hive-comms(active={comms['active']}, installed={comms['installed']})"
     )
     for warning in phase6_optional_plugins.get("warnings", []):
         plugin.log(f"cl-hive: {warning}", level="warn")

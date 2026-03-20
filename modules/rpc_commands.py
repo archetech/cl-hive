@@ -198,7 +198,6 @@ class HiveContext:
     traffic_intel_mgr: Any = None  # TrafficIntelligenceManager (Phase 14 - Traffic Intelligence)
     our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
     comms_active: bool = False
-    archon_active: bool = False
     signing_backend: str = "unknown"
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
@@ -294,7 +293,6 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
             "market_share_cap": ctx.config.market_share_cap_pct if ctx.config else 0.20,
         },
         "comms_active": bool(ctx.comms_active),
-        "archon_active": bool(ctx.archon_active),
         "signing_backend": str(ctx.signing_backend or "unknown"),
         "version": "2.2.6",
     }

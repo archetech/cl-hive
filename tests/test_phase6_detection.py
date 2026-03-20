@@ -33,7 +33,6 @@ def _detect(plugin_obj):
     # We replicate the function logic here for isolated testing.
     result = {
         "cl_hive_comms": {"installed": False, "active": False, "name": ""},
-        "cl_hive_archon": {"installed": False, "active": False, "name": ""},
         "warnings": [],
     }
     try:
@@ -58,18 +57,6 @@ def _detect(plugin_obj):
                     "active": is_active,
                     "name": raw_name,
                 }
-            elif "cl-hive-archon" in normalized:
-                result["cl_hive_archon"] = {
-                    "installed": True,
-                    "active": is_active,
-                    "name": raw_name,
-                }
-
-        if result["cl_hive_archon"]["active"] and not result["cl_hive_comms"]["active"]:
-            result["warnings"].append(
-                "cl-hive-archon is active while cl-hive-comms is inactive; "
-                "this is not a supported Phase 6 stack."
-            )
     except Exception as e:
         result["warnings"].append(f"optional plugin detection failed: {e}")
 
@@ -87,7 +74,6 @@ class TestPhase6Detection:
         ]})
         result = _detect(plugin)
         assert result["cl_hive_comms"]["installed"] is False
-        assert result["cl_hive_archon"]["installed"] is False
         assert result["warnings"] == []
 
     def test_comms_detected_active(self):
@@ -100,38 +86,14 @@ class TestPhase6Detection:
         assert result["cl_hive_comms"]["active"] is True
         assert result["cl_hive_comms"]["name"] == "/opt/cl-hive-comms/cl-hive-comms.py"
 
-    def test_archon_detected_inactive(self):
-        """Detects cl-hive-archon when installed but inactive."""
+    def test_comms_detected_inactive(self):
+        """Detects cl-hive-comms when installed but inactive."""
         plugin = _make_plugin_obj({"plugins": [
-            {"name": "cl-hive-comms.py", "active": True},
-            {"name": "cl-hive-archon.py", "active": False},
+            {"name": "cl-hive-comms.py", "active": False},
         ]})
         result = _detect(plugin)
-        assert result["cl_hive_archon"]["installed"] is True
-        assert result["cl_hive_archon"]["active"] is False
-
-    def test_full_stack_detected(self):
-        """Full Phase 6 stack with all plugins active."""
-        plugin = _make_plugin_obj({"plugins": [
-            {"name": "cl-hive-comms.py", "active": True},
-            {"name": "cl-hive-archon.py", "active": True},
-            {"name": "cl-hive.py", "active": True},
-        ]})
-        result = _detect(plugin)
-        assert result["cl_hive_comms"]["active"] is True
-        assert result["cl_hive_archon"]["active"] is True
-        assert result["warnings"] == []
-
-    def test_archon_without_comms_warns(self):
-        """Archon active without comms produces a warning."""
-        plugin = _make_plugin_obj({"plugins": [
-            {"name": "cl-hive-archon.py", "active": True},
-        ]})
-        result = _detect(plugin)
-        assert result["cl_hive_archon"]["active"] is True
+        assert result["cl_hive_comms"]["installed"] is True
         assert result["cl_hive_comms"]["active"] is False
-        assert len(result["warnings"]) == 1
-        assert "not a supported Phase 6 stack" in result["warnings"][0]
 
     def test_fallback_to_listplugins(self):
         """Falls back to listplugins() when plugin('list') fails."""
@@ -148,7 +110,6 @@ class TestPhase6Detection:
         plugin = _make_plugin_obj(raise_error=True)
         result = _detect(plugin)
         assert result["cl_hive_comms"]["installed"] is False
-        assert result["cl_hive_archon"]["installed"] is False
         assert len(result["warnings"]) == 1
         assert "optional plugin detection failed" in result["warnings"][0]
 
@@ -160,20 +121,11 @@ class TestPhase6Detection:
         result = _detect(plugin)
         assert result["cl_hive_comms"]["installed"] is True
 
-    def test_plugin_key_fallback(self):
-        """Detects plugin from 'plugin' key when others are absent."""
-        plugin = _make_plugin_obj({"plugins": [
-            {"plugin": "/opt/cl-hive-archon/cl-hive-archon.py", "active": True},
-        ]})
-        result = _detect(plugin)
-        assert result["cl_hive_archon"]["installed"] is True
-
     def test_empty_plugin_list(self):
         """Empty plugin list returns defaults without error."""
         plugin = _make_plugin_obj({"plugins": []})
         result = _detect(plugin)
         assert result["cl_hive_comms"]["installed"] is False
-        assert result["cl_hive_archon"]["installed"] is False
         assert result["warnings"] == []
 
     def test_malformed_plugin_entries_skipped(self):

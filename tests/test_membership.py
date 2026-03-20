@@ -95,18 +95,6 @@ def test_uniqueness_check():
     assert "peer_unique" in unique
 
 
-def test_quorum_calculation():
-    db = MagicMock()
-    contribution_mgr = MagicMock()
-    state_manager = MagicMock()
-    config = DummyConfig()
-    mgr = MembershipManager(db, state_manager, contribution_mgr, None, config)
-
-    assert mgr.calculate_quorum(5) == 3
-    assert mgr.calculate_quorum(1) == 1
-    assert mgr.calculate_quorum(2) == 2
-
-
 def test_leech_trigger():
     db = MagicMock()
     config = DummyConfig()

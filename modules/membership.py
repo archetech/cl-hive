@@ -4,7 +4,6 @@ Membership module for cl-hive.
 Implements admin/member role management, uptime tracking, and bridge policy sync.
 """
 
-import math
 import time
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -13,7 +12,6 @@ from . import network_metrics
 
 
 ACTIVE_MEMBER_WINDOW_SECONDS = 24 * 3600
-BAN_QUORUM_THRESHOLD = 0.51  # 51% quorum for ban proposals
 
 
 class MembershipTier(str, Enum):
@@ -225,19 +223,6 @@ class MembershipManager:
     def get_all_members(self) -> List[Dict[str, Any]]:
         """Alias for get_members() used by background loops."""
         return self.get_members()
-
-    def calculate_quorum(self, active_members: int) -> int:
-        """
-        Calculate quorum for voting (bans, etc).
-
-        Uses simple majority (51%) with minimum of 2 votes, except for
-        single-member bootstrap case where 1 vote is sufficient.
-        """
-        if active_members == 1:
-            return 1
-
-        threshold = math.ceil(active_members * 0.51)
-        return min(active_members, max(2, threshold))
 
     # =========================================================================
     # TIMESTAMP VALIDATION (used by protocol handlers)
