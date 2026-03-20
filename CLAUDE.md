@@ -2,11 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 📖 **For fleet monitoring**: See [MOLTY.md](MOLTY.md) for AI agent instructions on using cl-hive's MCP tools to monitor and manage Lightning node fleets.
-
 ## Project Overview
 
-cl-hive is a Core Lightning plugin implementing distributed "Swarm Intelligence" for Lightning node fleets. It coordinates multiple nodes through PKI authentication, shared state gossip, and distributed governance. Designed to work alongside [cl-revenue-ops](https://github.com/lightning-goats/cl_revenue_ops) which handles local fee/rebalancing decisions.
+cl-hive is a Core Lightning plugin that provides trusted fleet coordination for small groups of Lightning nodes. It shares membership state, fee intelligence, liquidity observations, and topology recommendations across fleet members so each node can make better local decisions. Designed to work alongside [cl-revenue-ops](https://github.com/lightning-goats/cl_revenue_ops) which handles local fee/rebalancing execution.
 
 ## Commands
 
@@ -24,67 +22,68 @@ python3 -m pytest tests/ -v
 python3 -m pytest tests/ -k "test_feerate"
 ```
 
-No build system - this is a CLN plugin deployed by copying `cl-hive.py` and `modules/` to the plugin directory.
+No build system -- this is a CLN plugin deployed by copying `cl-hive.py` and `modules/` to the plugin directory.
 
 ## Architecture
 
 ```
-cl-hive (Coordination Layer - "The Diplomat")
-    ↓
-cl-revenue-ops (Execution Layer - "The CFO")
-    ↓
+cl-hive (Coordination Layer)
+    |
+cl-revenue-ops (Execution Layer)
+    |
 Core Lightning
 ```
 
-### Three-Layer Design
-- **cl-hive**: Manages fleet topology, membership, and consensus decisions
-- **cl-revenue-ops**: Executes fee policies and rebalancing (called via RPC)
-- **Core Lightning**: Underlying node operations and HSM-based crypto
+### Data Flow
 
-### Module Organization (41 modules)
+```
+Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl-revenue-ops)
+```
+
+1. **Membership**: Admin adds members; handshake authenticates via CLN signmessage/checkmessage
+2. **State Sync**: Gossip protocol shares capacity, fees, health, and liquidity across the fleet
+3. **Observations**: Each node collects fee intelligence, traffic profiles, flow patterns, peer quality
+4. **Recommendations**: Planner generates topology, fee, rebalancing, and positioning recommendations
+5. **Bridge**: Coordinated signals are pushed to cl-revenue-ops for local execution
+
+### Module Organization (34 modules)
 
 | Module | Purpose |
 |--------|---------|
-| `protocol.py` | BOLT 8 custom messages (magic: "HIVE" = 0x48495645, types 32769-32845) |
+| `protocol.py` | BOLT 8 custom messages (magic: "HIVE" = 0x48495645) |
+| `protocol_handlers.py` | Dispatch handlers for each message type |
 | `handshake.py` | PKI auth using CLN signmessage/checkmessage |
 | `state_manager.py` | HiveMap distributed state + anti-entropy sync |
-| `gossip.py` | Threshold-based gossip (10% capacity change) with 5-min heartbeat |
-| `intent_manager.py` | Intent Lock protocol - Announce-Wait-Commit with lexicographic tie-breaker |
+| `gossip.py` | Threshold-based gossip (10% capacity change) with heartbeat |
+| `intent_manager.py` | Intent Lock protocol -- Announce-Wait-Commit with tie-breaker |
 | `bridge.py` | Circuit Breaker pattern for cl-revenue-ops integration |
-| `membership.py` | Three-tier system: Admin → Member → Neophyte with vouch-based promotion |
+| `membership.py` | Two-tier system: Admin and Member |
+| `governance.py` | Recommendation logging (no modes, no budget gating) |
 | `contribution.py` | Forwarding stats and anti-leech detection |
-| `planner.py` | Topology optimization - saturation analysis, expansion election, feerate gate |
-| `splice_manager.py` | Coordinated splice operations between hive members (Phase 11) |
-| `splice_coordinator.py` | High-level splice coordination and recommendation engine |
-| `mcf_solver.py` | Min-Cost Max-Flow solver for global fleet rebalance optimization |
-| `liquidity_coordinator.py` | Liquidity needs aggregation and rebalance assignment distribution |
-| `cost_reduction.py` | Fleet rebalance routing with MCF/BFS fallback |
-| `anticipatory_liquidity.py` | Kalman-filtered flow prediction, intra-day pattern detection |
-| `fee_coordination.py` | Pheromone-based fee coordination + stigmergic markers |
+| `planner.py` | Topology optimization -- saturation analysis, expansion targeting |
+| `fee_coordination.py` | Flow corridor management and competition avoidance |
 | `fee_intelligence.py` | Fee intelligence aggregation and sharing across fleet |
-| `cooperative_expansion.py` | Fleet-wide expansion election protocol (Nominate→Elect→Open) |
-| `budget_manager.py` | Autonomous/failsafe mode budget tracking and enforcement |
-| `idempotency.py` | Message deduplication via event ID tracking |
-| `outbox.py` | Reliable message delivery with retry and exponential backoff |
+| `liquidity_coordinator.py` | Liquidity needs aggregation and rebalance assignment |
+| `anticipatory_liquidity.py` | Kalman-filtered flow prediction, temporal pattern detection |
 | `routing_intelligence.py` | Routing path intelligence sharing across fleet |
-| `routing_pool.py` | Routing pool management for fee distribution |
-| `settlement.py` | BOLT12 settlement system - proposal/vote/execute consensus |
+| `traffic_intelligence.py` | Traffic profile sharing and demand forecasting |
 | `health_aggregator.py` | Fleet health scoring and NNLB status |
 | `network_metrics.py` | Network-level metrics collection |
 | `peer_reputation.py` | Peer reputation tracking and scoring |
 | `quality_scorer.py` | Peer quality scoring for membership decisions |
-| `relay.py` | Message relay logic for multi-hop fleet communication |
-| `rpc_commands.py` | RPC command handlers for all hive-* commands |
 | `channel_rationalization.py` | Channel optimization recommendations |
 | `strategic_positioning.py` | Strategic network positioning analysis |
-| `task_manager.py` | Background task coordination and scheduling |
-| `vpn_transport.py` | VPN transport layer (WireGuard integration) |
 | `yield_metrics.py` | Yield tracking and optimization metrics |
-| `governance.py` | Decision engine (advisor/failsafe mode routing) |
+| `idempotency.py` | Message deduplication via event ID tracking |
+| `outbox.py` | Reliable message delivery with retry and exponential backoff |
+| `relay.py` | Message relay logic for multi-hop fleet communication |
+| `log_writer.py` | Structured logging |
+| `rpc_commands.py` | RPC command handler implementations |
+| `background_loops.py` | Background loop definitions (gossip, planner, fee intel, etc.) |
+| `plugin_options.py` | Plugin option registration and rate limiting |
+| `phase6_ingest.py` | Injected-packet parsing helpers |
 | `config.py` | Hot-reloadable configuration with snapshot pattern |
-| `did_credentials.py` | DID credential issuance, verification, reputation aggregation (Phase 16) |
-| `management_schemas.py` | 15 management schema categories, danger scoring, credential lifecycle (Phase 2) |
-| `database.py` | SQLite with WAL mode, thread-local connections, 50 tables |
+| `database.py` | SQLite with WAL mode, thread-local connections, 26 tables |
 
 ### Key Patterns
 
@@ -98,7 +97,7 @@ Core Lightning
 - Use `shutdown_event.wait(interval)` not `time.sleep()`
 
 **Circuit Breaker** (in bridge.py):
-- States: CLOSED → OPEN (after 3 failures) → HALF_OPEN (after 60s)
+- States: CLOSED -> OPEN (after 3 failures) -> HALF_OPEN (after 60s)
 - All external plugin calls go through `safe_call()` wrapper
 
 **Configuration Snapshot**:
@@ -119,65 +118,97 @@ Core Lightning
 - Multi-hop message relay for peers not directly connected
 - Relay logic in `relay.py` with TTL-based loop prevention
 
-### Governance Modes
+### Background Loops (6)
 
-| Mode | Behavior |
-|------|----------|
-| `advisor` | **Primary mode** - Queue to pending_actions for AI/human approval via MCP server |
-| `failsafe` | Emergency mode - Auto-execute only critical safety actions (bans) within strict limits |
+| Loop | Purpose |
+|------|---------|
+| `gossip_loop` | Heartbeat broadcast and state sync |
+| `membership_maintenance_loop` | Ban enforcement, admin promotion checks |
+| `planner_loop` | Topology analysis and expansion recommendations |
+| `fee_intelligence_loop` | Fee observation broadcast and aggregation |
+| `intent_monitor_loop` | Intent lock expiry and cleanup |
+| `outbox_retry_loop` | Reliable message delivery retries |
 
-### Database Tables (50 tables)
-
-Key tables (see `database.py` for complete schema):
+### Database Tables (26)
 
 | Table | Purpose |
 |-------|---------|
-| `hive_members` | Member roster with tiers and stats |
-| `intent_locks` | Active intent locks for conflict resolution |
+| `hive_members` | Member roster with tiers (admin/member) |
 | `hive_state` | Key-value store for persistent state |
+| `intent_locks` | Active intent locks for conflict resolution |
 | `contribution_ledger` | Forwarding contribution tracking |
-| `hive_bans` | Ban proposals and votes |
-| `ban_proposals` / `ban_votes` | Distributed ban voting |
-| `promotion_requests` / `promotion_vouches` | Promotion workflow |
+| `contribution_rate_limits` | Rate limiting for contribution updates |
+| `contribution_daily_stats` | Daily contribution aggregates |
+| `promotion_requests` | Promotion request tracking |
+| `promotion_vouches` | Promotion vouch records |
+| `admin_promotions` | Admin-initiated promotion records |
+| `admin_promotion_approvals` | Admin promotion approval tracking |
+| `ban_proposals` | Distributed ban proposals |
+| `ban_votes` | Ban vote records |
+| `hive_bans` | Active bans |
+| `local_fee_tracking` | Local fee change tracking |
+| `peer_presence` | Peer online/offline tracking |
 | `hive_planner_log` | Planner decision audit log |
-| `pending_actions` | Actions awaiting approval (advisor mode) |
-| `splice_sessions` | Active and historical splice operations |
-| `peer_fee_profiles` | Fee profiles shared by fleet members |
+| `planner_ignored_peers` | Planner ignore list |
 | `fee_intelligence` | Aggregated fee intelligence data |
-| `fee_reports` | Fee earnings for settlement calculations |
-| `liquidity_needs` / `member_liquidity_state` | Liquidity coordination |
-| `pool_contributions` / `pool_revenue` / `pool_distributions` | Routing pool management |
-| `settlement_proposals` / `settlement_ready_votes` / `settlement_executions` | BOLT12 settlement |
-| `flow_samples` / `temporal_patterns` | Anticipatory liquidity data |
-| `peer_reputation` | Peer reputation scores |
+| `peer_fee_profiles` | Fee profiles shared by fleet members |
 | `member_health` | Fleet member health tracking |
-| `budget_tracking` / `budget_holds` | Budget enforcement |
+| `peer_reputation` | Peer reputation scores |
+| `flow_samples` | Anticipatory liquidity flow data |
+| `temporal_patterns` | Intra-day flow pattern data |
+| `peer_capabilities` | Peer protocol capabilities |
 | `proto_events` | Processed event IDs for idempotency |
 | `proto_outbox` | Reliable message delivery outbox |
-| `peer_presence` | Peer online/offline tracking |
-| `peer_capabilities` | Peer protocol capabilities |
-| `did_credentials` | DID reputation credentials (issued and received) |
-| `did_reputation_cache` | Cached aggregated reputation scores |
-| `management_credentials` | Management credentials (operator → agent permission) |
-| `management_receipts` | Signed receipts of management action executions |
+
+### Primary RPC Commands (115 total)
+
+**Membership & Admin**:
+`hive-genesis`, `hive-invite`, `hive-join`, `hive-leave`, `hive-members`, `hive-status`, `hive-promote-admin`, `hive-remove-member`, `hive-ban`, `hive-ban-candidates`
+
+**Configuration**:
+`hive-config`, `hive-reload-config`, `hive-reinit-bridge`, `hive-bump-version`
+
+**Fleet Intelligence**:
+`hive-fee-recommendation`, `hive-coord-fee-recommendation`, `hive-fee-profiles`, `hive-fee-intelligence`, `hive-fee-intel-query`, `hive-fee-coordination-status`, `hive-aggregate-fees`, `hive-corridor-assignments`, `hive-egress-desaturation-bias`
+
+**Topology & Planning**:
+`hive-topology`, `hive-expansion-recommendations`, `hive-planner-log`, `hive-planner-ignore`, `hive-planner-unignore`, `hive-intent-status`, `hive-test-intent`
+
+**Liquidity & Rebalancing**:
+`hive-liquidity-needs`, `hive-liquidity-status`, `hive-liquidity-state`, `hive-rebalance-recommendations`, `hive-rebalance-hubs`, `hive-check-rebalance-conflict`
+
+**Health & Monitoring**:
+`hive-health`, `hive-fleet-health`, `hive-member-health`, `hive-connectivity-alerts`, `hive-member-connectivity`, `hive-nnlb-status`, `hive-network-metrics`
+
+**Channel Analysis**:
+`hive-close-recommendations`, `hive-coverage-analysis`, `hive-rationalization-summary`, `hive-rationalization-status`, `hive-valuable-corridors`, `hive-exchange-coverage`
+
+**Peer & Quality**:
+`hive-peer-quality`, `hive-get-peer-quality`, `hive-quality-check`, `hive-peer-reputations`, `hive-reputation-stats`, `hive-contribution`
+
+**Traffic & Flow**:
+`hive-traffic-intelligence`, `hive-report-traffic-profile`, `hive-fleet-demand-forecast`, `hive-velocity-prediction`, `hive-critical-velocity`, `hive-anticipatory-predictions`, `hive-predict-liquidity`
+
+**Positioning**:
+`hive-positioning-recommendations`, `hive-positioning-summary`, `hive-positioning-status`
 
 ## Safety Constraints
 
 These are non-negotiable:
 
-1. **Fail closed**: On invalid input, RPC errors, schema mismatches → do nothing, log
+1. **Fail closed**: On invalid input, RPC errors, schema mismatches -> do nothing, log
 2. **Bound everything**: Message sizes, list sizes, DB growth, caches, loop runtime
-3. **No silent fund actions**: Never move funds unless governance mode explicitly allows
+3. **No silent fund actions**: Never move funds; coordination only
 4. **Identity binding**: Sender peer_id must match claimed pubkey in payload
 5. **DoS protection**: Max 200 remote intents cached, rate limits on all loops
-6. **Hive channels always zero fees**: Channels between hive fleet members MUST have 0 ppm fees (both base and proportional). Never apply static policies to hive channels.
+6. **Hive channels always zero fees**: Channels between fleet members MUST have 0 ppm fees
 
 ## Planner Rules
 
 The Planner proposes topology changes but cannot open channels directly:
 - May log decisions to `hive_planner_log`
-- May create `pending_actions` entries in advisor mode
-- May broadcast INTENT messages when governance mode allows
+- May log recommendations via `RecommendationLogger`
+- May broadcast INTENT messages for conflict-free coordination
 - Max 5 ignores per cycle
 - 20% market share cap per target
 
@@ -186,27 +217,16 @@ The Planner proposes topology changes but cannot open channels directly:
 - Set to 0 to disable feerate checking
 - Uses CLN `feerates` RPC to get current opening feerate
 
-### Cooperative Expansion (Phase 6.4)
-- Fleet-wide election for expansion targets
-- Nomination → Election → Winner opens channel
-- Prevents thundering herd via Intent Lock Protocol
-
-## Optional Integrations
-
-### Sling (Optional for cl-hive)
-Sling rebalancer is optional for cl-hive. cl-revenue-ops handles rebalancing coordination.
-Note: Sling IS required for cl-revenue-ops itself.
-
 ## Development Notes
 
 - Only external dependency: `pyln-client>=24.0`
-- All crypto done via CLN HSM (signmessage/checkmessage) - no crypto libs imported
-- Plugin options defined at top of `cl-hive.py` (30 configurable parameters)
-- Background loops (9): gossip_loop, membership_maintenance_loop, planner_loop, intent_monitor_loop, fee_intelligence_loop, settlement_loop, mcf_optimization_loop, outbox_retry_loop, did_maintenance_loop
+- All crypto done via CLN HSM (signmessage/checkmessage) -- no crypto libs imported
+- Plugin options defined in `modules/plugin_options.py`
+- Background loops defined in `modules/background_loops.py`
 
 ## Testing Conventions
 
-- Test files in `tests/` directory
+- Test files in `tests/` directory (43 test files)
 - Use pytest fixtures for mocking (see `conftest.py`)
 - Mock RPC calls, never hit real network
 - Test categories: unit, integration, feerate, planner, membership
@@ -216,61 +236,44 @@ Note: Sling IS required for cl-revenue-ops itself.
 ```
 cl-hive/
 ├── cl-hive.py              # Main plugin entry point
-├── modules/                # 41 modules
+├── cl-hive.conf.sample     # Production config sample
+├── modules/                # 34 modules
 │   ├── protocol.py         # Message types and encoding
+│   ├── protocol_handlers.py # Message dispatch handlers
 │   ├── handshake.py        # PKI authentication
 │   ├── state_manager.py    # Distributed state (HiveMap)
 │   ├── gossip.py           # Gossip protocol
 │   ├── intent_manager.py   # Intent locks
 │   ├── bridge.py           # cl-revenue-ops bridge (Circuit Breaker)
-│   ├── membership.py       # Member management
+│   ├── membership.py       # Member management (admin/member)
+│   ├── governance.py       # Recommendation logging
 │   ├── contribution.py     # Contribution tracking
 │   ├── planner.py          # Topology planner
-│   ├── cooperative_expansion.py  # Fleet expansion elections
-│   ├── splice_manager.py   # Coordinated splice operations
-│   ├── splice_coordinator.py    # Splice coordination engine
-│   ├── mcf_solver.py       # Min-Cost Max-Flow solver
-│   ├── liquidity_coordinator.py # Liquidity needs aggregation
-│   ├── cost_reduction.py   # Fleet rebalance routing
-│   ├── anticipatory_liquidity.py # Kalman-filtered flow prediction
-│   ├── fee_coordination.py # Pheromone-based fee coordination
+│   ├── fee_coordination.py # Corridor fee coordination
 │   ├── fee_intelligence.py # Fee intelligence sharing
-│   ├── settlement.py       # BOLT12 settlement system
+│   ├── liquidity_coordinator.py # Liquidity needs aggregation
+│   ├── anticipatory_liquidity.py # Flow prediction
 │   ├── routing_intelligence.py  # Routing path intelligence
-│   ├── routing_pool.py     # Routing pool management
-│   ├── budget_manager.py   # Budget tracking and enforcement
-│   ├── idempotency.py      # Message deduplication
-│   ├── outbox.py           # Reliable message delivery
-│   ├── relay.py            # Message relay logic
-│   ├── health_aggregator.py    # Fleet health scoring
+│   ├── traffic_intelligence.py  # Traffic profile sharing
+│   ├── health_aggregator.py # Fleet health scoring
 │   ├── network_metrics.py  # Network metrics collection
 │   ├── peer_reputation.py  # Peer reputation tracking
 │   ├── quality_scorer.py   # Peer quality scoring
 │   ├── channel_rationalization.py # Channel optimization
-│   ├── strategic_positioning.py   # Network positioning
+│   ├── strategic_positioning.py # Network positioning
 │   ├── yield_metrics.py    # Yield tracking
-│   ├── task_manager.py     # Background task coordination
-│   ├── vpn_transport.py    # VPN transport layer
+│   ├── idempotency.py      # Message deduplication
+│   ├── outbox.py           # Reliable message delivery
+│   ├── relay.py            # Message relay logic
+│   ├── log_writer.py       # Structured logging
 │   ├── rpc_commands.py     # RPC command handlers
-│   ├── governance.py       # Decision engine (advisor/failsafe)
-│   ├── did_credentials.py  # DID credential issuance + reputation (Phase 16)
-│   ├── management_schemas.py # Management schemas + danger scoring (Phase 2)
+│   ├── background_loops.py # Background loop definitions
+│   ├── plugin_options.py   # Plugin option registration
+│   ├── phase6_ingest.py    # Injected-packet parsing
 │   ├── config.py           # Configuration
-│   └── database.py         # Database layer (50 tables)
-├── tools/
-│   ├── mcp-hive-server.py  # MCP server for Claude Code integration
-│   ├── hive-monitor.py     # Real-time monitoring daemon
-│   └── ai_advisor.py       # AI advisor utility
-├── config/
-│   ├── nodes.rest.example.json    # REST API config example
-│   └── nodes.docker.example.json  # Docker/Polar config example
-├── tests/                  # 1,918 tests across 48 files
+│   └── database.py         # Database layer (26 tables)
+├── config/                 # Config examples
+├── tests/                  # 43 test files
 ├── docs/                   # Documentation
-│   ├── design/             # Design documents
-│   ├── planning/           # Implementation plans
-│   ├── security/           # Security docs
-│   ├── specs/              # Specifications
-│   └── testing/            # Testing guides & scripts
-├── audits/                 # Security audits
 └── docker/                 # Docker deployment
 ```

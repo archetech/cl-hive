@@ -2,13 +2,6 @@
 
 Production-ready Docker image for cl-hive Lightning nodes with Tor, WireGuard, and full plugin stack.
 
-Phase 6 optional plugin support:
-- Image now includes optional `cl-hive-comms` and `cl-hive-archon` binaries.
-- Both remain disabled by default to preserve current production behavior.
-- Enable with environment flags:
-  - `HIVE_COMMS_ENABLED=true`
-  - `HIVE_ARCHON_ENABLED=true` (requires comms enabled)
-
 ## Features
 
 - **Core Lightning** v25+ with all plugins
@@ -18,16 +11,12 @@ Phase 6 optional plugin support:
 - **cl-revenue-ops** for fee optimization
 - **cl-hive** for fleet coordination
 
-### Required Plugins (Pre-installed)
+### Pre-installed Plugins
 - **CLBOSS** - Automated channel management (ksedgwic fork with clboss-unmanage)
 - **Sling** - Rebalancing engine (required by cl-revenue-ops)
 - **c-lightning-REST** - REST API for RTL web interface
 - **cl-revenue-ops** - Fee optimization and profitability tracking
-- **cl-hive** - Fleet coordination and swarm intelligence
-
-### Optional Plugins (Pre-installed, Disabled by Default)
-- **cl-hive-comms** - Optional Phase 6 comms/policy transport layer
-- **cl-hive-archon** - Optional Phase 6 Archon identity/governance layer
+- **cl-hive** - Fleet coordination and intelligence sharing
 
 ### Production Features
 
@@ -294,37 +283,6 @@ docker-compose exec cln lightning-cli hive-status
 docker-compose exec cln lightning-cli revenue-status
 ```
 
-### Manual Local Install: `cl-hive-archon`
-
-For a running local container, install from your local checkout in `~/bin/cl-hive-archon`:
-
-```bash
-# From cl-hive/docker
-./scripts/manual-install-archon.sh
-```
-
-Custom source path:
-
-```bash
-./scripts/manual-install-archon.sh --source ~/bin/cl-hive-archon
-```
-
-Install dependencies from `requirements.txt` inside container (optional):
-
-```bash
-./scripts/manual-install-archon.sh --install-deps
-```
-
-Persist plugin startup in CLN config:
-
-```bash
-./scripts/manual-install-archon.sh --persist
-```
-
-Notes:
-- This copies files into `/opt/cl-hive-archon` inside the running container.
-- If the container is rebuilt/recreated, rerun this script unless you mount the repo.
-
 ### Backup and Restore
 
 ```bash
@@ -393,11 +351,6 @@ Updates cl-hive and cl-revenue-ops without rebuilding the Docker image. Only wor
 ./scripts/hot-upgrade.sh revenue
 ```
 
-**How it works:**
-- cl-hive is mounted from the host, so `git pull` updates it immediately
-- Restarts lightningd via supervisorctl to load new plugin code
-- No image rebuild required
-
 #### Method 3: Full Rebuild (For Core Lightning or system updates)
 
 Rebuilds the Docker image. Use when upgrading Core Lightning, system packages, or after major changes.
@@ -408,9 +361,6 @@ Rebuilds the Docker image. Use when upgrading Core Lightning, system packages, o
 
 # Perform upgrade (with automatic backup and rollback)
 ./scripts/upgrade.sh
-
-# Upgrade to specific version
-./scripts/upgrade.sh --version v1.2.0
 
 # Manual rollback if needed
 ./scripts/rollback.sh --latest
@@ -426,6 +376,32 @@ docker-compose exec cln /usr/local/bin/pre-stop.sh
 
 # Then stop
 docker-compose stop
+```
+
+## Hive Operations
+
+### Initialize Genesis (First Node)
+
+```bash
+docker-compose exec cln lightning-cli hive-genesis "my-fleet"
+```
+
+### Generate Invite
+
+```bash
+docker-compose exec cln lightning-cli hive-invite 24  # 24 hour validity
+```
+
+### Join Existing Fleet
+
+```bash
+docker-compose exec cln lightning-cli hive-join "HIVE1-INVITE-..."
+```
+
+### Check Members
+
+```bash
+docker-compose exec cln lightning-cli hive-members
 ```
 
 ## Tor Configuration
@@ -476,15 +452,13 @@ Trustedcoin is an alternative Bitcoin backend that can replace the default `bcli
 
 ### When to Use Trustedcoin
 
-- **VPS deployments** without local bitcoind - run a Lightning node without a full Bitcoin node
-- **Lightweight setups** - reduce resource requirements
-- **Redundancy** - hybrid mode provides explorer fallback if bitcoind fails
+- **VPS deployments** without local bitcoind
+- **Lightweight setups** to reduce resource requirements
+- **Redundancy** for explorer fallback if bitcoind fails
 
 ### Operating Modes
 
 #### Explorer-Only Mode (No bitcoind required)
-
-Perfect for VPS deployments where you don't want to run Bitcoin Core:
 
 ```bash
 # .env configuration
@@ -495,11 +469,7 @@ TRUSTEDCOIN_ENABLED=true
 # BITCOIN_RPCPASSWORD=
 ```
 
-In this mode, trustedcoin fetches all blockchain data from public explorers. No bitcoind needed.
-
 #### Hybrid Mode (bitcoind + explorer fallback)
-
-Best reliability for production - uses your bitcoind as primary, falls back to explorers if bitcoind is unavailable:
 
 ```bash
 # .env configuration
@@ -512,10 +482,6 @@ BITCOIN_RPCUSER=your_rpc_username
 BITCOIN_RPCPASSWORD=your_rpc_password
 ```
 
-Hybrid mode gives you the best of both worlds:
-- Primary: Fast, trusted data from your own bitcoind
-- Fallback: Explorer queries if bitcoind goes down
-
 ### Security Considerations
 
 | Mode | Trust Model | Recommendation |
@@ -524,56 +490,9 @@ Hybrid mode gives you the best of both worlds:
 | **Hybrid** | Primarily your bitcoind, explorers as fallback | Good balance of security and reliability |
 | **Explorer-only** | Trust third-party explorers | Convenient but less secure |
 
-**Explorer-only mode security notes:**
-- You're trusting multiple public block explorers to provide accurate data
-- Explorers could theoretically lie about transaction confirmations
-- For high-value nodes, hybrid or bcli mode is recommended
-- Acceptable risk for testing, low-value nodes, or when bitcoind isn't available
-
-### Verify Trustedcoin is Working
-
-```bash
-# Check if trustedcoin is loaded
-docker-compose exec cln lightning-cli plugin list | grep trustedcoin
-
-# Check current block height (should match network)
-docker-compose exec cln lightning-cli getinfo | jq '.blockheight'
-
-# View trustedcoin logs
-docker-compose logs cln | grep -i trustedcoin
-```
-
-## Hive Operations
-
-### Initialize Genesis (First Node)
-
-```bash
-docker-compose exec cln lightning-cli hive-genesis "my-hive-name"
-```
-
-### Generate Invite
-
-```bash
-docker-compose exec cln lightning-cli hive-invite 24  # 24 hour validity
-```
-
-### Join Existing Hive
-
-```bash
-docker-compose exec cln lightning-cli hive-join "HIVE1-INVITE-..."
-```
-
-### Check Members
-
-```bash
-docker-compose exec cln lightning-cli hive-members
-```
-
 ## Monitoring
 
 ### Log Aggregation
-
-For production monitoring, configure Fluent Bit to ship logs to your preferred destination:
 
 ```bash
 # Configure logging
@@ -605,8 +524,6 @@ docker-compose exec cln lightning-cli revenue-status
 
 **Common cause: Missing `rpcallowip` in Bitcoin config**
 
-Docker containers use a bridge network (typically 172.17.0.0/16 or 172.20.0.0/16). Your Bitcoin Core must allow connections from this network:
-
 ```bash
 # Add to your bitcoin.conf
 rpcallowip=172.16.0.0/12  # Covers all Docker networks
@@ -621,8 +538,6 @@ rpcallowip=172.20.0.0/16  # Use the subnet shown
 See [runbooks/bitcoin-rpc-recovery.md](runbooks/bitcoin-rpc-recovery.md) for more details
 
 ### bitcoin-cli Not Found / Build Timeout
-
-If the Docker build fails downloading bitcoin-cli from bitcoincore.org (timeout), or lightningd fails with "bitcoin-cli exec failed":
 
 ```bash
 # Copy bitcoin-cli from your host
@@ -699,7 +614,6 @@ docker/
 │   ├── restore.sh              # Restore from backup
 │   ├── upgrade.sh              # Full image upgrades
 │   ├── hot-upgrade.sh          # Quick plugin updates (no rebuild)
-│   ├── manual-install-archon.sh # Install cl-hive-archon into running local container
 │   ├── rollback.sh             # Rollback to backup
 │   ├── pre-stop.sh             # Graceful shutdown
 │   └── validate-config.sh      # Configuration validation
@@ -733,29 +647,17 @@ docker pull ghcr.io/lightning-goats/cl-hive-node:2.2.1
 # - linux/arm64 (Apple Silicon, Raspberry Pi 4+)
 ```
 
-**Advantages of pre-built images:**
-- No compilation required (faster startup)
-- Tested and verified before release
-- Consistent across all deployments
-- Easy upgrades: `docker-compose pull && docker-compose up -d`
-
 ### Building from Source
-
-For developers or custom modifications:
 
 ```bash
 # Prerequisites: Clone cl-revenue-ops next to cl-hive
 git clone https://github.com/lightning-goats/cl_revenue_ops.git ../cl_revenue_ops
-git clone https://github.com/lightning-goats/cl-hive-archon.git ../cl-hive-archon
 
 # Use the build override
 cp docker-compose.build.yml docker-compose.override.yml
 
 # Build
 docker-compose build
-
-# Or build directly
-docker build -t cl-hive-node:local -f docker/Dockerfile ..
 ```
 
 ### Image Contents
