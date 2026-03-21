@@ -202,16 +202,14 @@ class HiveContext:
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
 
-def check_permission(ctx: HiveContext, required_tier: str) -> Optional[Dict[str, Any]]:
+def check_permission(ctx: HiveContext, required_tier: str = 'member') -> Optional[Dict[str, Any]]:
     """
-    Check if the local node has the required tier for an RPC command.
+    Check if the local node is a hive member.
 
-    Args:
-        ctx: HiveContext with database and our_pubkey
-        required_tier: 'member' (only tier that has special permissions)
+    All members have equal privileges in the single-role model.
 
     Returns:
-        None if permission granted, or error dict if denied
+        None if permission granted, or error dict if denied.
     """
     if not ctx.our_pubkey or not ctx.database:
         return {"error": "Not initialized"}
@@ -219,17 +217,6 @@ def check_permission(ctx: HiveContext, required_tier: str) -> Optional[Dict[str,
     member = ctx.database.get_member(ctx.our_pubkey)
     if not member:
         return {"error": "Not a Hive member", "required_tier": required_tier}
-
-    current_tier = member.get('tier', 'member')
-
-    if required_tier == 'admin':
-        if current_tier != 'admin':
-            return {
-                "error": "permission_denied",
-                "message": "This command requires admin privileges",
-                "current_tier": current_tier,
-                "required_tier": "admin"
-            }
 
     return None  # Permission granted
 
@@ -249,14 +236,12 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
     Get current Hive status and membership info.
 
     Returns:
-        Dict with hive state, member count, governance mode, etc.
+        Dict with hive state and member count.
     """
     if not ctx.database:
         return {"error": "Hive not initialized"}
 
     members = ctx.database.get_all_members()
-    admin_count = len([m for m in members if m['tier'] == 'admin'])
-    member_count = len([m for m in members if m['tier'] == 'member'])
 
     # Get our own membership status (used by cl-revenue-ops to detect hive mode)
     our_membership = {"tier": None, "joined_at": None}
@@ -285,8 +270,6 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
         "membership": our_membership,  # Our own membership for cl-revenue-ops detection
         "members": {
             "total": len(members),
-            "admin": admin_count,
-            "member": member_count,
         },
         "limits": {
             "max_members": ctx.config.max_members if ctx.config else 50,
@@ -321,7 +304,6 @@ def get_config(ctx: HiveContext) -> Dict[str, Any]:
         "membership": {
             "membership_enabled": ctx.config.membership_enabled,
             "auto_join_enabled": ctx.config.auto_join_enabled,
-            "ban_autotrigger_enabled": ctx.config.ban_autotrigger_enabled,
             "member_fee_ppm": ctx.config.member_fee_ppm,
             "max_members": ctx.config.max_members,
         },

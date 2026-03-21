@@ -64,13 +64,13 @@ from modules.protocol import (
     IMPLICIT_ACK_MAP, IMPLICIT_ACK_MATCH_FIELD,
     RELIABLE_MESSAGE_TYPES,
 )
-from modules.handshake import HandshakeManager, Ticket, CHALLENGE_TTL_SECONDS
+from modules.handshake import HandshakeManager, CHALLENGE_TTL_SECONDS
 from modules.state_manager import StateManager, HivePeerState
 from modules.gossip import GossipManager
 from modules.intent_manager import IntentManager, Intent, IntentType
 from modules.bridge import Bridge, BridgeStatus, CircuitOpenError
 from modules.contribution import ContributionManager
-from modules.membership import MembershipManager, MembershipTier
+from modules.membership import MembershipManager, MEMBER_TIER
 from modules.planner import Planner, ChannelSizer
 from modules.quality_scorer import PeerQualityScorer
 from modules.governance import RecommendationLogger
@@ -310,16 +310,9 @@ def _save_fee_tracking_state() -> None:
 
 
 
-def _check_permission(required_tier: str) -> Optional[Dict[str, Any]]:
+def _check_permission() -> Optional[Dict[str, Any]]:
     """
-    Check if the local node has the required tier for an RPC command.
-
-    Permission model:
-    - Admin Only: hive-genesis, hive-invite, hive-ban, hive-set-mode
-    - Any Member: hive-status, hive-members, hive-contribution, hive-topology
-
-    Args:
-        required_tier: 'admin' or 'member' (any member)
+    Check if the local node is a hive member.
 
     Returns:
         None if permission granted, or error dict if denied
@@ -329,19 +322,7 @@ def _check_permission(required_tier: str) -> Optional[Dict[str, Any]]:
 
     member = database.get_member(our_pubkey)
     if not member:
-        return {"error": "Not a Hive member", "required_tier": required_tier}
-
-    current_tier = member.get('tier', 'member')
-
-    if required_tier == 'admin':
-        if current_tier != 'admin':
-            return {
-                "error": "permission_denied",
-                "message": "This command requires admin privileges",
-                "current_tier": current_tier,
-                "required_tier": "admin"
-            }
-    # 'member' tier means any member (including admins) can use the command
+        return {"error": "Not a Hive member"}
 
     return None  # Permission granted
 
@@ -666,7 +647,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             return []
         return [
             m["peer_id"] for m in database.get_all_members()
-            if m.get("tier") in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value)
+            if m.get("tier") == MEMBER_TIER
             and not database.is_banned(m["peer_id"])
         ]
 
@@ -1075,6 +1056,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'membership_mgr': membership_mgr,
         'contribution_mgr': contribution_mgr,
         'outbox_mgr': outbox_mgr,
+        'handshake_mgr': handshake_mgr,
         'planner': planner,
         'fee_intel_mgr': fee_intel_mgr,
         'gossip_mgr': gossip_mgr,
@@ -1589,7 +1571,7 @@ def hive_status(plugin: Plugin):
     Get current Hive status and membership info.
 
     Returns:
-        Dict with hive state, member count, governance mode, etc.
+        Dict with hive state and member count.
     """
     return rpc_status(_get_hive_context())
 @plugin.method("hive-config")
@@ -1638,13 +1620,13 @@ def hive_reinit_bridge(plugin: Plugin):
     Returns:
         Dict with bridge status and details.
 
-    Permission: Admin only
+    Permission: Any member
     """
     return rpc_reinit_bridge(_get_hive_context())
 @plugin.method("hive-members")
 def hive_members(plugin: Plugin):
     """
-    List all Hive members with their tier and stats.
+    List all Hive members with their stats.
 
     Returns:
         List of member records with tier, contribution ratio, uptime, etc.
@@ -2358,8 +2340,8 @@ def hive_test_intent(plugin: Plugin, target: str, intent_type: str = "channel_op
     Example:
         lightning-cli hive-test-intent 02abc123...
     """
-    # Permission check: Admin only (test commands)
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -2427,10 +2409,10 @@ def hive_fee_profiles(plugin: Plugin, peer_id: str = None):
     Returns:
         Dict with fee profile(s) and aggregation stats.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -2474,10 +2456,10 @@ def hive_fee_recommendation(plugin: Plugin, peer_id: str, channel_size: int = 0)
     Returns:
         Dict with recommended fee and reasoning.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -2514,10 +2496,10 @@ def hive_fee_intelligence(plugin: Plugin, max_age_hours: int = 24, peer_id: str 
     Returns:
         Dict with fee intelligence reports.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -2547,10 +2529,10 @@ def hive_aggregate_fees(plugin: Plugin):
     Returns:
         Dict with aggregation results.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -2728,10 +2710,10 @@ def hive_trigger_fee_broadcast(plugin: Plugin):
     Returns:
         Dict with broadcast results.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -2756,10 +2738,10 @@ def hive_trigger_health_report(plugin: Plugin):
     Returns:
         Dict with health report results.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -2797,10 +2779,10 @@ def hive_trigger_all(plugin: Plugin):
     Returns:
         Dict with all operation results.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -2849,10 +2831,10 @@ def hive_nnlb_status(plugin: Plugin):
     Returns:
         Dict with NNLB statistics and member health tiers.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -3020,10 +3002,10 @@ def hive_calculate_health(plugin: Plugin):
     Returns:
         Dict with our health assessment.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -3084,10 +3066,10 @@ def hive_routing_stats(plugin: Plugin):
     Returns:
         Dict with routing intelligence statistics.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -3119,10 +3101,10 @@ def hive_route_suggest(plugin: Plugin, destination: str, amount_sats: int = 1000
     Returns:
         Dict with route suggestions.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -3161,10 +3143,10 @@ def hive_peer_reputations(plugin: Plugin, peer_id: str = None):
     Returns:
         Dict with peer reputation data.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -3217,10 +3199,10 @@ def hive_reputation_stats(plugin: Plugin):
     Returns:
         Dict with reputation statistics.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -3244,10 +3226,10 @@ def hive_liquidity_needs(plugin: Plugin, peer_id: str = None):
     Returns:
         Dict with liquidity needs.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -3275,10 +3257,10 @@ def hive_liquidity_status(plugin: Plugin):
     Returns:
         Dict with liquidity coordination status.
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -3308,10 +3290,10 @@ def hive_liquidity_state(plugin: Plugin, action: str = "status"):
     Returns for "needs":
         List of fleet liquidity needs with relevance scores
 
-    Permission: Member or Admin
+    Permission: Any member
     """
-    # Permission check: Member or Admin
-    perm_error = _check_permission('member')
+    # Permission check: member
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -3554,7 +3536,7 @@ def hive_gossip_stats(plugin: Plugin):
 @plugin.method("hive-ban")
 def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     """
-    Propose a ban for a peer.
+    Ban a peer from the hive.
 
     Args:
         peer_id: Public key of the peer to ban
@@ -3563,10 +3545,9 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     Returns:
         Dict with ban status.
 
-    Permission: Admin only
+    Permission: Any member
     """
-    # Permission check: Admin only
-    perm_error = _check_permission('member')
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -3581,10 +3562,6 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     member = database.get_member(peer_id)
     if not member:
         return {"error": "peer_not_member", "peer_id": peer_id}
-
-    # Cannot direct-ban admins; use hive-propose-ban + vote instead
-    if member.get("tier") == MembershipTier.ADMIN.value:
-        return {"error": "cannot_ban_admin", "message": "Admins require proposal/vote via hive-propose-ban", "peer_id": peer_id}
 
     # Sign the ban reason
     now = int(time.time())
@@ -3608,8 +3585,9 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     if not success:
         return {"error": "Failed to add ban", "peer_id": peer_id}
 
-    # R5-M-9 fix: Remove member from roster after successful ban
+    # Remove member from roster after successful ban
     database.remove_member(peer_id)
+    database.log_membership_event("banned", peer_id, actor_peer_id=our_pubkey, reason=reason)
 
     plugin.log(f"cl-hive: Banned peer {peer_id[:16]}... reason: {reason}")
 
@@ -3621,38 +3599,6 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
         "expires_days": expires_days,
     }
 
-
-@plugin.method("hive-promote-admin")
-def hive_promote_admin(plugin: Plugin, peer_id: str):
-    """
-    Promote a member to admin tier.
-
-    Only admins can promote other members to admin.
-
-    Args:
-        peer_id: The member to promote
-
-    Permission: Admin only
-    """
-    perm = _check_permission('admin')
-    if perm:
-        return perm
-
-    if not membership_mgr:
-        return {"error": "Hive not initialized"}
-
-    member = database.get_member(peer_id)
-    if not member:
-        return {"error": "peer_not_member", "peer_id": peer_id}
-
-    if member.get("tier") == MembershipTier.ADMIN.value:
-        return {"error": "already_admin", "peer_id": peer_id}
-
-    success = membership_mgr.set_tier(peer_id, MembershipTier.ADMIN.value)
-    if not success:
-        return {"error": "promotion_failed"}
-
-    return {"success": True, "peer_id": peer_id, "new_tier": "admin"}
 
 
 @plugin.method("hive-leave")
@@ -3682,11 +3628,9 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
     if not member:
         return {"error": "not_a_member", "message": "You are not a member of any hive"}
 
-    our_tier = member.get("tier")
-
     # Check if we're the last member
     all_members = database.get_all_members()
-    member_count = sum(1 for m in all_members if m.get("tier") in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value))
+    member_count = len(all_members)
     if member_count <= 1:
         return {
             "error": "cannot_leave",
@@ -3720,12 +3664,12 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
 
     # Remove ourselves from the member list
     database.remove_member(our_pubkey)
-    plugin.log(f"cl-hive: Left the hive ({our_tier}): {reason}")
+    database.log_membership_event("left", our_pubkey, reason=reason)
+    plugin.log(f"cl-hive: Left the hive: {reason}")
 
     return {
         "status": "left",
         "peer_id": our_pubkey,
-        "former_tier": our_tier,
         "reason": reason,
         "message": "You have left the hive. Fee policies reverted to dynamic."
     }
@@ -3734,7 +3678,7 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
 @plugin.method("hive-remove-member")
 def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance", force: bool = False):
     """
-    Remove a member from the hive (admin maintenance).
+    Remove a member from the hive (fleet maintenance).
 
     Use this to clean up stale/orphaned member entries, such as when a node's
     database was reset and needs to rejoin fresh.
@@ -3753,7 +3697,7 @@ def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"
         return {"error": "Hive not initialized"}
 
     # Permission check: must be a member
-    perm_error = _check_permission('member')
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
@@ -3813,19 +3757,19 @@ def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"
 
     # Full removal: DB, state manager, bridge policy, and broadcast
     protocol_handlers._execute_member_removal(peer_id, reason)
+    database.log_membership_event("removed", peer_id, actor_peer_id=our_pubkey, reason=reason)
 
     plugin.log(
-        f"cl-hive: Removed member {peer_id[:16]}... ({target_tier})"
+        f"cl-hive: Removed member {peer_id[:16]}..."
         f"{' [FORCED]' if force and active_channel_states else ''}: {reason}"
     )
 
     return {
         "status": "removed",
         "peer_id": peer_id,
-        "former_tier": target_tier,
         "reason": reason,
         "forced": bool(force and active_channel_states),
-        "message": f"Member removed. They can rejoin with a new invite ticket."
+        "message": f"Member removed. They can rejoin by sending HELLO and awaiting approval."
     }
 @plugin.method("hive-contribution")
 def hive_contribution(plugin: Plugin, peer_id: str = None):
@@ -4363,15 +4307,15 @@ def hive_record_routing_outcome(
 @plugin.method("hive-ban-candidates")
 def hive_ban_candidates(plugin: Plugin, auto_propose: bool = False):
     """
-    Get peers that should be considered for ban proposals.
+    Get peers that should be considered for banning.
 
     Uses accumulated warnings from local threat detection and peer reputation
-    reports from other hive members to identify malicious actors.
+    reports from other hive members to identify problematic peers.
 
-    Permission: Member only
+    Permission: Any member
 
     Args:
-        auto_propose: If True, automatically create ban proposals for severe cases
+        auto_propose: Reserved for future use
 
     Returns:
         Dict with ban candidates and their severity scores.
@@ -4593,16 +4537,16 @@ def hive_positioning_status(plugin: Plugin):
 @plugin.method("hive-genesis")
 def hive_genesis(plugin: Plugin, hive_id: str = None):
     """
-    Initialize this node as the Genesis (Admin) node of a new Hive.
+    Initialize this node as the founding Member of a new Hive.
 
-    This creates the first member record with member privileges and
-    generates a self-signed genesis ticket.
+    This creates the first member record. Other nodes join by opening
+    a channel and awaiting approval via hive-approve.
 
     Args:
         hive_id: Optional custom Hive identifier (auto-generated if not provided)
 
     Returns:
-        Dict with genesis status and member ticket
+        Dict with genesis status
     """
     if not database or not plugin or not handshake_mgr:
         return {"error": "Hive not initialized"}
@@ -4620,105 +4564,99 @@ def hive_genesis(plugin: Plugin, hive_id: str = None):
         return {"error": f"Genesis failed: {e}"}
 
 
-@plugin.method("hive-invite")
-def hive_invite(plugin: Plugin, valid_hours: int = 24, requirements: int = 0,
-                tier: str = 'member'):
+@plugin.method("hive-approve")
+def hive_approve(plugin: Plugin, peer_id: str):
     """
-    Generate an invitation ticket for a new member.
+    Approve a pending join request.
 
-    Any member can generate invite tickets. New members join as 'member' tier.
+    After a peer sends HELLO and is stored as pending, any member can
+    approve them. This generates a challenge and sends it to the peer
+    to complete the handshake.
 
     Args:
-        valid_hours: Hours until ticket expires (default: 24)
-        requirements: Bitmask of required features (default: 0 = none)
-        tier: Starting tier - 'member' (default)
+        peer_id: Public key of the peer to approve
 
     Returns:
-        Dict with base64-encoded ticket
-
-    Permission: Any member
+        Dict with approval status
     """
-    # Permission check: Any member
-    perm_error = _check_permission('member')
+    perm_error = _check_permission()
+    if perm_error:
+        return perm_error
+
+    if not handshake_mgr or not database:
+        return {"error": "Hive not initialized"}
+
+    # Pop the pending request
+    request = handshake_mgr.pop_pending_request(peer_id)
+    if not request:
+        return {"error": "no_pending_request", "peer_id": peer_id,
+                "message": "No pending join request from this peer"}
+
+    # Check if already a member
+    if database.get_member(peer_id):
+        return {"error": "already_member", "peer_id": peer_id}
+
+    # Check if banned
+    if database.is_banned(peer_id):
+        return {"error": "peer_banned", "peer_id": peer_id}
+
+    # Generate challenge and send it
+    nonce = handshake_mgr.generate_challenge(peer_id, requirements=0, initial_tier='member')
+
+    # Get Hive ID from metadata
+    members = database.get_all_members()
+    hive_id = "hive"
+    for m in members:
+        if m.get('metadata'):
+            try:
+                metadata = json.loads(m['metadata'])
+                hive_id = metadata.get('hive_id', 'hive')
+                break
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    from modules.protocol import create_challenge
+    challenge_msg = create_challenge(nonce, hive_id)
+
+    try:
+        plugin.rpc.call("sendcustommsg", {
+            "node_id": peer_id,
+            "msg": challenge_msg.hex()
+        })
+    except Exception as e:
+        return {"error": f"Failed to send CHALLENGE: {e}"}
+
+    database.log_membership_event("approved", peer_id, actor_peer_id=our_pubkey)
+    plugin.log(f"cl-hive: Approved {peer_id[:16]}..., CHALLENGE sent")
+
+    return {
+        "status": "challenge_sent",
+        "peer_id": peer_id,
+        "message": "CHALLENGE sent. Peer will complete attestation automatically."
+    }
+
+
+@plugin.method("hive-pending")
+def hive_pending(plugin: Plugin):
+    """
+    List pending join requests awaiting approval.
+
+    Returns:
+        Dict with list of pending requests
+    """
+    perm_error = _check_permission()
     if perm_error:
         return perm_error
 
     if not handshake_mgr:
         return {"error": "Hive not initialized"}
 
-    # Validate tier (admin/member system)
-    if tier not in ('admin', 'member'):
-        return {"error": f"Invalid tier: {tier}. Use 'member' (default) or 'admin'"}
-
-    try:
-        ticket = handshake_mgr.generate_invite_ticket(valid_hours, requirements, tier)
-        bootstrap_note = " (BOOTSTRAP - grants full member tier)" if tier == 'member' else ""
-        return {
-            "status": "ticket_generated",
-            "ticket": ticket,
-            "valid_hours": valid_hours,
-            "initial_tier": tier,
-            "instructions": f"Share this ticket with the candidate.{bootstrap_note} They should use 'hive-join <ticket>' to request membership."
-        }
-    except PermissionError as e:
-        return {"error": str(e)}
-    except ValueError as e:
-        return {"error": str(e)}
-    except Exception as e:
-        return {"error": f"Failed to generate ticket: {e}"}
-
-
-@plugin.method("hive-join")
-def hive_join(plugin: Plugin, ticket: str, peer_id: str = None):
-    """
-    Request to join a Hive using an invitation ticket.
-    
-    This initiates the handshake protocol by sending a HELLO message
-    to a known Hive member.
-    
-    Args:
-        ticket: Base64-encoded invitation ticket
-        peer_id: Node ID of a known Hive member (optional, extracted from ticket if not provided)
-    
-    Returns:
-        Dict with join request status
-    """
-    if not handshake_mgr :
-        return {"error": "Hive not initialized"}
-    
-    # Decode ticket to get admin pubkey if peer_id not provided
-    try:
-        ticket_obj = Ticket.from_base64(ticket)
-        if not peer_id:
-            peer_id = ticket_obj.admin_pubkey
-    except Exception as e:
-        return {"error": f"Invalid ticket format: {e}"}
-    
-    # Check if ticket is expired
-    if ticket_obj.is_expired():
-        return {"error": "Ticket has expired"}
-    
-    # Send HELLO message with our pubkey (for identity binding)
-    from modules.protocol import create_hello
-    our_pubkey = handshake_mgr.get_our_pubkey()
-    hello_msg = create_hello(our_pubkey)
-    if hello_msg is None:
-        return {"error": "HELLO message too large to serialize"}
-
-    try:
-        plugin.rpc.call("sendcustommsg", {
-            "node_id": peer_id,
-            "msg": hello_msg.hex()
-        })
-        
-        return {
-            "status": "join_requested",
-            "target_peer": peer_id[:16] + "...",
-            "hive_id": ticket_obj.hive_id,
-            "message": "HELLO sent. Awaiting CHALLENGE from Hive member."
-        }
-    except Exception as e:
-        return {"error": f"Failed to send HELLO: {e}"}
+    requests = handshake_mgr.get_pending_requests()
+    return {
+        "status": "ok",
+        "pending_count": len(requests),
+        "pending": requests,
+    }
 
 
 # =============================================================================
