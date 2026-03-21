@@ -104,7 +104,7 @@ docker run --rm -v cl-hive_lightning-data:/data ubuntu:24.04 \
 # The plugin will recreate on next start
 # You'll need to rejoin the hive
 docker-compose up -d
-docker-compose exec cln lightning-cli hive-join "YOUR_INVITE_CODE"
+# After restart, have an existing member run: hive-approve <your-pubkey>
 ```
 
 ### Scenario 3: cl-revenue-ops Database Corrupted

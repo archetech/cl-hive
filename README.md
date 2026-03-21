@@ -39,16 +39,22 @@ For Docker deployment, see [docker/README.md](docker/README.md).
 lightning-cli hive-genesis "my-fleet"
 ```
 
-### Invite a Member
+### Add a Member
+
+A new node joins by opening a channel to any existing member:
 
 ```bash
-lightning-cli hive-invite 24   # 24 hour validity
+# On the new node: open a channel to a fleet member
+lightning-cli connect <member-pubkey>@<host>:<port>
+lightning-cli fundchannel <member-pubkey> 1000000
 ```
 
-### Join an Existing Fleet
+cl-hive sends a HELLO automatically. An existing member approves:
 
 ```bash
-lightning-cli hive-join "HIVE1-INVITE-..."
+# On any existing member's node:
+lightning-cli hive-pending
+lightning-cli hive-approve <new-node-pubkey>
 ```
 
 See [docs/JOINING_THE_HIVE.md](docs/JOINING_THE_HIVE.md) for the full joining guide.
@@ -73,8 +79,7 @@ See [docs/JOINING_THE_HIVE.md](docs/JOINING_THE_HIVE.md) for the full joining gu
 
 ### Coordination (consensus across fleet)
 
-- Membership management (admin adds/removes members)
-- Ban proposals with distributed voting
+- Membership management (any member can approve/remove/ban)
 - Intent Lock protocol for conflict-free channel opens
 - Gossip-based state synchronization with anti-entropy
 
@@ -85,8 +90,8 @@ See [docs/JOINING_THE_HIVE.md](docs/JOINING_THE_HIVE.md) for the full joining gu
 | `hive-status` | Current membership, fleet size, and health |
 | `hive-members` | Fleet roster and member state |
 | `hive-genesis` | Initialize a new fleet as the first member |
-| `hive-invite` | Create an invite ticket for a new member |
-| `hive-join <ticket>` | Join an existing fleet |
+| `hive-approve <pubkey>` | Approve a pending join request |
+| `hive-pending` | List pending join requests |
 | `hive-topology` | View planner output and underserved targets |
 | `hive-fee-recommendation` | Get coordinated fee recommendation for a channel |
 | `hive-fleet-health` | Fleet-wide health summary |

@@ -386,16 +386,14 @@ docker-compose stop
 docker-compose exec cln lightning-cli hive-genesis "my-fleet"
 ```
 
-### Generate Invite
+### Add a Member
+
+A new node joins by opening a channel to any existing member, then an existing member approves:
 
 ```bash
-docker-compose exec cln lightning-cli hive-invite 24  # 24 hour validity
-```
-
-### Join Existing Fleet
-
-```bash
-docker-compose exec cln lightning-cli hive-join "HIVE1-INVITE-..."
+# On any existing member's node:
+docker-compose exec cln lightning-cli hive-pending
+docker-compose exec cln lightning-cli hive-approve <new-node-pubkey>
 ```
 
 ### Check Members
@@ -433,7 +431,7 @@ WireGuard VPN allows secure connection to your bitcoind backend.
 
 ### Setup
 
-1. Get VPN credentials from your administrator
+1. Get VPN credentials from the fleet operator
 2. Run `./setup.sh` and follow WireGuard prompts
 3. Or configure manually in `.env`:
 

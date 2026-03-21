@@ -40,7 +40,7 @@ Core Lightning
 Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl-revenue-ops)
 ```
 
-1. **Membership**: Admin adds members; handshake authenticates via CLN signmessage/checkmessage
+1. **Membership**: Peer opens channel + sends HELLO; existing member approves via `hive-approve`; handshake authenticates via CLN signmessage/checkmessage
 2. **State Sync**: Gossip protocol shares capacity, fees, health, and liquidity across the fleet
 3. **Observations**: Each node collects fee intelligence, traffic profiles, flow patterns, peer quality
 4. **Recommendations**: Planner generates topology, fee, rebalancing, and positioning recommendations
@@ -57,7 +57,7 @@ Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl
 | `gossip.py` | Threshold-based gossip (10% capacity change) with heartbeat |
 | `intent_manager.py` | Intent Lock protocol -- Announce-Wait-Commit with tie-breaker |
 | `bridge.py` | Circuit Breaker pattern for cl-revenue-ops integration |
-| `membership.py` | Two-tier system: Admin and Member |
+| `membership.py` | Single-role membership (all members equal) |
 | `governance.py` | Recommendation logging (no modes, no budget gating) |
 | `contribution.py` | Forwarding stats and anti-leech detection |
 | `planner.py` | Topology optimization -- saturation analysis, expansion targeting |
@@ -83,7 +83,7 @@ Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl
 | `plugin_options.py` | Plugin option registration and rate limiting |
 | `phase6_ingest.py` | Injected-packet parsing helpers |
 | `config.py` | Hot-reloadable configuration with snapshot pattern |
-| `database.py` | SQLite with WAL mode, thread-local connections, 26 tables |
+| `database.py` | SQLite with WAL mode, thread-local connections, 21 tables |
 
 ### Key Patterns
 
@@ -123,28 +123,23 @@ Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl
 | Loop | Purpose |
 |------|---------|
 | `gossip_loop` | Heartbeat broadcast and state sync |
-| `membership_maintenance_loop` | Ban enforcement, admin promotion checks |
+| `membership_maintenance_loop` | Pending request expiry, contribution tracking |
 | `planner_loop` | Topology analysis and expansion recommendations |
 | `fee_intelligence_loop` | Fee observation broadcast and aggregation |
 | `intent_monitor_loop` | Intent lock expiry and cleanup |
 | `outbox_retry_loop` | Reliable message delivery retries |
 
-### Database Tables (26)
+### Database Tables (21)
 
 | Table | Purpose |
 |-------|---------|
-| `hive_members` | Member roster with tiers (admin/member) |
+| `hive_members` | Member roster (single "member" tier) |
 | `hive_state` | Key-value store for persistent state |
 | `intent_locks` | Active intent locks for conflict resolution |
 | `contribution_ledger` | Forwarding contribution tracking |
 | `contribution_rate_limits` | Rate limiting for contribution updates |
 | `contribution_daily_stats` | Daily contribution aggregates |
-| `promotion_requests` | Promotion request tracking |
-| `promotion_vouches` | Promotion vouch records |
-| `admin_promotions` | Admin-initiated promotion records |
-| `admin_promotion_approvals` | Admin promotion approval tracking |
-| `ban_proposals` | Distributed ban proposals |
-| `ban_votes` | Ban vote records |
+| `membership_audit_log` | Membership event audit trail (join/leave/ban/approve) |
 | `hive_bans` | Active bans |
 | `local_fee_tracking` | Local fee change tracking |
 | `peer_presence` | Peer online/offline tracking |
@@ -162,8 +157,8 @@ Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl
 
 ### Primary RPC Commands (115 total)
 
-**Membership & Admin**:
-`hive-genesis`, `hive-invite`, `hive-join`, `hive-leave`, `hive-members`, `hive-status`, `hive-promote-admin`, `hive-remove-member`, `hive-ban`, `hive-ban-candidates`
+**Membership**:
+`hive-genesis`, `hive-approve`, `hive-pending`, `hive-leave`, `hive-members`, `hive-status`, `hive-remove-member`, `hive-ban`, `hive-ban-candidates`
 
 **Configuration**:
 `hive-config`, `hive-reload-config`, `hive-reinit-bridge`, `hive-bump-version`
@@ -245,7 +240,7 @@ cl-hive/
 │   ├── gossip.py           # Gossip protocol
 │   ├── intent_manager.py   # Intent locks
 │   ├── bridge.py           # cl-revenue-ops bridge (Circuit Breaker)
-│   ├── membership.py       # Member management (admin/member)
+│   ├── membership.py       # Single-role membership management
 │   ├── governance.py       # Recommendation logging
 │   ├── contribution.py     # Contribution tracking
 │   ├── planner.py          # Topology planner

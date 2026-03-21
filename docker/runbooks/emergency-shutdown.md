@@ -76,7 +76,7 @@ sudo kill -KILL <pid>
 
 ## Contact Points
 
-- **Hive Admin**: [Configure in your deployment]
+- **Fleet Operator**: [Configure in your deployment]
 - **Node Operator**: [Your contact]
 - **Emergency Channel**: [Slack/Discord/etc]
 
