@@ -684,10 +684,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     
     if bridge_status == BridgeStatus.DEGRADED:
         plugin.log("cl-hive: Bridge DEGRADED - some features unavailable", level='warn')
-    else:
+    elif bridge_status == BridgeStatus.DISABLED:
         plugin.log(
             "cl-hive: Bridge DISABLED - cl-revenue-ops not detected or incompatible. "
-            "Hive policy integration will be unavailable. Recommended: v1.4.0+",
+            "Recommended: v1.4.0+",
             level='warn'
         )
 
