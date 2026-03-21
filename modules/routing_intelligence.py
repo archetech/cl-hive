@@ -832,7 +832,12 @@ class HiveRoutingMap:
         Rebuild path statistics from database probes.
 
         Used on startup or after clearing in-memory data.
+        Route probe storage was removed during trusted-fleet simplification;
+        this method is now a safe no-op until probes arrive via protocol.
         """
+        if not hasattr(self.database, "get_all_route_probes"):
+            return
+
         probes = self.database.get_all_route_probes(max_age_hours=PROBE_STALENESS_HOURS)
 
         for probe in probes:
