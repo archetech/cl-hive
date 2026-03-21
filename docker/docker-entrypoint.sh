@@ -17,7 +17,6 @@ set -e
 #   ANNOUNCE_ADDR        - Public address to announce (required for clearnet/hybrid)
 #   WIREGUARD_ENABLED    - Enable WireGuard (default: false)
 #   WIREGUARD_CONFIG     - Path to WireGuard config (default: /etc/wireguard/wg0.conf)
-#   CLBOSS_ENABLED       - Enable CLBOSS (default: true, optional - hive works without it)
 #   DUAL_FUND_ENABLED    - Enable dual-funded channels (default: true)
 #   FUNDER_POLICY        - Funder policy: match, fixed, available (default: match)
 #   FUNDER_POLICY_MOD    - Funder policy modifier percentage (default: 100)
@@ -215,11 +214,6 @@ if [ "${DUAL_FUND_ENABLED:-true}" = "true" ]; then
         echo "funder-per-channel-max=${FUNDER_PER_CHANNEL_MAX}" >> "$CONFIG_FILE"
     fi
     echo "Dual-funding enabled (policy: ${FUNDER_POLICY:-match}, mod: ${FUNDER_POLICY_MOD:-100})"
-fi
-
-# Disable CLBOSS if requested
-if [ "${CLBOSS_ENABLED:-true}" != "true" ]; then
-    echo "disable-plugin=clboss" >> "$CONFIG_FILE"
 fi
 
 # SECURITY: Restrict config file permissions (contains RPC password)
@@ -495,18 +489,6 @@ fi
 
 echo "Verifying required plugins..."
 
-# CLBOSS is optional - can be disabled via CLBOSS_ENABLED=false
-CLBOSS_ENABLED="${CLBOSS_ENABLED:-true}"
-if [ "$CLBOSS_ENABLED" = "true" ]; then
-    if [ -x /usr/local/bin/clboss ]; then
-        echo "CLBOSS: installed (enabled)"
-    else
-        echo "WARNING: CLBOSS not found but enabled - some features may not work"
-    fi
-else
-    echo "CLBOSS: disabled"
-fi
-
 # Sling is required for rebalancing (used by cl-revenue-ops)
 if [ -x /usr/local/bin/sling ]; then
     echo "Sling: installed"
@@ -691,11 +673,6 @@ if [ -n "$ANNOUNCE_ADDR" ]; then
 fi
 echo ""
 echo "Required Plugins:"
-if [ "$CLBOSS_ENABLED" = "true" ]; then
-    echo "  CLBOSS:       enabled"
-else
-    echo "  CLBOSS:       disabled"
-fi
 echo "  Sling:        installed"
 echo "  cl-hive:      installed"
 echo "  cl-revenue-ops: installed"

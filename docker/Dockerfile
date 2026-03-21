@@ -125,32 +125,6 @@ RUN pip install --no-cache-dir \
     requests
 
 # =============================================================================
-# CLBOSS (REQUIRED - ksedgwic fork with clboss-unmanage support)
-# =============================================================================
-# CLBOSS provides automated channel management and liquidity optimization.
-# Required for cl-hive fleet coordination.
-
-WORKDIR /tmp
-
-RUN apt-get update && apt-get install -y \
-    libev-dev \
-    libcurl4-openssl-dev \
-    autoconf-archive \
-    libunwind-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Build CLBOSS from ksedgwic fork (has clboss-unmanage support)
-RUN git clone --depth 1 https://github.com/ksedgwic/clboss.git \
-    && cd clboss \
-    && mkdir -p m4 \
-    && autoreconf -fi \
-    && ./configure \
-    && make -j$(nproc) \
-    && make install \
-    && cd .. \
-    && rm -rf clboss
-
-# =============================================================================
 # VITALITY PLUGIN (REQUIRED)
 # =============================================================================
 # Vitality monitors channel health, gossip health, and pings Amboss for online status.
@@ -256,7 +230,6 @@ RUN ln -sf /opt/cl-hive/cl-hive.py /home/lightning/.lightning/plugins/cl-hive.py
     && ln -sf /opt/cl-hive/modules /home/lightning/.lightning/plugins/modules \
     && ln -sf /opt/cl-revenue-ops/cl-revenue-ops.py /home/lightning/.lightning/plugins/cl-revenue-ops.py \
     && ln -sf /opt/cl-revenue-ops/modules /home/lightning/.lightning/plugins/revenue-modules \
-    && ln -sf /usr/local/bin/clboss /home/lightning/.lightning/plugins/clboss \
     && ln -sf /usr/local/bin/vitality /home/lightning/.lightning/plugins/vitality \
     && ln -sf /usr/local/bin/sling /home/lightning/.lightning/plugins/sling
 

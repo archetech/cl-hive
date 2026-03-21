@@ -83,9 +83,6 @@ services:
       - WG_DNS=${WG_DNS:-}
       - WG_PEER_KEEPALIVE=${WG_PEER_KEEPALIVE:-25}
 
-      # CLBOSS (optional - set to false to disable)
-      - CLBOSS_ENABLED=${CLBOSS_ENABLED:-true}
-
       # Boltz Client (submarine/reverse swaps - disabled by default)
       - BOLTZ_ENABLED=${BOLTZ_ENABLED:-false}
       # cl-revenue-ops Boltz integration defaults (used when BOLTZ_ENABLED=true)

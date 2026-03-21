@@ -12,7 +12,6 @@ Production-ready Docker image for cl-hive Lightning nodes with Tor, WireGuard, a
 - **cl-hive** for fleet coordination
 
 ### Pre-installed Plugins
-- **CLBOSS** - Automated channel management (ksedgwic fork with clboss-unmanage)
 - **Sling** - Rebalancing engine (required by cl-revenue-ops)
 - **c-lightning-REST** - REST API for RTL web interface
 - **cl-revenue-ops** - Fee optimization and profitability tracking
@@ -619,7 +618,6 @@ docker-compose build
 |-----------|---------|----------|
 | Ubuntu | 24.04 | Yes |
 | Core Lightning | v25.12.1 | Yes |
-| CLBOSS | latest (ksedgwic fork) | Yes |
 | Sling | v4.1.3 | Yes |
 | c-lightning-REST | v0.10.7 | Yes |
 | cl-revenue-ops | latest (from GitHub) | Yes |

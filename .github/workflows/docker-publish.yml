@@ -149,7 +149,6 @@ jobs:
           docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest test -f /opt/cl-hive/cl-hive.py
           docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest test -f /opt/cl-revenue-ops/cl-revenue-ops.py
           docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest test -f /usr/local/bin/sling
-          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest which clboss
 
           echo "Image verification passed"
 
