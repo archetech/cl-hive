@@ -1,5 +1,5 @@
 """
-Tests for Ticket S-01: Critical Security Hardening
+Tests for Critical Security Hardening
 
 Tests security fixes from audit remediation:
 - P3-01: Remote intent cache bounds (MAX_REMOTE_INTENTS=200)
@@ -71,8 +71,7 @@ def intent_manager(mock_database, mock_plugin):
 def contribution_manager(mock_database, mock_plugin):
     """Create a ContributionManager with mocked dependencies."""
     mock_rpc = MagicMock()
-    mock_config = MagicMock()
-    mock_config.ban_autotrigger_enabled = False
+    mock_config = MagicMock(spec=[])
     return ContributionManager(mock_rpc, mock_database, mock_plugin, mock_config)
 
 

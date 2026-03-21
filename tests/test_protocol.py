@@ -5,7 +5,7 @@ Tests:
 1. Magic Byte Verification - Non-HIVE messages are ignored
 2. Round Trip - Serialize -> Deserialize preserves data
 3. Message Types - All MVP message types are handled
-4. Ticket Expiry - Expired tickets are rejected
+4. Serialization round-trip tests
 
 Run with: pytest tests/test_protocol.py -v
 """
@@ -34,10 +34,8 @@ from modules.protocol import (
 )
 
 from modules.handshake import (
-    Ticket,
     Manifest,
     Requirements,
-    DEFAULT_TICKET_HOURS,
     NONCE_SIZE
 )
 
@@ -89,13 +87,13 @@ class TestSerialization:
     
     def test_hello_round_trip(self):
         """HELLO message should survive serialize -> deserialize."""
-        original_payload = {"ticket": "base64encodedticket", "protocol_version": 1}
-        
+        original_payload = {"pubkey": "02abcdef1234", "protocol_version": 1}
+
         data = serialize(HiveMessageType.HELLO, original_payload)
         msg_type, payload = deserialize(data)
-        
+
         assert msg_type == HiveMessageType.HELLO
-        assert payload['ticket'] == original_payload['ticket']
+        assert payload['pubkey'] == original_payload['pubkey']
         assert payload['protocol_version'] == original_payload['protocol_version']
     
     def test_challenge_round_trip(self):
@@ -234,89 +232,6 @@ class TestMessageHelpers:
         assert msg_type == HiveMessageType.WELCOME
         assert payload['tier'] == "member"
         assert payload['member_count'] == 10
-
-
-# =============================================================================
-# TICKET TESTS
-# =============================================================================
-
-class TestTicket:
-    """Test ticket structure and expiry."""
-    
-    def test_ticket_to_json_excludes_signature(self):
-        """Ticket JSON for signing should not include signature."""
-        ticket = Ticket(
-            admin_pubkey="02" + "a" * 64,
-            hive_id="hive_test",
-            requirements=0,
-            issued_at=1000,
-            expires_at=2000,
-            signature="should_not_appear"
-        )
-        
-        ticket_json = ticket.to_json()
-        parsed = json.loads(ticket_json)
-        
-        assert 'signature' not in parsed
-        assert parsed['admin_pubkey'] == ticket.admin_pubkey
-    
-    def test_ticket_base64_round_trip(self):
-        """Ticket should survive base64 encode -> decode."""
-        original = Ticket(
-            admin_pubkey="02" + "b" * 64,
-            hive_id="hive_roundtrip",
-            requirements=Requirements.SPLICE | Requirements.DUAL_FUND,
-            issued_at=int(time.time()),
-            expires_at=int(time.time()) + 3600,
-            signature="test_signature"
-        )
-        
-        encoded = original.to_base64()
-        decoded = Ticket.from_base64(encoded)
-        
-        assert decoded.admin_pubkey == original.admin_pubkey
-        assert decoded.hive_id == original.hive_id
-        assert decoded.requirements == original.requirements
-        assert decoded.signature == original.signature
-    
-    def test_ticket_not_expired(self):
-        """Fresh ticket should not be expired."""
-        ticket = Ticket(
-            admin_pubkey="02" + "c" * 64,
-            hive_id="hive_fresh",
-            requirements=0,
-            issued_at=int(time.time()),
-            expires_at=int(time.time()) + 3600,  # 1 hour from now
-            signature="sig"
-        )
-        
-        assert ticket.is_expired() is False
-    
-    def test_ticket_expired(self):
-        """Old ticket should be expired."""
-        ticket = Ticket(
-            admin_pubkey="02" + "d" * 64,
-            hive_id="hive_old",
-            requirements=0,
-            issued_at=1000,
-            expires_at=2000,  # Way in the past
-            signature="sig"
-        )
-        
-        assert ticket.is_expired() is True
-    
-    def test_ticket_just_expired(self):
-        """Ticket that just expired should be detected."""
-        ticket = Ticket(
-            admin_pubkey="02" + "e" * 64,
-            hive_id="hive_edge",
-            requirements=0,
-            issued_at=int(time.time()) - 10,
-            expires_at=int(time.time()) - 1,  # Expired 1 second ago
-            signature="sig"
-        )
-        
-        assert ticket.is_expired() is True
 
 
 # =============================================================================

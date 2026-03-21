@@ -1,11 +1,10 @@
 """
-Tests for Phase 6: Planner Module (Ticket 6-01)
+Tests for Phase 6: Planner Module
 
 Tests the Planner class for:
 - Network cache refresh and directional dedup
 - Saturation calculation with gossip clamping
 - Guard mechanism with max ignores/cycle limit
-- Governance mode behavior
 - Fail-closed on RPC errors
 
 Author: Lightning Goats Team
@@ -595,7 +594,7 @@ class TestSaturationRelease:
 
 
 # =============================================================================
-# EXPANSION LOGIC TESTS (Ticket 6-02)
+# EXPANSION LOGIC TESTS
 # =============================================================================
 
 class TestUnderservedTargets:

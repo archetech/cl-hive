@@ -2,8 +2,7 @@
 Tests for cl-hive bug fixes (Phase B/C hardening).
 
 Tests for:
-1. contribution.py: ban_autotrigger else branch correctness
-2. intent_manager.py: None pubkey guard in tie-breaker and create_intent
+1. intent_manager.py: None pubkey guard in tie-breaker and create_intent
 3. gossip.py: per-string length validation in gossip payloads
 4. gossip.py: FULL_SYNC per-peer rate limiting
 5. liquidity_coordinator.py: consistent composite dict keying
@@ -30,7 +29,7 @@ from modules.gossip import (
 )
 from modules.state_manager import HivePeerState
 from modules.config import HiveConfig
-from modules.contribution import ContributionManager, LEECH_WINDOW_DAYS
+
 
 
 # =============================================================================
@@ -66,55 +65,8 @@ def mock_state_manager():
 
 
 # =============================================================================
-# FIX 1: contribution.py — ban_autotrigger else branch
 # =============================================================================
-
-class TestBanAutotriggerFix:
-    """Fix 1: ban_autotrigger_enabled=False should NOT set ban_triggered=True."""
-
-    def _make_manager(self, mock_plugin, mock_db, autotrigger_enabled):
-        config = MagicMock()
-        config.ban_autotrigger_enabled = autotrigger_enabled
-        mgr = ContributionManager(rpc=MagicMock(), db=mock_db, plugin=mock_plugin, config=config)
-        return mgr
-
-    def test_autotrigger_disabled_sets_false(self, mock_plugin, mock_db):
-        """When autotrigger is disabled, ban_triggered should be False."""
-        mock_db.get_contribution_stats.return_value = {"forwarded": 10, "received": 100}
-        # Ratio = 10/100 = 0.1 < LEECH_BAN_RATIO (0.4) -> leech
-        mock_db.get_leech_flag.return_value = {
-            "low_since_ts": int(time.time()) - (LEECH_WINDOW_DAYS * 86400) - 1,
-            "ban_triggered": False,
-        }
-
-        mgr = self._make_manager(mock_plugin, mock_db, autotrigger_enabled=False)
-        result = mgr.check_leech_status("02" + "a" * 64)
-
-        assert result["is_leech"] is True
-        # The critical check: set_leech_flag must be called with ban_triggered=False
-        mock_db.set_leech_flag.assert_called_once()
-        call_args = mock_db.set_leech_flag.call_args
-        assert call_args[0][2] is False, "ban_triggered should be False when autotrigger disabled"
-
-    def test_autotrigger_enabled_sets_true(self, mock_plugin, mock_db):
-        """When autotrigger is enabled, ban_triggered should be True."""
-        mock_db.get_contribution_stats.return_value = {"forwarded": 10, "received": 100}
-        mock_db.get_leech_flag.return_value = {
-            "low_since_ts": int(time.time()) - (LEECH_WINDOW_DAYS * 86400) - 1,
-            "ban_triggered": False,
-        }
-
-        mgr = self._make_manager(mock_plugin, mock_db, autotrigger_enabled=True)
-        result = mgr.check_leech_status("02" + "a" * 64)
-
-        assert result["is_leech"] is True
-        mock_db.set_leech_flag.assert_called_once()
-        call_args = mock_db.set_leech_flag.call_args
-        assert call_args[0][2] is True, "ban_triggered should be True when autotrigger enabled"
-
-
-# =============================================================================
-# FIX 2: intent_manager.py — None pubkey guard
+# FIX 1: intent_manager.py — None pubkey guard
 # =============================================================================
 
 class TestNonePubkeyGuard:

@@ -1,5 +1,5 @@
 """
-Simulation & Game Theory Tests for the Planner (Ticket 6-05)
+Simulation & Game Theory Tests for the Planner
 
 Tests multi-node scenarios and edge cases:
 1. The Stalemate: Two nodes propose the same target simultaneously

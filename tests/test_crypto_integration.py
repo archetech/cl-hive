@@ -6,7 +6,7 @@ using checkmessage. This is critical for the Hive PKI authentication.
 
 Test Coverage:
 - Cross-node signature verification
-- Full ticket verification flow (Genesis → Invite → Join)
+- Full handshake verification flow (Genesis → HELLO → Approve → Join)
 - Manifest/nonce challenge-response protocol
 
 Requirements:
@@ -27,7 +27,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.handshake import (
-    HandshakeManager, Ticket, Manifest, Requirements,
+    HandshakeManager, Manifest, Requirements,
     NONCE_SIZE, CHALLENGE_TTL_SECONDS
 )
 
@@ -179,14 +179,13 @@ class MockDatabase:
         self._members = {}
 
     def add_member(self, peer_id: str, tier: str = 'member',
-                   joined_at: int = None, promoted_at: int = None) -> bool:
+                   joined_at: int = None) -> bool:
         if peer_id in self._members:
             return False
         self._members[peer_id] = {
             'peer_id': peer_id,
             'tier': tier,
             'joined_at': joined_at or int(time.time()),
-            'promoted_at': promoted_at,
             'metadata': '{}'
         }
         return True
@@ -337,9 +336,9 @@ class TestCrossNodeSignatureVerification:
         assert verify_result['verified'] is False
 
     def test_json_message_signature(self, node_a_rpc, node_b_rpc, node_a_pubkey):
-        """Test signing and verifying JSON-structured messages (like tickets)."""
-        ticket_data = {
-            "admin_pubkey": node_a_pubkey,
+        """Test signing and verifying JSON-structured messages."""
+        message_data = {
+            "member_pubkey": node_a_pubkey,
             "hive_id": "test_hive",
             "requirements": 0,
             "issued_at": int(time.time()),
@@ -347,7 +346,7 @@ class TestCrossNodeSignatureVerification:
         }
 
         # Serialize consistently (important for signature verification)
-        message = json.dumps(ticket_data, sort_keys=True, separators=(',', ':'))
+        message = json.dumps(message_data, sort_keys=True, separators=(',', ':'))
 
         # Node A signs
         sig_result = node_a_rpc.signmessage(message)
@@ -357,87 +356,6 @@ class TestCrossNodeSignatureVerification:
         verify_result = node_b_rpc.checkmessage(message, signature, node_a_pubkey)
 
         assert verify_result['verified'] is True
-
-
-# =============================================================================
-# TICKET VERIFICATION FLOW TESTS
-# =============================================================================
-
-class TestTicketVerificationFlow:
-    """Test the full Genesis → Invite → Join ticket flow."""
-
-    def test_genesis_creates_valid_ticket(self, node_a_handshake, node_a_pubkey):
-        """Genesis should create a self-signed, verifiable ticket."""
-        result = node_a_handshake.genesis(hive_id="test_hive")
-
-        assert result['status'] == 'genesis_complete'
-        assert result['hive_id'] == 'test_hive'
-        assert result['admin_pubkey'] == node_a_pubkey
-
-        # Verify the genesis ticket
-        is_valid, ticket, error = node_a_handshake.verify_ticket(result['genesis_ticket'])
-        assert is_valid is True
-        assert ticket.admin_pubkey == node_a_pubkey
-        assert ticket.hive_id == 'test_hive'
-
-    def test_admin_can_generate_invite_ticket(self, node_a_handshake):
-        """Admin should be able to generate invite tickets."""
-        # First, become admin via genesis
-        node_a_handshake.genesis(hive_id="test_hive")
-
-        # Generate invite ticket
-        invite_b64 = node_a_handshake.generate_invite_ticket(valid_hours=24)
-
-        # Verify the invite ticket
-        is_valid, ticket, error = node_a_handshake.verify_ticket(invite_b64)
-        assert is_valid is True
-        assert ticket.hive_id == 'test_hive'
-
-    def test_node_b_can_verify_node_a_ticket(self, node_a_handshake, node_b_handshake,
-                                              node_a_pubkey, node_b_db):
-        """Node B should be able to verify a ticket issued by Node A."""
-        # Node A creates Hive and generates invite
-        node_a_handshake.genesis(hive_id="cross_node_hive")
-        invite_b64 = node_a_handshake.generate_invite_ticket(valid_hours=24)
-
-        # Node B needs to know Node A is a member (simulating gossip/sync)
-        node_b_db.add_member(node_a_pubkey, tier='member')
-
-        # Node B verifies the ticket
-        is_valid, ticket, error = node_b_handshake.verify_ticket(invite_b64)
-
-        assert is_valid is True, f"Verification failed: {error}"
-        assert ticket.admin_pubkey == node_a_pubkey
-        assert ticket.hive_id == 'cross_node_hive'
-
-    def test_expired_ticket_rejected(self, node_a_handshake, node_b_handshake,
-                                      node_a_pubkey, node_b_db):
-        """Expired tickets should be rejected."""
-        # Node A creates Hive
-        node_a_handshake.genesis(hive_id="expiry_test")
-
-        # Generate a ticket that expires in -1 hours (already expired)
-        # We need to manually create an expired ticket
-        ticket_data = {
-            "admin_pubkey": node_a_pubkey,
-            "hive_id": "expiry_test",
-            "requirements": Requirements.NONE,
-            "issued_at": int(time.time()) - 7200,  # 2 hours ago
-            "expires_at": int(time.time()) - 3600,  # 1 hour ago (expired)
-        }
-
-        ticket_json = json.dumps(ticket_data, sort_keys=True, separators=(',', ':'))
-        sig_result = node_a_handshake.rpc.signmessage(ticket_json)
-
-        expired_ticket = Ticket(**ticket_data, signature=sig_result['signature'])
-        invite_b64 = expired_ticket.to_base64()
-
-        # Node B tries to verify
-        node_b_db.add_member(node_a_pubkey, tier='member')
-        is_valid, ticket, error = node_b_handshake.verify_ticket(invite_b64)
-
-        assert is_valid is False
-        assert "expired" in error.lower()
 
 
 # =============================================================================
@@ -504,16 +422,11 @@ class TestChallengeResponseProtocol:
                                            node_a_pubkey, node_b_pubkey,
                                            node_a_db, node_b_db):
         """Test the complete challenge-response flow between two nodes."""
-        # Setup: Node A is admin of a Hive
+        # Setup: Node A is founding member of a Hive
         node_a_handshake.genesis(hive_id="challenge_test")
-        invite_b64 = node_a_handshake.generate_invite_ticket()
 
-        # Node B presents ticket (HELLO)
-        # Node B would decode the ticket and present it
-        ticket = Ticket.from_base64(invite_b64)
-
-        # Node A creates challenge (CHALLENGE)
-        nonce = node_a_handshake.generate_challenge(node_b_pubkey, ticket.requirements)
+        # Node A creates challenge (CHALLENGE) after approving Node B
+        nonce = node_a_handshake.generate_challenge(node_b_pubkey, Requirements.NONE)
 
         # Node B creates manifest (ATTEST)
         manifest_data = node_b_handshake.create_manifest(nonce)

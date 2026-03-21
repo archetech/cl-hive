@@ -3,7 +3,7 @@ Tests for GitHub Issues #59 and #60: Member Stats and Addresses
 
 Issue #59: contribution_ratio and uptime_pct are 0.0 for all members;
            last_seen stuck at join time.
-Issue #60: A promoted member has null addresses.
+Issue #60: A member has null addresses.
 
 Tests verify:
 1. members() returns live contribution_ratio from ledger

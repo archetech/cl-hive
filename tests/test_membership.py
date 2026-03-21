@@ -1,5 +1,5 @@
 """
-Tests for membership module: admin/member model.
+Tests for membership module: single-role member model.
 """
 
 import time
@@ -9,7 +9,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.membership import MembershipManager, MembershipTier
+from modules.membership import MembershipManager, MEMBER_TIER
 from modules.contribution import ContributionManager, LEECH_WINDOW_DAYS
 
 
@@ -19,14 +19,12 @@ class DummyState:
 
 
 class DummyConfig:
-    ban_autotrigger_enabled = False
+    pass
 
 
-def test_membership_tier_values():
-    """Verify MembershipTier enum has only ADMIN and MEMBER."""
-    assert MembershipTier.ADMIN.value == "admin"
-    assert MembershipTier.MEMBER.value == "member"
-    assert len(MembershipTier) == 2
+def test_member_tier_constant():
+    """MEMBER_TIER should be 'member'."""
+    assert MEMBER_TIER == "member"
 
 
 def test_uptime_thresholds():
@@ -126,18 +124,16 @@ def test_is_member():
     assert mgr.is_member("xyz") is False
 
 
-def test_is_admin():
+def test_add_member_always_uses_member_tier():
+    """add_member should always store MEMBER_TIER regardless of input."""
     db = MagicMock()
-    contribution_mgr = MagicMock()
-    state_manager = MagicMock()
+    db.add_member.return_value = True
     config = DummyConfig()
-    mgr = MembershipManager(db, state_manager, contribution_mgr, None, config)
+    mgr = MembershipManager(db, MagicMock(), MagicMock(), None, config)
 
-    db.get_member.return_value = {"peer_id": "abc", "tier": "admin"}
-    assert mgr.is_admin("abc") is True
-
-    db.get_member.return_value = {"peer_id": "abc", "tier": "member"}
-    assert mgr.is_admin("abc") is False
+    mgr.add_member("peer123")
+    call_args = db.add_member.call_args
+    assert call_args[1]["tier"] == MEMBER_TIER
 
 
 def test_get_active_members():
@@ -149,7 +145,7 @@ def test_get_active_members():
 
     now = int(time.time())
     db.get_all_members.return_value = [
-        {"peer_id": "a", "tier": "admin", "last_seen": now - 100},
+        {"peer_id": "a", "tier": "member", "last_seen": now - 100},
         {"peer_id": "b", "tier": "member", "last_seen": now - 100},
         {"peer_id": "c", "tier": "member", "last_seen": now - 100000},  # stale
     ]
@@ -174,10 +170,15 @@ def test_sync_bridge_policies():
     mgr = MembershipManager(db, state_manager, contribution_mgr, bridge, config)
 
     db.get_all_members.return_value = [
-        {"peer_id": "a", "tier": "admin"},
+        {"peer_id": "a", "tier": "member"},
         {"peer_id": "b", "tier": "member"},
     ]
 
     synced = mgr.sync_bridge_policies()
     assert synced == 2
     assert bridge.set_hive_policy.call_count == 2
+
+
+if __name__ == "__main__":
+    import pytest
+    pytest.main([__file__, "-v"])
