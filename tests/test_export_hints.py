@@ -23,6 +23,7 @@ from modules.rpc_commands import (
     _derive_corridor_roles,
     _derive_competition_bias,
     _derive_rebalance_preferences,
+    _derive_channel_open_hints,
 )
 
 
@@ -398,6 +399,204 @@ class TestFieldRanges:
         for hint in result["hints"].values():
             if "traffic_confidence" in hint:
                 assert 0.0 <= hint["traffic_confidence"] <= 1.0
+
+
+# =============================================================================
+# CHANNEL-OPEN HINT DERIVATION
+# =============================================================================
+
+@dataclass
+class _MockUnderservedResult:
+    target: str
+    public_capacity_sats: int = 500_000_000
+    hive_share_pct: float = 0.02
+    score: float = 2.0
+    quality_score: float = 0.7
+    quality_confidence: float = 0.6
+    quality_recommendation: str = "good"
+
+
+@dataclass
+class _MockExpansionRec:
+    target: str
+    recommendation_type: str = "open_channel"
+    score: float = 1.5
+    reasoning: str = "underserved"
+    details: dict = None
+    hive_coverage_pct: float = 0.20
+    hive_members_count: int = 1
+    network_channels: int = 40
+    is_bottleneck: bool = False
+    competition_level: str = "low"
+
+    def __post_init__(self):
+        if self.details is None:
+            self.details = {}
+
+
+@dataclass
+class _MockSizeResult:
+    recommended_size_sats: int = 5_000_000
+    factors: dict = None
+    reasoning: str = "default"
+
+    def __post_init__(self):
+        if self.factors is None:
+            self.factors = {}
+
+
+def _make_planner_ctx(underserved=None, expansion_rec=None, size_result=None):
+    """Create context with planner mocks for channel-open hint tests."""
+    planner = MagicMock()
+    config = MagicMock()
+    cfg_snapshot = MagicMock()
+    cfg_snapshot.planner_min_channel_sats = 1_000_000
+    cfg_snapshot.planner_default_channel_sats = 5_000_000
+    cfg_snapshot.planner_max_channel_sats = 50_000_000
+    cfg_snapshot.market_share_cap_pct = 0.20
+    config.snapshot.return_value = cfg_snapshot
+
+    if underserved is None:
+        underserved = [_MockUnderservedResult(target=PEER_C)]
+    planner.get_underserved_targets.return_value = underserved
+
+    if expansion_rec is None:
+        expansion_rec = _MockExpansionRec(target=PEER_C)
+    planner.get_expansion_recommendation.return_value = expansion_rec
+
+    sizer = MagicMock()
+    if size_result is None:
+        size_result = _MockSizeResult()
+    sizer.calculate_size.return_value = size_result
+    planner.channel_sizer = sizer
+
+    return _make_ctx(planner=planner, config=config)
+
+
+class TestChannelOpenHintDerivation:
+    """Test _derive_channel_open_hints helper."""
+
+    def test_open_preference_for_underserved(self):
+        ctx = _make_planner_ctx()
+        hints = _derive_channel_open_hints(ctx)
+        assert PEER_C in hints
+        assert hints[PEER_C]["open_preference"] == "open"
+
+    def test_avoid_when_well_covered(self):
+        rec = _MockExpansionRec(
+            target=PEER_C,
+            recommendation_type="no_action",
+            hive_coverage_pct=0.60,
+        )
+        ctx = _make_planner_ctx(expansion_rec=rec)
+        hints = _derive_channel_open_hints(ctx)
+        assert hints[PEER_C]["open_preference"] == "avoid"
+
+    def test_neutral_when_no_planner(self):
+        ctx = _make_ctx(planner=None)
+        hints = _derive_channel_open_hints(ctx)
+        assert hints == {}
+
+    def test_topology_confidence_range(self):
+        ctx = _make_planner_ctx()
+        hints = _derive_channel_open_hints(ctx)
+        conf = hints[PEER_C]["topology_confidence"]
+        assert 0.0 <= conf <= 1.0
+
+    def test_reason_underserved_corridor(self):
+        ur = _MockUnderservedResult(target=PEER_C, hive_share_pct=0.01)
+        ctx = _make_planner_ctx(underserved=[ur])
+        hints = _derive_channel_open_hints(ctx)
+        assert hints[PEER_C]["reason"] == "underserved_corridor"
+
+    def test_reason_improve_coverage_for_bottleneck(self):
+        rec = _MockExpansionRec(target=PEER_C, is_bottleneck=True)
+        ctx = _make_planner_ctx(expansion_rec=rec)
+        hints = _derive_channel_open_hints(ctx)
+        assert hints[PEER_C]["reason"] == "improve_coverage"
+
+    def test_reason_reduce_overlap(self):
+        rec = _MockExpansionRec(
+            target=PEER_C,
+            recommendation_type="no_action",
+            hive_coverage_pct=0.60,
+        )
+        ctx = _make_planner_ctx(expansion_rec=rec)
+        hints = _derive_channel_open_hints(ctx)
+        assert hints[PEER_C]["reason"] == "reduce_overlap"
+
+    def test_reason_member_connectivity(self):
+        rec = _MockExpansionRec(target=PEER_C, hive_members_count=0)
+        ur = _MockUnderservedResult(target=PEER_C, hive_share_pct=0.04)
+        ctx = _make_planner_ctx(underserved=[ur], expansion_rec=rec)
+        hints = _derive_channel_open_hints(ctx)
+        assert hints[PEER_C]["reason"] == "member_connectivity"
+
+    def test_size_bucket_small(self):
+        size = _MockSizeResult(recommended_size_sats=1_500_000)
+        ctx = _make_planner_ctx(size_result=size)
+        hints = _derive_channel_open_hints(ctx)
+        assert hints[PEER_C]["suggested_size_bucket"] == "small"
+
+    def test_size_bucket_medium(self):
+        size = _MockSizeResult(recommended_size_sats=10_000_000)
+        ctx = _make_planner_ctx(size_result=size)
+        hints = _derive_channel_open_hints(ctx)
+        assert hints[PEER_C]["suggested_size_bucket"] == "medium"
+
+    def test_size_bucket_large(self):
+        size = _MockSizeResult(recommended_size_sats=40_000_000)
+        ctx = _make_planner_ctx(size_result=size)
+        hints = _derive_channel_open_hints(ctx)
+        assert hints[PEER_C]["suggested_size_bucket"] == "large"
+
+    def test_low_confidence_downgrades_to_neutral(self):
+        ur = _MockUnderservedResult(
+            target=PEER_C, score=0.1, quality_confidence=0.05,
+        )
+        ctx = _make_planner_ctx(underserved=[ur])
+        hints = _derive_channel_open_hints(ctx)
+        assert hints[PEER_C]["open_preference"] == "neutral"
+
+
+class TestChannelOpenHintInExport:
+    """Test channel_open_hint integration in export_hints response."""
+
+    def test_channel_open_hint_included(self):
+        ctx = _make_planner_ctx()
+        result = export_hints(ctx)
+        # PEER_C should appear in hints with channel_open_hint
+        assert PEER_C in result["hints"]
+        assert "channel_open_hint" in result["hints"][PEER_C]
+        ch = result["hints"][PEER_C]["channel_open_hint"]
+        assert ch["open_preference"] in ("open", "neutral", "avoid")
+
+    def test_channel_open_hint_omitted_when_no_topology_data(self):
+        ctx = _make_ctx()  # No planner
+        result = export_hints(ctx)
+        for hint in result["hints"].values():
+            assert "channel_open_hint" not in hint
+
+    def test_channel_open_hint_field_enums(self):
+        ctx = _make_planner_ctx()
+        result = export_hints(ctx)
+        for hint in result["hints"].values():
+            if "channel_open_hint" in hint:
+                ch = hint["channel_open_hint"]
+                assert ch["open_preference"] in ("open", "neutral", "avoid")
+                assert ch["suggested_size_bucket"] in ("small", "medium", "large")
+                assert ch["reason"] in (
+                    "underserved_corridor", "improve_coverage",
+                    "reduce_overlap", "member_connectivity", "none",
+                )
+                assert 0.0 <= ch["topology_confidence"] <= 1.0
+
+    def test_no_side_effects_with_channel_hints(self):
+        ctx = _make_planner_ctx()
+        export_hints(ctx)
+        # Planner should only be called for reads
+        ctx.database.add_member.assert_not_called()
+        ctx.database.remove_member.assert_not_called()
 
 
 if __name__ == "__main__":

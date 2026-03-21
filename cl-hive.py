@@ -1451,34 +1451,6 @@ def hive_connect(plugin: Plugin, peer_id: str):
     return rpc.connect(peer_id)
 
 
-@plugin.method("hive-open-channel")
-def hive_open_channel(plugin: Plugin, peer_id: str, amount_sats: int, feerate: str = "normal", announce: bool = True, request_amt: int = 0):
-    """Open a channel via plugin (native RPC).
-
-    When *request_amt* > 0, dual-fund (v2) is attempted if the peer supports it.
-    """
-    rpc, err = _require_rpc(plugin)
-    if err:
-        return err
-    if not peer_id:
-        return {"error": "peer_id is required"}
-    if not amount_sats or amount_sats < 20000:
-        return {"error": "amount_sats must be at least 20,000"}
-    try:
-        rpc.connect(peer_id)
-    except Exception:
-        pass
-    from modules.rpc_commands import _open_channel
-    return _open_channel(
-        rpc=rpc,
-        target=peer_id,
-        amount_sats=amount_sats,
-        feerate=feerate,
-        announce=announce,
-        request_amt=request_amt,
-        log_fn=lambda msg, lvl="info": plugin.log(msg, level=lvl),
-    )
-
 
 @plugin.method("hive-close-channel")
 def hive_close_channel(plugin: Plugin, peer_id: str = None, channel_id: str = None, unilateraltimeout: int = None):

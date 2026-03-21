@@ -16,160 +16,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 
-_DUAL_FUND_BIT_EVEN = 1 << 28
-_DUAL_FUND_BIT_ODD = 1 << 29
-
-
-def _peer_supports_dual_fund(rpc, peer_id: str, log_fn=None) -> bool:
-    """Check if a peer advertises option_dual_fund (feature bits 28/29)."""
-    try:
-        res = rpc.call("listpeers", {"id": peer_id})
-        peers = res.get("peers") or []
-        if not peers:
-            return False
-        features_hex = peers[0].get("features")
-        if not features_hex:
-            return False
-        features = int(features_hex, 16)
-        supported = bool(features & (_DUAL_FUND_BIT_EVEN | _DUAL_FUND_BIT_ODD))
-        if log_fn and supported:
-            log_fn(f"cl-hive: Peer {peer_id[:16]}... supports dual-fund (v2)", "info")
-        return supported
-    except Exception:
-        return False
-
-
-def _open_channel(rpc, target: str, amount_sats: int,
-                  feerate: str = "normal", announce: bool = True,
-                  request_amt: int = 0,
-                  log_fn=None) -> Dict[str, Any]:
-    """Open a channel using fundchannel.
-
-    When *request_amt* > 0 and the peer advertises ``option_dual_fund``,
-    the amount is passed as ``request_amt`` to ``fundchannel`` so the
-    remote funder plugin can contribute liquidity.  If the dual-funded
-    attempt fails, we retry without ``request_amt`` (graceful fallback).
-    """
-    if log_fn:
-        log_fn(f"cl-hive: Opening channel to {target[:16]}... for {amount_sats:,} sats", "info")
-
-    params = {
-        "id": target,
-        "amount": amount_sats,
-        "feerate": feerate,
-        "announce": announce,
-    }
-
-    dual_funded = False
-    if request_amt > 0 and _peer_supports_dual_fund(rpc, target, log_fn=log_fn):
-        params["request_amt"] = request_amt
-        dual_funded = True
-
-    try:
-        result = rpc.call("fundchannel", dict(params))
-    except Exception:
-        if dual_funded:
-            # Graceful fallback: retry without request_amt
-            if log_fn:
-                log_fn("cl-hive: Dual-fund attempt failed, retrying without request_amt", "info")
-            fallback_params = {k: v for k, v in params.items() if k != "request_amt"}
-            dual_funded = False
-            result = rpc.call("fundchannel", fallback_params)
-        else:
-            raise
-
-    return {
-        "channel_id": result.get("channel_id", "unknown"),
-        "txid": result.get("txid", "unknown"),
-        "dual_funded": dual_funded,
-    }
-
-
-def _batch_open_channels(
-    rpc,
-    targets: List[Dict[str, Any]],
-    feerate: str = "normal",
-    announce: bool = True,
-    log_fn=None,
-) -> Dict[str, Any]:
-    """Batch-open multiple channels in a single on-chain transaction.
-
-    Note: ``multifundchannel`` negotiates v2 transparently but does not
-    support per-destination ``request_amt``.  Use single ``_open_channel``
-    calls when dual-fund contributions are needed.
-    """
-    if log_fn:
-        log_fn(
-            f"cl-hive: Batch opening {len(targets)} channels via multifundchannel",
-            "info",
-        )
-
-    destinations = [{"id": t["id"], "amount": t["amount"]} for t in targets]
-    raw = rpc.call("multifundchannel", {
-        "destinations": destinations,
-        "feerate": feerate,
-        "announce": announce,
-        "minchannels": 1,  # Allow partial success
-    })
-
-    txid = raw.get("txid", "unknown")
-    raw_failed = raw.get("failed") or []
-    failed = []
-    failed_ids = set()
-    for entry in raw_failed:
-        peer_id = entry.get("id") or entry.get("peer_id")
-        if peer_id:
-            failed_ids.add(peer_id)
-        failed.append({
-            "id": peer_id,
-            "error": entry.get("error") or entry.get("message") or "multifundchannel failed",
-        })
-
-    results_by_id: Dict[str, Dict[str, Any]] = {}
-
-    # Some CLN variants may include detailed per-channel success entries.
-    for ch in raw.get("channels") or []:
-        peer_id = ch.get("id") or ch.get("peer_id")
-        if not peer_id:
-            continue
-        results_by_id[peer_id] = {
-            "status": "opened",
-            "channel_id": ch.get("channel_id", "unknown"),
-            "txid": ch.get("txid", txid),
-        }
-
-    channel_ids = raw.get("channel_ids") or []
-    success_targets = [t for t in targets if t["id"] not in failed_ids]
-    unmapped_success_targets = [t for t in success_targets if t["id"] not in results_by_id]
-
-    for target, channel_id in zip(unmapped_success_targets, channel_ids):
-        results_by_id[target["id"]] = {
-            "status": "opened",
-            "channel_id": channel_id,
-            "txid": txid,
-        }
-
-    for target in unmapped_success_targets[len(channel_ids):]:
-        results_by_id[target["id"]] = {
-            "status": "opened",
-            "channel_id": "unknown",
-            "txid": txid,
-        }
-
-    for item in failed:
-        if item.get("id"):
-            results_by_id[item["id"]] = {
-                "status": "failed",
-                "error": item["error"],
-            }
-
-    return {
-        "channel_ids": channel_ids,
-        "failed": failed,
-        "txid": txid,
-        "results_by_id": results_by_id,
-    }
-
 
 @dataclass
 class HiveContext:
@@ -2063,6 +1909,104 @@ def _derive_rebalance_preferences(ctx: HiveContext) -> Dict[str, str]:
     return prefs
 
 
+def _derive_channel_open_hints(ctx: HiveContext) -> Dict[str, Dict[str, Any]]:
+    """Derive per-peer channel-opening advisory hints from planner topology.
+
+    Returns dict mapping peer_id -> channel_open_hint dict with:
+        open_preference: "open" | "neutral" | "avoid"
+        topology_confidence: 0.0 to 1.0
+        suggested_size_bucket: "small" | "medium" | "large"
+        reason: "underserved_corridor" | "improve_coverage" | "reduce_overlap" |
+                "member_connectivity" | "none"
+    """
+    hints: Dict[str, Dict[str, Any]] = {}
+    if not ctx.planner or not ctx.config:
+        return hints
+
+    try:
+        cfg = ctx.config.snapshot()
+        underserved = ctx.planner.get_underserved_targets(cfg)
+    except Exception:
+        return hints
+
+    # Size bucket boundaries from config
+    min_sats = getattr(cfg, "planner_min_channel_sats", 1_000_000)
+    default_sats = getattr(cfg, "planner_default_channel_sats", 5_000_000)
+    max_sats = getattr(cfg, "planner_max_channel_sats", 50_000_000)
+    # Thresholds: small < low_thresh, medium < high_thresh, large >= high_thresh
+    low_thresh = min_sats + (default_sats - min_sats) // 2
+    high_thresh = default_sats + (max_sats - default_sats) // 2
+
+    for ur in underserved:
+        try:
+            rec = ctx.planner.get_expansion_recommendation(ur.target, cfg)
+        except Exception:
+            continue
+
+        # open_preference
+        if rec.recommendation_type == "open_channel":
+            open_pref = "open"
+        elif rec.hive_coverage_pct >= 0.50:
+            open_pref = "avoid"
+        else:
+            open_pref = "neutral"
+
+        # topology_confidence: blend quality confidence + data availability
+        data_confidence = min(1.0, ur.score / 3.0) if ur.score > 0 else 0.0
+        topology_confidence = round(
+            0.5 * ur.quality_confidence + 0.5 * data_confidence, 2
+        )
+
+        # reason
+        if rec.is_bottleneck:
+            reason = "improve_coverage"
+        elif rec.hive_coverage_pct >= 0.50:
+            reason = "reduce_overlap"
+        elif ur.hive_share_pct < 0.03:
+            reason = "underserved_corridor"
+        elif rec.hive_members_count == 0:
+            reason = "member_connectivity"
+        else:
+            reason = "none"
+
+        # suggested_size_bucket from recommended size
+        try:
+            size_result = ctx.planner.channel_sizer.calculate_size(
+                target=ur.target,
+                target_capacity_sats=ur.public_capacity_sats,
+                target_channel_count=rec.network_channels,
+                hive_share_pct=ur.hive_share_pct,
+                target_share_cap=getattr(cfg, "market_share_cap_pct", 0.20),
+                onchain_balance_sats=0,  # Unknown at hint time
+                min_channel_sats=min_sats,
+                max_channel_sats=max_sats,
+                default_channel_sats=default_sats,
+            )
+            size_sats = size_result.recommended_size_sats
+        except Exception:
+            size_sats = default_sats
+
+        if size_sats < low_thresh:
+            size_bucket = "small"
+        elif size_sats >= high_thresh:
+            size_bucket = "large"
+        else:
+            size_bucket = "medium"
+
+        # Downgrade to neutral if confidence is very low
+        if topology_confidence < 0.15 and open_pref == "open":
+            open_pref = "neutral"
+
+        hints[ur.target] = {
+            "open_preference": open_pref,
+            "topology_confidence": topology_confidence,
+            "suggested_size_bucket": size_bucket,
+            "reason": reason,
+        }
+
+    return hints
+
+
 def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dict[str, Any]:
     """
     Export compact short-lived per-peer hints for trusted local consumers.
@@ -2088,12 +2032,14 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
     corridor_roles = _derive_corridor_roles(ctx)
     competition_biases = _derive_competition_bias(ctx)
     rebalance_prefs = _derive_rebalance_preferences(ctx)
+    channel_open_hints = _derive_channel_open_hints(ctx)
 
     # Build the set of peers to export hints for: members + any peer
     # we have corridor/quality/traffic data about
     all_peers = set(member_set)
     all_peers.update(corridor_roles.keys())
     all_peers.update(rebalance_prefs.keys())
+    all_peers.update(channel_open_hints.keys())
 
     # Exclude ourselves
     all_peers.discard(ctx.our_pubkey)
@@ -2133,6 +2079,11 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
         # Rebalance preference
         pref = rebalance_prefs.get(peer_id, "neutral")
         hint["rebalance_preference"] = pref
+
+        # Channel-opening advisory hint (omitted if no topology data)
+        ch_hint = channel_open_hints.get(peer_id)
+        if ch_hint:
+            hint["channel_open_hint"] = ch_hint
 
         hints[peer_id] = hint
 

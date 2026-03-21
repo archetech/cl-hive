@@ -188,7 +188,7 @@ Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl
 `hive-positioning-recommendations`, `hive-positioning-summary`, `hive-positioning-status`
 
 **Local Integration**:
-`hive-export-hints` — Compact short-lived per-peer hints for trusted local consumers (cl-revenue-ops). Read-only, no side effects. Returns per-peer member status, corridor role, competition bias, quality score, traffic confidence, and rebalance preference. Does not set fees or trigger rebalances — local execution remains the responsibility of cl-revenue-ops.
+`hive-export-hints` — Compact short-lived per-peer hints for trusted local consumers (cl-revenue-ops). Read-only, no side effects. Returns per-peer member status, corridor role, competition bias, quality score, traffic confidence, rebalance preference, and topology-based channel-opening advisory hints. cl-hive does not directly open channels, set fees, or trigger rebalances — local execution remains the responsibility of cl-revenue-ops.
 
 ## Safety Constraints
 
