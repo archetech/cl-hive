@@ -32,7 +32,7 @@ from modules.state_manager import StateManager
 from modules.gossip import GossipManager
 from modules.intent_manager import Intent, IntentType
 from modules.bridge import BridgeStatus
-from modules.membership import MembershipTier
+from modules.membership import MEMBER_TIER
 from modules.idempotency import check_and_record, generate_event_id
 from modules.outbox import OutboxManager
 
@@ -78,16 +78,17 @@ def init_protocol_handlers(deps: dict):
 
 def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
-    Handle HIVE_HELLO message (autodiscovery join request).
+    Handle HIVE_HELLO message (join request).
 
     A node is requesting to join the hive. Channel existence serves as
-    proof of stake - no ticket required.
+    proof of stake. The request is stored as pending, awaiting explicit
+    approval via hive-approve.
 
     Flow:
-    1. Check if we're a hive member (only members can accept new nodes)
+    1. Check if we're a hive member
     2. Check if peer has a channel with us (proof of stake)
-    3. Check if peer is already a member
-    4. Send CHALLENGE if all conditions met
+    3. Check if peer is already a member or banned
+    4. Store as pending request (awaiting hive-approve)
     """
     sender_pubkey = payload.get('pubkey')
     if not sender_pubkey:
@@ -99,10 +100,10 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... pubkey mismatch", level='warn')
         return {"result": "continue"}
 
-    # Check if we're a member (only members can accept new nodes)
+    # Check if we're a member
     our_pubkey = handshake_mgr.get_our_pubkey()
     our_member = database.get_member(our_pubkey)
-    if not our_member or our_member.get('tier') != 'member':
+    if not our_member:
         plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... but we're not a member", level='debug')
         return {"result": "continue"}
 
@@ -114,14 +115,13 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Check if peer is already a member
     existing_member = database.get_member(peer_id)
     if existing_member:
-        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... already a {existing_member.get('tier')}", level='debug')
+        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... already a member", level='debug')
         return {"result": "continue"}
 
     # Check if peer has a channel with us (proof of stake)
     try:
         channels = plugin.rpc.call("listpeerchannels", {"id": peer_id})
         peer_channels = channels.get('channels', [])
-        # Look for any active channel
         has_channel = any(
             ch.get('state') in ('CHANNELD_NORMAL', 'CHANNELD_AWAITING_LOCKIN')
             for ch in peer_channels
@@ -133,33 +133,9 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... channel check failed: {e}", level='warn')
         return {"result": "continue"}
 
-    # All checks passed - generate challenge
-    # No requirements for autodiscovery join, tier is always member
-    nonce = handshake_mgr.generate_challenge(peer_id, requirements=0, initial_tier='member')
-
-    # Get Hive ID from metadata
-    members = database.get_all_members()
-    hive_id = "hive"
-    for m in members:
-        if m.get('metadata'):
-            try:
-                metadata = json.loads(m['metadata'])
-                hive_id = metadata.get('hive_id', 'hive')
-                break
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-    # Send CHALLENGE response
-    challenge_msg = create_challenge(nonce, hive_id)
-
-    try:
-        plugin.rpc.call("sendcustommsg", {
-            "node_id": peer_id,
-            "msg": challenge_msg.hex()
-        })
-        plugin.log(f"cl-hive: Sent CHALLENGE to {peer_id[:16]}... (autodiscovery join)")
-    except Exception as e:
-        plugin.log(f"cl-hive: Failed to send CHALLENGE: {e}", level='warn')
+    # All checks passed — store as pending, awaiting hive-approve
+    handshake_mgr.store_pending_request(peer_id)
+    plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... stored as pending, awaiting hive-approve")
 
     return {"result": "continue"}
 
@@ -292,15 +268,15 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         handshake_mgr.clear_challenge(peer_id)
         return {"result": "continue"}
 
-    # Get initial tier from pending challenge (always member for autodiscovery)
-    initial_tier = pending.get('initial_tier', 'member')
-
     # Verification passed! Add member
     database.add_member(
         peer_id=peer_id,
-        tier=initial_tier,
+        tier=MEMBER_TIER,
         joined_at=int(time.time())
     )
+
+    # Audit log
+    database.log_membership_event("joined", peer_id)
 
     # Phase B: persist peer capabilities from manifest features
     manifest_features = manifest_data.get("features", [])
@@ -420,7 +396,7 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Store Hive membership info for ourselves
     if database and our_pubkey:
         now = int(time.time())
-        # Start as member — admin promotion is done via RPC by the fleet operator.
+        # Start as member — single-role model, all members have equal privileges.
         database.add_member(our_pubkey, tier='member', joined_at=now)
         # Store hive_id in metadata
         database.update_member(our_pubkey, metadata=json.dumps({"hive_id": hive_id}))
@@ -755,8 +731,8 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
         joined_at = member_info.get("joined_at", int(time.time()))
         addresses = member_info.get("addresses", [])
 
-        # Validate tier value (admin/member system)
-        if tier not in ("admin", "member"):
+        # Validate tier value (single-role model)
+        if tier != "member":
             tier = "member"
 
         # Check if we already know this member
@@ -1385,7 +1361,7 @@ def broadcast_intent_abort(target: str, intent_type: str) -> None:
     )
 
 # =============================================================================
-# PHASE 5: PROMOTION PROTOCOL HANDLERS
+# PHASE 5: MEMBERSHIP PROTOCOL HELPERS
 # =============================================================================
 
 def _get_broadcast_targets() -> List[Dict[str, Any]]:
@@ -1400,7 +1376,7 @@ def _get_broadcast_targets() -> List[Dict[str, Any]]:
         return []
     return [
         m for m in database.get_all_members()
-        if m.get("tier") in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value)
+        if m.get("tier") == MEMBER_TIER
         and m["peer_id"] != our_pubkey
         and not database.is_banned(m["peer_id"])
     ]
@@ -1616,7 +1592,7 @@ def _outbox_get_member_ids() -> List[str]:
         return []
     return [
         m["peer_id"] for m in database.get_all_members()
-        if m.get("tier") in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value)
+        if m.get("tier") == MEMBER_TIER
         and not database.is_banned(m["peer_id"])
     ]
 
@@ -1695,7 +1671,7 @@ def _validate_relay_sender(peer_id: str, sender_id: str, payload: Dict[str, Any]
     if _is_relayed_message(payload):
         # Relayed message: verify peer_id is a known member (they're relaying)
         relay_peer = database.get_member(peer_id)
-        if not relay_peer or relay_peer.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
+        if not relay_peer or relay_peer.get("tier") != MEMBER_TIER:
             return False
         # P5R3-L-1 fix: Reject relayed messages from banned relay peers
         if database.is_banned(peer_id):
@@ -1884,8 +1860,7 @@ def _sync_member_policies(plugin: Plugin) -> None:
     the plugin was restarted or policies were reset.
 
     Policy assignment:
-    - Member: HIVE strategy (0 PPM fees)
-    - Neophyte: dynamic strategy (normal fee behavior)
+    - All members: HIVE strategy (0 PPM fees)
     """
     if not database or not bridge or bridge.status != BridgeStatus.ENABLED:
         return
@@ -1909,9 +1884,8 @@ def _sync_member_policies(plugin: Plugin) -> None:
                 pass
             continue
 
-        # Determine if this peer should have HIVE strategy
-        # All members (admin or member) get HIVE strategy (0-fee)
-        is_hive_member = tier in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value)
+        # All members get HIVE strategy (0-fee)
+        is_hive_member = tier == MEMBER_TIER
 
         try:
             # Use bypass_rate_limit=True for startup sync
@@ -2063,7 +2037,7 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Check if hive is now headless (no members)
     all_members = database.get_all_members()
-    member_count = sum(1 for m in all_members if m.get("tier") in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value))
+    member_count = sum(1 for m in all_members if m.get("tier") == MEMBER_TIER)
     if member_count == 0 and len(all_members) > 0:
         plugin.log("cl-hive: WARNING - Hive has no members remaining.", level='warn')
 
@@ -2083,10 +2057,8 @@ def handle_ban(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle BAN message - notification that a ban has been executed.
 
-    BAN is broadcast by the node that first reaches quorum in _check_ban_quorum.
-    Most nodes will have already executed the ban independently when they tallied
-    enough BAN_VOTEs.  This handler acts as a catch-up mechanism: if this node
-    missed some votes and hasn't banned the target yet, we enforce it now.
+    BAN is broadcast by the banning member to notify the fleet.
+    This handler is idempotent — if we've already banned the target, it's a no-op.
 
     The handler is intentionally lightweight - add_ban is idempotent (returns
     False if the peer is already banned).
@@ -2095,7 +2067,7 @@ def handle_ban(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"status": "ignored", "reason": "not_initialised"}
 
     target_peer_id = payload.get("peer_id")
-    reason = payload.get("reason", "quorum_ban")
+    reason = payload.get("reason", "member_ban")
     proposal_id = payload.get("proposal_id")
 
     if not target_peer_id:
@@ -2122,10 +2094,7 @@ def handle_ban(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         except Exception as e:
             plugin.log(f"cl-hive: Failed to clear intents for banned member: {e}", level='warn')
 
-    plugin.log(f"cl-hive: BAN catch-up executed for {target_peer_id[:16]}... (proposal={proposal_id})")
-
-    if proposal_id:
-        database.update_ban_proposal_status(proposal_id, "approved")
+    plugin.log(f"cl-hive: BAN catch-up executed for {target_peer_id[:16]}...")
 
     return {"status": "banned", "peer_id": target_peer_id}
 
@@ -2500,7 +2469,7 @@ def handle_route_probe(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2571,7 +2540,7 @@ def handle_route_probe_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dic
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2643,7 +2612,7 @@ def handle_peer_reputation_snapshot(peer_id: str, payload: Dict, plugin: Plugin)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2713,7 +2682,7 @@ def handle_yield_metrics_batch(peer_id: str, payload: Dict, plugin: Plugin) -> D
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2802,7 +2771,7 @@ def handle_temporal_pattern_batch(peer_id: str, payload: Dict, plugin: Plugin) -
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2895,7 +2864,7 @@ def handle_corridor_value_batch(peer_id: str, payload: Dict, plugin: Plugin) -> 
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2983,7 +2952,7 @@ def handle_positioning_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> 
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -3065,7 +3034,7 @@ def handle_coverage_analysis_batch(peer_id: str, payload: Dict, plugin: Plugin) 
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)

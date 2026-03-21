@@ -64,10 +64,10 @@ class HiveMessageType(IntEnum):
         HELLO, CHALLENGE, ATTEST, WELCOME
     
     Deferred Messages:
-        GOSSIP (Phase 2), INTENT (Phase 3), VOUCH/BAN/PROMOTION (Phase 5)
+        GOSSIP (Phase 2), INTENT (Phase 3), BAN/MEMBERSHIP (Phase 5)
     """
     # Phase 1: Handshake
-    HELLO = 32769       # Ticket presentation
+    HELLO = 32769       # Join request presentation
     CHALLENGE = 32771   # Nonce for proof-of-identity
     ATTEST = 32773      # Signed manifest + nonce response
     WELCOME = 32775     # Session established, HiveID assigned
@@ -261,7 +261,7 @@ def serialize(msg_type: HiveMessageType, payload: Dict[str, Any]) -> Optional[by
         bytes: Wire-ready message with magic prefix
         
     Example:
-        >>> data = serialize(HiveMessageType.HELLO, {"ticket": "abc123..."})
+        >>> data = serialize(HiveMessageType.HELLO, {"pubkey": "02abc123..."})
         >>> data[:4]
         b'HIVE'
     """
@@ -768,7 +768,7 @@ def create_hello(pubkey: str) -> bytes:
     Args:
         pubkey: Sender's public key (66 hex chars)
 
-    Channel existence serves as proof of stake - no ticket needed.
+    Channel existence serves as proof of stake.
     """
     return serialize(HiveMessageType.HELLO, {
         "pubkey": pubkey,
