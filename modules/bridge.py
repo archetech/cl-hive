@@ -570,26 +570,6 @@ class Bridge:
             return None
 
     # =========================================================================
-    # BOLTZ ACTIVITY
-    # =========================================================================
-
-    def get_boltz_activity(self) -> Optional[Dict[str, Any]]:
-        """Get Boltz swap activity summary from cl-revenue-ops for gossip state."""
-        if self._status == BridgeStatus.DISABLED:
-            return None
-        try:
-            result = self.safe_call("revenue-boltz-budget")
-            if not isinstance(result, dict) or "error" in result:
-                return None
-            return {
-                "pending_swaps": int(result.get("pending_swap_count", 0) or 0),
-                "daily_spend_sats": int(result.get("spent_24h_sats_estimate", result.get("boltz_spent_24h_sats_estimate", 0)) or 0),
-                "last_swap_ts": int(result.get("last_swap_ts", 0) or 0),
-            }
-        except Exception:
-            return None
-
-    # =========================================================================
     # STATUS & STATISTICS
     # =========================================================================
 

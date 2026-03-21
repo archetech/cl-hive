@@ -73,8 +73,6 @@ class HivePeerState:
     budget_last_update: int = 0
     # Capabilities for feature negotiation
     capabilities: List[str] = field(default_factory=list)
-    # Boltz swap activity for fleet coordination (F1)
-    boltz_activity: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -117,9 +115,6 @@ class HivePeerState:
         # Capabilities (optional, backward compatible - old nodes have no capabilities)
         capabilities = data.get("capabilities", [])
 
-        # Boltz activity (optional, backward compatible - defaults to empty)
-        boltz_activity = data.get("boltz_activity", {})
-
         return cls(
             peer_id=peer_id,
             capacity_sats=capacity_sats,
@@ -133,7 +128,6 @@ class HivePeerState:
             budget_reserved_until=budget_reserved_until,
             budget_last_update=budget_last_update,
             capabilities=list(capabilities),   # defensive copy
-            boltz_activity=dict(boltz_activity) if isinstance(boltz_activity, dict) else {},
         )
     
     def to_hash_tuple(self) -> Dict[str, Any]:
@@ -338,8 +332,6 @@ class StateManager:
                 budget_last_update=gossip_data.get('budget_last_update', 0),
                 # Capabilities (backward compatible, defaults to empty)
                 capabilities=list(gossip_data.get('capabilities', [])),  # defensive copy
-                # Boltz activity for fleet coordination (F1 - backward compatible, defaults to empty)
-                boltz_activity=dict(gossip_data.get('boltz_activity', {})),  # defensive copy
             )
 
             # Update in-memory cache

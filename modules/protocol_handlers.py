@@ -942,8 +942,7 @@ def _try_auto_connect(peer_id: str, addresses: List[str]) -> bool:
 
 def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
                                fee_policy: Dict, topology: list,
-                               addresses: List[str] = None,
-                               boltz_activity: Dict = None) -> Optional[bytes]:
+                               addresses: List[str] = None) -> Optional[bytes]:
     """
     Create a signed GOSSIP message for broadcast.
 
@@ -957,7 +956,6 @@ def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
         fee_policy: Current fee policy dict
         topology: List of external peer connections
         addresses: List of our connection addresses for auto-connect
-        boltz_activity: Boltz swap activity summary for fleet coordination
 
     Returns:
         Serialized and signed GOSSIP message, or None if signing fails
@@ -973,7 +971,6 @@ def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
         fee_policy=fee_policy,
         topology=topology,
         addresses=addresses or [],
-        boltz_activity=boltz_activity
     )
 
     # Add sender identification for signature verification

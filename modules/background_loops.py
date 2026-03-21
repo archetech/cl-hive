@@ -610,14 +610,12 @@ def gossip_loop():
             if should_broadcast:
                 # Step 5: Create signed GOSSIP message (with addresses for auto-connect)
                 our_addresses = protocol_handlers._get_our_addresses()
-                boltz_activity = bridge.get_boltz_activity() if bridge else None
                 gossip_msg = protocol_handlers._create_signed_gossip_msg(
                     capacity_sats=hive_capacity_sats,
                     available_sats=hive_available_sats,
                     fee_policy=fee_policy,
                     topology=external_peers,
                     addresses=our_addresses,
-                    boltz_activity=boltz_activity
                 )
 
                 if gossip_msg:
