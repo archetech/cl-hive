@@ -17,9 +17,6 @@ set -e
 #   ANNOUNCE_ADDR        - Public address to announce (required for clearnet/hybrid)
 #   WIREGUARD_ENABLED    - Enable WireGuard (default: false)
 #   WIREGUARD_CONFIG     - Path to WireGuard config (default: /etc/wireguard/wg0.conf)
-#   HIVE_GOVERNANCE_MODE - advisor, autonomous, oracle (default: advisor)
-#   HIVE_COMMS_ENABLED   - Enable optional cl-hive-comms plugin (default: false)
-#   HIVE_ARCHON_ENABLED  - Enable optional cl-hive-archon plugin (default: false; requires comms)
 #   CLBOSS_ENABLED       - Enable CLBOSS (default: true, optional - hive works without it)
 #   DUAL_FUND_ENABLED    - Enable dual-funded channels (default: true)
 #   FUNDER_POLICY        - Funder policy: match, fixed, available (default: match)
@@ -92,9 +89,6 @@ RGB="${RGB:-e33502}"
 LIGHTNING_PORT="${LIGHTNING_PORT:-9736}"
 NETWORK_MODE="${NETWORK_MODE:-tor}"
 WIREGUARD_ENABLED="${WIREGUARD_ENABLED:-false}"
-HIVE_GOVERNANCE_MODE="${HIVE_GOVERNANCE_MODE:-advisor}"
-HIVE_COMMS_ENABLED="${HIVE_COMMS_ENABLED:-false}"
-HIVE_ARCHON_ENABLED="${HIVE_ARCHON_ENABLED:-false}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 BOLTZ_ENABLED="${BOLTZ_ENABLED:-false}"
 export BOLTZ_ENABLED
@@ -569,46 +563,6 @@ fi
 
 echo "Configuring optional Phase 6 plugins..."
 
-if [ "$HIVE_ARCHON_ENABLED" = "true" ] && [ "$HIVE_COMMS_ENABLED" != "true" ]; then
-    echo "ERROR: HIVE_ARCHON_ENABLED=true requires HIVE_COMMS_ENABLED=true"
-    exit 1
-fi
-
-if [ "$HIVE_COMMS_ENABLED" = "true" ]; then
-    if [ ! -x /opt/cl-hive-comms/cl-hive-comms.py ]; then
-        echo "ERROR: cl-hive-comms enabled but /opt/cl-hive-comms/cl-hive-comms.py not found/executable"
-        exit 1
-    fi
-    echo "cl-hive-comms: enabled"
-else
-    echo "cl-hive-comms: disabled"
-fi
-
-if [ "$HIVE_ARCHON_ENABLED" = "true" ]; then
-    if [ ! -x /opt/cl-hive-archon/cl-hive-archon.py ]; then
-        echo "ERROR: cl-hive-archon enabled but /opt/cl-hive-archon/cl-hive-archon.py not found/executable"
-        exit 1
-    fi
-    echo "cl-hive-archon: enabled"
-else
-    echo "cl-hive-archon: disabled"
-fi
-
-cat >> "$CONFIG_FILE" << EOF
-
-# =============================================================================
-# Plugin Load Order (Phase 6 optional stack)
-# =============================================================================
-EOF
-
-# Optional plugins are loaded first if enabled.
-if [ "$HIVE_COMMS_ENABLED" = "true" ]; then
-    echo "plugin=/opt/cl-hive-comms/cl-hive-comms.py" >> "$CONFIG_FILE"
-fi
-if [ "$HIVE_ARCHON_ENABLED" = "true" ]; then
-    echo "plugin=/opt/cl-hive-archon/cl-hive-archon.py" >> "$CONFIG_FILE"
-fi
-
 # Core plugin dir (for Sling and other packaged plugins) is loaded before plugin-owned
 # options so CLN recognizes those options during config parsing.
 PLUGIN_DIR="/home/lightning/.lightning/plugins"
@@ -653,7 +607,6 @@ cat >> "$CONFIG_FILE" << EOF
 # cl-hive Configuration
 # =============================================================================
 
-hive-governance-mode=$HIVE_GOVERNANCE_MODE
 hive-db-path=$LIGHTNING_DIR/$NETWORK/cl_hive.db
 
 # =============================================================================
@@ -690,7 +643,7 @@ fi
 # Append additional hive config if exists
 if [ -f /etc/lightning/custom/cl-hive.conf ]; then
     echo "" >> "$CONFIG_FILE"
-    grep -v "^hive-governance-mode" /etc/lightning/custom/cl-hive.conf >> "$CONFIG_FILE" || true
+    cat /etc/lightning/custom/cl-hive.conf >> "$CONFIG_FILE" || true
 fi
 
 # Append additional revenue-ops config if exists
@@ -787,9 +740,6 @@ echo "Lightning Port: $LIGHTNING_PORT"
 echo "Network Mode:   $NETWORK_MODE"
 echo "WireGuard:      $WIREGUARD_ENABLED"
 echo "Boltz:          $BOLTZ_ENABLED"
-echo "Hive Mode:      $HIVE_GOVERNANCE_MODE"
-echo "Hive Comms:     $HIVE_COMMS_ENABLED"
-echo "Hive Archon:    $HIVE_ARCHON_ENABLED"
 echo "Lightning Dir:  $LIGHTNING_DIR"
 echo "Advisor DB:     $ADVISOR_DB_PATH"
 if [ -n "$ANNOUNCE_ADDR" ]; then
@@ -805,16 +755,6 @@ fi
 echo "  Sling:        installed"
 echo "  cl-hive:      installed"
 echo "  cl-revenue-ops: installed"
-if [ "$HIVE_COMMS_ENABLED" = "true" ]; then
-    echo "  cl-hive-comms: enabled"
-else
-    echo "  cl-hive-comms: disabled"
-fi
-if [ "$HIVE_ARCHON_ENABLED" = "true" ]; then
-    echo "  cl-hive-archon: enabled"
-else
-    echo "  cl-hive-archon: disabled"
-fi
 if [ "${TRUSTEDCOIN_ENABLED:-false}" = "true" ]; then
     echo "  trustedcoin:  enabled (replaces bcli)"
 fi

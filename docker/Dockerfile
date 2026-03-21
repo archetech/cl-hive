@@ -122,8 +122,7 @@ RUN ARCH=$(uname -m) \
 RUN pip install --no-cache-dir \
     pyln-client>=24.0 \
     PyNaCl>=1.5.0 \
-    requests \
-    anthropic
+    requests
 
 # =============================================================================
 # CLBOSS (REQUIRED - ksedgwic fork with clboss-unmanage support)
@@ -218,21 +217,6 @@ RUN git clone --depth 1 --branch ${CLN_REST_VERSION} https://github.com/Ride-The
 ARG CL_REVENUE_OPS_VERSION=main
 RUN git clone --depth 1 --branch ${CL_REVENUE_OPS_VERSION} https://github.com/lightning-goats/cl_revenue_ops.git /opt/cl-revenue-ops \
     && chmod +x /opt/cl-revenue-ops/cl-revenue-ops.py
-
-# =============================================================================
-# OPTIONAL PHASE 6 PLUGINS (disabled by default at runtime)
-# =============================================================================
-# These repos are baked into the image so operators can enable them via:
-#   HIVE_COMMS_ENABLED=true
-#   HIVE_ARCHON_ENABLED=true
-
-ARG CL_HIVE_COMMS_VERSION=main
-RUN git clone --depth 1 --branch ${CL_HIVE_COMMS_VERSION} https://github.com/lightning-goats/cl-hive-comms.git /opt/cl-hive-comms \
-    && chmod +x /opt/cl-hive-comms/cl-hive-comms.py
-
-ARG CL_HIVE_ARCHON_VERSION=main
-RUN git clone --depth 1 --branch ${CL_HIVE_ARCHON_VERSION} https://github.com/lightning-goats/cl-hive-archon.git /opt/cl-hive-archon \
-    && chmod +x /opt/cl-hive-archon/cl-hive-archon.py
 
 # =============================================================================
 # CL-HIVE PLUGIN
