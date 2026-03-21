@@ -319,7 +319,6 @@ class YieldMetricsManager:
     Integrates with:
     - cl-revenue-ops for profitability data (via bridge)
     - State manager for member topology
-    - Routing pool for revenue data
     """
 
     def __init__(
@@ -327,7 +326,6 @@ class YieldMetricsManager:
         database: Any,
         plugin: Any,
         state_manager: Any = None,
-        routing_pool: Any = None,
         bridge: Any = None
     ):
         """
@@ -337,13 +335,11 @@ class YieldMetricsManager:
             database: HiveDatabase instance
             plugin: Plugin instance for RPC/logging
             state_manager: StateManager for member topology
-            routing_pool: RoutingPool for revenue data
             bridge: Bridge to cl-revenue-ops for profitability data
         """
         self.database = database
         self.plugin = plugin
         self.state_manager = state_manager
-        self.routing_pool = routing_pool
         self.bridge = bridge
         self.our_pubkey: Optional[str] = None
 

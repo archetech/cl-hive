@@ -20,50 +20,9 @@ from typing import Any, Dict, Optional, Tuple
 # Maps message type name -> list of payload fields that form the stable
 # event identity.  Order matters for deterministic hashing.
 EVENT_ID_FIELDS: Dict[str, list] = {
-    # Phase 5: Membership
-    "PROMOTION_REQUEST": ["target_pubkey", "request_id"],
-    "VOUCH": ["target_pubkey", "request_id", "voucher_pubkey"],
-    "PROMOTION": ["target_pubkey", "request_id"],
+    # Membership
     "MEMBER_LEFT": ["peer_id", "timestamp"],
-    # Phase 5: Ban governance
-    "BAN_PROPOSAL": ["proposal_id"],
-    "BAN_VOTE": ["proposal_id", "voter_peer_id"],
-    # Phase 9: Fee reports
-    "FEE_REPORT": ["peer_id", "period_start"],
-    # Phase 12: Settlement
-    "SETTLEMENT_PROPOSE": ["proposal_id"],
-    "SETTLEMENT_READY": ["proposal_id", "voter_peer_id"],
-    "SETTLEMENT_EXECUTED": ["proposal_id", "executor_peer_id"],
-    # Phase 10: Task delegation
-    "TASK_REQUEST": ["request_id"],
-    "TASK_RESPONSE": ["request_id", "responder_id"],
-    # Phase 11: Splice coordination
-    "SPLICE_INIT_RESPONSE": ["session_id", "responder_id"],
-    "SPLICE_INIT_REQUEST": ["session_id"],
-    "SPLICE_UPDATE": ["session_id", "update_seq"],
-    "SPLICE_SIGNED": ["session_id"],
-    "SPLICE_ABORT": ["session_id"],
-    # Phase 16: DID Credentials
-    # PRESENT: event_id is sender-generated UUID; handler has content-level
-    # dedup via credential_id check in handle_credential_present (M2 fix).
-    "DID_CREDENTIAL_PRESENT": ["event_id"],
-    # REVOKE: use domain-specific fields for content-based dedup
-    "DID_CREDENTIAL_REVOKE": ["credential_id", "issuer_id"],
-    # Phase 16: Management Credentials
-    # PRESENT: event_id is sender-generated UUID; handler has content-level
-    # dedup via credential_id check in store_management_credential.
-    "MGMT_CREDENTIAL_PRESENT": ["event_id"],
-    # REVOKE: use domain-specific fields for content-based dedup
-    "MGMT_CREDENTIAL_REVOKE": ["credential_id", "issuer_id"],
-    # Phase 4: Extended Settlements
-    "SETTLEMENT_RECEIPT": ["receipt_id"],
-    "BOND_POSTING": ["bond_id"],
-    "BOND_SLASH": ["bond_id", "dispute_id"],
-    "NETTING_PROPOSAL": ["window_id", "sender_id"],
-    "NETTING_ACK": ["window_id", "sender_id"],
-    "VIOLATION_REPORT": ["violation_id"],
-    "ARBITRATION_VOTE": ["dispute_id", "sender_id"],
-    # Phase 16: Traffic Intelligence
+    # Traffic Intelligence
     "TRAFFIC_INTELLIGENCE_BATCH": ["reporter_id", "timestamp"],
 }
 

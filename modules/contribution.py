@@ -202,14 +202,14 @@ class ContributionManager:
 
         if in_peer and in_peer != out_peer:
             member = self.db.get_member(in_peer)
-            if member and member.get("tier") in ("member", "neophyte"):
+            if member:
                 if self._allow_record(in_peer):
                     self.db.record_contribution(in_peer, "forwarded", amount_sats)
                     self.check_leech_status(in_peer)
 
         if out_peer and out_peer != in_peer:
             member = self.db.get_member(out_peer)
-            if member and member.get("tier") in ("member", "neophyte"):
+            if member:
                 if self._allow_record(out_peer):
                     self.db.record_contribution(out_peer, "received", amount_sats)
                     self.check_leech_status(out_peer)
@@ -240,11 +240,7 @@ class ContributionManager:
         low_since = flag["low_since_ts"]
         ban_triggered = bool(flag["ban_triggered"])
         if not ban_triggered and now - low_since >= (LEECH_WINDOW_DAYS * 86400):
-            if self.config.ban_autotrigger_enabled:
-                self._log(f"Leech ban auto-triggered for {peer_id[:16]}... (ratio={ratio:.2f})", level="warn")
-                self.db.set_leech_flag(peer_id, low_since, True)
-            else:
-                self._log(f"Leech ban flagged for review: {peer_id[:16]}... (ratio={ratio:.2f})", level="warn")
-                self.db.set_leech_flag(peer_id, low_since, False)
+            self._log(f"Leech ban flagged for review: {peer_id[:16]}... (ratio={ratio:.2f})", level="warn")
+            self.db.set_leech_flag(peer_id, low_since, False)
 
         return {"is_leech": True, "ratio": ratio}

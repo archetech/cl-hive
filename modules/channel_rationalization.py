@@ -263,27 +263,8 @@ class RedundancyAnalyzer:
             return set()
 
     def _get_markers_for_peer(self, peer_id: str) -> List[Any]:
-        """
-        Get all stigmergic markers involving this peer.
-
-        Markers where peer is either source or destination.
-        """
-        if not self.fee_coordination_mgr:
-            return []
-
-        try:
-            stigmergy = self.fee_coordination_mgr.stigmergy
-            if not stigmergy:
-                return []
-
-            all_markers = stigmergy.get_all_markers()
-            return [
-                m for m in all_markers
-                if m.source_peer_id == peer_id or m.destination_peer_id == peer_id
-            ]
-        except Exception as e:
-            self._log(f"Error getting markers for peer: {e}", level="debug")
-            return []
+        """Get coordination markers involving this peer (currently none)."""
+        return []
 
     def analyze_peer_coverage(self, peer_id: str) -> PeerCoverage:
         """
@@ -425,7 +406,7 @@ class ChannelRationalizer:
         database=None,
         state_manager=None,
         fee_coordination_mgr=None,
-        governance=None
+        recommendation_logger=None
     ):
         """
         Initialize the channel rationalizer.
@@ -435,12 +416,12 @@ class ChannelRationalizer:
             database: Database for persistence
             state_manager: StateManager for fleet state
             fee_coordination_mgr: FeeCoordinationManager for markers
-            governance: Governance module for pending_actions
+            recommendation_logger: RecommendationLogger for logging recommendations
         """
         self.plugin = plugin
         self.database = database
         self.state_manager = state_manager
-        self.governance = governance
+        self.recommendation_logger = recommendation_logger
 
         # Initialize redundancy analyzer
         self.redundancy_analyzer = RedundancyAnalyzer(
@@ -761,58 +742,47 @@ class ChannelRationalizer:
         all_recs = self.generate_close_recommendations()
         return [r for r in all_recs if r.member_id == self._our_pubkey]
 
-    def create_pending_actions(self, recommendations: List[CloseRecommendation]) -> int:
+    def log_close_recommendations(self, recommendations: List[CloseRecommendation]) -> int:
         """
-        Create pending_actions for close recommendations.
+        Log close recommendations via RecommendationLogger.
 
         Args:
             recommendations: List of close recommendations
 
         Returns:
-            Number of pending_actions created
+            Number of recommendations logged
         """
-        if not self.governance:
-            self._log("Governance not available, cannot create pending_actions", level="warn")
+        if not self.recommendation_logger:
+            self._log("RecommendationLogger not available, skipping", level="warn")
             return 0
 
-        created = 0
+        logged = 0
 
         for rec in recommendations:
-            # Only create actions for high confidence recommendations
+            # Only log high confidence recommendations
             if rec.confidence < 0.5:
                 continue
 
             try:
-                action_data = {
-                    "action_type": "close_channel",
-                    "member_id": rec.member_id,
-                    "peer_id": rec.peer_id,
-                    "channel_id": rec.channel_id,
-                    "reason": rec.reason,
-                    "urgency": rec.urgency,
-                    "confidence": rec.confidence,
-                    "freed_capital_sats": rec.freed_capital_sats,
-                    "owner_member": rec.owner_member,
-                    "recommendation_type": "rationalization"
-                }
-
-                self.governance.create_pending_action(
-                    action_type="close_recommendation",
-                    data=action_data,
-                    source="channel_rationalization"
+                self.recommendation_logger.log_recommendation(
+                    action_type='close_channel',
+                    target=rec.peer_id,
+                    context={
+                        'member_id': rec.member_id,
+                        'channel_id': rec.channel_id,
+                        'reason': rec.reason,
+                        'urgency': rec.urgency,
+                        'confidence': rec.confidence,
+                        'freed_capital_sats': rec.freed_capital_sats,
+                        'owner_member': rec.owner_member,
+                    },
                 )
-                created += 1
-
-                self._log(
-                    f"Created pending action: close {rec.channel_id} "
-                    f"({rec.member_id[:8]}... → {rec.peer_id[:8]}...)",
-                    level="info"
-                )
+                logged += 1
 
             except Exception as e:
-                self._log(f"Error creating pending action: {e}", level="warn")
+                self._log(f"Error logging recommendation: {e}", level="warn")
 
-        return created
+        return logged
 
     def get_rationalization_summary(self) -> RationalizationSummary:
         """
@@ -880,7 +850,7 @@ class RationalizationManager:
         database=None,
         state_manager=None,
         fee_coordination_mgr=None,
-        governance=None
+        recommendation_logger=None
     ):
         """
         Initialize the rationalization manager.
@@ -890,7 +860,7 @@ class RationalizationManager:
             database: Database for persistence
             state_manager: StateManager for fleet state
             fee_coordination_mgr: FeeCoordinationManager for markers
-            governance: Governance module for pending_actions
+            recommendation_logger: RecommendationLogger for logging recommendations
         """
         self.plugin = plugin
         self.database = database
@@ -901,7 +871,7 @@ class RationalizationManager:
             database=database,
             state_manager=state_manager,
             fee_coordination_mgr=fee_coordination_mgr,
-            governance=governance
+            recommendation_logger=recommendation_logger
         )
 
         self._our_pubkey: Optional[str] = None
@@ -963,17 +933,17 @@ class RationalizationManager:
 
     def create_close_actions(self) -> Dict[str, Any]:
         """
-        Create pending_actions for close recommendations.
+        Log close recommendations via RecommendationLogger.
 
         Returns:
-            Dict with creation results
+            Dict with logging results
         """
         recommendations = self.rationalizer.generate_close_recommendations()
-        created = self.rationalizer.create_pending_actions(recommendations)
+        logged = self.rationalizer.log_close_recommendations(recommendations)
 
         return {
             "recommendations_analyzed": len(recommendations),
-            "pending_actions_created": created
+            "recommendations_logged": logged
         }
 
     def get_summary(self) -> Dict[str, Any]:

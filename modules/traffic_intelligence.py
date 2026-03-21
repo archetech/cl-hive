@@ -44,14 +44,12 @@ class TrafficIntelligenceManager:
         database,
         plugin=None,
         our_pubkey: str = "",
-        anticipatory_mgr=None,
         liquidity_coordinator=None,
         membership_mgr=None,
     ):
         self.db = database
         self.plugin = plugin
         self.our_pubkey = our_pubkey
-        self.anticipatory_mgr = anticipatory_mgr
         self.liquidity_coordinator = liquidity_coordinator
         self.membership_mgr = membership_mgr
 
@@ -423,16 +421,13 @@ class TrafficIntelligenceManager:
             "fleet_drain_forecast_sats": 0,
         }
 
-        # Check active MCF assignments for this peer
+        # Check for rebalancing conflicts with this peer
         if self.liquidity_coordinator:
             try:
-                mcf_status = self.liquidity_coordinator.get_mcf_status()
-                active = mcf_status.get("active_assignments", [])
-                for a in active:
-                    if peer_id in (a.get("from_channel", ""), a.get("to_channel", "")):
-                        result["conflict"] = True
-                        result["conflicting_member"] = a.get("member_id")
-                        break
+                conflict = self.liquidity_coordinator.check_rebalancing_conflict(peer_id)
+                if conflict.get("conflict"):
+                    result["conflict"] = True
+                    result["conflicting_member"] = conflict.get("conflicting_member")
             except Exception:
                 pass
 
@@ -495,87 +490,5 @@ class TrafficIntelligenceManager:
             "generated_at": int(time.time()),
             "hours_ahead": hours_ahead,
         }
-
-        # Get Kalman predictions from anticipatory liquidity manager
-        if not self.anticipatory_mgr:
-            return forecast
-
-        try:
-            predictions = self.anticipatory_mgr.get_all_predictions()
-        except Exception:
-            predictions = {}
-
-        if not predictions:
-            return forecast
-
-        # Get all traffic profiles for enrichment
-        all_profiles = self.db.get_all_traffic_profiles()
-        profile_by_peer = {}
-        for p in all_profiles:
-            pid = p.get("peer_id")
-            if pid not in profile_by_peer:
-                profile_by_peer[pid] = []
-            profile_by_peer[pid].append(p)
-
-        # Build per-member forecast
-        now = time.time()
-        now_utc = datetime.now(timezone.utc).hour
-
-        for channel_id, pred in predictions.items():
-            if not isinstance(pred, dict):
-                continue
-
-            peer_id = pred.get("peer_id", "")
-            predicted_pct = pred.get("predicted_local_pct")
-            velocity = pred.get("velocity_pct_per_hour", 0)
-
-            if predicted_pct is None:
-                continue
-
-            current_pct = pred.get("current_local_pct", 50)
-            hours_to_depletion = None
-            hours_to_saturation = None
-
-            if velocity < 0 and current_pct > 0:
-                hours_to_depletion = current_pct / abs(velocity)
-            elif velocity > 0 and current_pct < 100:
-                hours_to_saturation = (100 - current_pct) / velocity
-
-            # Enrich with traffic intelligence
-            optimal_window = None
-            traffic_profiles = profile_by_peer.get(peer_id, [])
-            if traffic_profiles:
-                best = max(traffic_profiles, key=lambda p: p.get("confidence", 0))
-                quiet_str = best.get("quiet_hours_utc", "[]")
-                quiet = json.loads(quiet_str) if isinstance(quiet_str, str) else quiet_str
-                if quiet:
-                    next_quiet = None
-                    for h in sorted(quiet):
-                        if h > now_utc:
-                            next_quiet = h
-                            break
-                    if next_quiet is None and quiet:
-                        next_quiet = quiet[0]
-                    if next_quiet is not None:
-                        optimal_window = next_quiet
-
-            entry = {
-                "channel_id": channel_id,
-                "peer_id": peer_id,
-                "current_local_pct": current_pct,
-                "velocity_pct_per_hour": velocity,
-                "hours_to_depletion": hours_to_depletion,
-                "hours_to_saturation": hours_to_saturation,
-                "optimal_rebalance_hour_utc": optimal_window,
-            }
-
-            if hours_to_depletion is not None and hours_to_depletion <= hours_ahead:
-                entry["action"] = "depleting"
-            elif hours_to_saturation is not None and hours_to_saturation <= hours_ahead:
-                entry["action"] = "saturating"
-            else:
-                entry["action"] = "stable"
-
-            forecast["members"].append(entry)
 
         return forecast

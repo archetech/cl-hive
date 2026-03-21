@@ -6,7 +6,6 @@ Extracted from cl-hive.py monolith. Contains:
 - RateLimiter: Token bucket rate limiter for gossip flooding prevention
 - register_options(): All plugin.add_option() calls
 - OPTION_TO_CONFIG_MAP: Option name -> config attribute mapping
-- VPN_OPTIONS: Options requiring VPN transport reconfiguration
 - _parse_setconfig_value(): Typed value parser for setconfig
 """
 
@@ -150,47 +149,6 @@ def register_options(plugin):
     )
 
     # All other options are dynamic (hot-reloadable via `lightning-cli setconfig`)
-    plugin.add_option(
-        name='hive-governance-mode',
-        default='advisor',
-        description='Governance mode: advisor (AI/human approval), failsafe (emergency auto-execute)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-neophyte-fee-discount',
-        default='0.5',
-        description='Fee discount for Neophyte members (0.5 = 50% of public rate)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-member-fee-ppm',
-        default='0',
-        description='Fee charged to full Hive members (default: 0 = free)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-probation-days',
-        default='90',
-        description='Minimum days as Neophyte before promotion eligibility',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-vouch-threshold',
-        default='0.51',
-        description='Percentage of member vouches required for promotion (0.51 = 51%)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-min-vouch-count',
-        default='3',
-        description='Minimum number of vouches required for promotion',
-        dynamic=True
-    )
 
     plugin.add_option(
         name='hive-max-members',
@@ -207,37 +165,9 @@ def register_options(plugin):
     )
 
     plugin.add_option(
-        name='hive-membership-enabled',
-        default='true',
-        description='Enable membership & promotion protocol (default: true)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-auto-vouch',
-        default='true',
-        description='Auto-vouch for eligible neophytes (default: true)',
-        dynamic=True
-    )
-
-    plugin.add_option(
         name='hive-auto-join',
         default='false',
         description='Auto-discover hive peers on connect (disabled to avoid CLN crash bug)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-auto-promote',
-        default='true',
-        description='Auto-promote when quorum reached (default: true)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-ban-autotrigger',
-        default='false',
-        description='Auto-trigger ban proposal on sustained leeching (default: false)',
         dynamic=True
     )
 
@@ -269,126 +199,6 @@ def register_options(plugin):
         dynamic=True
     )
 
-    plugin.add_option(
-        name='hive-planner-enable-expansions',
-        default='false',
-        description='Enable expansion proposals (new channel openings) in Planner',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-planner-min-channel-sats',
-        default='1000000',
-        description='Minimum channel size for expansion proposals (default: 1M sats)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-planner-max-channel-sats',
-        default='50000000',
-        description='Maximum channel size for expansion proposals (default: 50M sats)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-planner-default-channel-sats',
-        default='5000000',
-        description='Default channel size for expansion proposals (default: 5M sats)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-planner-max-active-channels',
-        default='50',
-        description='Maximum total channels before expansion auto-approval is gated (default: 50). Above this, channel opens escalate for human review.',
-        dynamic=True
-    )
-
-    # Budget Options (Phase 7 - Governance)
-    plugin.add_option(
-        name='hive-failsafe-budget-per-day',
-        default='10000000',
-        description='Daily budget for failsafe mode actions in sats (default: 10M)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-budget-reserve-pct',
-        default='0.20',
-        description='Reserve percentage of onchain balance for future expansion (default: 20%)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-budget-max-per-channel-pct',
-        default='0.50',
-        description='Maximum per-channel spend as percentage of daily budget (default: 50%)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-max-expansion-feerate',
-        default='5000',
-        description='Max on-chain feerate (sat/kB) to allow expansion proposals (default: 5000 = ~1.25 sat/vB). Set to 0 to disable check.',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-rpc-pool-size',
-        default='3',
-        description='Number of RPC worker processes for bounded execution (1-8, default: 3)',
-    )
-
-    # VPN Transport Options (all dynamic)
-    plugin.add_option(
-        name='hive-transport-mode',
-        default='any',
-        description='Hive transport mode: any, vpn-only, vpn-preferred',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-vpn-subnets',
-        default='',
-        description='VPN subnets for hive peers (CIDR, comma-separated). Example: 10.8.0.0/24',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-vpn-bind',
-        default='',
-        description='VPN bind address for hive traffic (ip:port)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-cashu-mints',
-        default='',
-        description='Comma-separated Cashu mint URLs for escrow tickets',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-nostr-relays',
-        default='',
-        description='DEPRECATED/ignored: internal Nostr transport removed; use cl-hive-comms',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-vpn-peers',
-        default='',
-        description='VPN peer mappings (pubkey@ip:port, comma-separated)',
-        dynamic=True
-    )
-
-    plugin.add_option(
-        name='hive-vpn-required-messages',
-        default='all',
-        description='Message types requiring VPN: all, gossip, intent, sync, none',
-        dynamic=True
-    )
-
 
 # =============================================================================
 # CONFIG RELOAD SUPPORT
@@ -399,41 +209,13 @@ def register_options(plugin):
 
 # Mapping from plugin option names to config attribute names and types
 OPTION_TO_CONFIG_MAP: Dict[str, tuple] = {
-    'hive-governance-mode': ('governance_mode', str),
-    'hive-neophyte-fee-discount': ('neophyte_fee_discount_pct', float),
-    'hive-member-fee-ppm': ('member_fee_ppm', int),
-    'hive-probation-days': ('probation_days', int),
     'hive-max-members': ('max_members', int),
     'hive-market-share-cap': ('market_share_cap_pct', float),
-    'hive-membership-enabled': ('membership_enabled', bool),
     'hive-auto-join': ('auto_join_enabled', bool),
-    'hive-auto-vouch': ('auto_vouch_enabled', bool),
-    'hive-auto-promote': ('auto_promote_enabled', bool),
-    'hive-ban-autotrigger': ('ban_autotrigger_enabled', bool),
     'hive-intent-hold-seconds': ('intent_hold_seconds', int),
     'hive-gossip-threshold': ('gossip_threshold_pct', float),
     'hive-heartbeat-interval': ('heartbeat_interval', int),
     'hive-planner-interval': ('planner_interval', int),
-    'hive-planner-enable-expansions': ('planner_enable_expansions', bool),
-    'hive-planner-min-channel-sats': ('planner_min_channel_sats', int),
-    'hive-planner-max-channel-sats': ('planner_max_channel_sats', int),
-    'hive-planner-default-channel-sats': ('planner_default_channel_sats', int),
-    'hive-planner-max-active-channels': ('planner_max_active_channels', int),
-    # Budget options (failsafe mode)
-    'hive-failsafe-budget-per-day': ('failsafe_budget_per_day', int),
-    'hive-budget-reserve-pct': ('budget_reserve_pct', float),
-    'hive-budget-max-per-channel-pct': ('budget_max_per_channel_pct', float),
-    # Feerate gate
-    'hive-max-expansion-feerate': ('max_expansion_feerate_perkb', int),
-}
-
-# VPN options require special handling (reconfigure VPN transport)
-VPN_OPTIONS = {
-    'hive-transport-mode',
-    'hive-vpn-subnets',
-    'hive-vpn-bind',
-    'hive-vpn-peers',
-    'hive-vpn-required-messages',
 }
 
 

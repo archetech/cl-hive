@@ -5,7 +5,7 @@ Provides centralized calculation and caching of network position metrics
 for hive members. These metrics are used across multiple modules:
 
 - Routing Pool: Fair share calculation for revenue distribution
-- Membership: Promotion eligibility evaluation
+- Membership: Member verification and fleet topology
 - Planner: Channel open target prioritization
 - Rebalancing: Identify optimal rebalance paths through central nodes
 - Fee Coordination: Adjust strategies based on network position

@@ -1,5 +1,5 @@
 """
-Tests for Phase 5: Governance & Membership.
+Tests for membership module: single-role member model.
 """
 
 import time
@@ -9,14 +9,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.membership import MembershipManager, MembershipTier
+from modules.membership import MembershipManager, MEMBER_TIER
 from modules.contribution import ContributionManager, LEECH_WINDOW_DAYS
-from modules.protocol import (
-    validate_promotion_request,
-    validate_vouch,
-    validate_promotion,
-    MAX_VOUCHES_IN_PROMOTION
-)
 
 
 class DummyState:
@@ -25,10 +19,12 @@ class DummyState:
 
 
 class DummyConfig:
-    probation_days = 30
-    vouch_threshold_pct = 0.51
-    min_vouch_count = 3
-    ban_autotrigger_enabled = False
+    pass
+
+
+def test_member_tier_constant():
+    """MEMBER_TIER should be 'member'."""
+    assert MEMBER_TIER == "member"
 
 
 def test_uptime_thresholds():
@@ -93,18 +89,8 @@ def test_uniqueness_check():
     ]
 
     mgr = MembershipManager(db, state_manager, contribution_mgr, None, config)
-    unique = mgr.get_unique_peers("neophyte")
+    unique = mgr.get_unique_peers("candidate")
     assert "peer_unique" in unique
-
-
-def test_quorum_calculation():
-    db = MagicMock()
-    contribution_mgr = MagicMock()
-    state_manager = MagicMock()
-    config = DummyConfig()
-    mgr = MembershipManager(db, state_manager, contribution_mgr, None, config)
-
-    assert mgr.calculate_quorum(5) == 3
 
 
 def test_leech_trigger():
@@ -124,26 +110,53 @@ def test_leech_trigger():
     db.set_leech_flag.assert_called()
 
 
-def test_promotion_validation_caps():
-    payload = {
-        "target_pubkey": "02" + "a" * 64,
-        "request_id": "a" * 32,
-        "vouches": [
-            {
-                "target_pubkey": "02" + "a" * 64,
-                "request_id": "a" * 32,
-                "timestamp": 1,
-                "voucher_pubkey": "02" + "b" * 64,
-                "sig": "sig"
-            }
-        ] * (MAX_VOUCHES_IN_PROMOTION + 1)
-    }
-    assert validate_promotion(payload) is False
+def test_is_member():
+    db = MagicMock()
+    contribution_mgr = MagicMock()
+    state_manager = MagicMock()
+    config = DummyConfig()
+    mgr = MembershipManager(db, state_manager, contribution_mgr, None, config)
+
+    db.get_member.return_value = {"peer_id": "abc", "tier": "member"}
+    assert mgr.is_member("abc") is True
+
+    db.get_member.return_value = None
+    assert mgr.is_member("xyz") is False
 
 
-def test_vouch_validation_missing_fields():
-    assert validate_vouch({"target_pubkey": "x"}) is False
+def test_add_member_always_uses_member_tier():
+    """add_member should always store MEMBER_TIER regardless of input."""
+    db = MagicMock()
+    db.add_member.return_value = True
+    config = DummyConfig()
+    mgr = MembershipManager(db, MagicMock(), MagicMock(), None, config)
+
+    mgr.add_member("peer123")
+    call_args = db.add_member.call_args
+    assert call_args[1]["tier"] == MEMBER_TIER
 
 
-def test_request_validation_missing_fields():
-    assert validate_promotion_request({"target_pubkey": "x"}) is False
+def test_get_active_members():
+    db = MagicMock()
+    contribution_mgr = MagicMock()
+    state_manager = MagicMock()
+    config = DummyConfig()
+    mgr = MembershipManager(db, state_manager, contribution_mgr, None, config)
+
+    now = int(time.time())
+    db.get_all_members.return_value = [
+        {"peer_id": "a", "tier": "member", "last_seen": now - 100},
+        {"peer_id": "b", "tier": "member", "last_seen": now - 100},
+        {"peer_id": "c", "tier": "member", "last_seen": now - 100000},  # stale
+    ]
+    db.is_banned.return_value = False
+
+    active = mgr.get_active_members()
+    assert "a" in active
+    assert "b" in active
+    assert "c" not in active
+
+
+if __name__ == "__main__":
+    import pytest
+    pytest.main([__file__, "-v"])

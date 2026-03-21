@@ -90,7 +90,7 @@ class TestUpdateRebalancingActivityPreservesData:
     def setup_method(self):
         self.db = MockDatabase()
         self.db.members = {PEER1: {"peer_id": PEER1, "tier": "member"},
-                           OUR_PUBKEY: {"peer_id": OUR_PUBKEY, "tier": "admin"}}
+                           OUR_PUBKEY: {"peer_id": OUR_PUBKEY, "tier": "member"}}
         self.plugin = MockPlugin()
         self.coord = LiquidityCoordinator(
             database=self.db,
@@ -178,7 +178,7 @@ class TestEnrichedNeedsIntegration:
 
     def setup_method(self):
         self.db = MockDatabase()
-        self.db.members = {OUR_PUBKEY: {"peer_id": OUR_PUBKEY, "tier": "admin"}}
+        self.db.members = {OUR_PUBKEY: {"peer_id": OUR_PUBKEY, "tier": "member"}}
         self.plugin = MockPlugin()
         self.coord = LiquidityCoordinator(
             database=self.db,

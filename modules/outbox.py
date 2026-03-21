@@ -1,15 +1,15 @@
 """
 OutboxManager for cl-hive (Phase D: Reliable Delivery).
 
-Provides durable, per-peer message delivery with exponential backoff,
-explicit MSG_ACK handling, and implicit ack resolution via domain responses.
+Provides durable, per-peer message delivery with exponential backoff
+and implicit ack resolution via domain responses.
 
 Design:
 - Each critical broadcast creates N outbox rows (one per target peer).
 - Unicast messages create a single row.
 - The outbox_retry_loop calls retry_pending() every 30 seconds.
 - Messages are retried with exponential backoff (30s -> 1h cap).
-- Explicit MSG_ACK or implicit domain responses clear entries.
+- Implicit domain responses clear entries.
 - Backpressure: MAX_INFLIGHT_PER_PEER limits per-peer queue depth.
 """
 
@@ -90,58 +90,13 @@ class OutboxManager:
                 enqueued += 1
                 targeted_peers.append(pid)
 
-        if msg_type == HiveMessageType.SETTLEMENT_PROPOSE and enqueued > 0:
-            # Keep proposal rebroadcast telemetry in sync with reliable-delivery sends.
-            try:
-                self._db.update_proposal_broadcast_time(msg_id, now)
-            except Exception as e:
-                self._log(
-                    f"Outbox: failed to update settlement proposal broadcast time "
-                    f"{msg_id[:16]}...: {e}",
-                    level='debug'
-                )
-            try:
-                peers_preview = ", ".join(p[:12] + "..." for p in targeted_peers[:8])
-                if len(targeted_peers) > 8:
-                    peers_preview += f", +{len(targeted_peers) - 8} more"
-                self._log(
-                    f"SETTLEMENT OUTBOX: Enqueued proposal {msg_id[:16]}... "
-                    f"to {enqueued} peer(s){': ' + peers_preview if peers_preview else ''}",
-                    level='info'
-                )
-            except Exception:
-                pass
-
         return enqueued
-
-    def process_ack(self, peer_id: str, ack_msg_id: str, status: str) -> bool:
-        """
-        Handle explicit MSG_ACK from a peer.
-
-        Args:
-            peer_id: Peer that sent the ack
-            ack_msg_id: The msg_id being acknowledged
-            status: "ok", "invalid", or "retry_later"
-
-        Returns:
-            True if an outbox entry was found and updated.
-        """
-        if status == "ok":
-            return self._db.ack_outbox(ack_msg_id, peer_id)
-        elif status == "invalid":
-            return self._db.fail_outbox(ack_msg_id, peer_id,
-                                        "remote_invalid")
-        # "retry_later" - leave as-is, will retry on schedule
-        return False
 
     def process_implicit_ack(self, peer_id: str,
                              response_type: HiveMessageType,
                              response_payload: Dict[str, Any]) -> int:
         """
         Handle a domain-specific response that implies acknowledgment.
-
-        E.g. receiving SETTLEMENT_READY from a peer clears our outbox
-        SETTLEMENT_PROPOSE entries for that peer+proposal_id.
 
         Returns:
             Number of outbox entries cleared.
@@ -222,16 +177,6 @@ class OutboxManager:
             if success:
                 next_retry = self._calculate_next_retry(retry_count)
                 self._db.update_outbox_sent(msg_id, peer_id, next_retry)
-                if msg_type == int(HiveMessageType.SETTLEMENT_PROPOSE):
-                    try:
-                        self._db.update_proposal_broadcast_time(msg_id)
-                    except Exception:
-                        pass
-                    self._log(
-                        f"SETTLEMENT OUTBOX: Sent/retried proposal {msg_id[:16]}... "
-                        f"to {peer_id[:16]}... (retry_count={retry_count})",
-                        level='debug'
-                    )
                 stats["sent"] += 1
             else:
                 # Send failed (peer unreachable) — schedule retry without
@@ -240,12 +185,6 @@ class OutboxManager:
                 short_delay = self.BASE_RETRY_SECONDS + random.uniform(0, 10)
                 next_retry = int(time.time() + short_delay)
                 self._db.update_outbox_retry(msg_id, peer_id, next_retry)
-                if msg_type == int(HiveMessageType.SETTLEMENT_PROPOSE):
-                    self._log(
-                        f"SETTLEMENT OUTBOX: Send failed for proposal {msg_id[:16]}... "
-                        f"to {peer_id[:16]}...; retry scheduled",
-                        level='debug'
-                    )
                 stats["skipped"] += 1
 
         return stats

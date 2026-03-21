@@ -157,7 +157,7 @@ class GossipManager:
         """
         now = int(time.time())
 
-        # Rule 3: Force on status change (bans, promotions)
+        # Rule 3: Force on status change (bans, membership changes)
         if force_status:
             self._log("Broadcast triggered: Status change (forced)")
             return True
@@ -248,9 +248,8 @@ class GossipManager:
         """
         now = int(time.time())
 
-        # Default capabilities include MCF support (this node has it)
         if capabilities is None:
-            capabilities = ["mcf"]
+            capabilities = []
 
         with self._lock:
             new_version = self._last_broadcast_state.version + 1

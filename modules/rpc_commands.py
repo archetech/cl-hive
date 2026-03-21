@@ -11,165 +11,10 @@ Design Pattern:
     - Permission checks are done via check_permission() helper
 """
 
-import json
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
-
-_DUAL_FUND_BIT_EVEN = 1 << 28
-_DUAL_FUND_BIT_ODD = 1 << 29
-
-
-def _peer_supports_dual_fund(rpc, peer_id: str, log_fn=None) -> bool:
-    """Check if a peer advertises option_dual_fund (feature bits 28/29)."""
-    try:
-        res = rpc.call("listpeers", {"id": peer_id})
-        peers = res.get("peers") or []
-        if not peers:
-            return False
-        features_hex = peers[0].get("features")
-        if not features_hex:
-            return False
-        features = int(features_hex, 16)
-        supported = bool(features & (_DUAL_FUND_BIT_EVEN | _DUAL_FUND_BIT_ODD))
-        if log_fn and supported:
-            log_fn(f"cl-hive: Peer {peer_id[:16]}... supports dual-fund (v2)", "info")
-        return supported
-    except Exception:
-        return False
-
-
-def _open_channel(rpc, target: str, amount_sats: int,
-                  feerate: str = "normal", announce: bool = True,
-                  request_amt: int = 0,
-                  log_fn=None) -> Dict[str, Any]:
-    """Open a channel using fundchannel.
-
-    When *request_amt* > 0 and the peer advertises ``option_dual_fund``,
-    the amount is passed as ``request_amt`` to ``fundchannel`` so the
-    remote funder plugin can contribute liquidity.  If the dual-funded
-    attempt fails, we retry without ``request_amt`` (graceful fallback).
-    """
-    if log_fn:
-        log_fn(f"cl-hive: Opening channel to {target[:16]}... for {amount_sats:,} sats", "info")
-
-    params = {
-        "id": target,
-        "amount": amount_sats,
-        "feerate": feerate,
-        "announce": announce,
-    }
-
-    dual_funded = False
-    if request_amt > 0 and _peer_supports_dual_fund(rpc, target, log_fn=log_fn):
-        params["request_amt"] = request_amt
-        dual_funded = True
-
-    try:
-        result = rpc.call("fundchannel", dict(params))
-    except Exception:
-        if dual_funded:
-            # Graceful fallback: retry without request_amt
-            if log_fn:
-                log_fn("cl-hive: Dual-fund attempt failed, retrying without request_amt", "info")
-            fallback_params = {k: v for k, v in params.items() if k != "request_amt"}
-            dual_funded = False
-            result = rpc.call("fundchannel", fallback_params)
-        else:
-            raise
-
-    return {
-        "channel_id": result.get("channel_id", "unknown"),
-        "txid": result.get("txid", "unknown"),
-        "dual_funded": dual_funded,
-    }
-
-
-def _batch_open_channels(
-    rpc,
-    targets: List[Dict[str, Any]],
-    feerate: str = "normal",
-    announce: bool = True,
-    log_fn=None,
-) -> Dict[str, Any]:
-    """Batch-open multiple channels in a single on-chain transaction.
-
-    Note: ``multifundchannel`` negotiates v2 transparently but does not
-    support per-destination ``request_amt``.  Use single ``_open_channel``
-    calls when dual-fund contributions are needed.
-    """
-    if log_fn:
-        log_fn(
-            f"cl-hive: Batch opening {len(targets)} channels via multifundchannel",
-            "info",
-        )
-
-    destinations = [{"id": t["id"], "amount": t["amount"]} for t in targets]
-    raw = rpc.call("multifundchannel", {
-        "destinations": destinations,
-        "feerate": feerate,
-        "announce": announce,
-        "minchannels": 1,  # Allow partial success
-    })
-
-    txid = raw.get("txid", "unknown")
-    raw_failed = raw.get("failed") or []
-    failed = []
-    failed_ids = set()
-    for entry in raw_failed:
-        peer_id = entry.get("id") or entry.get("peer_id")
-        if peer_id:
-            failed_ids.add(peer_id)
-        failed.append({
-            "id": peer_id,
-            "error": entry.get("error") or entry.get("message") or "multifundchannel failed",
-        })
-
-    results_by_id: Dict[str, Dict[str, Any]] = {}
-
-    # Some CLN variants may include detailed per-channel success entries.
-    for ch in raw.get("channels") or []:
-        peer_id = ch.get("id") or ch.get("peer_id")
-        if not peer_id:
-            continue
-        results_by_id[peer_id] = {
-            "status": "opened",
-            "channel_id": ch.get("channel_id", "unknown"),
-            "txid": ch.get("txid", txid),
-        }
-
-    channel_ids = raw.get("channel_ids") or []
-    success_targets = [t for t in targets if t["id"] not in failed_ids]
-    unmapped_success_targets = [t for t in success_targets if t["id"] not in results_by_id]
-
-    for target, channel_id in zip(unmapped_success_targets, channel_ids):
-        results_by_id[target["id"]] = {
-            "status": "opened",
-            "channel_id": channel_id,
-            "txid": txid,
-        }
-
-    for target in unmapped_success_targets[len(channel_ids):]:
-        results_by_id[target["id"]] = {
-            "status": "opened",
-            "channel_id": "unknown",
-            "txid": txid,
-        }
-
-    for item in failed:
-        if item.get("id"):
-            results_by_id[item["id"]] = {
-                "status": "failed",
-                "error": item["error"],
-            }
-
-    return {
-        "channel_ids": channel_ids,
-        "failed": failed,
-        "txid": txid,
-        "results_by_id": results_by_id,
-    }
 
 
 @dataclass
@@ -184,48 +29,31 @@ class HiveContext:
     config: Any    # HiveConfig
     safe_plugin: Any  # ThreadSafePluginProxy
     our_pubkey: str
-    vpn_transport: Any = None  # VPNTransportManager
     planner: Any = None  # Planner
     quality_scorer: Any = None  # PeerQualityScorer
     bridge: Any = None  # Bridge
     intent_mgr: Any = None  # IntentManager
     membership_mgr: Any = None  # MembershipManager
-    coop_expansion_mgr: Any = None  # CooperativeExpansionManager
     contribution_mgr: Any = None  # ContributionManager
-    routing_pool: Any = None  # RoutingPool (Phase 0 - Collective Economics)
     yield_metrics_mgr: Any = None  # YieldMetricsManager (Phase 1 - Metrics)
     liquidity_coordinator: Any = None  # LiquidityCoordinator (for competition detection)
     fee_coordination_mgr: Any = None  # FeeCoordinationManager (Phase 2 - Fee Coordination)
-    cost_reduction_mgr: Any = None  # CostReductionManager (Phase 3 - Cost Reduction)
     rationalization_mgr: Any = None  # RationalizationManager (Channel Rationalization)
     strategic_positioning_mgr: Any = None  # StrategicPositioningManager (Phase 5 - Strategic Positioning)
-    anticipatory_manager: Any = None  # AnticipatoryLiquidityManager (Phase 7.1 - Anticipatory Liquidity)
-    did_credential_mgr: Any = None  # DIDCredentialManager (Phase 16 - DID Credentials)
-    management_schema_registry: Any = None  # ManagementSchemaRegistry (Phase 2 - Management Schemas)
-    cashu_escrow_mgr: Any = None  # CashuEscrowManager (Phase 4A - Cashu Escrow)
-    nostr_transport: Any = None  # NostrTransport (Phase 5A - Nostr transport)
-    marketplace_mgr: Any = None  # MarketplaceManager (Phase 5B - Advisor marketplace)
-    liquidity_mgr: Any = None  # LiquidityMarketplaceManager (Phase 5C - Liquidity marketplace)
     traffic_intel_mgr: Any = None  # TrafficIntelligenceManager (Phase 14 - Traffic Intelligence)
-    policy_engine: Any = None  # PolicyEngine (Phase 6A - client policy)
     our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
-    nostr_transport_enabled: bool = False
-    comms_active: bool = False
-    archon_active: bool = False
     signing_backend: str = "unknown"
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
 
-def check_permission(ctx: HiveContext, required_tier: str) -> Optional[Dict[str, Any]]:
+def check_permission(ctx: HiveContext, required_tier: str = 'member') -> Optional[Dict[str, Any]]:
     """
-    Check if the local node has the required tier for an RPC command.
+    Check if the local node is a hive member.
 
-    Args:
-        ctx: HiveContext with database and our_pubkey
-        required_tier: 'member' (only tier that has special permissions)
+    All members have equal privileges in the single-role model.
 
     Returns:
-        None if permission granted, or error dict if denied
+        None if permission granted, or error dict if denied.
     """
     if not ctx.our_pubkey or not ctx.database:
         return {"error": "Not initialized"}
@@ -234,17 +62,6 @@ def check_permission(ctx: HiveContext, required_tier: str) -> Optional[Dict[str,
     if not member:
         return {"error": "Not a Hive member", "required_tier": required_tier}
 
-    current_tier = member.get('tier', 'neophyte')
-
-    if required_tier == 'member':
-        if current_tier != 'member':
-            return {
-                "error": "permission_denied",
-                "message": "This command requires member privileges",
-                "current_tier": current_tier,
-                "required_tier": "member"
-            }
-
     return None  # Permission granted
 
 
@@ -252,129 +69,6 @@ def check_permission(ctx: HiveContext, required_tier: str) -> Optional[Dict[str,
 # VPN COMMANDS
 # =============================================================================
 
-def vpn_status(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
-    """
-    Get VPN transport status and configuration.
-
-    Shows the current VPN transport mode, configured subnets, peer mappings,
-    and which hive members are connected via VPN.
-
-    Args:
-        ctx: HiveContext
-        peer_id: Optional - Get VPN info for a specific peer
-
-    Returns:
-        Dict with VPN transport configuration and status.
-    """
-    if not ctx.vpn_transport:
-        return {"error": "VPN transport not initialized"}
-
-    if peer_id:
-        # Get info for specific peer
-        peer_info = ctx.vpn_transport.get_peer_vpn_info(peer_id)
-        if peer_info:
-            return {
-                "peer_id": peer_id,
-                **peer_info
-            }
-        return {
-            "peer_id": peer_id,
-            "message": "No VPN info for this peer"
-        }
-
-    # Return full status
-    return ctx.vpn_transport.get_status()
-
-
-def vpn_add_peer(ctx: HiveContext, pubkey: str, vpn_address: str) -> Dict[str, Any]:
-    """
-    Add or update a VPN peer mapping.
-
-    Maps a node's pubkey to its VPN address for routing hive gossip.
-
-    Args:
-        ctx: HiveContext
-        pubkey: Node pubkey
-        vpn_address: VPN address in format ip:port or just ip (default port 9735)
-
-    Returns:
-        Dict with result.
-
-    Permission: Member only
-    """
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.vpn_transport:
-        return {"error": "VPN transport not initialized"}
-
-    # Validate pubkey format (66 hex chars for compressed secp256k1 key)
-    import re
-    if not re.match(r'^[0-9a-fA-F]{66}$', pubkey):
-        return {"error": "Invalid pubkey format: expected 66 hex characters"}
-
-    # Parse address
-    if ':' in vpn_address:
-        ip, port_str = vpn_address.rsplit(':', 1)
-        try:
-            port = int(port_str)
-        except (ValueError, TypeError):
-            return {"error": "Invalid port number"}
-        if not (1 <= port <= 65535):
-            return {"error": f"Port {port} out of valid range (1-65535)"}
-    else:
-        ip = vpn_address
-        port = 9735
-
-    success = ctx.vpn_transport.add_vpn_peer(pubkey, ip, port)
-    if success:
-        return {
-            "success": True,
-            "pubkey": pubkey,
-            "vpn_address": f"{ip}:{port}",
-            "message": "VPN peer mapping added"
-        }
-    return {
-        "success": False,
-        "error": "Failed to add peer - max peers may be reached"
-    }
-
-
-def vpn_remove_peer(ctx: HiveContext, pubkey: str) -> Dict[str, Any]:
-    """
-    Remove a VPN peer mapping.
-
-    Args:
-        ctx: HiveContext
-        pubkey: Node pubkey to remove
-
-    Returns:
-        Dict with result.
-
-    Permission: Member only
-    """
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.vpn_transport:
-        return {"error": "VPN transport not initialized"}
-
-    success = ctx.vpn_transport.remove_vpn_peer(pubkey)
-    if success:
-        return {
-            "success": True,
-            "pubkey": pubkey,
-            "message": "VPN peer mapping removed"
-        }
-    return {
-        "success": False,
-        "pubkey": pubkey,
-        "message": "Peer not found in VPN mappings"
-    }
 
 
 # =============================================================================
@@ -386,14 +80,12 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
     Get current Hive status and membership info.
 
     Returns:
-        Dict with hive state, member count, governance mode, etc.
+        Dict with hive state and member count.
     """
     if not ctx.database:
         return {"error": "Hive not initialized"}
 
     members = ctx.database.get_all_members()
-    member_count = len([m for m in members if m['tier'] == 'member'])
-    neophyte_count = len([m for m in members if m['tier'] == 'neophyte'])
 
     # Get our own membership status (used by cl-revenue-ops to detect hive mode)
     our_membership = {"tier": None, "joined_at": None}
@@ -418,20 +110,15 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
 
     return {
         "status": "active" if members else "no_members",
-        "governance_mode": ctx.config.governance_mode if ctx.config else "unknown",
+        "governance": "recommendation_only",
         "membership": our_membership,  # Our own membership for cl-revenue-ops detection
         "members": {
             "total": len(members),
-            "member": member_count,
-            "neophyte": neophyte_count,
         },
         "limits": {
             "max_members": ctx.config.max_members if ctx.config else 50,
             "market_share_cap": ctx.config.market_share_cap_pct if ctx.config else 0.20,
         },
-        "nostr_transport_enabled": bool(ctx.nostr_transport_enabled),
-        "comms_active": bool(ctx.comms_active),
-        "archon_active": bool(ctx.archon_active),
         "signing_backend": str(ctx.signing_backend or "unknown"),
         "version": "2.2.6",
     }
@@ -456,23 +143,10 @@ def get_config(ctx: HiveContext) -> Dict[str, Any]:
         "immutable": {
             "db_path": ctx.config.db_path,
         },
-        "governance": {
-            "governance_mode": ctx.config.governance_mode,
-            "failsafe_budget_per_day": ctx.config.failsafe_budget_per_day,
-            "failsafe_actions_per_hour": ctx.config.failsafe_actions_per_hour,
-        },
+        "governance": "recommendation_only",
         "membership": {
             "membership_enabled": ctx.config.membership_enabled,
             "auto_join_enabled": ctx.config.auto_join_enabled,
-            "auto_vouch_enabled": ctx.config.auto_vouch_enabled,
-            "auto_promote_enabled": ctx.config.auto_promote_enabled,
-            "ban_autotrigger_enabled": ctx.config.ban_autotrigger_enabled,
-            "neophyte_fee_discount_pct": ctx.config.neophyte_fee_discount_pct,
-            "member_fee_ppm": ctx.config.member_fee_ppm,
-            "probation_days": ctx.config.probation_days,
-            "min_contribution_ratio": ctx.config.min_contribution_ratio,
-            "min_uptime_pct": ctx.config.min_uptime_pct,
-            "min_unique_peers": ctx.config.min_unique_peers,
             "max_members": ctx.config.max_members,
         },
         "protocol": {
@@ -484,12 +158,11 @@ def get_config(ctx: HiveContext) -> Dict[str, Any]:
         },
         "planner": {
             "planner_interval": ctx.config.planner_interval,
-            "planner_enable_expansions": ctx.config.planner_enable_expansions,
             "planner_min_channel_sats": ctx.config.planner_min_channel_sats,
             "planner_max_channel_sats": ctx.config.planner_max_channel_sats,
             "planner_default_channel_sats": ctx.config.planner_default_channel_sats,
         },
-        "vpn": ctx.vpn_transport.get_status() if ctx.vpn_transport else {"enabled": False},
+        "vpn": {"enabled": False},  # VPN transport removed
     }
 
 
@@ -524,1271 +197,6 @@ def members(ctx: HiveContext) -> Dict[str, Any]:
 # ACTION MANAGEMENT COMMANDS
 # =============================================================================
 
-def pending_actions(ctx: HiveContext) -> Dict[str, Any]:
-    """
-    Get all pending actions awaiting operator approval.
-
-    Returns:
-        Dict with list of pending actions.
-    """
-    if not ctx.database:
-        return {"error": "Database not initialized"}
-
-    actions = ctx.database.get_pending_actions()
-    return {
-        "count": len(actions),
-        "actions": actions,
-    }
-
-
-def reject_action(ctx: HiveContext, action_id, reason=None) -> Dict[str, Any]:
-    """
-    Reject pending action(s).
-
-    Args:
-        ctx: HiveContext
-        action_id: ID of the action to reject, or "all" to reject all pending actions
-        reason: Optional reason for rejection (stored for learning)
-
-    Returns:
-        Dict with rejection result.
-
-    Permission: Member only
-    """
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.database:
-        return {"error": "Database not initialized"}
-
-    # Handle "all" option
-    if action_id == "all":
-        return _reject_all_actions(ctx, reason=reason)
-
-    # Single action rejection - validate action_id
-    try:
-        action_id = int(action_id)
-    except (ValueError, TypeError):
-        return {"error": "Invalid action_id, must be an integer or 'all'"}
-
-    # Get the action
-    action = ctx.database.get_pending_action_by_id(action_id)
-    if not action:
-        return {"error": "Action not found", "action_id": action_id}
-
-    if action['status'] != 'pending':
-        return {"error": f"Action already {action['status']}", "action_id": action_id}
-
-    # Also abort the associated intent if it exists
-    payload = action.get('payload', {})
-    intent_id = payload.get('intent_id')
-    if intent_id:
-        ctx.database.update_intent_status(intent_id, 'aborted', reason="action_rejected")
-
-    # Update action status with optional reason
-    ctx.database.update_action_status(action_id, 'rejected', reason=reason)
-
-    if ctx.log:
-        reason_str = f" (reason: {reason})" if reason else ""
-        ctx.log(f"cl-hive: Rejected action {action_id}{reason_str}", 'info')
-
-    result = {
-        "status": "rejected",
-        "action_id": action_id,
-        "action_type": action['action_type'],
-    }
-    if reason:
-        result["reason"] = reason
-    return result
-
-
-MAX_BULK_ACTIONS = 100  # CLAUDE.md: "Bound everything"
-
-
-def _reject_all_actions(ctx: HiveContext, reason=None) -> Dict[str, Any]:
-    """Reject all pending actions (up to MAX_BULK_ACTIONS)."""
-    actions = ctx.database.get_pending_actions()
-
-    if not actions:
-        return {"status": "no_actions", "message": "No pending actions to reject"}
-
-    # Bound the number of actions processed (CLAUDE.md safety constraint)
-    total_pending = len(actions)
-    actions = actions[:MAX_BULK_ACTIONS]
-
-    rejected = []
-    errors = []
-
-    for action in actions:
-        action_id = action['id']
-        try:
-            # Abort associated intent if exists
-            payload = action.get('payload', {})
-            intent_id = payload.get('intent_id')
-            if intent_id:
-                ctx.database.update_intent_status(intent_id, 'aborted', reason="action_rejected")
-
-            # Update action status with optional reason
-            ctx.database.update_action_status(action_id, 'rejected', reason=reason)
-            rejected.append({
-                "action_id": action_id,
-                "action_type": action['action_type']
-            })
-        except Exception as e:
-            errors.append({"action_id": action_id, "error": str(e)})
-
-    if ctx.log:
-        ctx.log(f"cl-hive: Rejected {len(rejected)} actions", 'info')
-
-    result = {
-        "status": "rejected_all",
-        "rejected_count": len(rejected),
-        "rejected": rejected,
-        "errors": errors if errors else None
-    }
-
-    # Warn if there were more actions than we processed
-    if total_pending > MAX_BULK_ACTIONS:
-        result["warning"] = f"Only processed {MAX_BULK_ACTIONS} of {total_pending} pending actions"
-
-    return result
-
-
-def budget_summary(ctx: HiveContext, days: int = 7) -> Dict[str, Any]:
-    """
-    Get budget usage summary for failsafe mode.
-
-    Args:
-        ctx: HiveContext
-        days: Number of days of history to include (default: 7, max: 365)
-
-    Returns:
-        Dict with budget utilization and spending history.
-
-    Permission: Member only
-    """
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.database:
-        return {"error": "Database not initialized"}
-
-    # Bound days parameter (CLAUDE.md: "Bound everything")
-    try:
-        days = min(max(int(days), 1), 365)
-    except (ValueError, TypeError):
-        days = 7
-
-    cfg = ctx.config.snapshot() if ctx.config else None
-    if not cfg:
-        return {"error": "Config not initialized"}
-
-    daily_budget = cfg.failsafe_budget_per_day
-    summary = ctx.database.get_budget_summary(daily_budget, days)
-
-    return {
-        "daily_budget_sats": daily_budget,
-        "governance_mode": cfg.governance_mode,
-        **summary
-    }
-
-
-def approve_action(ctx: HiveContext, action_id, amount_sats: int = None) -> Dict[str, Any]:
-    """
-    Approve and execute pending action(s).
-
-    Args:
-        ctx: HiveContext
-        action_id: ID of the action to approve, or "all" to approve all pending actions
-        amount_sats: Optional override for channel size (member budget control).
-            If provided, uses this amount instead of the proposed amount.
-            Must be >= min_channel_sats and will still be subject to budget limits.
-            Only applies when approving a single action.
-
-    Returns:
-        Dict with approval result including budget details.
-
-    Permission: Member only
-    """
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.database:
-        return {"error": "Database not initialized"}
-
-    # Handle "all" option
-    if action_id == "all":
-        if amount_sats is not None:
-            return {"error": "amount_sats override not supported with 'all' — approve individually to set custom amounts"}
-        return _approve_all_actions(ctx)
-
-    # Single action approval - validate action_id
-    try:
-        action_id = int(action_id)
-    except (ValueError, TypeError):
-        return {"error": "Invalid action_id, must be an integer or 'all'"}
-
-    # Get the action
-    action = ctx.database.get_pending_action_by_id(action_id)
-    if not action:
-        return {"error": "Action not found", "action_id": action_id}
-
-    if action['status'] != 'pending':
-        return {"error": f"Action already {action['status']}", "action_id": action_id}
-
-    # Check if expired
-    now = int(time.time())
-    if action.get('expires_at') and now > action['expires_at']:
-        ctx.database.update_action_status(action_id, 'expired')
-        return {"error": "Action has expired", "action_id": action_id}
-
-    action_type = action['action_type']
-    payload = action['payload']
-
-    # Execute based on action type
-    if action_type == 'channel_open':
-        return _execute_channel_open(ctx, action_id, action_type, payload, amount_sats)
-
-    else:
-        # Unknown action type - just mark as approved
-        ctx.database.update_action_status(action_id, 'approved')
-        return {
-            "status": "approved",
-            "action_id": action_id,
-            "action_type": action_type,
-            "note": "Unknown action type, marked as approved only"
-        }
-
-
-def _extract_channel_open_details(
-    action_id: int,
-    payload: Dict[str, Any],
-    amount_sats: int = None,
-) -> Dict[str, Any]:
-    """Parse and validate channel_open payload details."""
-    target = payload.get('target')
-    context = payload.get('context', {})
-    intent_id = context.get('intent_id') or payload.get('intent_id')
-
-    proposed_size = (
-        context.get('channel_size_sats') or
-        context.get('amount_sats') or
-        payload.get('amount_sats') or
-        payload.get('channel_size_sats') or
-        1_000_000
-    )
-    try:
-        proposed_size = int(proposed_size)
-    except (ValueError, TypeError):
-        return {"error": "Invalid channel_size_sats in action payload", "action_id": action_id}
-
-    if amount_sats is not None:
-        try:
-            channel_size_sats = int(amount_sats)
-        except (ValueError, TypeError):
-            return {"error": "Invalid amount_sats", "action_id": action_id}
-        override_applied = True
-    else:
-        channel_size_sats = proposed_size
-        override_applied = False
-
-    if not target:
-        return {"error": "Missing target in action payload", "action_id": action_id}
-
-    return {
-        "target": target,
-        "context": context,
-        "intent_id": intent_id,
-        "proposed_size_sats": proposed_size,
-        "channel_size_sats": channel_size_sats,
-        "override_applied": override_applied,
-        "override_amount": amount_sats if override_applied else None,
-    }
-
-
-def _preflight_channel_open(
-    ctx: HiveContext,
-    action_id: int,
-    target: str,
-    channel_size_sats: int,
-    override_applied: bool = False,
-    reserved_budget_sats: int = 0,
-) -> Tuple[bool, int, Dict[str, Any], Optional[Dict[str, Any]]]:
-    """Run reusable preflight checks for a channel open, including peer connect."""
-    # Check for existing or pending channels to this target
-    try:
-        peer_channels = ctx.safe_plugin.rpc.listpeerchannels(target)
-        channels = peer_channels.get('channels', [])
-        for ch in channels:
-            state = ch.get('state', '')
-            if state in ('CHANNELD_AWAITING_LOCKIN', 'CHANNELD_NORMAL', 'DUALOPEND_AWAITING_LOCKIN'):
-                existing_capacity = ch.get('total_msat', 0) // 1000
-                funding_txid = ch.get('funding_txid', 'unknown')
-                return False, channel_size_sats, {}, {
-                    "error": f"Already have {'pending' if 'AWAITING' in state else 'active'} channel to this peer",
-                    "action_id": action_id,
-                    "target": target,
-                    "existing_channel_state": state,
-                    "existing_capacity_sats": existing_capacity,
-                    "existing_funding_txid": funding_txid,
-                    "hint": "Wait for pending channel to confirm or close existing channel first"
-                }
-    except Exception as e:
-        if ctx.log:
-            ctx.log(f"cl-hive: Could not check existing channels: {e}", 'debug')
-
-    cfg = ctx.config.snapshot() if ctx.config else None
-    if cfg and ctx.safe_plugin:
-        max_feerate = getattr(cfg, 'max_expansion_feerate_perkb', 5000)
-        if max_feerate != 0:
-            try:
-                feerates = ctx.safe_plugin.rpc.feerates("perkb")
-                opening_feerate = feerates.get("perkb", {}).get("opening")
-                if opening_feerate is None:
-                    opening_feerate = feerates.get("perkb", {}).get("min_acceptable", 0)
-                if opening_feerate > 0 and opening_feerate > max_feerate:
-                    ctx.database.update_action_status(action_id, 'failed')
-                    return False, channel_size_sats, {}, {
-                        "error": "Feerate gate: on-chain fees too high for channel open",
-                        "action_id": action_id,
-                        "opening_feerate_perkb": opening_feerate,
-                        "max_feerate_perkb": max_feerate,
-                        "hint": "Wait for feerates to drop or increase hive-max-expansion-feerate"
-                    }
-            except Exception as e:
-                if ctx.log:
-                    ctx.log(f"cl-hive: Could not check feerates: {e}", 'debug')
-
-    if not cfg:
-        return False, channel_size_sats, {}, {
-            "error": "Cannot open channel: config unavailable for budget enforcement",
-            "action_id": action_id
-        }
-
-    # Get onchain balance for reserve calculation
-    try:
-        funds = ctx.safe_plugin.rpc.listfunds()
-        onchain_sats = sum(
-            o.get('amount_msat', 0) // 1000
-            for o in funds.get('outputs', [])
-            if o.get('status') == 'confirmed'
-        )
-    except Exception:
-        onchain_sats = 0
-
-    daily_remaining_raw = ctx.database.get_available_budget(cfg.failsafe_budget_per_day)
-    daily_remaining = max(0, daily_remaining_raw - reserved_budget_sats)
-    spendable_onchain_raw = int(onchain_sats * (1.0 - cfg.budget_reserve_pct))
-    spendable_onchain = max(0, spendable_onchain_raw - reserved_budget_sats)
-    max_per_channel = int(cfg.failsafe_budget_per_day * cfg.budget_max_per_channel_pct)
-    effective_budget = min(daily_remaining, spendable_onchain, max_per_channel)
-
-    budget_info = {
-        "onchain_sats": onchain_sats,
-        "reserve_pct": cfg.budget_reserve_pct,
-        "spendable_onchain": spendable_onchain,
-        "daily_budget": cfg.failsafe_budget_per_day,
-        "daily_remaining": daily_remaining,
-        "max_per_channel_pct": cfg.budget_max_per_channel_pct,
-        "max_per_channel": max_per_channel,
-        "effective_budget": effective_budget,
-    }
-    if reserved_budget_sats:
-        budget_info["reserved_batch_sats"] = reserved_budget_sats
-        budget_info["daily_remaining_before_batch"] = daily_remaining_raw
-        budget_info["spendable_onchain_before_batch"] = spendable_onchain_raw
-
-    if channel_size_sats > effective_budget:
-        if effective_budget >= cfg.planner_min_channel_sats:
-            if ctx.log:
-                ctx.log(
-                    f"cl-hive: Reducing channel size from {channel_size_sats:,} to {effective_budget:,} "
-                    f"due to budget constraints (daily={daily_remaining:,}, reserve={spendable_onchain:,}, "
-                    f"per-channel={max_per_channel:,})",
-                    'info'
-                )
-            channel_size_sats = effective_budget
-        else:
-            limiting_factor = (
-                "daily budget" if daily_remaining == effective_budget else
-                "reserve limit" if spendable_onchain == effective_budget else
-                "per-channel limit"
-            )
-            return False, channel_size_sats, budget_info, {
-                "error": f"Insufficient budget for channel open ({limiting_factor})",
-                "action_id": action_id,
-                "requested_sats": channel_size_sats,
-                "effective_budget_sats": effective_budget,
-                "min_channel_sats": cfg.planner_min_channel_sats,
-                "budget_info": budget_info,
-            }
-
-    if override_applied:
-        if channel_size_sats < cfg.planner_min_channel_sats:
-            return False, channel_size_sats, budget_info, {
-                "error": f"Override amount {channel_size_sats:,} below minimum {cfg.planner_min_channel_sats:,}",
-                "action_id": action_id,
-                "min_channel_sats": cfg.planner_min_channel_sats,
-            }
-        if channel_size_sats > effective_budget:
-            return False, channel_size_sats, budget_info, {
-                "error": f"Override amount {channel_size_sats:,} exceeds effective budget {effective_budget:,}",
-                "action_id": action_id,
-                "effective_budget_sats": effective_budget,
-                "budget_info": budget_info,
-            }
-
-    # Connect to target if not already connected
-    try:
-        peerchannels = ctx.safe_plugin.rpc.listpeerchannels(target)
-        if not peerchannels.get('channels'):
-            try:
-                ctx.safe_plugin.rpc.connect(target)
-                if ctx.log:
-                    ctx.log(f"cl-hive: Connected to {target[:16]}...", 'info')
-            except Exception as conn_err:
-                if ctx.log:
-                    ctx.log(f"cl-hive: Could not connect to {target[:16]}...: {conn_err}", 'warn')
-    except Exception:
-        pass
-
-    return True, channel_size_sats, budget_info, None
-
-
-def _broadcast_channel_open_intent(ctx: HiveContext, intent_id: Optional[str]) -> int:
-    """Broadcast intent coordination message for a channel open action."""
-    if not intent_id or not ctx.intent_mgr or not ctx.database:
-        return 0
-
-    intent_record = ctx.database.get_intent_by_id(intent_id)
-    if not intent_record:
-        return 0
-
-    # Lazy imports to avoid circular deps
-    from modules.protocol import HiveMessageType, serialize, get_intent_signing_payload
-    from modules.intent_manager import Intent
-
-    broadcast_count = 0
-    try:
-        intent = Intent(
-            intent_id=intent_record['id'],
-            intent_type=intent_record['intent_type'],
-            target=intent_record['target'],
-            initiator=intent_record['initiator'],
-            timestamp=intent_record['timestamp'],
-            expires_at=intent_record['expires_at'],
-            status=intent_record['status']
-        )
-
-        intent_payload = ctx.intent_mgr.create_intent_message(intent)
-
-        # Sign the intent payload
-        try:
-            signing_payload = get_intent_signing_payload(intent_payload)
-            sig_result = ctx.safe_plugin.rpc.signmessage(signing_payload)
-            intent_payload['signature'] = sig_result.get('signature', sig_result.get('zbase', ''))
-        except Exception as sign_err:
-            if ctx.log:
-                ctx.log(f"cl-hive: Intent signing failed: {sign_err}", 'warn')
-            return 0
-
-        msg = serialize(HiveMessageType.INTENT, intent_payload)
-        members = ctx.database.get_all_members()
-
-        for member in members:
-            member_id = member.get('peer_id')
-            if not member_id or member_id == ctx.our_pubkey:
-                continue
-            try:
-                ctx.safe_plugin.rpc.call("sendcustommsg", {
-                    "node_id": member_id,
-                    "msg": msg.hex()
-                })
-                broadcast_count += 1
-            except Exception as send_err:
-                if ctx.log:
-                    ctx.log(f"cl-hive: Intent send to {member_id[:16]}... failed: {send_err}", 'debug')
-
-        if ctx.log:
-            ctx.log(f"cl-hive: Broadcast intent to {broadcast_count} hive members", 'info')
-    except Exception as e:
-        if ctx.log:
-            ctx.log(f"cl-hive: Intent broadcast failed: {e}", 'warn')
-
-    return broadcast_count
-
-
-def _finalize_channel_open_success(
-    ctx: HiveContext,
-    action_id: int,
-    action_type: str,
-    details: Dict[str, Any],
-    channel_size_sats: int,
-    budget_info: Dict[str, Any],
-    broadcast_count: int,
-    channel_id: str,
-    txid: str,
-) -> Dict[str, Any]:
-    """Persist side effects and build success response for channel open."""
-    target = details["target"]
-    intent_id = details.get("intent_id")
-
-    if ctx.log:
-        ctx.log(f"cl-hive: Channel opened! txid={txid[:16]}... channel_id={channel_id}", 'info')
-
-    if intent_id and ctx.database:
-        ctx.database.update_intent_status(intent_id, 'committed', reason="action_executed")
-
-    ctx.database.update_action_status(action_id, 'executed')
-    ctx.database.record_budget_spend(
-        action_type='channel_open',
-        amount_sats=channel_size_sats,
-        target=target,
-        action_id=action_id
-    )
-    if ctx.log:
-        ctx.log(f"cl-hive: Recorded budget spend of {channel_size_sats:,} sats", 'debug')
-
-    result = {
-        "status": "executed",
-        "action_id": action_id,
-        "action_type": action_type,
-        "target": target,
-        "channel_size_sats": channel_size_sats,
-        "proposed_size_sats": details.get("proposed_size_sats"),
-        "channel_id": channel_id,
-        "txid": txid,
-        "funding_type": "fundchannel",
-        "broadcast_count": broadcast_count,
-        "sizing_reasoning": details.get("context", {}).get('sizing_reasoning', 'N/A'),
-    }
-    if details.get("override_applied"):
-        result["override_applied"] = True
-        result["override_amount"] = details.get("override_amount")
-    if budget_info:
-        result["budget_info"] = budget_info
-    return result
-
-
-def _build_channel_open_failure_result(
-    ctx: HiveContext,
-    action_id: int,
-    action_type: str,
-    target: str,
-    channel_size_sats: int,
-    broadcast_count: int,
-    error_msg: str,
-) -> Dict[str, Any]:
-    """Persist side effects and build failure response for channel open."""
-    if ctx.log:
-        ctx.log(f"cl-hive: fundchannel failed: {error_msg}", 'error')
-
-    try:
-        ctx.database.update_action_status(action_id, 'failed')
-    except Exception as db_err:
-        if ctx.log:
-            ctx.log(f"cl-hive: Failed to update action status: {db_err}", 'error')
-
-    failure_info = _classify_channel_open_failure(error_msg)
-    result = {
-        "status": "failed",
-        "action_id": action_id,
-        "action_type": action_type,
-        "target": target,
-        "channel_size_sats": channel_size_sats,
-        "error": error_msg,
-        "broadcast_count": broadcast_count,
-        "failure_type": failure_info["type"],
-        "delegation_recommended": failure_info["delegation_recommended"],
-    }
-
-    if failure_info["delegation_recommended"] and ctx.database:
-        delegation_result = _attempt_channel_open_delegation(
-            ctx, target, channel_size_sats, action_id, failure_info
-        )
-        if delegation_result:
-            result["delegation"] = delegation_result
-
-    return result
-
-
-def _approve_all_actions(ctx: HiveContext) -> Dict[str, Any]:
-    """Approve and execute all pending actions (up to MAX_BULK_ACTIONS)."""
-    actions = ctx.database.get_pending_actions()
-
-    if not actions:
-        return {"status": "no_actions", "message": "No pending actions to approve"}
-
-    total_pending = len(actions)
-    actions = actions[:MAX_BULK_ACTIONS]
-
-    approved = []
-    errors = []
-    now = int(time.time())
-
-    channel_open_actions = []
-    other_actions = []
-
-    for action in actions:
-        action_id = action['id']
-        try:
-            if action.get('expires_at') and now > action['expires_at']:
-                ctx.database.update_action_status(action_id, 'expired')
-                errors.append({"action_id": action_id, "error": "Action has expired"})
-                continue
-
-            if action.get('action_type') == 'channel_open':
-                channel_open_actions.append(action)
-            else:
-                other_actions.append(action)
-        except Exception as e:
-            errors.append({"action_id": action_id, "error": str(e) or f"{type(e).__name__}"})
-
-    batch_items = []
-    reserved_batch_sats = 0
-    for action in channel_open_actions:
-        action_id = action['id']
-        payload = action.get('payload', {})
-        try:
-            details = _extract_channel_open_details(action_id, payload)
-            if 'error' in details:
-                errors.append({"action_id": action_id, "error": details['error']})
-                continue
-
-            ok, channel_size_sats, budget_info, error_result = _preflight_channel_open(
-                ctx=ctx,
-                action_id=action_id,
-                target=details["target"],
-                channel_size_sats=details["channel_size_sats"],
-                override_applied=details.get("override_applied", False),
-                reserved_budget_sats=reserved_batch_sats,
-            )
-            if not ok:
-                errors.append({"action_id": action_id, "error": error_result.get("error", "Preflight failed")})
-                continue
-
-            details["channel_size_sats"] = channel_size_sats
-            broadcast_count = _broadcast_channel_open_intent(ctx, details.get("intent_id"))
-
-            batch_items.append({
-                "action": action,
-                "details": details,
-                "budget_info": budget_info,
-                "broadcast_count": broadcast_count,
-            })
-            reserved_batch_sats += channel_size_sats
-        except Exception as e:
-            errors.append({"action_id": action_id, "error": str(e) or f"{type(e).__name__}"})
-
-    def _record_approved(action_id: int, action_type: str, result_status: str = "approved"):
-        approved.append({
-            "action_id": action_id,
-            "action_type": action_type,
-            "result": result_status,
-        })
-
-    if len(batch_items) == 1:
-        item = batch_items[0]
-        action = item["action"]
-        action_id = action["id"]
-        details = item["details"]
-        try:
-            open_result = _open_channel(
-                rpc=ctx.safe_plugin.rpc,
-                target=details["target"],
-                amount_sats=details["channel_size_sats"],
-                announce=True,
-                log_fn=ctx.log,
-            )
-            final = _finalize_channel_open_success(
-                ctx=ctx,
-                action_id=action_id,
-                action_type=action["action_type"],
-                details=details,
-                channel_size_sats=details["channel_size_sats"],
-                budget_info=item["budget_info"],
-                broadcast_count=item["broadcast_count"],
-                channel_id=open_result.get("channel_id", "unknown"),
-                txid=open_result.get("txid", "unknown"),
-            )
-            _record_approved(action_id, action["action_type"], final.get("status", "approved"))
-        except Exception as e:
-            failure = _build_channel_open_failure_result(
-                ctx=ctx,
-                action_id=action_id,
-                action_type=action["action_type"],
-                target=details["target"],
-                channel_size_sats=details["channel_size_sats"],
-                broadcast_count=item["broadcast_count"],
-                error_msg=str(e) or f"{type(e).__name__} during channel open",
-            )
-            errors.append({"action_id": action_id, "error": failure["error"]})
-
-    elif len(batch_items) > 1:
-        try:
-            batch_result = _batch_open_channels(
-                rpc=ctx.safe_plugin.rpc,
-                targets=[{"id": i["details"]["target"], "amount": i["details"]["channel_size_sats"]} for i in batch_items],
-                announce=True,
-                log_fn=ctx.log,
-            )
-            txid = batch_result.get("txid", "unknown")
-            results_by_id = batch_result.get("results_by_id", {})
-            failed_map = {f.get("id"): f for f in batch_result.get("failed", []) if f.get("id")}
-
-            for item in batch_items:
-                action = item["action"]
-                action_id = action["id"]
-                details = item["details"]
-                peer_id = details["target"]
-                peer_result = results_by_id.get(peer_id, {})
-
-                try:
-                    if peer_result.get("status") == "failed" or peer_id in failed_map:
-                        error_msg = (
-                            peer_result.get("error") or
-                            failed_map.get(peer_id, {}).get("error") or
-                            "multifundchannel failed"
-                        )
-                        failure = _build_channel_open_failure_result(
-                            ctx=ctx,
-                            action_id=action_id,
-                            action_type=action["action_type"],
-                            target=peer_id,
-                            channel_size_sats=details["channel_size_sats"],
-                            broadcast_count=item["broadcast_count"],
-                            error_msg=error_msg,
-                        )
-                        errors.append({"action_id": action_id, "error": failure["error"]})
-                        continue
-
-                    channel_id = peer_result.get("channel_id", "unknown")
-                    final = _finalize_channel_open_success(
-                        ctx=ctx,
-                        action_id=action_id,
-                        action_type=action["action_type"],
-                        details=details,
-                        channel_size_sats=details["channel_size_sats"],
-                        budget_info=item["budget_info"],
-                        broadcast_count=item["broadcast_count"],
-                        channel_id=channel_id,
-                        txid=peer_result.get("txid", txid),
-                    )
-                    _record_approved(action_id, action["action_type"], final.get("status", "approved"))
-                except Exception as e:
-                    errors.append({"action_id": action_id, "error": str(e) or f"{type(e).__name__}"})
-        except Exception as e:
-            batch_error = str(e) or f"{type(e).__name__} during multifundchannel"
-            for item in batch_items:
-                action = item["action"]
-                action_id = action["id"]
-                details = item["details"]
-                failure = _build_channel_open_failure_result(
-                    ctx=ctx,
-                    action_id=action_id,
-                    action_type=action["action_type"],
-                    target=details["target"],
-                    channel_size_sats=details["channel_size_sats"],
-                    broadcast_count=item["broadcast_count"],
-                    error_msg=batch_error,
-                )
-                errors.append({"action_id": action_id, "error": failure["error"]})
-
-    for action in other_actions:
-        action_id = action['id']
-        action_type = action['action_type']
-        try:
-            ctx.database.update_action_status(action_id, 'approved')
-            approved.append({
-                "action_id": action_id,
-                "action_type": action_type,
-                "note": "Unknown action type, marked as approved only"
-            })
-        except Exception as e:
-            errors.append({"action_id": action_id, "error": str(e) or f"{type(e).__name__}"})
-
-    if ctx.log:
-        ctx.log(f"cl-hive: Approved {len(approved)} actions", 'info')
-
-    result = {
-        "status": "approved_all",
-        "approved_count": len(approved),
-        "approved": approved,
-        "errors": errors if errors else None
-    }
-
-    if total_pending > MAX_BULK_ACTIONS:
-        result["warning"] = f"Only processed {MAX_BULK_ACTIONS} of {total_pending} pending actions"
-
-    return result
-
-
-def _execute_channel_open(
-    ctx: HiveContext,
-    action_id: int,
-    action_type: str,
-    payload: Dict[str, Any],
-    amount_sats: int = None
-) -> Dict[str, Any]:
-    """
-    Execute a channel_open action.
-
-    This helper handles budget calculation, intent broadcast, peer connection,
-    and fundchannel execution.
-    """
-    details = _extract_channel_open_details(action_id, payload, amount_sats)
-    if 'error' in details:
-        return details
-
-    ok, channel_size_sats, budget_info, error_result = _preflight_channel_open(
-        ctx=ctx,
-        action_id=action_id,
-        target=details["target"],
-        channel_size_sats=details["channel_size_sats"],
-        override_applied=details.get("override_applied", False),
-    )
-    if not ok:
-        return error_result
-
-    details["channel_size_sats"] = channel_size_sats
-    broadcast_count = _broadcast_channel_open_intent(ctx, details.get("intent_id"))
-
-    # Step 3: Open channel using fundchannel
-    try:
-        result = _open_channel(
-            rpc=ctx.safe_plugin.rpc,
-            target=details["target"],
-            amount_sats=channel_size_sats,
-            announce=True,
-            log_fn=ctx.log,
-        )
-        return _finalize_channel_open_success(
-            ctx=ctx,
-            action_id=action_id,
-            action_type=action_type,
-            details=details,
-            channel_size_sats=channel_size_sats,
-            budget_info=budget_info,
-            broadcast_count=broadcast_count,
-            channel_id=result.get('channel_id', 'unknown'),
-            txid=result.get('txid', 'unknown'),
-        )
-    except Exception as e:
-        error_msg = str(e) or f"{type(e).__name__} during channel open"
-        return _build_channel_open_failure_result(
-            ctx=ctx,
-            action_id=action_id,
-            action_type=action_type,
-            target=details["target"],
-            channel_size_sats=channel_size_sats,
-            broadcast_count=broadcast_count,
-            error_msg=error_msg,
-        )
-
-
-def _classify_channel_open_failure(error_msg: str) -> Dict[str, Any]:
-    """
-    Classify channel open failure to determine appropriate response.
-
-    Failure types:
-    - peer_offline: Peer not reachable (temporary, retry later)
-    - peer_rejected: Peer actively refused connection (may need different opener)
-    - openingd_crash: Protocol error or stale state (peer issue)
-    - insufficient_funds: We don't have enough funds
-    - channel_exists: Already have a channel
-    - unknown: Unclassified error
-
-    Returns:
-        Dict with failure type and whether delegation is recommended
-    """
-    error_lower = error_msg.lower()
-
-    # Peer actively closed connection - might reject us specifically
-    if "peer closed connection" in error_lower or "connection refused" in error_lower:
-        return {
-            "type": "peer_rejected",
-            "delegation_recommended": True,
-            "reason": "Peer may be rejecting connections from this node (reputation/policy)",
-            "retry_delay_seconds": 0,  # Don't retry ourselves
-        }
-
-    # Openingd died - often indicates stale channel state or peer protocol issue
-    if "openingd died" in error_lower or "subdaemon" in error_lower:
-        return {
-            "type": "openingd_crash",
-            "delegation_recommended": True,
-            "reason": "Protocol error or stale channel state with peer",
-            "retry_delay_seconds": 0,
-        }
-
-    # Peer unreachable - might be temporarily offline
-    if "no addresses" in error_lower or "connection timed out" in error_lower:
-        return {
-            "type": "peer_offline",
-            "delegation_recommended": False,  # Peer is down for everyone
-            "reason": "Peer appears to be offline",
-            "retry_delay_seconds": 3600,  # Retry in 1 hour
-        }
-
-    # Insufficient funds
-    if "insufficient" in error_lower or "not enough" in error_lower:
-        return {
-            "type": "insufficient_funds",
-            "delegation_recommended": True,  # Another node might have funds
-            "reason": "Insufficient on-chain funds",
-            "retry_delay_seconds": 0,
-        }
-
-    # Channel already exists
-    if "already have" in error_lower or "channel exists" in error_lower:
-        return {
-            "type": "channel_exists",
-            "delegation_recommended": False,
-            "reason": "Channel already exists with this peer",
-            "retry_delay_seconds": 0,
-        }
-
-    # Unknown error
-    return {
-        "type": "unknown",
-        "delegation_recommended": False,
-        "reason": "Unknown error - manual investigation needed",
-        "retry_delay_seconds": 3600,
-    }
-
-
-def _attempt_channel_open_delegation(
-    ctx: HiveContext,
-    target: str,
-    channel_size_sats: int,
-    original_action_id: int,
-    failure_info: Dict[str, Any]
-) -> Optional[Dict[str, Any]]:
-    """
-    Attempt to delegate a failed channel open to another hive member.
-
-    Uses the Task Delegation Protocol (Phase 10) to ask another hive
-    member to open the channel on our behalf when we can't connect
-    to the target peer.
-
-    Returns:
-        Dict with delegation status
-    """
-    if not ctx.database or not ctx.safe_plugin:
-        return None
-
-    # Import task manager from main module
-    try:
-        from modules.task_manager import TaskManager
-
-        # Get task_mgr from the global context
-        # We need to access it through the plugin's globals
-        import sys
-        main_module = sys.modules.get('__main__')
-        if not main_module:
-            # Try cl-hive module
-            main_module = sys.modules.get('cl-hive')
-
-        task_mgr = getattr(main_module, 'task_mgr', None) if main_module else None
-
-        if not task_mgr:
-            if ctx.log:
-                ctx.log("cl-hive: Task manager not available for delegation", 'debug')
-            return {
-                "status": "delegation_unavailable",
-                "message": "Task manager not initialized"
-            }
-
-        # Prepare failure context
-        failure_context = {
-            "original_action_id": original_action_id,
-            "failure_type": failure_info.get("type", "unknown"),
-            "failure_reason": failure_info.get("reason", ""),
-            "requester_pubkey": ctx.our_pubkey
-        }
-
-        # Request channel open delegation
-        result = task_mgr.request_channel_open_delegation(
-            target_peer=target,
-            channel_size_sats=channel_size_sats,
-            rpc=ctx.safe_plugin.rpc,
-            failure_context=failure_context
-        )
-
-        if ctx.log:
-            if result.get("status") == "delegation_requested":
-                ctx.log(
-                    f"cl-hive: Delegated channel open to {result.get('delegated_to', 'unknown')} "
-                    f"(request_id={result.get('request_id', '')})",
-                    'info'
-                )
-            else:
-                ctx.log(
-                    f"cl-hive: Delegation failed: {result.get('status', 'unknown')}",
-                    'debug'
-                )
-
-        return result
-
-    except Exception as e:
-        if ctx.log:
-            ctx.log(f"cl-hive: Delegation error: {e}", 'warn')
-        return {
-            "status": "delegation_error",
-            "message": str(e)
-        }
-
-
-# =============================================================================
-# GOVERNANCE COMMANDS
-# =============================================================================
-
-def set_mode(ctx: HiveContext, mode: str) -> Dict[str, Any]:
-    """
-    Change the governance mode at runtime.
-
-    Args:
-        ctx: HiveContext
-        mode: New governance mode ('advisor' or 'failsafe')
-
-    Returns:
-        Dict with new mode and previous mode.
-
-    Permission: Member only
-    """
-    from modules.config import VALID_GOVERNANCE_MODES, LEGACY_GOVERNANCE_ALIASES
-
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.config:
-        return {"error": "Config not initialized"}
-
-    # Validate mode
-    mode_lower = str(mode).strip().lower()
-    mode_lower = LEGACY_GOVERNANCE_ALIASES.get(mode_lower, mode_lower)
-    if mode_lower not in VALID_GOVERNANCE_MODES:
-        return {
-            "error": f"Invalid mode: {mode}",
-            "valid_modes": list(VALID_GOVERNANCE_MODES)
-        }
-
-    # Store previous mode
-    previous_mode = ctx.config.governance_mode
-
-    # Update config
-    ctx.config.governance_mode = mode_lower
-    ctx.config._version += 1
-
-    if ctx.log:
-        ctx.log(f"cl-hive: Governance mode changed from {previous_mode} to {mode_lower}", 'info')
-
-    return {
-        "status": "ok",
-        "previous_mode": previous_mode,
-        "current_mode": mode_lower,
-    }
-
-
-def enable_expansions(ctx: HiveContext, enabled: bool = True) -> Dict[str, Any]:
-    """
-    Enable or disable expansion proposals at runtime.
-
-    Args:
-        ctx: HiveContext
-        enabled: True to enable expansions, False to disable (default: True)
-
-    Returns:
-        Dict with new setting.
-
-    Permission: Member only
-    """
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.config:
-        return {"error": "Config not initialized"}
-
-    previous = ctx.config.planner_enable_expansions
-    ctx.config.planner_enable_expansions = enabled
-    ctx.config._version += 1
-
-    if ctx.log:
-        ctx.log(f"cl-hive: Expansion proposals {'enabled' if enabled else 'disabled'}", 'info')
-
-    return {
-        "status": "ok",
-        "previous_setting": previous,
-        "expansions_enabled": enabled,
-    }
-
-
-def pending_promotions(ctx: HiveContext) -> Dict[str, Any]:
-    """
-    View pending manual promotion proposals.
-
-    Shows neophytes proposed for early promotion to member status
-    and the current approval count for each proposal.
-
-    Returns:
-        Dict with pending promotions and their approval status.
-
-    Permission: Any hive member (read-only)
-    """
-    if not ctx.database or not ctx.membership_mgr:
-        return {"error": "Not initialized"}
-
-    pending = ctx.membership_mgr.get_pending_promotions()
-
-    return {
-        "count": len(pending),
-        "pending_promotions": pending
-    }
-
-
-def propose_promotion(ctx: HiveContext, target_peer_id: str,
-                      proposer_peer_id: str = None) -> Dict[str, Any]:
-    """
-    Propose a neophyte for early promotion to member status.
-
-    Any member can propose a neophyte for promotion before the 90-day
-    probation period completes. When a majority (51%) of active members
-    approve, the neophyte is promoted.
-
-    Args:
-        target_peer_id: The neophyte to propose for promotion
-        proposer_peer_id: Optional, defaults to our pubkey
-
-    Permission: Member only
-    """
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.membership_mgr:
-        return {"error": "Membership manager not initialized"}
-
-    proposer = proposer_peer_id or ctx.our_pubkey
-    return ctx.membership_mgr.propose_manual_promotion(target_peer_id, proposer)
-
-
-def vote_promotion(ctx: HiveContext, target_peer_id: str,
-                   voter_peer_id: str = None) -> Dict[str, Any]:
-    """
-    Vote to approve a neophyte's promotion to member.
-
-    Args:
-        target_peer_id: The neophyte being voted on
-        voter_peer_id: Optional, defaults to our pubkey
-
-    Permission: Member only
-    """
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.membership_mgr:
-        return {"error": "Membership manager not initialized"}
-
-    voter = voter_peer_id or ctx.our_pubkey
-    return ctx.membership_mgr.vote_on_promotion(target_peer_id, voter)
-
-
-def execute_promotion(ctx: HiveContext, target_peer_id: str) -> Dict[str, Any]:
-    """
-    Execute a manual promotion if quorum has been reached.
-
-    This bypasses the normal 90-day probation period when a majority
-    of members have approved the promotion.
-
-    Args:
-        target_peer_id: The neophyte to promote
-
-    Permission: Any member can execute once quorum is reached
-    """
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.membership_mgr:
-        return {"error": "Membership manager not initialized"}
-
-    return ctx.membership_mgr.execute_manual_promotion(target_peer_id)
-
-
-def pending_bans(ctx: HiveContext) -> Dict[str, Any]:
-    """
-    View pending ban proposals.
-
-    Returns:
-        Dict with pending ban proposals and their vote counts.
-
-    Permission: Any member
-    """
-    from modules.membership import MembershipTier, BAN_QUORUM_THRESHOLD
-
-    if not ctx.database:
-        return {"error": "Database not initialized"}
-
-    # Clean up expired proposals
-    now = int(time.time())
-    ctx.database.cleanup_expired_ban_proposals(now)
-
-    # Get pending proposals
-    proposals = ctx.database.get_pending_ban_proposals()
-
-    # Get eligible voters info
-    all_members = ctx.database.get_all_members()
-
-    result = []
-    for p in proposals:
-        target_id = p["target_peer_id"]
-        eligible = [m for m in all_members
-                    if m.get("tier") == MembershipTier.MEMBER.value
-                    and m["peer_id"] != target_id]
-        eligible_ids = set(m["peer_id"] for m in eligible)
-        quorum_needed = int(len(eligible) * BAN_QUORUM_THRESHOLD) + 1
-
-        votes = ctx.database.get_ban_votes(p["proposal_id"])
-        approve_count = sum(1 for v in votes if v["vote"] == "approve" and v["voter_peer_id"] in eligible_ids)
-        reject_count = sum(1 for v in votes if v["vote"] == "reject" and v["voter_peer_id"] in eligible_ids)
-
-        # Check if we've voted
-        my_vote = None
-        if ctx.our_pubkey:
-            for v in votes:
-                if v["voter_peer_id"] == ctx.our_pubkey:
-                    my_vote = v["vote"]
-                    break
-
-        result.append({
-            "proposal_id": p["proposal_id"],
-            "target_peer_id": target_id,
-            "target_tier": next((m.get("tier", "unknown") for m in all_members if m["peer_id"] == target_id), "unknown"),
-            "proposer": p["proposer_peer_id"][:16] + "...",
-            "reason": p["reason"],
-            "proposed_at": p["proposed_at"],
-            "expires_at": p["expires_at"],
-            "approve_count": approve_count,
-            "reject_count": reject_count,
-            "quorum_needed": quorum_needed,
-            "my_vote": my_vote
-        })
-
-    return {
-        "count": len(result),
-        "proposals": result
-    }
 
 
 # =============================================================================
@@ -1869,8 +277,7 @@ def topology(ctx: HiveContext) -> Dict[str, Any]:
         "config": {
             "market_share_cap_pct": cfg.market_share_cap_pct,
             "planner_interval_seconds": cfg.planner_interval,
-            "expansions_enabled": cfg.planner_enable_expansions,
-            "governance_mode": cfg.governance_mode,
+            "governance": "recommendation_only",
         }
     }
 
@@ -1907,7 +314,7 @@ def expansion_recommendations(ctx: HiveContext, limit: int = 10) -> Dict[str, An
     - Hive coverage diversity (% of members with channels)
     - Network competition (peer channel count)
     - Bottleneck detection (from liquidity_coordinator)
-    - Splice recommendations (from splice_coordinator)
+    - Channel rationalization recommendations
 
     Args:
         limit: Maximum number of recommendations to return (default: 10)
@@ -1992,7 +399,6 @@ def expansion_recommendations(ctx: HiveContext, limit: int = 10) -> Dict[str, An
         "coverage_summary": coverage_stats,
         "cooperation_modules": {
             "liquidity_coordinator": ctx.planner.liquidity_coordinator is not None,
-            "splice_coordinator": ctx.planner.splice_coordinator is not None,
             "health_aggregator": ctx.planner.health_aggregator is not None
         }
     }
@@ -2071,350 +477,6 @@ def contribution(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
     return result
 
 
-def expansion_status(ctx: HiveContext, round_id: str = None,
-                     target_peer_id: str = None) -> Dict[str, Any]:
-    """
-    Get status of cooperative expansion rounds.
-
-    Args:
-        round_id: Get status of a specific round (optional)
-        target_peer_id: Get rounds for a specific target peer (optional)
-
-    Returns:
-        Dict with expansion round status and statistics.
-    """
-    if not ctx.coop_expansion_mgr:
-        return {"error": "Cooperative expansion not initialized"}
-
-    if round_id:
-        # Get specific round
-        round_obj = ctx.coop_expansion_mgr.get_round(round_id)
-        if not round_obj:
-            return {"error": f"Round {round_id} not found"}
-        return {
-            "round_id": round_id,
-            "round": round_obj.to_dict(),
-            "nominations": [
-                {
-                    "nominator": n.nominator_id[:16] + "...",
-                    "liquidity": n.available_liquidity_sats,
-                    "quality_score": round(n.quality_score, 3),
-                    "channel_count": n.channel_count,
-                    "has_existing": n.has_existing_channel,
-                }
-                for n in round_obj.nominations.values()
-            ]
-        }
-
-    if target_peer_id:
-        # Get rounds for target
-        rounds = ctx.coop_expansion_mgr.get_rounds_for_target(target_peer_id)
-        return {
-            "target_peer_id": target_peer_id,
-            "count": len(rounds),
-            "rounds": [r.to_dict() for r in rounds],
-        }
-
-    # Get overall status
-    return ctx.coop_expansion_mgr.get_status()
-
-
-# =============================================================================
-# ROUTING POOL COMMANDS (Phase 0 - Collective Economics)
-# =============================================================================
-
-def pool_status(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
-    """
-    Get current routing pool status and statistics.
-
-    Shows pool revenue, member contributions, and distribution info.
-
-    Args:
-        ctx: HiveContext
-        period: Optional period to query (format: YYYY-Www, defaults to current week)
-
-    Returns:
-        Dict with pool status including revenue, contributions, and distributions.
-    """
-    if not ctx.routing_pool:
-        return {"error": "Routing pool not initialized"}
-
-    try:
-        status = ctx.routing_pool.get_pool_status(period)
-        return status
-    except Exception as e:
-        return {"error": f"Failed to get pool status: {e}"}
-
-
-def pool_member_status(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
-    """
-    Get routing pool status for a specific member.
-
-    Shows the member's contribution scores, revenue share, and distribution history.
-
-    Args:
-        ctx: HiveContext
-        peer_id: Member pubkey (defaults to self)
-
-    Returns:
-        Dict with member's pool status and history.
-    """
-    if not ctx.routing_pool:
-        return {"error": "Routing pool not initialized"}
-
-    target_id = peer_id or ctx.our_pubkey
-    if not target_id:
-        return {"error": "No peer specified and our_pubkey not available"}
-
-    try:
-        status = ctx.routing_pool.get_member_status(target_id)
-        return status
-    except Exception as e:
-        return {"error": f"Failed to get member status: {e}"}
-
-
-def pool_snapshot(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
-    """
-    Trigger a contribution snapshot for all hive members.
-
-    Takes a snapshot of current contribution metrics for all members.
-    This is typically done automatically but can be triggered manually.
-
-    Args:
-        ctx: HiveContext
-        period: Optional period to snapshot (format: YYYY-Www, defaults to current week)
-
-    Returns:
-        Dict with snapshot results.
-
-    Permission: Member only
-    """
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.routing_pool:
-        return {"error": "Routing pool not initialized"}
-
-    try:
-        import datetime
-        # Get period if not specified
-        if period is None:
-            now = datetime.datetime.now(tz=datetime.timezone.utc)
-            year, week, _ = now.isocalendar()
-            period = f"{year}-W{week:02d}"
-
-        # Sync uptime from presence data before snapshotting
-        # This ensures uptime_pct in hive_members is current
-        if ctx.database:
-            ctx.database.sync_uptime_from_presence(window_seconds=30 * 86400)
-
-        # snapshot_contributions returns List[MemberContribution]
-        contributions = ctx.routing_pool.snapshot_contributions(period)
-
-        # Convert to serializable format
-        contrib_list = []
-        for c in contributions:
-            contrib_list.append({
-                "member_id": c.member_id[:16] + "..." if c.member_id else "",
-                "member_id_full": c.member_id,
-                "capacity_sats": c.total_capacity_sats,
-                "weighted_capacity_sats": c.weighted_capacity_sats,
-                "uptime_pct": round(c.uptime_pct * 100, 1),
-                "pool_share": round(c.pool_share * 100, 2),
-            })
-
-        return {
-            "status": "ok",
-            "period": period,
-            "members_snapshotted": len(contributions),
-            "contributions": contrib_list
-        }
-    except Exception as e:
-        return {"error": f"Failed to snapshot contributions: {e}"}
-
-
-def pool_distribution(ctx: HiveContext, period: str = None) -> Dict[str, Any]:
-    """
-    Calculate distribution amounts for a period (dry run).
-
-    Shows what each member would receive if the period were settled now.
-    Does NOT actually settle the period - use pool_settle for that.
-
-    Args:
-        ctx: HiveContext
-        period: Optional period to calculate (format: YYYY-Www, defaults to current week)
-
-    Returns:
-        Dict with calculated distribution amounts for each member.
-    """
-    if not ctx.routing_pool:
-        return {"error": "Routing pool not initialized"}
-
-    try:
-        import datetime
-
-        # Get current period if not specified
-        if period is None:
-            now = datetime.datetime.now(tz=datetime.timezone.utc)
-            year, week, _ = now.isocalendar()
-            period = f"{year}-W{week:02d}"
-
-        # Get revenue for the period
-        revenue_info = ctx.routing_pool.db.get_pool_revenue(period=period)
-        total_revenue = revenue_info.get('total_sats', 0)
-
-        # calculate_distribution returns Dict[str, int] mapping member_id to amount
-        distributions_dict = ctx.routing_pool.calculate_distribution(period)
-
-        # Convert to list format for JSON response
-        distributions_list = [
-            {"member_id": mid, "amount_sats": amt}
-            for mid, amt in distributions_dict.items()
-        ]
-
-        return {
-            "status": "calculated",
-            "period": period,
-            "total_revenue_sats": total_revenue,
-            "distributions": distributions_list,
-            "note": "This is a dry run - use pool-settle to actually distribute"
-        }
-    except Exception as e:
-        return {"error": f"Failed to calculate distribution: {e}"}
-
-
-def pool_settle(ctx: HiveContext, period: str = None, dry_run: bool = True) -> Dict[str, Any]:
-    """
-    Settle a routing pool period and record distributions.
-
-    Calculates final distributions and records them to the database.
-    This marks the period as settled and distributions as finalized.
-
-    Args:
-        ctx: HiveContext
-        period: Period to settle (format: YYYY-Www, defaults to PREVIOUS week)
-        dry_run: If True, calculate but don't actually record (default: True)
-
-    Returns:
-        Dict with settlement results.
-
-    Permission: Member only
-    """
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.routing_pool:
-        return {"error": "Routing pool not initialized"}
-
-    try:
-        import datetime
-
-        # Get period (default to previous week for settlement)
-        if period is None:
-            now = datetime.datetime.now(tz=datetime.timezone.utc)
-            last_week = now - datetime.timedelta(days=7)
-            year, week, _ = last_week.isocalendar()
-            period = f"{year}-W{week:02d}"
-
-        if dry_run:
-            # Just calculate
-            revenue_info = ctx.routing_pool.db.get_pool_revenue(period=period)
-            total_revenue = revenue_info.get('total_sats', 0)
-
-            distributions_dict = ctx.routing_pool.calculate_distribution(period)
-            distributions_list = [
-                {"member_id": mid, "amount_sats": amt}
-                for mid, amt in distributions_dict.items()
-            ]
-
-            return {
-                "status": "dry_run",
-                "period": period,
-                "total_revenue_sats": total_revenue,
-                "distributions": distributions_list,
-                "note": "Set dry_run=false to actually settle this period"
-            }
-        else:
-            # Actually settle
-            results = ctx.routing_pool.settle_period(period)
-            # settle_period() returns a list of PoolDistribution objects.
-            # Convert to a stable JSON shape for RPC callers.
-            revenue_info = ctx.routing_pool.db.get_pool_revenue(period=period)
-            total_revenue = revenue_info.get("total_sats", 0)
-            settled_at = int(time.time())
-
-            distributions = [
-                {
-                    "member_id": r.member_id,
-                    "amount_sats": r.revenue_share_sats,
-                    "contribution_share": r.contribution_share,
-                }
-                for r in results
-            ]
-            return {
-                "status": "settled",
-                "period": period,
-                "total_revenue_sats": total_revenue,
-                "distributions": distributions,
-                "settled_at": settled_at,
-                "distribution_count": len(distributions),
-            }
-    except Exception as e:
-        return {"error": f"Failed to settle period: {e}"}
-
-
-def pool_record_revenue(ctx: HiveContext, amount_sats: int, channel_id: str = None,
-                        payment_hash: str = None) -> Dict[str, Any]:
-    """
-    Manually record routing revenue to the pool.
-
-    Normally revenue is recorded automatically from forward events,
-    but this allows manual recording for testing or corrections.
-
-    Args:
-        ctx: HiveContext
-        amount_sats: Revenue amount in satoshis
-        channel_id: Optional channel ID (SCID format)
-        payment_hash: Optional payment hash for tracking
-
-    Returns:
-        Dict with recording result.
-
-    Permission: Member only
-    """
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.routing_pool:
-        return {"error": "Routing pool not initialized"}
-
-    if amount_sats <= 0:
-        return {"error": "Amount must be positive"}
-
-    if amount_sats > 1_000_000_000:  # 10 BTC sanity check
-        return {"error": "Amount exceeds sanity limit (10 BTC)"}
-
-    try:
-        ctx.routing_pool.record_revenue(
-            member_id=ctx.our_pubkey,
-            amount_sats=amount_sats,
-            channel_id=channel_id,
-            payment_hash=payment_hash
-        )
-        return {
-            "status": "ok",
-            "recorded_sats": amount_sats,
-            "member_id": ctx.our_pubkey[:16] + "...",
-            "channel_id": channel_id
-        }
-    except Exception as e:
-        return {"error": f"Failed to record revenue: {e}"}
 
 
 # =============================================================================
@@ -2554,26 +616,6 @@ def critical_velocity_channels(ctx: HiveContext,
         return {"error": f"Failed to get critical velocity channels: {e}"}
 
 
-def internal_competition(ctx: HiveContext) -> Dict[str, Any]:
-    """
-    Detect internal competition between fleet members.
-
-    Shows routes where multiple members compete, causing fee undercutting.
-
-    Args:
-        ctx: HiveContext
-
-    Returns:
-        Dict with internal competition analysis.
-    """
-    if not ctx.liquidity_coordinator:
-        return {"error": "Liquidity coordinator not initialized"}
-
-    try:
-        summary = ctx.liquidity_coordinator.get_internal_competition_summary()
-        return summary
-    except Exception as e:
-        return {"error": f"Failed to detect internal competition: {e}"}
 
 
 # =============================================================================
@@ -2591,8 +633,7 @@ def fee_recommendation(
     """
     Get coordinated fee recommendation for a channel.
 
-    Combines corridor assignment, adaptive pheromone signals,
-    stigmergic markers, and defensive adjustments.
+    Combines corridor assignment, centrality, and size-aware signals.
 
     Args:
         ctx: HiveContext
@@ -2714,447 +755,30 @@ def corridor_assignments(ctx: HiveContext, force_refresh: bool = False) -> Dict[
         return {"error": f"Failed to get corridor assignments: {e}"}
 
 
-def stigmergic_markers(ctx: HiveContext, source: str = None, destination: str = None) -> Dict[str, Any]:
-    """
-    Get stigmergic route markers from the fleet.
-
-    Shows fee signals left by members after routing attempts.
-
-    Args:
-        ctx: HiveContext
-        source: Filter by source peer
-        destination: Filter by destination peer
-
-    Returns:
-        Dict with route markers and analysis.
-    """
-    if not ctx.fee_coordination_mgr:
-        return {"error": "Fee coordination not initialized"}
-
-    try:
-        if source and destination:
-            markers = ctx.fee_coordination_mgr.stigmergic_coord.read_markers(
-                source, destination
-            )
-        else:
-            markers = ctx.fee_coordination_mgr.stigmergic_coord.get_all_markers()
-
-        # Analyze markers
-        successful = [m for m in markers if m.success]
-        failed = [m for m in markers if not m.success]
-
-        avg_success_fee = (
-            sum(m.fee_ppm for m in successful) / len(successful)
-            if successful else 0
-        )
-        avg_failed_fee = (
-            sum(m.fee_ppm for m in failed) / len(failed)
-            if failed else 0
-        )
-
-        return {
-            "total_markers": len(markers),
-            "successful_markers": len(successful),
-            "failed_markers": len(failed),
-            "avg_successful_fee_ppm": int(avg_success_fee),
-            "avg_failed_fee_ppm": int(avg_failed_fee),
-            "markers": [m.to_dict() for m in markers[:50]],  # Limit output
-            "filtered": {
-                "source": source,
-                "destination": destination
-            } if source or destination else None
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to get stigmergic markers: {e}"}
-
-
-def deposit_marker(
-    ctx: HiveContext,
-    source: str,
-    destination: str,
-    fee_ppm: int,
-    success: bool,
-    volume_sats: int
-) -> Dict[str, Any]:
-    """
-    Deposit a stigmergic route marker.
-
-    Used to report routing outcomes to the fleet for indirect coordination.
-
-    Args:
-        ctx: HiveContext
-        source: Source peer ID
-        destination: Destination peer ID
-        fee_ppm: Fee charged in ppm
-        success: Whether routing succeeded
-        volume_sats: Volume routed in sats
-
-    Returns:
-        Dict with deposited marker info.
-
-    Permission: Member only
-    """
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.fee_coordination_mgr:
-        return {"error": "Fee coordination not initialized"}
-
-    # Input validation
-    try:
-        fee_ppm = int(fee_ppm)
-        volume_sats = int(volume_sats)
-    except (ValueError, TypeError):
-        return {"error": "fee_ppm and volume_sats must be numeric"}
-    if fee_ppm < 0 or fee_ppm > 50000:
-        return {"error": "fee_ppm must be between 0 and 50000"}
-    if volume_sats < 0 or volume_sats > 10_000_000_000:  # 100 BTC
-        return {"error": "volume_sats out of range"}
-
-    try:
-        marker = ctx.fee_coordination_mgr.stigmergic_coord.deposit_marker(
-            source=source,
-            destination=destination,
-            fee_charged=fee_ppm,
-            success=success,
-            volume_sats=volume_sats
-        )
-
-        return {
-            "status": "deposited",
-            "marker": marker.to_dict()
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to deposit marker: {e}"}
-
-
-def defense_status(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
-    """
-    Get mycelium defense system status.
-
-    Shows active warnings and defensive fee adjustments.
-    If peer_id is specified, includes peer_threat info for that peer.
-
-    Args:
-        ctx: HiveContext
-        peer_id: Optional peer to check for threats
-
-    Returns:
-        Dict with defense system status.
-        If peer_id specified, includes peer_threat with is_threat, threat_type, etc.
-    """
-    if not ctx.fee_coordination_mgr:
-        return {"error": "Fee coordination not initialized"}
-
-    try:
-        defense = ctx.fee_coordination_mgr.defense_system
-
-        # Get active (non-expired) warnings and enrich with computed fields
-        active_warnings = []
-        for w in defense.get_active_warnings():
-            warning_dict = w.to_dict()
-            warning_dict["expires_at"] = w.timestamp + w.ttl
-            warning_dict["defensive_multiplier"] = defense.get_defensive_multiplier(w.peer_id)
-            active_warnings.append(warning_dict)
-
-        result = {
-            "active_warnings": active_warnings,
-            "warning_count": len(active_warnings),
-            "defensive_fees_active": len(defense._defensive_fees),
-        }
-
-        # If peer_id specified, add peer-specific threat info
-        if peer_id:
-            peer_threat = {
-                "is_threat": False,
-                "threat_type": None,
-                "severity": 0.0,
-                "defensive_multiplier": 1.0
-            }
-
-            for warning in active_warnings:
-                if warning.get("peer_id") == peer_id:
-                    peer_threat = {
-                        "is_threat": True,
-                        "threat_type": warning.get("threat_type"),
-                        "severity": warning.get("severity", 0.5),
-                        "defensive_multiplier": warning.get("defensive_multiplier", 1.0),
-                        "expires_at": warning.get("expires_at", 0)
-                    }
-                    break
-
-            result["peer_threat"] = peer_threat
-
-        return result
-
-    except Exception as e:
-        return {"error": f"Failed to get defense status: {e}"}
-
-
-def broadcast_warning(
-    ctx: HiveContext,
-    peer_id: str,
-    threat_type: str = "drain",
-    severity: float = 0.5
-) -> Dict[str, Any]:
-    """
-    Broadcast a peer warning to the fleet.
-
-    Permission: Member only
-
-    Args:
-        ctx: HiveContext
-        peer_id: Peer to warn about
-        threat_type: Type of threat ('drain', 'unreliable', 'force_close')
-        severity: Severity from 0.0 to 1.0
-
-    Returns:
-        Dict with broadcast result.
-    """
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.fee_coordination_mgr:
-        return {"error": "Fee coordination not initialized"}
-
-    if threat_type not in ("drain", "unreliable", "force_close"):
-        return {"error": f"Invalid threat_type: {threat_type}"}
-
-    if not 0.0 <= severity <= 1.0:
-        return {"error": "Severity must be between 0.0 and 1.0"}
-
-    try:
-        from modules.fee_coordination import PeerWarning, WARNING_TTL_HOURS
-
-        warning = PeerWarning(
-            peer_id=peer_id,
-            threat_type=threat_type,
-            severity=severity,
-            reporter=ctx.our_pubkey,
-            timestamp=time.time(),
-            ttl=WARNING_TTL_HOURS * 3600
-        )
-
-        success = ctx.fee_coordination_mgr.defense_system.broadcast_warning(warning)
-
-        return {
-            "status": "broadcast" if success else "stored_locally",
-            "warning": warning.to_dict()
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to broadcast warning: {e}"}
-
-
-def pheromone_levels(ctx: HiveContext, channel_id: str = None) -> Dict[str, Any]:
-    """
-    Get pheromone levels for adaptive fee control.
-
-    Shows the "memory" of successful fees for channels.
-
-    Args:
-        ctx: HiveContext
-        channel_id: Optional specific channel
-
-    Returns:
-        Dict with pheromone levels.
-    """
-    if not ctx.fee_coordination_mgr:
-        return {"error": "Fee coordination not initialized"}
-
-    try:
-        all_levels = ctx.fee_coordination_mgr.adaptive_controller.get_all_pheromone_levels()
-
-        if channel_id:
-            level = all_levels.get(channel_id, 0.0)
-            above = level > 10.0
-            return {
-                "channel_id": channel_id,
-                "pheromone_level": round(level, 2),
-                "above_exploit_threshold": above,
-                # Also return in list format for cl-revenue-ops compatibility
-                "pheromone_levels": [{
-                    "channel_id": channel_id,
-                    "level": round(level, 2),
-                    "above_threshold": above
-                }]
-            }
-
-        # Sort by level descending
-        sorted_levels = sorted(
-            all_levels.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-
-        return {
-            "total_channels": len(all_levels),
-            "channels_above_threshold": sum(
-                1 for _, v in all_levels.items() if v > 10.0
-            ),
-            "levels": [
-                {"channel_id": k, "level": round(v, 2)}
-                for k, v in sorted_levels[:50]
-            ],
-            "pheromone_levels": [
-                {
-                    "channel_id": k,
-                    "level": round(v, 2),
-                    "above_threshold": v > 10.0
-                }
-                for k, v in sorted_levels[:50]
-            ]
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to get pheromone levels: {e}"}
 
 
 def get_routing_intelligence(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
     """
-    Get routing intelligence for channel(s).
-
-    Exports pheromone levels, trends, and corridor membership for use by
-    external fee optimization systems (e.g., cl-revenue-ops Thompson sampling).
+    Get routing intelligence based on corridor assignments.
 
     Args:
         ctx: HiveContext
-        scid: Optional specific channel short_channel_id. If None, returns all.
+        scid: Optional specific channel short_channel_id (unused, kept for compat).
 
     Returns:
-        Dict with routing intelligence:
-        {
-            "channels": {
-                "932263x1883x0": {
-                    "pheromone_level": 3.98,
-                    "pheromone_trend": "stable",  # rising/falling/stable
-                    "last_forward_age_hours": 2.5,
-                    "marker_count": 3,
-                    "on_active_corridor": true
-                },
-                ...
-            },
-            "timestamp": 1234567890
-        }
+        Dict with corridor assignment data.
     """
     if not ctx.fee_coordination_mgr:
         return {"error": "Fee coordination not initialized"}
 
     try:
-        adaptive = ctx.fee_coordination_mgr.adaptive_controller
-        stigmergic = ctx.fee_coordination_mgr.stigmergic_coord
-
-        # Get all pheromone levels
-        all_levels = adaptive.get_all_pheromone_levels()
-
-        # Get pheromone timestamps and fees
-        with adaptive._lock:
-            pheromone_timestamps = dict(adaptive._pheromone_last_update)
-            pheromone_fees = dict(adaptive._pheromone_fee)
-            channel_peer_map = dict(adaptive._channel_peer_map)
-
-        # Get all active markers
-        all_markers = stigmergic.get_all_markers()
-
-        # Build a set of (source, dest) pairs that have active markers
-        active_corridors = set()
-        marker_counts = {}  # (source, dest) -> count
-        for marker in all_markers:
-            key = (marker.source_peer_id, marker.destination_peer_id)
-            active_corridors.add(key)
-            marker_counts[key] = marker_counts.get(key, 0) + 1
-
+        assignments = ctx.fee_coordination_mgr.corridor_mgr.get_assignments()
         now = time.time()
 
-        def get_channel_intel(channel_id: str) -> Dict[str, Any]:
-            """Build intelligence dict for a single channel."""
-            level = all_levels.get(channel_id, 0.0)
-            last_update = pheromone_timestamps.get(channel_id, 0)
-            peer_id = channel_peer_map.get(channel_id)
-
-            # Calculate last forward age in hours
-            if last_update > 0:
-                last_forward_age_hours = round((now - last_update) / 3600, 2)
-            else:
-                last_forward_age_hours = None
-
-            # Determine pheromone trend
-            # If we have a recent update (last 6 hours) and high pheromone, it's rising
-            # If pheromone is decaying (old update), it's falling
-            # Otherwise stable
-            if last_update > 0:
-                hours_since_update = (now - last_update) / 3600
-                if hours_since_update < 6 and level > 1.0:
-                    trend = "rising"
-                elif hours_since_update > 24 and level > 0.1:
-                    trend = "falling"
-                else:
-                    trend = "stable"
-            else:
-                trend = "stable"
-
-            # Check if this channel is on an active corridor
-            on_active_corridor = False
-            channel_marker_count = 0
-
-            if peer_id:
-                # Check all corridors involving this peer
-                for (src, dst), count in marker_counts.items():
-                    if src == peer_id or dst == peer_id:
-                        on_active_corridor = True
-                        channel_marker_count += count
-
-            return {
-                "pheromone_level": round(level, 2),
-                "pheromone_trend": trend,
-                "last_forward_age_hours": last_forward_age_hours,
-                "marker_count": channel_marker_count,
-                "on_active_corridor": on_active_corridor
-            }
-
-        # Build result
-        if scid:
-            # Single channel requested
-            if scid not in all_levels and scid not in channel_peer_map:
-                return {
-                    "channels": {
-                        scid: {
-                            "pheromone_level": 0.0,
-                            "pheromone_trend": "stable",
-                            "last_forward_age_hours": None,
-                            "marker_count": 0,
-                            "on_active_corridor": False
-                        }
-                    },
-                    "timestamp": int(now)
-                }
-            return {
-                "channels": {scid: get_channel_intel(scid)},
-                "timestamp": int(now)
-            }
-
-        # All channels
-        channels = {}
-        # Include all channels with pheromone levels
-        for channel_id in all_levels.keys():
-            channels[channel_id] = get_channel_intel(channel_id)
-
-        # Also include channels that have peer mappings but no pheromone yet
-        for channel_id in channel_peer_map.keys():
-            if channel_id not in channels:
-                channels[channel_id] = get_channel_intel(channel_id)
-
         return {
-            "channels": channels,
+            "corridor_assignments": len(assignments),
+            "assignments": [a.to_dict() for a in assignments[:20]],
             "timestamp": int(now),
-            "total_channels": len(channels),
-            "channels_with_pheromone": len(all_levels),
-            "active_corridors": len(active_corridors)
         }
 
     except Exception as e:
@@ -3198,302 +822,19 @@ def rebalance_recommendations(
     """
     Get predictive rebalance recommendations.
 
-    Analyzes channels to find those predicted to deplete or saturate,
-    with recommendations for preemptive rebalancing at lower fees.
-
-    Args:
-        ctx: HiveContext
-        prediction_hours: How far ahead to predict (default: 24)
-
     Returns:
         Dict with rebalance recommendations sorted by urgency.
     """
-    if not ctx.cost_reduction_mgr:
-        return {"error": "Cost reduction not initialized"}
-
-    try:
-        recommendations = ctx.cost_reduction_mgr.get_rebalance_recommendations(
-            prediction_hours=prediction_hours
-        )
-
-        # Summarize by urgency
-        by_urgency = {
-            "critical": [],
-            "high": [],
-            "medium": [],
-            "low": []
-        }
-
-        for rec in recommendations:
-            urgency = rec.get("urgency", "low")
-            if urgency in by_urgency:
-                by_urgency[urgency].append(rec)
-
-        return {
-            "recommendations": recommendations,
-            "by_urgency": by_urgency,
-            "total_count": len(recommendations),
-            "critical_count": len(by_urgency["critical"]),
-            "prediction_hours": prediction_hours
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to get rebalance recommendations: {e}"}
+    # Cost reduction manager removed — return empty recommendations
+    return {
+        "recommendations": [],
+        "by_urgency": {"critical": [], "high": [], "medium": [], "low": []},
+        "total_count": 0,
+        "critical_count": 0,
+        "prediction_hours": prediction_hours,
+    }
 
 
-def fleet_rebalance_path(
-    ctx: HiveContext,
-    from_channel: str,
-    to_channel: str,
-    amount_sats: int
-) -> Dict[str, Any]:
-    """
-    Get fleet rebalance path recommendation.
-
-    Checks if rebalancing through fleet members is cheaper than
-    external routing. Fleet members have coordinated fees and
-    can offer internal "friendship" rates.
-
-    Args:
-        ctx: HiveContext
-        from_channel: Source channel SCID
-        to_channel: Destination channel SCID
-        amount_sats: Amount to rebalance
-
-    Returns:
-        Dict with path recommendation and savings estimate.
-    """
-    if not ctx.cost_reduction_mgr:
-        return {"error": "Cost reduction not initialized"}
-
-    try:
-        return ctx.cost_reduction_mgr.get_fleet_rebalance_path(
-            from_channel=from_channel,
-            to_channel=to_channel,
-            amount_sats=amount_sats
-        )
-
-    except Exception as e:
-        return {"error": f"Failed to get fleet path: {e}"}
-
-
-def record_rebalance_outcome(
-    ctx: HiveContext,
-    from_channel: str,
-    to_channel: str,
-    amount_sats: int,
-    cost_sats: int,
-    success: bool,
-    via_fleet: bool = False,
-    failure_reason: str = ""
-) -> Dict[str, Any]:
-    """
-    Record a rebalance outcome for tracking and circular flow detection.
-
-    Should be called after each rebalance attempt (success or failure).
-    Enables detection of wasteful circular flows like A→B→C→A.
-
-    Args:
-        ctx: HiveContext
-        from_channel: Source channel SCID
-        to_channel: Destination channel SCID
-        amount_sats: Amount rebalanced
-        cost_sats: Cost paid
-        success: Whether rebalance succeeded
-        via_fleet: Whether routed through fleet members
-        failure_reason: Error description if failed
-
-    Returns:
-        Dict with recording result and any circular flow warnings.
-    """
-    if not ctx.cost_reduction_mgr:
-        return {"error": "Cost reduction not initialized"}
-
-    try:
-        result = ctx.cost_reduction_mgr.record_rebalance_outcome(
-            from_channel=from_channel,
-            to_channel=to_channel,
-            amount_sats=amount_sats,
-            cost_sats=cost_sats,
-            success=success,
-            via_fleet=via_fleet
-        )
-        if failure_reason and not success:
-            result["failure_reason"] = failure_reason
-
-        # Deposit stigmergic marker for routing intelligence
-        marker_deposited = False
-        if ctx.fee_coordination_mgr and ctx.safe_plugin:
-            try:
-                # Resolve SCIDs to peer_ids
-                channels = ctx.safe_plugin.rpc.listpeerchannels()
-                scid_to_peer = {}
-                for ch in channels.get('channels', []):
-                    ch_scid = ch.get('short_channel_id')
-                    if ch_scid:
-                        scid_to_peer[ch_scid] = ch.get('peer_id', '')
-
-                from_peer = scid_to_peer.get(from_channel)
-                to_peer = scid_to_peer.get(to_channel)
-
-                if from_peer and to_peer:
-                    fee_ppm = cost_sats * 1_000_000 // max(amount_sats, 1)
-                    ctx.fee_coordination_mgr.stigmergic_coord.deposit_marker(
-                        source=from_peer,
-                        destination=to_peer,
-                        fee_charged=fee_ppm,
-                        success=success,
-                        volume_sats=amount_sats if success else 0
-                    )
-                    marker_deposited = True
-            except Exception:
-                pass  # Non-fatal: marker deposit is best-effort
-
-        result["marker_deposited"] = marker_deposited
-        return result
-
-    except Exception as e:
-        return {"error": f"Failed to record rebalance outcome: {e}"}
-
-
-def circular_flow_status(ctx: HiveContext) -> Dict[str, Any]:
-    """
-    Get circular flow detection status.
-
-    Shows any detected circular flows (e.g., A→B→C→A) that waste
-    fees moving liquidity in circles.
-
-    Args:
-        ctx: HiveContext
-
-    Returns:
-        Dict with circular flow status and detected patterns.
-    """
-    if not ctx.cost_reduction_mgr:
-        return {"error": "Cost reduction not initialized"}
-
-    try:
-        return ctx.cost_reduction_mgr.circular_detector.get_circular_flow_status()
-
-    except Exception as e:
-        return {"error": f"Failed to get circular flow status: {e}"}
-
-
-def cost_reduction_status(ctx: HiveContext) -> Dict[str, Any]:
-    """
-    Get overall cost reduction status.
-
-    Comprehensive view of all Phase 3 cost reduction systems:
-    - Predictive rebalancing
-    - Fleet routing
-    - Circular flow detection
-
-    Args:
-        ctx: HiveContext
-
-    Returns:
-        Dict with cost reduction status.
-    """
-    if not ctx.cost_reduction_mgr:
-        return {"error": "Cost reduction not initialized"}
-
-    try:
-        return ctx.cost_reduction_mgr.get_cost_reduction_status()
-
-    except Exception as e:
-        return {"error": f"Failed to get cost reduction status: {e}"}
-
-
-def execute_hive_circular_rebalance(
-    ctx: HiveContext,
-    from_channel: str,
-    to_channel: str,
-    amount_sats: int,
-    via_members: list = None,
-    dry_run: bool = True
-) -> Dict[str, Any]:
-    """
-    Execute a circular rebalance through the hive using explicit sendpay route.
-
-    This bypasses sling's automatic route finding and uses an explicit route
-    through hive members, ensuring zero-fee internal routing.
-
-    Args:
-        ctx: HiveContext
-        from_channel: Source channel SCID (where we have outbound liquidity)
-        to_channel: Destination channel SCID (where we want more local balance)
-        amount_sats: Amount to rebalance in satoshis
-        via_members: Optional list of intermediate member pubkeys
-        dry_run: If True, just show the route without executing (default: True)
-
-    Returns:
-        Dict with route details and execution result (or preview if dry_run)
-    """
-    if not ctx.cost_reduction_mgr:
-        return {"error": "Cost reduction not initialized"}
-
-    # Permission check: fund movements require member tier
-    if not dry_run:
-        perm_err = check_permission(ctx, "member")
-        if perm_err:
-            return perm_err
-
-    try:
-        return ctx.cost_reduction_mgr.execute_hive_circular_rebalance(
-            from_channel=from_channel,
-            to_channel=to_channel,
-            amount_sats=amount_sats,
-            via_members=via_members,
-            dry_run=dry_run,
-            bridge=ctx.bridge
-        )
-
-    except Exception as e:
-        return {"error": f"Failed to execute hive circular rebalance: {e}"}
-
-
-# =============================================================================
-# MCF (MIN-COST MAX-FLOW) PATH COMMAND
-# =============================================================================
-
-def mcf_optimized_path(
-    ctx: HiveContext,
-    from_channel: str,
-    to_channel: str,
-    amount_sats: int
-) -> Dict[str, Any]:
-    """
-    Get MCF-optimized rebalance path between channels.
-
-    Uses the latest MCF solution if available and valid,
-    otherwise falls back to BFS-based fleet routing.
-
-    Args:
-        ctx: HiveContext
-        from_channel: Source channel SCID
-        to_channel: Destination channel SCID
-        amount_sats: Amount to rebalance
-
-    Returns:
-        Dict with path recommendation including:
-        - source: "mcf" or "bfs" indicating which algorithm found the path
-        - fleet_path_available: Whether a fleet path exists
-        - fleet_path: List of pubkeys in the path
-        - estimated_fleet_cost_sats: Expected cost
-        - recommendation: Recommended action
-    """
-    if not ctx.cost_reduction_mgr:
-        return {"error": "Cost reduction not initialized"}
-
-    try:
-        return ctx.cost_reduction_mgr.get_mcf_optimized_path(
-            from_channel=from_channel,
-            to_channel=to_channel,
-            amount_sats=amount_sats
-        )
-
-    except Exception as e:
-        return {"error": f"Failed to get MCF optimized path: {e}"}
 
 
 # =============================================================================
@@ -3534,9 +875,8 @@ def close_recommendations(
     """
     Get channel close recommendations for underperforming redundant channels.
 
-    Uses stigmergic markers (routing success) to determine which member
-    "owns" each peer relationship. Recommends closes for members with
-    <10% of the owner's routing activity.
+    Uses corridor assignments to determine which member "owns" each peer
+    relationship. Recommends closes for members with redundant channels.
 
     Args:
         ctx: HiveContext
@@ -3572,33 +912,6 @@ def close_recommendations(
         return {"error": f"Failed to get close recommendations: {e}"}
 
 
-def create_close_actions(ctx: HiveContext) -> Dict[str, Any]:
-    """
-    Create pending_actions for close recommendations.
-
-    Puts high-confidence close recommendations into the pending_actions
-    queue for AI/human approval.
-
-    Permission: Member or higher (prevents neophytes from creating close proposals).
-
-    Args:
-        ctx: HiveContext
-
-    Returns:
-        Dict with number of actions created.
-    """
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.rationalization_mgr:
-        return {"error": "Rationalization not initialized"}
-
-    try:
-        return ctx.rationalization_mgr.create_close_actions()
-
-    except Exception as e:
-        return {"error": f"Failed to create close actions: {e}"}
 
 
 def rationalization_summary(ctx: HiveContext) -> Dict[str, Any]:
@@ -3652,7 +965,6 @@ def rationalization_status(ctx: HiveContext) -> Dict[str, Any]:
 # Position fleet on critical network paths:
 # - RouteValueAnalyzer: High-value corridors with limited competition
 # - FleetPositioningStrategy: Coordinated channel opens (max 2 per target)
-# - PhysarumChannelManager: Flow-based channel lifecycle (strengthen/atrophy)
 
 def valuable_corridors(
     ctx: HiveContext,
@@ -3764,107 +1076,6 @@ def positioning_recommendations(
         return {"error": f"Failed to get positioning recommendations: {e}"}
 
 
-def flow_recommendations(
-    ctx: HiveContext,
-    channel_id: str = None
-) -> Dict[str, Any]:
-    """
-    Get Physarum-inspired flow recommendations for channel lifecycle.
-
-    Channels evolve based on flow like slime mold tubes:
-    - High flow (>2% daily) → strengthen (splice in)
-    - Low flow (<0.1% daily) → atrophy (recommend close)
-    - Young + low flow → stimulate (fee reduction)
-
-    Args:
-        ctx: HiveContext
-        channel_id: Specific channel, or None for all non-hold recommendations
-
-    Returns:
-        Dict with flow recommendations.
-    """
-    if not ctx.strategic_positioning_mgr:
-        return {"error": "Strategic positioning not initialized"}
-
-    try:
-        recommendations = ctx.strategic_positioning_mgr.get_flow_recommendations(
-            channel_id=channel_id
-        )
-
-        # Summarize by action
-        by_action = {
-            "strengthen": 0,
-            "stimulate": 0,
-            "atrophy": 0,
-            "hold": 0
-        }
-        total_redeploy = 0
-        total_splice = 0
-
-        for rec in recommendations:
-            action = rec.get("action", "hold")
-            if action in by_action:
-                by_action[action] += 1
-            total_redeploy += rec.get("capital_to_redeploy_sats", 0)
-            total_splice += rec.get("splice_amount_sats", 0)
-
-        return {
-            "recommendations": recommendations,
-            "count": len(recommendations),
-            "by_action": by_action,
-            "capital_to_redeploy_sats": total_redeploy,
-            "recommended_splice_sats": total_splice
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to get flow recommendations: {e}"}
-
-
-def report_flow_intensity(
-    ctx: HiveContext,
-    channel_id: str,
-    peer_id: str,
-    intensity: float
-) -> Dict[str, Any]:
-    """
-    Report flow intensity for a channel to the Physarum model.
-
-    Flow intensity = Daily volume / Capacity
-    This updates the slime-mold model that drives channel lifecycle decisions.
-
-    Args:
-        ctx: HiveContext
-        channel_id: Channel ID (SCID format)
-        peer_id: Peer public key
-        intensity: Observed flow intensity (0.0 to 1.0+)
-
-    Returns:
-        Dict with acknowledgment.
-
-    Permission: Member only
-    """
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.strategic_positioning_mgr:
-        return {"error": "Strategic positioning not initialized"}
-
-    # Input validation
-    intensity = float(intensity)
-    if intensity < 0.0 or intensity > 100.0:
-        return {"error": "intensity must be between 0.0 and 100.0"}
-
-    try:
-        return ctx.strategic_positioning_mgr.report_flow_intensity(
-            channel_id=channel_id,
-            peer_id=peer_id,
-            intensity=intensity
-        )
-
-    except Exception as e:
-        return {"error": f"Failed to report flow intensity: {e}"}
 
 
 def positioning_summary(ctx: HiveContext) -> Dict[str, Any]:
@@ -4002,70 +1213,6 @@ def rebalance_hubs(
         return {"error": f"Failed to get rebalance hubs: {e}"}
 
 
-def rebalance_path(
-    ctx: HiveContext,
-    source_member: str,
-    dest_member: str,
-    max_hops: int = 2
-) -> Dict[str, Any]:
-    """
-    Find the optimal zero-fee path for internal hive rebalancing.
-
-    Finds a path through the hive's internal network from source to destination.
-    All channels between hive members have 0 ppm fees, so internal rebalancing
-    through these paths is free.
-
-    Args:
-        ctx: HiveContext
-        source_member: Source member pubkey
-        dest_member: Destination member pubkey
-        max_hops: Maximum number of hops (default: 2)
-
-    Returns:
-        Dict with path information including intermediaries.
-    """
-    from . import network_metrics as nm
-
-    calculator = nm.get_calculator()
-    if not calculator:
-        return {"error": "Network metrics calculator not initialized"}
-
-    try:
-        path = calculator.find_best_rebalance_path(
-            source_member=source_member,
-            dest_member=dest_member,
-            max_hops=max_hops
-        )
-
-        if not path:
-            return {
-                "path_found": False,
-                "path": [],
-                "hop_count": 0,
-                "note": f"No path within {max_hops} hops between these members"
-            }
-
-        # Enrich path with aliases
-        enriched_path = []
-        for peer_id in path:
-            node_info = {"peer_id": peer_id}
-            if getattr(ctx, 'state_manager', None):
-                state = ctx.state_manager.get_peer_state(peer_id)
-                if state and hasattr(state, 'alias') and state.alias:
-                    node_info['alias'] = state.alias
-            enriched_path.append(node_info)
-
-        return {
-            "path_found": True,
-            "path": enriched_path,
-            "hop_count": len(path) - 1,
-            "source": enriched_path[0] if enriched_path else None,
-            "destination": enriched_path[-1] if enriched_path else None,
-            "intermediaries": enriched_path[1:-1] if len(enriched_path) > 2 else []
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to find rebalance path: {e}"}
 
 
 def fleet_health(ctx: HiveContext) -> Dict[str, Any]:
@@ -4158,351 +1305,6 @@ def member_connectivity(ctx: HiveContext, member_id: str) -> Dict[str, Any]:
         return {"error": f"Failed to get member connectivity: {e}"}
 
 
-def neophyte_rankings(ctx: HiveContext) -> Dict[str, Any]:
-    """
-    Get all neophytes ranked by their promotion readiness.
-
-    Returns neophytes sorted by a readiness score (0-100) based on:
-    - Probation progress (40%)
-    - Uptime (20%)
-    - Contribution ratio (20%)
-    - Hive centrality (20%)
-
-    Neophytes with high hive centrality may be eligible for fast-track
-    promotion (after 30 days instead of 90 if centrality >= 0.5).
-
-    Args:
-        ctx: HiveContext
-
-    Returns:
-        Dict with ranked list of neophytes and their metrics.
-    """
-    if not ctx.membership_mgr:
-        return {"error": "Membership manager not initialized"}
-
-    try:
-        rankings = ctx.membership_mgr.get_neophyte_rankings()
-        eligible_count = sum(1 for n in rankings if n.get("eligible"))
-        fast_track_count = sum(1 for n in rankings if n.get("fast_track_eligible"))
-
-        return {
-            "neophyte_count": len(rankings),
-            "eligible_for_promotion": eligible_count,
-            "fast_track_eligible": fast_track_count,
-            "rankings": rankings
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to get neophyte rankings: {e}"}
-
-
-# =============================================================================
-# MCF (Min-Cost Max-Flow) COMMANDS
-# =============================================================================
-
-def mcf_status(ctx: HiveContext) -> Dict[str, Any]:
-    """
-    Get MCF optimization status.
-
-    Shows coordinator election, pending assignments, completion stats,
-    and latest solution information.
-
-    Args:
-        ctx: HiveContext
-
-    Returns:
-        Dict with MCF status including:
-        - enabled: Whether MCF is enabled
-        - is_coordinator: Whether we are the elected coordinator
-        - coordinator_id: Elected coordinator's pubkey
-        - pending_assignments: Our pending MCF assignments
-        - solution_info: Latest solution stats
-        - ack_stats: Assignment acknowledgment stats
-        - completion_stats: Completion report stats
-    """
-    if not ctx.cost_reduction_mgr:
-        return {"error": "Cost reduction manager not initialized"}
-
-    try:
-        # Get basic MCF status
-        mcf_coord_status = ctx.cost_reduction_mgr.get_mcf_status()
-
-        # Get coordinator info
-        coordinator_id = ctx.cost_reduction_mgr.get_current_mcf_coordinator()
-
-        # Get our assignments from liquidity coordinator
-        pending_assignments = []
-        if ctx.liquidity_coordinator:
-            liq_status = ctx.liquidity_coordinator.get_mcf_status()
-            pending_assignments = liq_status.get("pending_assignments", [])
-
-        # Get ACK and completion stats
-        acks = ctx.cost_reduction_mgr.get_mcf_acks()
-        completions = ctx.cost_reduction_mgr.get_mcf_completions()
-
-        success_count = sum(1 for c in completions if c.get("success"))
-        failure_count = sum(1 for c in completions if not c.get("success"))
-
-        return {
-            "enabled": mcf_coord_status.get("enabled", False),
-            "is_coordinator": mcf_coord_status.get("is_coordinator", False),
-            "coordinator_id": coordinator_id,
-            "our_pubkey": ctx.our_pubkey,
-            "pending_assignments": {
-                "count": len(pending_assignments),
-                "assignments": pending_assignments[:5],  # First 5
-            },
-            "solution_info": {
-                "valid": mcf_coord_status.get("solution_valid", False),
-                "last_timestamp": mcf_coord_status.get("last_solution_timestamp", 0),
-                "total_flow_sats": mcf_coord_status.get("total_flow_sats", 0),
-                "total_cost_sats": mcf_coord_status.get("total_cost_sats", 0),
-                "assignment_count": mcf_coord_status.get("assignment_count", 0),
-            },
-            "ack_stats": {
-                "count": len(acks),
-                "recent": acks[-5:] if acks else [],  # Last 5
-            },
-            "completion_stats": {
-                "total": len(completions),
-                "success": success_count,
-                "failure": failure_count,
-                "recent": completions[-5:] if completions else [],  # Last 5
-            },
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to get MCF status: {e}"}
-
-
-def mcf_solve(ctx: HiveContext, dry_run: bool = True) -> Dict[str, Any]:
-    """
-    Trigger MCF optimization cycle manually.
-
-    Computes optimal rebalance assignments for the fleet. Only works if
-    this node is the elected coordinator.
-
-    Args:
-        ctx: HiveContext
-        dry_run: If True, compute solution but don't broadcast (default: True)
-
-    Returns:
-        Dict with solution details including:
-        - coordinator: Whether we are coordinator
-        - solution: Optimization results (flow, cost, assignments)
-        - broadcast: Whether solution was broadcast
-
-    Permission: Member only
-    """
-    # Permission check: Member only
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.cost_reduction_mgr:
-        return {"error": "Cost reduction manager not initialized"}
-
-    try:
-        # Check if we're coordinator
-        coordinator_id = ctx.cost_reduction_mgr.get_current_mcf_coordinator()
-        is_coordinator = coordinator_id == ctx.our_pubkey
-
-        if not is_coordinator:
-            return {
-                "error": "Not coordinator",
-                "message": "Only the elected coordinator can run MCF optimization",
-                "coordinator_id": coordinator_id,
-                "our_pubkey": ctx.our_pubkey
-            }
-
-        # Run optimization
-        solution = ctx.cost_reduction_mgr.run_mcf_optimization()
-
-        if not solution:
-            return {
-                "success": False,
-                "message": "No solution generated (may not have enough demand)",
-                "is_coordinator": True
-            }
-
-        result = {
-            "success": True,
-            "is_coordinator": True,
-            "dry_run": dry_run,
-            "solution": {
-                "total_flow_sats": solution.get("total_flow_sats", 0),
-                "total_cost_sats": solution.get("total_cost_sats", 0),
-                "unmet_demand_sats": solution.get("unmet_demand_sats", 0),
-                "assignment_count": len(solution.get("assignments", [])),
-                "computation_time_ms": solution.get("computation_time_ms", 0),
-                "iterations": solution.get("iterations", 0),
-            },
-            "assignments": solution.get("assignments", [])[:10],  # First 10
-        }
-
-        if not dry_run:
-            result["broadcast"] = False
-            result["message"] = "Solution generated. Fleet broadcast not yet implemented — use assignments to execute manually."
-        else:
-            result["broadcast"] = False
-            result["message"] = "Dry run - solution not broadcast (use dry_run=false to generate)"
-
-        return result
-
-    except Exception as e:
-        return {"error": f"MCF optimization failed: {e}"}
-
-
-def mcf_assignments(ctx: HiveContext) -> Dict[str, Any]:
-    """
-    Get detailed view of our MCF assignments.
-
-    Shows all pending, executing, completed, and failed assignments
-    from the current and recent MCF solutions.
-
-    Args:
-        ctx: HiveContext
-
-    Returns:
-        Dict with assignment details by status.
-    """
-    if not ctx.liquidity_coordinator:
-        return {"error": "Liquidity coordinator not initialized"}
-
-    try:
-        status = ctx.liquidity_coordinator.get_mcf_status()
-
-        # Get all assignments by status
-        all_assignments = []
-        if hasattr(ctx.liquidity_coordinator, 'get_all_assignments'):
-            all_assignments = ctx.liquidity_coordinator.get_all_assignments()
-
-        pending = [a for a in all_assignments if a.status == "pending"]
-        executing = [a for a in all_assignments if a.status == "executing"]
-        completed = [a for a in all_assignments if a.status == "completed"]
-        failed = [a for a in all_assignments if a.status in ("failed", "rejected")]
-
-        def format_assignment(a):
-            return {
-                "assignment_id": a.assignment_id,
-                "from_channel": a.from_channel,
-                "to_channel": a.to_channel,
-                "amount_sats": a.amount_sats,
-                "expected_cost_sats": a.expected_cost_sats,
-                "priority": a.priority,
-                "status": a.status,
-                "coordinator_id": a.coordinator_id[:16] + "..." if a.coordinator_id else "",
-            }
-
-        return {
-            "last_solution_timestamp": status.get("last_solution_timestamp", 0),
-            "ack_sent": status.get("ack_sent", False),
-            "summary": {
-                "pending": len(pending),
-                "executing": len(executing),
-                "completed": len(completed),
-                "failed": len(failed),
-            },
-            "pending": [format_assignment(a) for a in pending],
-            "executing": [format_assignment(a) for a in executing],
-            "completed": [format_assignment(a) for a in completed[-10:]],  # Last 10
-            "failed": [format_assignment(a) for a in failed[-10:]],  # Last 10
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to get MCF assignments: {e}"}
-
-
-# =============================================================================
-# REVENUE OPS INTEGRATION COMMANDS
-# =============================================================================
-# These RPC methods provide data to cl-revenue-ops for improved fee optimization
-# and rebalancing decisions. They expose cl-hive's intelligence layer.
-
-
-def get_defense_status(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
-    """
-    Get defense status for channel(s).
-
-    Returns whether channels are under defensive fee protection due to
-    drain attacks, spam, or fee wars. Used by cl-revenue-ops to avoid
-    overriding defensive fees during optimization.
-
-    Args:
-        ctx: HiveContext
-        scid: Optional specific channel SCID. If None, returns all channels.
-
-    Returns:
-        Dict with defense status for each channel:
-        {
-            "channels": {
-                "932263x1883x0": {
-                    "under_defense": false,
-                    "defense_type": null,
-                    "defensive_fee_ppm": null,
-                    "defense_started_at": null,
-                    "defense_reason": null
-                }
-            }
-        }
-    """
-    if not ctx.fee_coordination_mgr:
-        return {"error": "Fee coordination manager not initialized"}
-
-    try:
-        channels_data = {}
-
-        # Get all channels with defense status
-        if ctx.safe_plugin:
-            channels = ctx.safe_plugin.rpc.listpeerchannels()
-
-            for ch in channels.get('channels', []):
-                ch_scid = ch.get('short_channel_id')
-                if not ch_scid:
-                    continue
-
-                # Skip if specific scid requested and this isn't it
-                if scid and ch_scid != scid:
-                    continue
-
-                peer_id = ch.get('peer_id', '')
-
-                # Check defense status from fee coordination manager
-                defense_info = ctx.fee_coordination_mgr.get_channel_defense_status(
-                    ch_scid, peer_id
-                ) if hasattr(ctx.fee_coordination_mgr, 'get_channel_defense_status') else {}
-
-                # Also check active warnings
-                active_warnings = ctx.fee_coordination_mgr.get_active_warnings_for_peer(
-                    peer_id
-                ) if hasattr(ctx.fee_coordination_mgr, 'get_active_warnings_for_peer') else []
-
-                under_defense = defense_info.get('under_defense', False) or len(active_warnings) > 0
-                defense_type = defense_info.get('defense_type')
-
-                if not defense_type and active_warnings:
-                    # Derive from warnings
-                    for warn in active_warnings:
-                        if warn.get('threat_type') == 'drain':
-                            defense_type = 'drain_protection'
-                            break
-                        elif warn.get('threat_type') == 'unreliable':
-                            defense_type = 'spam_defense'
-                            break
-
-                channels_data[ch_scid] = {
-                    "under_defense": under_defense,
-                    "defense_type": defense_type,
-                    "defensive_fee_ppm": defense_info.get('defensive_fee_ppm'),
-                    "defense_started_at": defense_info.get('defense_started_at'),
-                    "defense_reason": defense_info.get('defense_reason'),
-                    "active_warnings": len(active_warnings),
-                }
-
-        return {"channels": channels_data}
-
-    except Exception as e:
-        return {"error": f"Failed to get defense status: {e}"}
 
 
 def get_peer_quality(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
@@ -4600,95 +1402,6 @@ def get_peer_quality(ctx: HiveContext, peer_id: str = None) -> Dict[str, Any]:
         return {"error": f"Failed to get peer quality: {e}"}
 
 
-def get_fee_change_outcomes(ctx: HiveContext, scid: str = None,
-                             days: int = 30) -> Dict[str, Any]:
-    """
-    Get outcomes of past fee changes for learning.
-
-    Returns historical fee changes with before/after metrics to help
-    cl-revenue-ops learn from past decisions and adjust Thompson priors.
-
-    Args:
-        ctx: HiveContext
-        scid: Optional specific channel SCID. If None, returns all.
-        days: Number of days of history to return (default: 30, max: 90)
-
-    Returns:
-        Dict with fee change outcomes:
-        {
-            "changes": [
-                {
-                    "scid": "932263x1883x0",
-                    "timestamp": 1707500000,
-                    "old_fee_ppm": 200,
-                    "new_fee_ppm": 300,
-                    "source": "advisor",
-                    "outcome": {
-                        "forwards_before_24h": 5,
-                        "forwards_after_24h": 3,
-                        "revenue_before_24h": 500,
-                        "revenue_after_24h": 600,
-                        "verdict": "positive"
-                    }
-                }
-            ]
-        }
-    """
-    if not ctx.database:
-        return {"error": "Database not initialized"}
-
-    # Bound days parameter
-    days = min(max(1, days), 90)
-
-    try:
-        changes = []
-        cutoff_ts = int(time.time()) - (days * 86400)
-
-        # Query fee change history from database
-        # This data may come from multiple sources:
-        # 1. fee_coordination_mgr stigmergic markers
-        # 2. database recorded fee changes
-        # 3. routing_map pheromone history
-
-        if ctx.fee_coordination_mgr:
-            # Get markers which track fee changes
-            markers = ctx.fee_coordination_mgr.get_all_markers() \
-                if hasattr(ctx.fee_coordination_mgr, 'get_all_markers') else []
-
-            # Filter by scid if specified
-            if scid:
-                markers = [m for m in markers if m.get('channel_id') == scid]
-
-            for marker in markers:
-                if marker.get('timestamp', 0) < cutoff_ts:
-                    continue
-
-                # Get outcome data if available
-                outcome_data = marker.get('outcome', {})
-
-                change_entry = {
-                    "scid": marker.get('channel_id', ''),
-                    "timestamp": marker.get('timestamp', 0),
-                    "old_fee_ppm": marker.get('old_fee_ppm', 0),
-                    "new_fee_ppm": marker.get('fee_ppm', 0),
-                    "source": marker.get('source', 'unknown'),
-                    "outcome": {
-                        "forwards_before_24h": outcome_data.get('forwards_before', 0),
-                        "forwards_after_24h": outcome_data.get('forwards_after', 0),
-                        "revenue_before_24h": outcome_data.get('revenue_before', 0),
-                        "revenue_after_24h": outcome_data.get('revenue_after', 0),
-                        "verdict": outcome_data.get('verdict', 'unknown'),
-                    }
-                }
-                changes.append(change_entry)
-
-        # Sort by timestamp descending
-        changes.sort(key=lambda x: x['timestamp'], reverse=True)
-
-        return {"changes": changes[:200]}  # Limit to 200 entries
-
-    except Exception as e:
-        return {"error": f"Failed to get fee change outcomes: {e}"}
 
 
 def get_channel_flags(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
@@ -4763,108 +1476,6 @@ def get_channel_flags(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
         return {"error": f"Failed to get channel flags: {e}"}
 
 
-def get_mcf_targets(ctx: HiveContext) -> Dict[str, Any]:
-    """
-    Get MCF-computed optimal balance targets.
-
-    Returns the Multi-Commodity Flow computed optimal local balance
-    percentages for each channel. Used by cl-revenue-ops to guide
-    rebalancing toward globally optimal distribution.
-
-    Args:
-        ctx: HiveContext
-
-    Returns:
-        Dict with MCF targets:
-        {
-            "targets": {
-                "932263x1883x0": {
-                    "optimal_local_pct": 45,
-                    "current_local_pct": 30,
-                    "delta_sats": 150000,
-                    "priority": "high"
-                }
-            },
-            "computed_at": 1707600000
-        }
-    """
-    if not ctx.cost_reduction_mgr:
-        return {"error": "Cost reduction manager not initialized"}
-
-    try:
-        targets_data = {}
-        computed_at = 0
-
-        # Get current MCF solution if available
-        if hasattr(ctx.cost_reduction_mgr, 'get_current_mcf_solution'):
-            solution = ctx.cost_reduction_mgr.get_current_mcf_solution()
-            if solution:
-                computed_at = solution.get('timestamp', 0)
-
-                # Extract target balances from assignments
-                assignments = solution.get('assignments', [])
-                channel_deltas: Dict[str, int] = {}
-
-                for assignment in assignments:
-                    to_channel = assignment.get('to_channel')
-                    from_channel = assignment.get('from_channel')
-                    amount = assignment.get('amount_sats', 0)
-
-                    if to_channel:
-                        channel_deltas[to_channel] = channel_deltas.get(to_channel, 0) + amount
-                    if from_channel:
-                        channel_deltas[from_channel] = channel_deltas.get(from_channel, 0) - amount
-
-                # Get current channel balances
-                if ctx.safe_plugin:
-                    channels = ctx.safe_plugin.rpc.listpeerchannels()
-
-                    for ch in channels.get('channels', []):
-                        ch_scid = ch.get('short_channel_id')
-                        if not ch_scid:
-                            continue
-
-                        local_msat = ch.get('to_us_msat', 0)
-                        if isinstance(local_msat, str):
-                            local_msat = int(local_msat.replace('msat', ''))
-                        total_msat = ch.get('total_msat', 0)
-                        if isinstance(total_msat, str):
-                            total_msat = int(total_msat.replace('msat', ''))
-
-                        if total_msat <= 0:
-                            continue
-
-                        current_local_pct = (local_msat / total_msat) * 100
-                        delta_sats = channel_deltas.get(ch_scid, 0)
-
-                        # Calculate optimal based on delta
-                        optimal_local_sats = (local_msat // 1000) + delta_sats
-                        optimal_local_pct = (optimal_local_sats * 1000 / total_msat) * 100
-                        optimal_local_pct = max(0, min(100, optimal_local_pct))
-
-                        # Determine priority
-                        abs_delta = abs(delta_sats)
-                        if abs_delta > 500000:
-                            priority = "high"
-                        elif abs_delta > 100000:
-                            priority = "medium"
-                        else:
-                            priority = "low"
-
-                        targets_data[ch_scid] = {
-                            "optimal_local_pct": round(optimal_local_pct, 1),
-                            "current_local_pct": round(current_local_pct, 1),
-                            "delta_sats": delta_sats,
-                            "priority": priority,
-                        }
-
-        return {
-            "targets": targets_data,
-            "computed_at": computed_at,
-        }
-
-    except Exception as e:
-        return {"error": f"Failed to get MCF targets: {e}"}
 
 
 def get_nnlb_opportunities(ctx: HiveContext, min_amount: int = 50000) -> Dict[str, Any]:
@@ -4894,27 +1505,13 @@ def get_nnlb_opportunities(ctx: HiveContext, min_amount: int = 50000) -> Dict[st
             ]
         }
     """
-    if not ctx.anticipatory_manager:
-        # Fall back to liquidity coordinator
-        if not ctx.liquidity_coordinator:
-            return {"error": "Neither anticipatory manager nor liquidity coordinator initialized"}
+    if not ctx.liquidity_coordinator:
+        return {"error": "Liquidity coordinator not initialized"}
 
     try:
         opportunities = []
 
-        # Get NNLB recommendations from anticipatory manager
-        if ctx.anticipatory_manager and hasattr(ctx.anticipatory_manager, 'get_nnlb_opportunities'):
-            nnlb_opps = ctx.anticipatory_manager.get_nnlb_opportunities(min_amount)
-            for opp in nnlb_opps:
-                opportunities.append({
-                    "source_scid": opp.get('source_channel'),
-                    "sink_scid": opp.get('sink_channel'),
-                    "amount_sats": opp.get('amount_sats', 0),
-                    "estimated_cost_sats": opp.get('estimated_cost', 0),
-                    "path_hops": opp.get('path_hops', 1),
-                    "is_hive_internal": opp.get('is_hive_internal', False),
-                })
-        elif ctx.liquidity_coordinator:
+        if ctx.liquidity_coordinator:
             # Use liquidity coordinator's circular flow detection
             if hasattr(ctx.liquidity_coordinator, 'get_circular_rebalance_opportunities'):
                 circ_opps = ctx.liquidity_coordinator.get_circular_rebalance_opportunities()
@@ -5051,948 +1648,6 @@ def get_channel_ages(ctx: HiveContext, scid: str = None) -> Dict[str, Any]:
 # DID CREDENTIAL COMMANDS (Phase 16)
 # =============================================================================
 
-def did_issue_credential(ctx: HiveContext, subject_id: str, domain: str,
-                         metrics_json: str, outcome: str = "neutral",
-                         evidence_json: str = "[]") -> Dict[str, Any]:
-    """Issue a DID reputation credential for a subject."""
-    perm = check_permission(ctx, "member")
-    if perm:
-        return perm
-
-    if not ctx.did_credential_mgr:
-        return {"error": "DID credential manager not initialized"}
-
-    try:
-        metrics = json.loads(metrics_json)
-    except (json.JSONDecodeError, TypeError):
-        return {"error": "invalid metrics_json: must be valid JSON"}
-
-    try:
-        evidence = json.loads(evidence_json) if evidence_json else []
-    except (json.JSONDecodeError, TypeError):
-        return {"error": "invalid evidence_json: must be valid JSON array"}
-
-    if not isinstance(evidence, list):
-        return {"error": "evidence must be a JSON array"}
-
-    credential = ctx.did_credential_mgr.issue_credential(
-        subject_id=subject_id,
-        domain=domain,
-        metrics=metrics,
-        outcome=outcome,
-        evidence=evidence,
-    )
-
-    if not credential:
-        return {"error": "failed to issue credential (check logs for details)"}
-
-    return {
-        "credential_id": credential.credential_id,
-        "issuer_id": credential.issuer_id,
-        "subject_id": credential.subject_id,
-        "domain": credential.domain,
-        "outcome": credential.outcome,
-        "issued_at": credential.issued_at,
-        "signature": credential.signature,
-    }
-
-
-def did_list_credentials(ctx: HiveContext, subject_id: str = "",
-                         domain: str = "", issuer_id: str = "") -> Dict[str, Any]:
-    """List DID credentials with optional filters."""
-    if not ctx.database:
-        return {"error": "database not initialized"}
-
-    if subject_id:
-        creds = ctx.database.get_did_credentials_for_subject(
-            subject_id, domain=domain or None, limit=100
-        )
-    elif issuer_id:
-        creds = ctx.database.get_did_credentials_by_issuer(
-            issuer_id, limit=100
-        )
-        # Apply domain filter if specified (DB method doesn't support it)
-        if domain:
-            creds = [c for c in creds if c.get("domain") == domain]
-    else:
-        return {"error": "must specify subject_id or issuer_id"}
-
-    return {
-        "credentials": creds,
-        "count": len(creds),
-    }
-
-
-def did_revoke_credential(ctx: HiveContext, credential_id: str,
-                          reason: str) -> Dict[str, Any]:
-    """Revoke a DID credential we issued."""
-    perm = check_permission(ctx, "member")
-    if perm:
-        return perm
-
-    if not ctx.did_credential_mgr:
-        return {"error": "DID credential manager not initialized"}
-
-    success = ctx.did_credential_mgr.revoke_credential(credential_id, reason)
-
-    if not success:
-        return {"error": "failed to revoke credential (not found, not issuer, or already revoked)"}
-
-    return {
-        "credential_id": credential_id,
-        "revoked": True,
-        "reason": reason,
-    }
-
-
-def did_get_reputation(ctx: HiveContext, subject_id: str,
-                       domain: str = "") -> Dict[str, Any]:
-    """Get aggregated reputation score for a subject."""
-    if not ctx.did_credential_mgr:
-        return {"error": "DID credential manager not initialized"}
-
-    result = ctx.did_credential_mgr.aggregate_reputation(
-        subject_id, domain=domain or None
-    )
-
-    if not result:
-        return {
-            "subject_id": subject_id,
-            "domain": domain or "_all",
-            "score": 50,
-            "tier": "newcomer",
-            "confidence": "none",
-            "credential_count": 0,
-            "issuer_count": 0,
-            "message": "no credentials found for this subject",
-        }
-
-    return {
-        "subject_id": result.subject_id,
-        "domain": result.domain,
-        "score": result.score,
-        "tier": result.tier,
-        "confidence": result.confidence,
-        "credential_count": result.credential_count,
-        "issuer_count": result.issuer_count,
-        "computed_at": result.computed_at,
-        "components": result.components,
-    }
-
-
-def did_list_profiles(ctx: HiveContext) -> Dict[str, Any]:
-    """List supported DID credential profiles."""
-    from modules.did_credentials import CREDENTIAL_PROFILES
-
-    profiles = {}
-    for domain, profile in CREDENTIAL_PROFILES.items():
-        profiles[domain] = {
-            "description": profile.description,
-            "subject_type": profile.subject_type,
-            "issuer_type": profile.issuer_type,
-            "required_metrics": profile.required_metrics,
-            "optional_metrics": profile.optional_metrics,
-            "metric_ranges": {k: list(v) for k, v in profile.metric_ranges.items()},
-        }
-
-    return {"profiles": profiles, "count": len(profiles)}
-
-
-# =========================================================================
-# MANAGEMENT SCHEMA COMMANDS (Phase 2)
-# =========================================================================
-
-def schema_list(ctx: HiveContext) -> Dict[str, Any]:
-    """List all management schemas with their actions and danger scores."""
-    if not ctx.management_schema_registry:
-        return {"error": "management schema registry not initialized"}
-
-    schemas = ctx.management_schema_registry.list_schemas()
-    return {"schemas": schemas, "count": len(schemas)}
-
-
-def schema_validate(ctx: HiveContext, schema_id: str, action: str,
-                    params_json: Optional[str] = None) -> Dict[str, Any]:
-    """Validate a command against its schema definition (dry run)."""
-    if not ctx.management_schema_registry:
-        return {"error": "management schema registry not initialized"}
-
-    params = None
-    if params_json:
-        try:
-            params = json.loads(params_json)
-        except (json.JSONDecodeError, TypeError):
-            return {"error": "invalid params_json"}
-        if not isinstance(params, dict):
-            return {"error": "params_json must decode to an object"}
-
-    is_valid, reason = ctx.management_schema_registry.validate_command(
-        schema_id, action, params
-    )
-    danger = ctx.management_schema_registry.get_danger_score(schema_id, action)
-    required_tier = ctx.management_schema_registry.get_required_tier(schema_id, action)
-
-    result = {
-        "schema_id": schema_id,
-        "action": action,
-        "valid": is_valid,
-        "reason": reason,
-    }
-    if danger:
-        result["danger"] = danger.to_dict()
-        result["required_tier"] = required_tier
-    return result
-
-
-def mgmt_credential_issue(ctx: HiveContext, agent_id: str, tier: str,
-                           allowed_schemas_json: str,
-                           constraints_json: Optional[str] = None,
-                           valid_days: int = 90) -> Dict[str, Any]:
-    """Issue a management credential granting an agent permission to manage our node."""
-    if not ctx.management_schema_registry:
-        return {"error": "management schema registry not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    try:
-        allowed_schemas = json.loads(allowed_schemas_json)
-    except (json.JSONDecodeError, TypeError):
-        return {"error": "invalid allowed_schemas_json"}
-
-    if not isinstance(allowed_schemas, list):
-        return {"error": "allowed_schemas must be a JSON array"}
-
-    constraints = {}
-    if constraints_json:
-        try:
-            constraints = json.loads(constraints_json)
-        except (json.JSONDecodeError, TypeError):
-            return {"error": "invalid constraints_json"}
-        if not isinstance(constraints, dict):
-            return {"error": "constraints_json must decode to a JSON object"}
-
-    node_id = ctx.our_pubkey or ""
-    cred = ctx.management_schema_registry.issue_credential(
-        agent_id=agent_id,
-        node_id=node_id,
-        tier=tier,
-        allowed_schemas=allowed_schemas,
-        constraints=constraints,
-        valid_days=valid_days,
-    )
-
-    if not cred:
-        return {"error": "failed to issue management credential"}
-
-    return {"credential": cred.to_dict()}
-
-
-def mgmt_credential_list(ctx: HiveContext, agent_id: Optional[str] = None,
-                          node_id: Optional[str] = None) -> Dict[str, Any]:
-    """List management credentials with optional filters."""
-    if not ctx.management_schema_registry:
-        return {"error": "management schema registry not initialized"}
-
-    creds = ctx.management_schema_registry.list_credentials(
-        agent_id=agent_id, node_id=node_id
-    )
-    # Parse JSON fields for display
-    results = []
-    for c in creds:
-        entry = dict(c)
-        for jf in ("allowed_schemas_json", "constraints_json"):
-            if jf in entry and entry[jf]:
-                try:
-                    entry[jf.replace("_json", "")] = json.loads(entry[jf])
-                except (json.JSONDecodeError, TypeError):
-                    pass
-        results.append(entry)
-
-    return {"credentials": results, "count": len(results)}
-
-
-def mgmt_credential_revoke(ctx: HiveContext, credential_id: str) -> Dict[str, Any]:
-    """Revoke a management credential we issued."""
-    if not ctx.management_schema_registry:
-        return {"error": "management schema registry not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    success = ctx.management_schema_registry.revoke_credential(credential_id)
-    return {"revoked": success, "credential_id": credential_id}
-
-
-# =============================================================================
-# PHASE 4A: CASHU ESCROW COMMANDS
-# =============================================================================
-
-def escrow_create(ctx: HiveContext, agent_id: str, schema_id: str = "",
-                  action: str = "", danger_score: int = 1,
-                  amount_sats: int = 0, mint_url: str = "",
-                  ticket_type: str = "single") -> Dict[str, Any]:
-    """Create a new Cashu escrow ticket."""
-    if not ctx.cashu_escrow_mgr:
-        return {"error": "cashu escrow manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not agent_id:
-        return {"error": "agent_id is required"}
-
-    # Generate a task_id (include randomness to prevent collisions)
-    import hashlib as _hashlib
-    import os as _os
-    task_id = _hashlib.sha256(
-        f"{agent_id}:{schema_id}:{action}:{int(time.time())}:{_os.urandom(8).hex()}".encode()
-    ).hexdigest()[:32]
-
-    ticket = ctx.cashu_escrow_mgr.create_ticket(
-        agent_id=agent_id,
-        task_id=task_id,
-        danger_score=danger_score,
-        amount_sats=amount_sats,
-        mint_url=mint_url,
-        ticket_type=ticket_type,
-        schema_id=schema_id or None,
-        action=action or None,
-    )
-
-    if not ticket:
-        return {"error": "failed to create escrow ticket"}
-
-    return {"ticket": ticket, "task_id": task_id}
-
-
-def escrow_list(ctx: HiveContext, agent_id: Optional[str] = None,
-                status: Optional[str] = None) -> Dict[str, Any]:
-    """List escrow tickets with optional filters."""
-    if not ctx.cashu_escrow_mgr:
-        return {"error": "cashu escrow manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    VALID_TICKET_STATUSES = {'active', 'redeemed', 'refunded', 'expired', 'pending'}
-    if status and status not in VALID_TICKET_STATUSES:
-        return {"error": f"invalid status filter: {status}"}
-
-    tickets = ctx.cashu_escrow_mgr.db.list_escrow_tickets(
-        agent_id=agent_id, status=status
-    )
-    return {"tickets": tickets, "count": len(tickets)}
-
-
-def escrow_redeem(ctx: HiveContext, ticket_id: str,
-                  preimage: str) -> Dict[str, Any]:
-    """Redeem an escrow ticket with HTLC preimage."""
-    if not ctx.cashu_escrow_mgr:
-        return {"error": "cashu escrow manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ticket_id or not preimage:
-        return {"error": "ticket_id and preimage are required"}
-
-    result = ctx.cashu_escrow_mgr.redeem_ticket(ticket_id, preimage, caller_id=ctx.our_pubkey)
-    return result if result else {"error": "redemption failed"}
-
-
-def escrow_refund(ctx: HiveContext, ticket_id: str) -> Dict[str, Any]:
-    """Refund an escrow ticket after timelock expiry."""
-    if not ctx.cashu_escrow_mgr:
-        return {"error": "cashu escrow manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ticket_id:
-        return {"error": "ticket_id is required"}
-
-    result = ctx.cashu_escrow_mgr.refund_ticket(ticket_id, caller_id=ctx.our_pubkey)
-    return result if result else {"error": "refund failed"}
-
-
-def escrow_get_receipt(ctx: HiveContext, ticket_id: str) -> Dict[str, Any]:
-    """Get escrow receipts for a ticket."""
-    if not ctx.cashu_escrow_mgr:
-        return {"error": "cashu escrow manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ticket_id:
-        return {"error": "ticket_id is required"}
-
-    receipts = ctx.cashu_escrow_mgr.db.get_escrow_receipts(ticket_id)
-    ticket = ctx.cashu_escrow_mgr.db.get_escrow_ticket(ticket_id)
-    return {
-        "ticket": ticket,
-        "receipts": receipts,
-        "count": len(receipts),
-    }
-
-
-def escrow_complete(ctx: HiveContext, ticket_id: str, schema_id: str = "",
-                    action: str = "", params_json: str = "{}",
-                    result_json: str = "{}", success: bool = True,
-                    reveal_preimage: bool = True) -> Dict[str, Any]:
-    """
-    Record a task completion receipt and optionally reveal escrow preimage.
-
-    This provides the operator-side completion step:
-    1) record signed escrow receipt
-    2) reveal HTLC preimage (if requested)
-    """
-    if not ctx.cashu_escrow_mgr:
-        return {"error": "cashu escrow manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ticket_id:
-        return {"error": "ticket_id is required"}
-
-    ticket = ctx.cashu_escrow_mgr.db.get_escrow_ticket(ticket_id)
-    if not ticket:
-        return {"error": "ticket not found"}
-
-    try:
-        params = json.loads(params_json) if params_json else {}
-    except (json.JSONDecodeError, TypeError):
-        return {"error": "invalid params_json"}
-    if not isinstance(params, dict):
-        return {"error": "params_json must decode to an object"}
-
-    result = None
-    if result_json:
-        try:
-            parsed = json.loads(result_json)
-        except (json.JSONDecodeError, TypeError):
-            return {"error": "invalid result_json"}
-        if parsed is not None and not isinstance(parsed, dict):
-            return {"error": "result_json must decode to an object or null"}
-        result = parsed
-
-    receipt = ctx.cashu_escrow_mgr.create_receipt(
-        ticket_id=ticket_id,
-        schema_id=schema_id or ticket.get("schema_id") or "",
-        action=action or ticket.get("action") or "",
-        params=params,
-        result=result,
-        success=bool(success),
-    )
-    if not receipt:
-        return {"error": "failed to create escrow receipt"}
-
-    response: Dict[str, Any] = {"receipt": receipt}
-    if reveal_preimage:
-        secret = ctx.cashu_escrow_mgr.db.get_escrow_secret_by_ticket(ticket_id)
-        if not secret:
-            response["preimage"] = None
-            response["error"] = "secret not found for ticket"
-            return response
-
-        task_id = secret.get("task_id", "")
-        preimage = ctx.cashu_escrow_mgr.reveal_secret(
-            task_id=task_id,
-            caller_id=ctx.our_pubkey,
-            require_receipt=True,
-        )
-        response["task_id"] = task_id
-        response["preimage"] = preimage
-        if preimage is None:
-            response["error"] = "preimage reveal failed"
-
-    return response
-
-
-# =============================================================================
-# PHASE 4B: EXTENDED SETTLEMENT COMMANDS
-# =============================================================================
-
-def bond_post(ctx: HiveContext, amount_sats: int = 0,
-              tier: str = "") -> Dict[str, Any]:
-    """Post a settlement bond."""
-    from .settlement import BondManager
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.database:
-        return {"error": "database not initialized"}
-
-    bond_mgr = BondManager(ctx.database, ctx.safe_plugin)
-    result = bond_mgr.post_bond(ctx.our_pubkey, amount_sats)
-    return result if result else {"error": "failed to post bond"}
-
-
-def bond_status(ctx: HiveContext, peer_id: Optional[str] = None) -> Dict[str, Any]:
-    """Get bond status for a peer."""
-    from .settlement import BondManager
-
-    if not ctx.database:
-        return {"error": "database not initialized"}
-
-    target = peer_id or ctx.our_pubkey
-    bond_mgr = BondManager(ctx.database, ctx.safe_plugin)
-    result = bond_mgr.get_bond_status(target)
-    if not result:
-        return {"error": "no active bond found", "peer_id": target}
-    return result
-
-
-def settlement_obligations_list(ctx: HiveContext,
-                                 window_id: Optional[str] = None,
-                                 peer_id: Optional[str] = None) -> Dict[str, Any]:
-    """List settlement obligations."""
-    if not ctx.database:
-        return {"error": "database not initialized"}
-
-    if window_id:
-        obligations = ctx.database.get_obligations_for_window(window_id)
-    elif peer_id:
-        obligations = ctx.database.get_obligations_between_peers(
-            peer_id, ctx.our_pubkey
-        )
-    else:
-        obligations = ctx.database.get_obligations_for_window("", limit=100)
-
-    return {"obligations": obligations, "count": len(obligations)}
-
-
-def settlement_net(ctx: HiveContext, window_id: str = "",
-                   peer_id: Optional[str] = None) -> Dict[str, Any]:
-    """Compute netting for a settlement window."""
-    from .settlement import NettingEngine
-
-    if not ctx.database:
-        return {"error": "database not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not window_id:
-        return {"error": "window_id is required"}
-
-    obligations = ctx.database.get_obligations_for_window(window_id)
-
-    if peer_id:
-        result = NettingEngine.bilateral_net(obligations, ctx.our_pubkey, peer_id, window_id)
-        return {"netting_type": "bilateral", "result": result}
-    else:
-        payments = NettingEngine.multilateral_net(obligations, window_id)
-        obligations_hash = NettingEngine.compute_obligations_hash(obligations)
-        return {
-            "netting_type": "multilateral",
-            "payments": payments,
-            "payment_count": len(payments),
-            "obligations_hash": obligations_hash,
-        }
-
-
-def dispute_file(ctx: HiveContext, obligation_id: str = "",
-                 evidence_json: str = "{}") -> Dict[str, Any]:
-    """File a settlement dispute."""
-    from .settlement import DisputeResolver
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.database:
-        return {"error": "database not initialized"}
-
-    if not obligation_id:
-        return {"error": "obligation_id is required"}
-
-    try:
-        evidence = json.loads(evidence_json)
-    except (json.JSONDecodeError, TypeError):
-        return {"error": "invalid evidence_json"}
-
-    resolver = DisputeResolver(ctx.database, ctx.safe_plugin)
-    result = resolver.file_dispute(obligation_id, ctx.our_pubkey, evidence)
-    return result if result else {"error": "failed to file dispute"}
-
-
-def dispute_vote(ctx: HiveContext, dispute_id: str = "",
-                 vote: str = "", reason: str = "") -> Dict[str, Any]:
-    """Cast an arbitration panel vote."""
-    from .settlement import DisputeResolver
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not ctx.database:
-        return {"error": "database not initialized"}
-
-    if not dispute_id or not vote:
-        return {"error": "dispute_id and vote are required"}
-
-    from .protocol import VALID_ARBITRATION_VOTES
-    if vote not in VALID_ARBITRATION_VOTES:
-        return {"error": f"vote must be one of: {', '.join(VALID_ARBITRATION_VOTES)}"}
-
-    signature = ""
-    try:
-        from .protocol import get_arbitration_vote_signing_payload
-        signing_payload = get_arbitration_vote_signing_payload(dispute_id, vote, reason)
-        sig_result = ctx.safe_plugin.rpc.signmessage(signing_payload)
-        if isinstance(sig_result, dict):
-            signature = sig_result.get("zbase", "")
-    except Exception:
-        signature = ""
-
-    resolver = DisputeResolver(ctx.database, ctx.safe_plugin)
-    result = resolver.record_vote(dispute_id, ctx.our_pubkey, vote, reason, signature)
-    return result if result else {"error": "failed to record vote"}
-
-
-def dispute_status(ctx: HiveContext, dispute_id: str = "") -> Dict[str, Any]:
-    """Get dispute status."""
-    if not ctx.database:
-        return {"error": "database not initialized"}
-
-    if not dispute_id:
-        return {"error": "dispute_id is required"}
-
-    dispute = ctx.database.get_dispute(dispute_id)
-    if not dispute:
-        return {"error": "dispute not found"}
-
-    # Parse JSON fields
-    for jf in ("evidence_json", "panel_members_json", "votes_json"):
-        if jf in dispute and dispute[jf]:
-            try:
-                dispute[jf.replace("_json", "")] = json.loads(dispute[jf])
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-    return dispute
-
-
-def credit_tier_info(ctx: HiveContext,
-                     peer_id: Optional[str] = None) -> Dict[str, Any]:
-    """Get credit tier information for a peer."""
-    from .settlement import get_credit_tier_info
-
-    target = peer_id or ctx.our_pubkey
-    return get_credit_tier_info(target, ctx.did_credential_mgr)
-
-
-# =============================================================================
-# PHASE 5B: ADVISOR MARKETPLACE COMMANDS
-# =============================================================================
-
-def marketplace_discover(ctx: HiveContext, criteria_json: str = "{}") -> Dict[str, Any]:
-    """Discover advisor profiles from the marketplace cache."""
-    if not ctx.marketplace_mgr:
-        return {"error": "marketplace manager not initialized"}
-
-    try:
-        criteria = json.loads(criteria_json) if criteria_json else {}
-    except (json.JSONDecodeError, TypeError):
-        return {"error": "invalid criteria_json"}
-    if not isinstance(criteria, dict):
-        return {"error": "criteria_json must decode to an object"}
-
-    advisors = ctx.marketplace_mgr.discover_advisors(criteria)
-    return {"advisors": advisors, "count": len(advisors)}
-
-
-def marketplace_profile(ctx: HiveContext, profile_json: str = "") -> Dict[str, Any]:
-    """View cached advisors or publish our advisor profile."""
-    if not ctx.marketplace_mgr:
-        return {"error": "marketplace manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not profile_json:
-        advisors = ctx.marketplace_mgr.discover_advisors({})
-        return {"advisors": advisors, "count": len(advisors)}
-
-    try:
-        profile = json.loads(profile_json)
-    except (json.JSONDecodeError, TypeError):
-        return {"error": "invalid profile_json"}
-    if not isinstance(profile, dict):
-        return {"error": "profile_json must decode to an object"}
-
-    return ctx.marketplace_mgr.publish_profile(profile)
-
-
-def marketplace_propose(ctx: HiveContext, advisor_did: str, node_id: str,
-                        scope_json: str = "{}", tier: str = "standard",
-                        pricing_json: str = "{}") -> Dict[str, Any]:
-    """Propose a contract to an advisor."""
-    if not ctx.marketplace_mgr:
-        return {"error": "marketplace manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not advisor_did or not node_id:
-        return {"error": "advisor_did and node_id are required"}
-
-    try:
-        scope = json.loads(scope_json) if scope_json else {}
-        pricing = json.loads(pricing_json) if pricing_json else {}
-    except (json.JSONDecodeError, TypeError):
-        return {"error": "invalid scope_json or pricing_json"}
-    if not isinstance(scope, dict) or not isinstance(pricing, dict):
-        return {"error": "scope_json and pricing_json must decode to objects"}
-
-    return ctx.marketplace_mgr.propose_contract(
-        advisor_did, node_id, scope, tier, pricing, operator_id=ctx.our_pubkey
-    )
-
-
-def marketplace_accept(ctx: HiveContext, contract_id: str) -> Dict[str, Any]:
-    """Accept a proposed advisor contract."""
-    if not ctx.marketplace_mgr:
-        return {"error": "marketplace manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not contract_id:
-        return {"error": "contract_id is required"}
-
-    return ctx.marketplace_mgr.accept_contract(contract_id)
-
-
-def marketplace_trial(ctx: HiveContext, contract_id: str,
-                      action: str = "start",
-                      duration_days: int = 14,
-                      flat_fee_sats: int = 0,
-                      evaluation_json: str = "{}") -> Dict[str, Any]:
-    """Start or evaluate an advisor trial."""
-    if not ctx.marketplace_mgr:
-        return {"error": "marketplace manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not contract_id:
-        return {"error": "contract_id is required"}
-
-    if action == "start":
-        return ctx.marketplace_mgr.start_trial(contract_id, duration_days, flat_fee_sats)
-    if action == "evaluate":
-        try:
-            evaluation = json.loads(evaluation_json) if evaluation_json else {}
-        except (json.JSONDecodeError, TypeError):
-            return {"error": "invalid evaluation_json"}
-        if not isinstance(evaluation, dict):
-            return {"error": "evaluation_json must decode to an object"}
-        return ctx.marketplace_mgr.evaluate_trial(contract_id, evaluation)
-    return {"error": "action must be 'start' or 'evaluate'"}
-
-
-def marketplace_terminate(ctx: HiveContext, contract_id: str,
-                          reason: str = "") -> Dict[str, Any]:
-    """Terminate an advisor contract."""
-    if not ctx.marketplace_mgr:
-        return {"error": "marketplace manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not contract_id:
-        return {"error": "contract_id is required"}
-
-    return ctx.marketplace_mgr.terminate_contract(contract_id, reason)
-
-
-def marketplace_status(ctx: HiveContext) -> Dict[str, Any]:
-    """Get high-level marketplace status."""
-    if not ctx.marketplace_mgr or not ctx.database:
-        return {"error": "marketplace manager not initialized"}
-
-    try:
-        conn = ctx.database._get_connection()
-        contracts = conn.execute(
-            "SELECT status, COUNT(*) as cnt FROM marketplace_contracts GROUP BY status"
-        ).fetchall()
-        trials = conn.execute(
-            "SELECT COUNT(*) as cnt FROM marketplace_trials WHERE outcome IS NULL"
-        ).fetchone()
-        return {
-            "contract_counts": {row["status"]: int(row["cnt"]) for row in contracts},
-            "active_trials": int(trials["cnt"]) if trials else 0,
-        }
-    except Exception:
-        return {"contract_counts": {}, "active_trials": 0}
-
-
-# =============================================================================
-# PHASE 5C: LIQUIDITY MARKETPLACE COMMANDS
-# =============================================================================
-
-def liquidity_discover(ctx: HiveContext, service_type: Optional[int] = None,
-                       min_capacity: int = 0,
-                       max_rate: Optional[int] = None) -> Dict[str, Any]:
-    """Discover liquidity offers."""
-    if not ctx.liquidity_mgr:
-        return {"error": "liquidity manager not initialized"}
-
-    offers = ctx.liquidity_mgr.discover_offers(service_type, min_capacity, max_rate)
-    return {"offers": offers, "count": len(offers)}
-
-
-def liquidity_offer(ctx: HiveContext, provider_id: str, service_type: int,
-                    capacity_sats: int, duration_hours: int = 24,
-                    pricing_model: str = "sat-hours",
-                    rate_json: str = "{}",
-                    min_reputation: int = 0,
-                    expires_at: Optional[int] = None) -> Dict[str, Any]:
-    """Publish a liquidity offer."""
-    if not ctx.liquidity_mgr:
-        return {"error": "liquidity manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    try:
-        rate = json.loads(rate_json) if rate_json else {}
-    except (json.JSONDecodeError, TypeError):
-        return {"error": "invalid rate_json"}
-    if not isinstance(rate, dict):
-        return {"error": "rate_json must decode to an object"}
-
-    return ctx.liquidity_mgr.publish_offer(
-        provider_id=provider_id,
-        service_type=service_type,
-        capacity_sats=capacity_sats,
-        duration_hours=duration_hours,
-        pricing_model=pricing_model,
-        rate=rate,
-        min_reputation=min_reputation,
-        expires_at=expires_at,
-    )
-
-
-def liquidity_request(ctx: HiveContext, requester_id: str, service_type: int,
-                      capacity_sats: int, details_json: str = "{}") -> Dict[str, Any]:
-    """Publish a liquidity request (RFP) on Nostr."""
-    if not ctx.nostr_transport:
-        return {"error": "nostr transport not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    try:
-        details = json.loads(details_json) if details_json else {}
-    except (json.JSONDecodeError, TypeError):
-        return {"error": "invalid details_json"}
-    if not isinstance(details, dict):
-        return {"error": "details_json must decode to an object"}
-
-    event = ctx.nostr_transport.publish({
-        "kind": 38902,
-        "content": json.dumps({
-            "requester_id": requester_id,
-            "service_type": int(service_type),
-            "capacity_sats": int(capacity_sats),
-            "details": details,
-        }, sort_keys=True, separators=(",", ":")),
-        "tags": [["t", "hive-liquidity-rfp"]],
-    })
-    return {"ok": True, "nostr_event_id": event.get("id")}
-
-
-def liquidity_lease(ctx: HiveContext, offer_id: str, client_id: str,
-                    heartbeat_interval: int = 3600) -> Dict[str, Any]:
-    """Accept a liquidity offer and create a lease."""
-    if not ctx.liquidity_mgr:
-        return {"error": "liquidity manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not offer_id or not client_id:
-        return {"error": "offer_id and client_id are required"}
-
-    return ctx.liquidity_mgr.accept_offer(offer_id, client_id, heartbeat_interval)
-
-
-def liquidity_heartbeat(ctx: HiveContext, lease_id: str, action: str = "send",
-                        heartbeat_id: str = "", channel_id: str = "",
-                        remote_balance_sats: int = 0,
-                        capacity_sats: Optional[int] = None) -> Dict[str, Any]:
-    """Send or verify a liquidity lease heartbeat."""
-    if not ctx.liquidity_mgr:
-        return {"error": "liquidity manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not lease_id:
-        return {"error": "lease_id is required"}
-
-    if action == "send":
-        if not channel_id:
-            return {"error": "channel_id is required when action=send"}
-        return ctx.liquidity_mgr.send_heartbeat(
-            lease_id=lease_id,
-            channel_id=channel_id,
-            remote_balance_sats=remote_balance_sats,
-            capacity_sats=capacity_sats,
-        )
-    if action == "verify":
-        if not heartbeat_id:
-            return {"error": "heartbeat_id is required when action=verify"}
-        return ctx.liquidity_mgr.verify_heartbeat(lease_id, heartbeat_id)
-    return {"error": "action must be 'send' or 'verify'"}
-
-
-def liquidity_lease_status(ctx: HiveContext, lease_id: str) -> Dict[str, Any]:
-    """Get lease details and heartbeat history."""
-    if not ctx.liquidity_mgr:
-        return {"error": "liquidity manager not initialized"}
-    if not lease_id:
-        return {"error": "lease_id is required"}
-    return ctx.liquidity_mgr.get_lease_status(lease_id)
-
-
-def liquidity_terminate(ctx: HiveContext, lease_id: str,
-                        reason: str = "") -> Dict[str, Any]:
-    """Terminate a liquidity lease."""
-    if not ctx.liquidity_mgr:
-        return {"error": "liquidity manager not initialized"}
-
-    perm_error = check_permission(ctx, 'member')
-    if perm_error:
-        return perm_error
-
-    if not lease_id:
-        return {"error": "lease_id is required"}
-    return ctx.liquidity_mgr.terminate_lease(lease_id, reason)
 
 
 # =============================================================================
@@ -6114,3 +1769,307 @@ def get_fleet_demand_forecast(ctx, hours_ahead: int = 6):
         )
     except Exception as e:
         return {"error": f"Forecast failed: {e}"}
+
+
+# =============================================================================
+# EXPORT HINTS (Local trusted integration surface for cl-revenue-ops)
+# =============================================================================
+
+_DEFAULT_HINTS_TTL = 900  # 15 minutes
+
+
+def _derive_corridor_roles(ctx: HiveContext) -> Dict[str, str]:
+    """Derive per-peer corridor role from corridor assignments.
+
+    Returns dict mapping peer_id -> one of "owner", "secondary", "contested", "none".
+    A peer is "owner" if it is the primary member on any corridor,
+    "secondary" if it appears only as secondary, and "contested" if it
+    appears as both primary and secondary on different corridors.
+    """
+    roles: Dict[str, str] = {}
+    if not ctx.fee_coordination_mgr:
+        return roles
+
+    try:
+        corridor_mgr = getattr(ctx.fee_coordination_mgr, "corridor_mgr", None)
+        if not corridor_mgr:
+            return roles
+        assignments = corridor_mgr.get_assignments()
+    except Exception:
+        return roles
+
+    for a in assignments:
+        # Primary member
+        pm = a.primary_member
+        if pm:
+            prev = roles.get(pm)
+            if prev is None:
+                roles[pm] = "owner"
+            elif prev == "secondary":
+                roles[pm] = "contested"
+        # Secondary members
+        for sm in (a.secondary_members or []):
+            prev = roles.get(sm)
+            if prev is None:
+                roles[sm] = "secondary"
+            elif prev == "owner":
+                roles[sm] = "contested"
+
+    return roles
+
+
+def _derive_competition_bias(ctx: HiveContext) -> Dict[str, int]:
+    """Derive per-peer competition bias from corridor competition levels.
+
+    Returns dict mapping peer_id -> one of -1, 0, 1.
+    -1 = high competition (back off), 0 = neutral, 1 = low competition (lean in).
+    """
+    biases: Dict[str, int] = {}
+    if not ctx.fee_coordination_mgr:
+        return biases
+
+    try:
+        corridor_mgr = getattr(ctx.fee_coordination_mgr, "corridor_mgr", None)
+        if not corridor_mgr:
+            return biases
+        assignments = corridor_mgr.get_assignments()
+    except Exception:
+        return biases
+
+    # Collect competition signals per peer (from corridors they participate in)
+    peer_signals: Dict[str, list] = {}
+    for a in assignments:
+        level = getattr(a.corridor, "competition_level", "none")
+        participants = set()
+        if a.primary_member:
+            participants.add(a.primary_member)
+        for sm in (a.secondary_members or []):
+            participants.add(sm)
+        for pid in participants:
+            peer_signals.setdefault(pid, []).append(level)
+
+    for pid, signals in peer_signals.items():
+        high_count = sum(1 for s in signals if s in ("high", "medium"))
+        low_count = sum(1 for s in signals if s in ("none", "low"))
+        if high_count > low_count:
+            biases[pid] = -1
+        elif low_count > high_count:
+            biases[pid] = 1
+        else:
+            biases[pid] = 0
+
+    return biases
+
+
+def _derive_rebalance_preferences(ctx: HiveContext) -> Dict[str, str]:
+    """Derive per-peer rebalance preference from yield metrics flow direction.
+
+    Returns dict mapping peer_id -> one of "source", "sink", "neutral".
+    """
+    prefs: Dict[str, str] = {}
+    if not ctx.yield_metrics_mgr:
+        return prefs
+
+    try:
+        metrics = ctx.yield_metrics_mgr.get_channel_yield_metrics()
+    except Exception:
+        return prefs
+
+    for m in metrics:
+        peer_id = getattr(m, "peer_id", None)
+        if not peer_id:
+            continue
+        direction = getattr(m, "flow_direction", "balanced")
+        if direction == "source":
+            prefs[peer_id] = "source"
+        elif direction == "sink":
+            prefs[peer_id] = "sink"
+        # If multiple channels to same peer, last wins (fine for hints)
+
+    return prefs
+
+
+def _derive_channel_open_hints(ctx: HiveContext) -> Dict[str, Dict[str, Any]]:
+    """Derive per-peer channel-opening advisory hints from planner topology.
+
+    Returns dict mapping peer_id -> channel_open_hint dict with:
+        open_preference: "open" | "neutral" | "avoid"
+        topology_confidence: 0.0 to 1.0
+        suggested_size_bucket: "small" | "medium" | "large"
+        reason: "underserved_corridor" | "improve_coverage" | "reduce_overlap" |
+                "member_connectivity" | "none"
+    """
+    hints: Dict[str, Dict[str, Any]] = {}
+    if not ctx.planner or not ctx.config:
+        return hints
+
+    try:
+        cfg = ctx.config.snapshot()
+        underserved = ctx.planner.get_underserved_targets(cfg)
+    except Exception:
+        return hints
+
+    # Size bucket boundaries from config
+    min_sats = getattr(cfg, "planner_min_channel_sats", 1_000_000)
+    default_sats = getattr(cfg, "planner_default_channel_sats", 5_000_000)
+    max_sats = getattr(cfg, "planner_max_channel_sats", 50_000_000)
+    # Thresholds: small < low_thresh, medium < high_thresh, large >= high_thresh
+    low_thresh = min_sats + (default_sats - min_sats) // 2
+    high_thresh = default_sats + (max_sats - default_sats) // 2
+
+    for ur in underserved:
+        try:
+            rec = ctx.planner.get_expansion_recommendation(ur.target, cfg)
+        except Exception:
+            continue
+
+        # open_preference
+        if rec.recommendation_type == "open_channel":
+            open_pref = "open"
+        elif rec.hive_coverage_pct >= 0.50:
+            open_pref = "avoid"
+        else:
+            open_pref = "neutral"
+
+        # topology_confidence: blend quality confidence + data availability
+        data_confidence = min(1.0, ur.score / 3.0) if ur.score > 0 else 0.0
+        topology_confidence = round(
+            0.5 * ur.quality_confidence + 0.5 * data_confidence, 2
+        )
+
+        # reason
+        if rec.is_bottleneck:
+            reason = "improve_coverage"
+        elif rec.hive_coverage_pct >= 0.50:
+            reason = "reduce_overlap"
+        elif ur.hive_share_pct < 0.03:
+            reason = "underserved_corridor"
+        elif rec.hive_members_count == 0:
+            reason = "member_connectivity"
+        else:
+            reason = "none"
+
+        # suggested_size_bucket from recommended size
+        try:
+            size_result = ctx.planner.channel_sizer.calculate_size(
+                target=ur.target,
+                target_capacity_sats=ur.public_capacity_sats,
+                target_channel_count=rec.network_channels,
+                hive_share_pct=ur.hive_share_pct,
+                target_share_cap=getattr(cfg, "market_share_cap_pct", 0.20),
+                onchain_balance_sats=0,  # Unknown at hint time
+                min_channel_sats=min_sats,
+                max_channel_sats=max_sats,
+                default_channel_sats=default_sats,
+            )
+            size_sats = size_result.recommended_size_sats
+        except Exception:
+            size_sats = default_sats
+
+        if size_sats < low_thresh:
+            size_bucket = "small"
+        elif size_sats >= high_thresh:
+            size_bucket = "large"
+        else:
+            size_bucket = "medium"
+
+        # Downgrade to neutral if confidence is very low
+        if topology_confidence < 0.15 and open_pref == "open":
+            open_pref = "neutral"
+
+        hints[ur.target] = {
+            "open_preference": open_pref,
+            "topology_confidence": topology_confidence,
+            "suggested_size_bucket": size_bucket,
+            "reason": reason,
+        }
+
+    return hints
+
+
+def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dict[str, Any]:
+    """
+    Export compact short-lived per-peer hints for trusted local consumers.
+
+    This is a read-only distillation of fleet coordination state.
+    cl-revenue-ops may poll this locally and use the hints as bounded
+    soft biases in its own local decision logic.
+
+    Returns:
+        Dict with generated_at, ttl_seconds, and per-peer hints map.
+    """
+    if not ctx.database:
+        return {"error": "Hive not initialized"}
+
+    now = int(time.time())
+    hints: Dict[str, Dict[str, Any]] = {}
+
+    # Collect all known peer_ids from membership + our channel peers
+    members = ctx.database.get_all_members()
+    member_set = {m["peer_id"] for m in members}
+
+    # Pre-compute bulk lookups
+    corridor_roles = _derive_corridor_roles(ctx)
+    competition_biases = _derive_competition_bias(ctx)
+    rebalance_prefs = _derive_rebalance_preferences(ctx)
+    channel_open_hints = _derive_channel_open_hints(ctx)
+
+    # Build the set of peers to export hints for: members + any peer
+    # we have corridor/quality/traffic data about
+    all_peers = set(member_set)
+    all_peers.update(corridor_roles.keys())
+    all_peers.update(rebalance_prefs.keys())
+    all_peers.update(channel_open_hints.keys())
+
+    # Exclude ourselves
+    all_peers.discard(ctx.our_pubkey)
+
+    for peer_id in all_peers:
+        hint: Dict[str, Any] = {}
+        is_member = peer_id in member_set
+        hint["member"] = is_member
+
+        # Corridor role
+        role = corridor_roles.get(peer_id, "none")
+        hint["corridor_role"] = role
+
+        # Competition bias
+        hint["competition_bias"] = competition_biases.get(peer_id, 0)
+
+        # Peer quality score
+        if ctx.quality_scorer:
+            try:
+                qr = ctx.quality_scorer.calculate_score(peer_id, days=90)
+                if qr.confidence > 0.0:
+                    hint["peer_quality_score"] = round(qr.overall_score, 2)
+            except Exception:
+                pass
+
+        # Traffic confidence
+        if ctx.traffic_intel_mgr:
+            try:
+                profile = ctx.traffic_intel_mgr.get_aggregated_profile(peer_id)
+                if profile:
+                    hint["traffic_confidence"] = round(
+                        profile.get("confidence", 0.0), 2
+                    )
+            except Exception:
+                pass
+
+        # Rebalance preference
+        pref = rebalance_prefs.get(peer_id, "neutral")
+        hint["rebalance_preference"] = pref
+
+        # Channel-opening advisory hint (omitted if no topology data)
+        ch_hint = channel_open_hints.get(peer_id)
+        if ch_hint:
+            hint["channel_open_hint"] = ch_hint
+
+        hints[peer_id] = hint
+
+    return {
+        "generated_at": now,
+        "ttl_seconds": ttl_seconds,
+        "peer_count": len(hints),
+        "hints": hints,
+    }

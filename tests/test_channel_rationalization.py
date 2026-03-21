@@ -98,17 +98,17 @@ class MockStigmergy:
         self.markers.append(marker)
 
 
-class MockGovernance:
-    """Mock governance for testing."""
+class MockRecommendationLogger:
+    """Mock recommendation logger for testing."""
 
     def __init__(self):
-        self.pending_actions = []
+        self.recommendations = []
 
-    def create_pending_action(self, action_type, data, source):
-        self.pending_actions.append({
+    def log_recommendation(self, action_type, target, context=None):
+        self.recommendations.append({
             "action_type": action_type,
-            "data": data,
-            "source": source
+            "target": target,
+            "context": context or {}
         })
 
 
@@ -374,54 +374,6 @@ class TestRedundancyAnalyzer:
         assert coverage.redundancy_count == 3
         assert coverage.is_over_redundant is True
 
-    def test_determine_ownership_by_markers(self):
-        """Test ownership determination based on markers."""
-        plugin = MockPlugin()
-        state_manager = MockStateManager()
-        fee_coord_mgr = MockFeeCoordinationManager()
-
-        external_peer = "02" + "x" * 64
-        member_a = "02" + "a" * 64  # Will be owner (strong markers)
-        member_b = "02" + "b" * 64  # Weak markers
-
-        state_manager.set_peer_state(member_a, topology=[external_peer])
-        state_manager.set_peer_state(member_b, topology=[external_peer])
-
-        # Member A has strong markers
-        for i in range(5):
-            fee_coord_mgr.stigmergy.add_marker(
-                depositor=member_a,
-                source=external_peer,
-                destination="02" + "y" * 64,
-                fee_ppm=500,
-                success=True,
-                volume_sats=1_000_000,
-                strength=2.0
-            )
-
-        # Member B has weak markers
-        fee_coord_mgr.stigmergy.add_marker(
-            depositor=member_b,
-            source=external_peer,
-            destination="02" + "z" * 64,
-            fee_ppm=500,
-            success=True,
-            volume_sats=100_000,
-            strength=0.5
-        )
-
-        analyzer = RedundancyAnalyzer(
-            plugin=plugin,
-            state_manager=state_manager,
-            fee_coordination_mgr=fee_coord_mgr
-        )
-
-        coverage = analyzer.analyze_peer_coverage(external_peer)
-
-        # Member A should own this peer
-        assert coverage.owner_member == member_a
-        assert coverage.ownership_confidence > 0.6
-
     def test_get_redundant_peers(self):
         """Test getting all redundant peers."""
         plugin = MockPlugin()
@@ -579,14 +531,14 @@ class TestChannelRationalizer:
         for rec in my_recs:
             assert rec.member_id == our_pubkey
 
-    def test_create_pending_actions(self):
-        """Test creating pending actions for recommendations."""
+    def test_log_close_recommendations(self):
+        """Test logging close recommendations."""
         plugin = MockPlugin()
-        governance = MockGovernance()
+        logger = MockRecommendationLogger()
 
         rationalizer = ChannelRationalizer(
             plugin=plugin,
-            governance=governance
+            recommendation_logger=logger
         )
 
         recommendations = [
@@ -601,11 +553,11 @@ class TestChannelRationalizer:
             )
         ]
 
-        created = rationalizer.create_pending_actions(recommendations)
+        logged = rationalizer.log_close_recommendations(recommendations)
 
-        assert created == 1
-        assert len(governance.pending_actions) == 1
-        assert governance.pending_actions[0]["action_type"] == "close_recommendation"
+        assert logged == 1
+        assert len(logger.recommendations) == 1
+        assert logger.recommendations[0]["action_type"] == "close_channel"
 
 
 # =============================================================================

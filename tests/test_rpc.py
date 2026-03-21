@@ -3,7 +3,7 @@ Tests for Phase 8 RPC Commands
 
 Tests the RPC command interface as specified in IMPLEMENTATION_PLAN.md Section 8.6:
 - Genesis Test: Call hive-genesis -> verify DB initialized, returns hive_id
-- Invite/Join Test: Generate ticket -> verify ticket structure
+- Approval Flow Test: Pending request -> approve -> verify membership
 - Status Test: Verify all fields returned with correct types
 - Permission Test: (Pending - requires Issue #25)
 - Approve Flow: Create pending action, approve -> verify status change
@@ -22,10 +22,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.database import HiveDatabase
 from modules.config import HiveConfig
-from modules.handshake import HandshakeManager, Ticket
-from modules.membership import MembershipManager, MembershipTier
+from modules.handshake import HandshakeManager
+from modules.membership import MembershipManager, MEMBER_TIER
 from modules.contribution import ContributionManager
-from modules.governance import DecisionEngine, GovernanceMode, DecisionResult
+from modules.governance import RecommendationLogger
 
 
 # =============================================================================
@@ -64,10 +64,7 @@ def config():
     """Create a test config."""
     return HiveConfig(
         db_path=':memory:',
-        governance_mode='advisor',
         membership_enabled=True,
-        auto_vouch_enabled=True,
-        auto_promote_enabled=True,
     )
 
 
@@ -84,18 +81,18 @@ def handshake_mgr(mock_rpc, database, mock_plugin):
 class TestGenesisRPC:
     """Test hive-genesis RPC command functionality."""
 
-    def test_genesis_creates_admin(self, handshake_mgr, database):
-        """Genesis should create an admin member and return hive_id."""
+    def test_genesis_creates_member(self, handshake_mgr, database):
+        """Genesis should create a member and return hive_id."""
         result = handshake_mgr.genesis(hive_id="test-hive")
 
         assert result['status'] == 'genesis_complete'
         assert result['hive_id'] == 'test-hive'
-        assert 'admin_pubkey' in result  # Note: key still named admin_pubkey for backward compat
+        assert 'member_pubkey' in result
 
-        # Verify founding member was created in DB (admin tier removed, uses member tier)
-        founder = database.get_member(result['admin_pubkey'])
-        assert founder is not None
-        assert founder['tier'] == 'member'
+        # Verify founding member was created in DB
+        member = database.get_member(result['member_pubkey'])
+        assert member is not None
+        assert member['tier'] == 'member'
 
     def test_genesis_auto_generates_hive_id(self, handshake_mgr, database):
         """Genesis without hive_id should auto-generate one."""
@@ -116,43 +113,56 @@ class TestGenesisRPC:
 
 
 # =============================================================================
-# INVITE/JOIN TESTS
+# APPROVAL FLOW TESTS
 # =============================================================================
 
-class TestInviteRPC:
-    """Test hive-invite RPC command functionality."""
+class TestApprovalFlow:
+    """Test the pending request and approval flow."""
 
-    def test_invite_generates_valid_ticket(self, handshake_mgr, database):
-        """Invite should generate a valid base64 ticket."""
-        # First create genesis
-        handshake_mgr.genesis(hive_id="test-hive")
+    def test_hello_stores_pending_request(self, handshake_mgr):
+        """store_pending_request should create a retrievable pending entry."""
+        peer_id = '02' + 'b' * 64
+        handshake_mgr.store_pending_request(peer_id)
 
-        # Generate invite
-        ticket_b64 = handshake_mgr.generate_invite_ticket(valid_hours=24)
+        pending = handshake_mgr.get_pending_requests()
+        assert len(pending) == 1
+        assert pending[0]['peer_id'] == peer_id
+        assert pending[0]['channel_verified'] is True
 
-        assert ticket_b64 is not None
-        assert len(ticket_b64) > 0
+    def test_approve_triggers_challenge(self, handshake_mgr):
+        """pop_pending_request should return and remove the request."""
+        peer_id = '02' + 'c' * 64
+        handshake_mgr.store_pending_request(peer_id)
 
-        # Verify ticket can be decoded
-        ticket = Ticket.from_base64(ticket_b64)
-        assert ticket.hive_id == "test-hive"
-        assert not ticket.is_expired()
+        req = handshake_mgr.pop_pending_request(peer_id)
+        assert req is not None
+        assert req['peer_id'] == peer_id
 
-    def test_invite_requires_admin(self, handshake_mgr, database):
-        """Invite should fail if no admin exists."""
-        with pytest.raises(PermissionError):
-            handshake_mgr.generate_invite_ticket(valid_hours=24)
+        # Should be gone now
+        assert handshake_mgr.pop_pending_request(peer_id) is None
 
-    def test_ticket_expiry_respected(self, handshake_mgr, database):
-        """Ticket should respect valid_hours parameter."""
-        handshake_mgr.genesis(hive_id="test-hive")
+    def test_approve_unknown_peer_returns_none(self, handshake_mgr):
+        """pop_pending_request for unknown peer should return None."""
+        assert handshake_mgr.pop_pending_request('02' + 'f' * 64) is None
 
-        ticket_b64 = handshake_mgr.generate_invite_ticket(valid_hours=1)
-        ticket = Ticket.from_base64(ticket_b64)
+    def test_pending_returns_stored_requests(self, handshake_mgr):
+        """get_pending_requests should return all stored requests."""
+        handshake_mgr.store_pending_request('02' + 'a' * 64)
+        handshake_mgr.store_pending_request('02' + 'b' * 64)
 
-        # Ticket should expire in ~1 hour
-        assert ticket.expires_at > int(time.time())
-        assert ticket.expires_at < int(time.time()) + 3700  # 1 hour + margin
+        pending = handshake_mgr.get_pending_requests()
+        assert len(pending) == 2
+
+    def test_pending_request_expiry(self, handshake_mgr):
+        """expire_pending_requests should remove old entries."""
+        peer_id = '02' + 'd' * 64
+        handshake_mgr.store_pending_request(peer_id)
+        # Manually backdate the request
+        handshake_mgr._pending_requests[peer_id]['received_at'] = int(time.time()) - 90000
+
+        expired = handshake_mgr.expire_pending_requests(max_age_seconds=86400)
+        assert expired == 1
+        assert len(handshake_mgr.get_pending_requests()) == 0
 
 
 # =============================================================================
@@ -164,23 +174,18 @@ class TestStatusRPC:
 
     def test_status_returns_correct_structure(self, database, config):
         """Status should return all required fields with correct types."""
-        # Add some members
+        # Add some members (all single tier)
         database.add_member('02' + 'a' * 64, tier='member', joined_at=int(time.time()))
         database.add_member('02' + 'b' * 64, tier='member', joined_at=int(time.time()))
-        database.add_member('02' + 'c' * 64, tier='neophyte', joined_at=int(time.time()))
+        database.add_member('02' + 'c' * 64, tier='member', joined_at=int(time.time()))
 
-        # Simulate status response (admin tier removed)
         members = database.get_all_members()
-        member_count = len([m for m in members if m['tier'] == 'member'])
-        neophyte_count = len([m for m in members if m['tier'] == 'neophyte'])
 
         status = {
             "status": "active",
-            "governance_mode": config.governance_mode,
+            "governance": "recommendation_only",
             "members": {
                 "total": len(members),
-                "member": member_count,
-                "neophyte": neophyte_count,
             },
             "limits": {
                 "max_members": config.max_members,
@@ -191,12 +196,10 @@ class TestStatusRPC:
 
         # Verify structure
         assert isinstance(status['status'], str)
-        assert isinstance(status['governance_mode'], str)
+        assert isinstance(status['governance'], str)
         assert isinstance(status['members'], dict)
         assert isinstance(status['members']['total'], int)
         assert status['members']['total'] == 3
-        assert status['members']['member'] == 2  # 1 member + 1 converted from admin
-        assert status['members']['neophyte'] == 1
 
     def test_status_genesis_required_when_empty(self, database, config):
         """Status should indicate genesis_required when no members."""
@@ -204,102 +207,6 @@ class TestStatusRPC:
 
         status = "genesis_required" if not members else "active"
         assert status == "genesis_required"
-
-
-# =============================================================================
-# APPROVE FLOW TESTS
-# =============================================================================
-
-class TestApproveFlowRPC:
-    """Test hive-approve and hive-reject RPC commands."""
-
-    def test_pending_action_created(self, database):
-        """Pending action should be created and retrievable."""
-        action_id = database.add_pending_action(
-            action_type='channel_open',
-            payload={'target': '02' + 'x' * 64, 'amount_sats': 1000000},
-            expires_hours=24
-        )
-
-        assert action_id > 0
-
-        actions = database.get_pending_actions()
-        assert len(actions) == 1
-        assert actions[0]['action_type'] == 'channel_open'
-        assert actions[0]['status'] == 'pending'
-
-    def test_approve_action_updates_status(self, database):
-        """Approving an action should update its status."""
-        action_id = database.add_pending_action(
-            action_type='channel_open',
-            payload={'target': '02' + 'x' * 64},
-            expires_hours=24
-        )
-
-        # Approve
-        success = database.update_action_status(action_id, 'approved')
-        assert success
-
-        # Verify status changed
-        action = database.get_pending_action_by_id(action_id)
-        assert action['status'] == 'approved'
-
-        # Should not appear in pending list
-        pending = database.get_pending_actions()
-        assert len(pending) == 0
-
-    def test_reject_action_updates_status(self, database):
-        """Rejecting an action should update its status."""
-        action_id = database.add_pending_action(
-            action_type='channel_open',
-            payload={'target': '02' + 'x' * 64},
-            expires_hours=24
-        )
-
-        # Reject
-        success = database.update_action_status(action_id, 'rejected')
-        assert success
-
-        # Verify status changed
-        action = database.get_pending_action_by_id(action_id)
-        assert action['status'] == 'rejected'
-
-    def test_expired_action_not_in_pending(self, database):
-        """Expired actions should not appear in pending list."""
-        # Create action that expires immediately
-        action_id = database.add_pending_action(
-            action_type='channel_open',
-            payload={'target': '02' + 'x' * 64},
-            expires_hours=0  # Expires immediately
-        )
-
-        # Small delay to ensure expiry
-        time.sleep(0.1)
-
-        # Mark expired
-        database.cleanup_expired_actions()
-
-        # Should not appear in pending
-        pending = database.get_pending_actions()
-        assert len(pending) == 0
-
-
-# =============================================================================
-# SET MODE TESTS
-# =============================================================================
-
-class TestSetModeRPC:
-    """Test hive-set-mode RPC command functionality."""
-
-    def test_set_mode_advisor(self, config):
-        """Setting mode to advisor should work."""
-        config.governance_mode = 'advisor'
-        assert config.governance_mode == 'advisor'
-
-    def test_set_mode_failsafe(self, config):
-        """Setting mode to failsafe should work."""
-        config.governance_mode = 'failsafe'
-        assert config.governance_mode == 'failsafe'
 
 
 # =============================================================================
@@ -372,71 +279,15 @@ class TestMembersRPC:
     """Test hive-members RPC command functionality."""
 
     def test_members_list_returned(self, database):
-        """Members list should include all tiers."""
+        """Members list should include all members."""
         database.add_member('02' + 'a' * 64, tier='member', joined_at=int(time.time()))
         database.add_member('02' + 'b' * 64, tier='member', joined_at=int(time.time()))
-        database.add_member('02' + 'c' * 64, tier='neophyte', joined_at=int(time.time()))
+        database.add_member('02' + 'c' * 64, tier='member', joined_at=int(time.time()))
 
         members = database.get_all_members()
 
         assert len(members) == 3
-        tiers = [m['tier'] for m in members]
-        # Admin tier removed - only member and neophyte tiers exist
-        assert 'member' in tiers
-        assert 'neophyte' in tiers
-
-
-# =============================================================================
-# VOUCH TESTS
-# =============================================================================
-
-class TestVouchRPC:
-    """Test hive-vouch RPC command functionality."""
-
-    def test_vouch_stored_in_db(self, database):
-        """Vouch should be stored in the database."""
-        target = '02' + 'a' * 64
-        voucher = '02' + 'b' * 64
-        request_id = 'test-request-123'
-
-        # Add promotion request first
-        database.add_promotion_request(target, request_id, status='pending')
-
-        # Add vouch
-        success = database.add_promotion_vouch(
-            target_peer_id=target,
-            request_id=request_id,
-            voucher_peer_id=voucher,
-            sig='test_signature',
-            timestamp=int(time.time())
-        )
-
-        assert success
-
-        # Verify vouch exists
-        vouches = database.get_promotion_vouches(target, request_id)
-        assert len(vouches) == 1
-        assert vouches[0]['voucher_peer_id'] == voucher
-
-    def test_duplicate_vouch_rejected(self, database):
-        """Same voucher cannot vouch twice for same request."""
-        target = '02' + 'a' * 64
-        voucher = '02' + 'b' * 64
-        request_id = 'test-request-456'
-
-        database.add_promotion_request(target, request_id, status='pending')
-
-        # First vouch
-        success1 = database.add_promotion_vouch(
-            target, request_id, voucher, 'sig1', int(time.time())
-        )
-        assert success1
-
-        # Second vouch (duplicate)
-        success2 = database.add_promotion_vouch(
-            target, request_id, voucher, 'sig2', int(time.time())
-        )
-        assert not success2  # Should fail due to unique constraint
+        assert all(m['tier'] == 'member' for m in members)
 
 
 # =============================================================================
@@ -482,32 +333,44 @@ class TestPermissionModel:
     """Test permission model enforcement."""
 
     def test_member_permission_granted(self, database):
-        """Member should have permission for member-only commands."""
-        # Add member
+        """Any member should have permission for all commands."""
         member_pubkey = '02' + 'a' * 64
         database.add_member(member_pubkey, tier='member', joined_at=int(time.time()))
 
         member = database.get_member(member_pubkey)
+        assert member is not None
         assert member['tier'] == 'member'
 
-    def test_neophyte_permission_denied_for_member_command(self, database):
-        """Neophyte should be denied for member-only commands."""
-        # Add neophyte
-        neophyte_pubkey = '02' + 'c' * 64
-        database.add_member(neophyte_pubkey, tier='neophyte', joined_at=int(time.time()))
+    def test_non_member_permission_denied(self, database):
+        """Non-member should be denied."""
+        member = database.get_member('02' + 'z' * 64)
+        assert member is None
 
-        member = database.get_member(neophyte_pubkey)
-        assert member['tier'] == 'neophyte'
-        # In real RPC, _check_permission('member') would return error
 
-    def test_member_has_full_permissions(self, database):
-        """Member tier has full permissions (admin tier removed)."""
-        member_pubkey = '02' + 'a' * 64
-        database.add_member(member_pubkey, tier='member', joined_at=int(time.time()))
+class TestMembershipAuditLog:
+    """Test the membership audit log."""
 
-        member = database.get_member(member_pubkey)
-        # Only two tiers: member and neophyte
-        assert member['tier'] == 'member'
+    def test_membership_audit_log(self, database):
+        """Audit log should record and retrieve events."""
+        peer_id = '02' + 'a' * 64
+        actor_id = '02' + 'b' * 64
+
+        database.log_membership_event("joined", peer_id)
+        database.log_membership_event("banned", peer_id, actor_peer_id=actor_id, reason="spam")
+
+        log = database.get_membership_audit_log(peer_id=peer_id)
+        assert len(log) == 2
+        assert log[0]['event'] == 'banned'  # newest first
+        assert log[0]['reason'] == 'spam'
+        assert log[1]['event'] == 'joined'
+
+    def test_audit_log_all_events(self, database):
+        """Audit log without filter returns all events."""
+        database.log_membership_event("joined", '02' + 'a' * 64)
+        database.log_membership_event("joined", '02' + 'b' * 64)
+
+        log = database.get_membership_audit_log()
+        assert len(log) == 2
 
 
 if __name__ == "__main__":

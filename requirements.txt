@@ -1,13 +1,8 @@
-# cl-hive: Distributed swarm intelligence for Core Lightning
+# cl-hive: Trusted fleet coordination for Core Lightning
 # Python dependencies
 
 # Core Lightning Python bindings
 # Provides Plugin base class, RPC methods, custom messaging
 pyln-client>=24.0
-
-# Phase 5A (Nostr transport foundation)
-# Optional at runtime during transition; transport degrades without these.
-websockets>=12.0
-coincurve>=21.0.0
 
 # Note: sqlite3 is part of Python stdlib, no external dependency needed
