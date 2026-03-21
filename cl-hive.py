@@ -818,7 +818,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         rationalization_mgr=rationalization_mgr,
         strategic_positioning_mgr=strategic_positioning_mgr
     )
-    plugin.log("cl-hive: Planner linked to yield optimization modules (slime mold mode)")
+    plugin.log("cl-hive: Planner linked to cooperation modules")
 
     # Inject all globals into the protocol_handlers module so that moved
     # handler functions can reference the same variable names they always did.
