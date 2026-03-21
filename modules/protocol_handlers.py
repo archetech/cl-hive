@@ -54,7 +54,6 @@ bridge = None
 relay_mgr = None
 fee_intel_mgr = None
 liquidity_coord = None
-routing_map = None
 peer_reputation_mgr = None
 yield_metrics_mgr = None
 rationalization_mgr = None

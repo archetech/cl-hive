@@ -78,7 +78,6 @@ from modules.fee_intelligence import FeeIntelligenceManager
 from modules.traffic_intelligence import TrafficIntelligenceManager
 from modules.liquidity_coordinator import LiquidityCoordinator
 from modules.health_aggregator import HealthScoreAggregator, HealthTier
-from modules.routing_intelligence import HiveRoutingMap
 from modules.peer_reputation import PeerReputationManager
 from modules.yield_metrics import YieldMetricsManager
 from modules.fee_coordination import FeeCoordinationManager
@@ -118,7 +117,6 @@ from modules.rpc_commands import (
     fee_recommendation as rpc_fee_recommendation,
     egress_desaturation_bias as rpc_egress_desaturation_bias,
     corridor_assignments as rpc_corridor_assignments,
-    get_routing_intelligence as rpc_get_routing_intelligence,
     fee_coordination_status as rpc_fee_coordination_status,
     # Rebalance
     rebalance_recommendations as rpc_rebalance_recommendations,
@@ -193,7 +191,6 @@ fee_intel_mgr: Optional[FeeIntelligenceManager] = None
 traffic_intel_mgr: Optional[TrafficIntelligenceManager] = None
 health_aggregator: Optional[HealthScoreAggregator] = None
 liquidity_coord: Optional[LiquidityCoordinator] = None
-routing_map: Optional[HiveRoutingMap] = None
 peer_reputation_mgr: Optional[PeerReputationManager] = None
 yield_metrics_mgr: Optional[YieldMetricsManager] = None
 fee_coordination_mgr: Optional[FeeCoordinationManager] = None
@@ -813,15 +810,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     )
     plugin.log("cl-hive: Planner linked to cooperation modules")
 
-    # Initialize Routing Map (Phase 7.4 - Routing Intelligence)
-    global routing_map
-    routing_map = HiveRoutingMap(
-        database=database,
-        plugin=plugin,
-        our_pubkey=our_pubkey
-    )
-    plugin.log("cl-hive: Routing map initialized")
-
     # Initialize Peer Reputation Manager (Phase 5 - Advanced Cooperation)
     global peer_reputation_mgr
     peer_reputation_mgr = PeerReputationManager(
@@ -971,7 +959,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'fee_intel_mgr': fee_intel_mgr,
         'health_aggregator': health_aggregator,
         'liquidity_coord': liquidity_coord,
-        'routing_map': routing_map,
         'peer_reputation_mgr': peer_reputation_mgr,
         'yield_metrics_mgr': yield_metrics_mgr,
         'fee_coordination_mgr': fee_coordination_mgr,
@@ -1012,7 +999,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'fee_intel_mgr': fee_intel_mgr,
         'gossip_mgr': gossip_mgr,
         'bridge': bridge,
-        'routing_map': routing_map,
         'peer_reputation_mgr': peer_reputation_mgr,
         'fee_coordination_mgr': fee_coordination_mgr,
         'yield_metrics_mgr': yield_metrics_mgr,
@@ -1037,15 +1023,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Broadcast membership to peers for consistency (Phase 5 enhancement)
     protocol_handlers._sync_membership_on_startup(plugin)
-
-    # Auto-backfill routing intelligence on first-ever startup (empty DB)
-    if fee_coordination_mgr and fee_coordination_mgr.should_auto_backfill():
-        plugin.log("cl-hive: Empty routing intelligence, auto-backfilling from forwards...")
-        try:
-            result = hive_backfill_routing_intelligence(plugin, days=7)
-            plugin.log(f"cl-hive: Auto-backfill complete: {result.get('processed', 0)} forwards")
-        except Exception as e:
-            plugin.log(f"cl-hive: Auto-backfill failed: {e}", level='warn')
 
     # Set up graceful shutdown handler
     def handle_shutdown_signal(signum, frame):
@@ -2805,80 +2782,6 @@ def hive_calculate_health(plugin: Plugin):
         "capacity_sats": capacity_sats,
         "available_sats": available_sats,
         **health
-    }
-
-
-@plugin.method("hive-routing-stats")
-def hive_routing_stats(plugin: Plugin):
-    """
-    Get routing intelligence statistics.
-
-    Shows collective routing intelligence from all hive members including
-    path success rates, probe counts, and route suggestions.
-
-    Returns:
-        Dict with routing intelligence statistics.
-
-    Permission: Any member
-    """
-    # Permission check: member
-    perm_error = _check_permission()
-    if perm_error:
-        return perm_error
-
-    if not routing_map:
-        return {"error": "Routing intelligence not initialized"}
-
-    stats = routing_map.get_routing_stats()
-    return {
-        "paths_tracked": stats.get("total_paths", 0),
-        "total_probes": stats.get("total_probes", 0),
-        "total_successes": stats.get("total_successes", 0),
-        "unique_destinations": stats.get("unique_destinations", 0),
-        "high_quality_paths": stats.get("high_quality_paths", 0),
-        "overall_success_rate": round(stats.get("overall_success_rate", 0.0), 3),
-    }
-
-
-@plugin.method("hive-route-suggest")
-def hive_route_suggest(plugin: Plugin, destination: str, amount_sats: int = 100000):
-    """
-    Get route suggestions for a destination using hive intelligence.
-
-    Uses collective routing data to suggest optimal paths.
-
-    Args:
-        destination: Target node pubkey
-        amount_sats: Amount to route (default 100000)
-
-    Returns:
-        Dict with route suggestions.
-
-    Permission: Any member
-    """
-    # Permission check: member
-    perm_error = _check_permission()
-    if perm_error:
-        return perm_error
-
-    if not routing_map:
-        return {"error": "Routing intelligence not initialized"}
-
-    routes = routing_map.get_routes_to(destination, amount_sats)
-
-    return {
-        "destination": destination,
-        "amount_sats": amount_sats,
-        "route_count": len(routes),
-        "routes": [
-            {
-                "path": list(r.path),
-                "success_rate": r.success_rate,
-                "expected_latency_ms": r.expected_latency_ms,
-                "confidence": r.confidence,
-            }
-            for r in routes[:5]  # Top 5 suggestions
-        ]
     }
 
 
