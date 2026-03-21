@@ -69,10 +69,8 @@ class TestStatusCapabilityFields:
         ctx = _make_ctx(database, pubkey, tier='member')
         ctx.config.max_members = 50
         ctx.config.market_share_cap_pct = 0.20
-        ctx.comms_active = True
         ctx.signing_backend = "cln-hsm"
 
         result = rpc_status(ctx)
 
-        assert result["comms_active"] is True
         assert result["signing_backend"] == "cln-hsm"

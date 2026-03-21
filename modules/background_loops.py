@@ -398,18 +398,6 @@ def fee_intelligence_loop():
             except Exception as e:
                 plugin.log(f"cl-hive: Yield metrics broadcast check error: {e}", level='debug')
 
-            # Step 5b: Broadcast temporal patterns (Weekly)
-            try:
-                from datetime import datetime, timezone
-                current_week = datetime.now(timezone.utc).strftime("%Y-W%W")
-                last_temporal_broadcast = getattr(_broadcast_our_temporal_patterns, '_last_broadcast', None)
-                if last_temporal_broadcast != current_week:
-                    _broadcast_our_temporal_patterns()
-                    _broadcast_our_temporal_patterns._last_broadcast = current_week
-                    shutdown_event.wait(0.05)
-            except Exception as e:
-                plugin.log(f"cl-hive: Temporal patterns broadcast check error: {e}", level='debug')
-
             # Step 5c: Broadcast corridor values (Weekly)
             try:
                 from datetime import datetime, timezone
@@ -508,18 +496,6 @@ def fee_intelligence_loop():
                         )
             except Exception as e:
                 plugin.log(f"cl-hive: Remote yield metrics cleanup error: {e}", level='warn')
-
-            # Step 12: Cleanup old remote temporal patterns (Phase 14)
-            try:
-                if anticipatory_liquidity_mgr:
-                    cleaned_patterns = anticipatory_liquidity_mgr.cleanup_old_remote_patterns(max_age_days=14)
-                    if cleaned_patterns > 0:
-                        plugin.log(
-                            f"cl-hive: Cleaned up {cleaned_patterns} old remote temporal patterns",
-                            level='debug'
-                        )
-            except Exception as e:
-                plugin.log(f"cl-hive: Remote temporal patterns cleanup error: {e}", level='warn')
 
             # Step 13: Cleanup old remote strategic positioning data (Phase 14.2)
             try:
@@ -905,69 +881,6 @@ def _broadcast_our_yield_metrics():
     except Exception as e:
         if plugin:
             plugin.log(f"cl-hive: Yield metrics broadcast error: {e}", level='warn')
-
-
-def _broadcast_our_temporal_patterns():
-    """
-    Broadcast our temporal patterns to hive members for fleet-wide learning.
-
-    Temporal patterns include hour/day flow patterns that enable coordinated
-    liquidity positioning and proactive fee optimization.
-    """
-    if not anticipatory_liquidity_mgr or not plugin or not database or not our_pubkey:
-        return
-
-    try:
-        from modules.protocol import (
-            create_temporal_pattern_batch,
-            MAX_TEMPORAL_PATTERNS_IN_BATCH,
-            MIN_TEMPORAL_PATTERN_CONFIDENCE,
-            MIN_TEMPORAL_PATTERN_SAMPLES
-        )
-
-        # Get hive member IDs to exclude from sharing
-        members = database.get_all_members()
-        member_ids = {m.get("peer_id") for m in members}
-
-        # Get shareable temporal patterns (excluding hive members)
-        shareable_patterns = anticipatory_liquidity_mgr.get_shareable_patterns(
-            min_confidence=MIN_TEMPORAL_PATTERN_CONFIDENCE,
-            min_samples=MIN_TEMPORAL_PATTERN_SAMPLES,
-            exclude_peer_ids=member_ids,
-            max_patterns=MAX_TEMPORAL_PATTERNS_IN_BATCH
-        )
-
-        if not shareable_patterns:
-            return
-
-        # Create signed batch message
-        msg = create_temporal_pattern_batch(
-            patterns=shareable_patterns,
-            rpc=plugin.rpc,
-            our_pubkey=our_pubkey
-        )
-
-        if not msg:
-            return
-
-        result = protocol_handlers._broadcast_member_message(
-            message_bytes=msg,
-            reliability="direct",
-            failure_policy="best_effort",
-            log_label="temporal_patterns",
-        )
-        broadcast_count = result["sent"]
-
-        if broadcast_count > 0:
-            plugin.log(
-                f"cl-hive: Broadcast {len(shareable_patterns)} temporal patterns "
-                f"to {broadcast_count} members",
-                level='debug'
-            )
-
-    except Exception as e:
-        if plugin:
-            plugin.log(f"cl-hive: Temporal patterns broadcast error: {e}", level='warn')
 
 
 # ============================================================================

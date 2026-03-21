@@ -44,14 +44,12 @@ class TrafficIntelligenceManager:
         database,
         plugin=None,
         our_pubkey: str = "",
-        anticipatory_mgr=None,
         liquidity_coordinator=None,
         membership_mgr=None,
     ):
         self.db = database
         self.plugin = plugin
         self.our_pubkey = our_pubkey
-        self.anticipatory_mgr = anticipatory_mgr
         self.liquidity_coordinator = liquidity_coordinator
         self.membership_mgr = membership_mgr
 

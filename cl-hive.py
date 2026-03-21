@@ -83,11 +83,9 @@ from modules.yield_metrics import YieldMetricsManager
 from modules.fee_coordination import FeeCoordinationManager
 from modules.channel_rationalization import RationalizationManager
 from modules.strategic_positioning import StrategicPositioningManager
-from modules.anticipatory_liquidity import AnticipatoryLiquidityManager
 from modules.relay import RelayManager
 from modules.idempotency import check_and_record, generate_event_id
 from modules.outbox import OutboxManager
-from modules.phase6_ingest import parse_injected_hive_packet
 from modules import network_metrics
 from modules.plugin_options import (
     RateLimiter, _parse_bool, _parse_setconfig_value,
@@ -196,16 +194,10 @@ yield_metrics_mgr: Optional[YieldMetricsManager] = None
 fee_coordination_mgr: Optional[FeeCoordinationManager] = None
 rationalization_mgr: Optional[RationalizationManager] = None
 strategic_positioning_mgr: Optional[StrategicPositioningManager] = None
-anticipatory_liquidity_mgr: Optional[AnticipatoryLiquidityManager] = None
 quality_scorer_mgr: Optional[PeerQualityScorer] = None
 relay_mgr: Optional[RelayManager] = None
 outbox_mgr: Optional[OutboxManager] = None
 our_pubkey: Optional[str] = None
-phase6_optional_plugins: Dict[str, Any] = {
-    "cl_hive_comms": {"installed": False, "active": False, "name": ""},
-    "warnings": [],
-}
-
 # Startup timestamp for lightweight health endpoint (Phase 4)
 _start_time: float = time.time()
 
@@ -350,9 +342,6 @@ def _get_hive_context() -> HiveContext:
     _fee_coordination_mgr = fee_coordination_mgr if fee_coordination_mgr is not None else None
     _rationalization_mgr = rationalization_mgr if rationalization_mgr is not None else None
     _strategic_positioning_mgr = strategic_positioning_mgr if strategic_positioning_mgr is not None else None
-    _anticipatory_liquidity_mgr = anticipatory_liquidity_mgr if anticipatory_liquidity_mgr is not None else None
-    _phase6_plugins = phase6_optional_plugins if isinstance(phase6_optional_plugins, dict) else {}
-    _comms_active = bool(_phase6_plugins.get("cl_hive_comms", {}).get("active"))
 
     # Create a log wrapper that calls plugin.log
     def _log(msg: str, level: str = 'info'):
@@ -374,9 +363,7 @@ def _get_hive_context() -> HiveContext:
         fee_coordination_mgr=_fee_coordination_mgr,
         rationalization_mgr=_rationalization_mgr,
         strategic_positioning_mgr=_strategic_positioning_mgr,
-        anticipatory_manager=_anticipatory_liquidity_mgr,
         traffic_intel_mgr=traffic_intel_mgr,
-        comms_active=_comms_active,
         signing_backend="none",
         our_id=_our_pubkey or "",
         log=_log,
@@ -388,47 +375,6 @@ def _get_hive_context() -> HiveContext:
 # =============================================================================
 # Options, config maps, and parsers moved to modules/plugin_options.py
 register_options(plugin)
-
-
-def _detect_phase6_optional_plugins(plugin_obj: Plugin) -> Dict[str, Any]:
-    """
-    Detect optional Phase 6 sibling plugins.
-
-    This is used for runtime capability selection and status reporting.
-    When cl-hive-comms is absent, external transport features are disabled.
-    The result is cached in the global phase6_optional_plugins map.
-    """
-    result: Dict[str, Any] = {
-        "cl_hive_comms": {"installed": False, "active": False, "name": ""},
-        "warnings": [],
-    }
-
-    try:
-        try:
-            plugins_resp = plugin_obj.rpc.plugin("list")
-        except Exception:
-            plugins_resp = plugin_obj.rpc.listplugins()
-
-        for entry in plugins_resp.get("plugins", []):
-            raw_name = (
-                entry.get("name")
-                or entry.get("path")
-                or entry.get("plugin")
-                or ""
-            )
-            normalized = os.path.basename(str(raw_name)).lower()
-            is_active = bool(entry.get("active", False))
-
-            if "cl-hive-comms" in normalized:
-                result["cl_hive_comms"] = {
-                    "installed": True,
-                    "active": is_active,
-                    "name": raw_name,
-                }
-    except Exception as e:
-        result["warnings"].append(f"optional plugin detection failed: {e}")
-
-    return result
 
 
 def _reload_config_from_cln(plugin_obj: Plugin) -> Dict[str, Any]:
@@ -501,46 +447,6 @@ def _submit_hive_message(peer_id: str, msg_type: HiveMessageType, msg_payload: D
     return True
 
 
-def _handle_external_transport_dm(envelope: Dict[str, Any]) -> None:
-    """Decode injected payloads from comms and feed existing Hive dispatch path."""
-    try:
-        if not isinstance(envelope, dict):
-            return
-
-        packet = envelope.get("payload")
-        if not isinstance(packet, dict):
-            plaintext = envelope.get("plaintext")
-            if isinstance(plaintext, str) and plaintext:
-                packet = {"raw_plaintext": plaintext}
-            else:
-                return
-
-        transport_sender = str(envelope.get("pubkey") or "")
-        if not transport_sender:
-            plugin.log("cl-hive: dropped injected packet (missing authenticated sender)", level="warn")
-            return
-
-        claimed_sender = str(packet.get("sender") or "")
-        if claimed_sender and claimed_sender != transport_sender:
-            plugin.log("cl-hive: dropped injected packet (sender mismatch)", level="warn")
-            return
-
-        packet = dict(packet)
-        packet["sender"] = transport_sender
-
-        peer_id, msg_type, msg_payload = parse_injected_hive_packet(packet)
-        if msg_type is None or not isinstance(msg_payload, dict):
-            plugin.log("cl-hive: dropped injected packet (unrecognized format)", level="debug")
-            return
-        if not peer_id:
-            plugin.log("cl-hive: dropped injected packet (missing sender)", level="debug")
-            return
-
-        _submit_hive_message(peer_id, msg_type, msg_payload, plugin)
-    except Exception as exc:
-        plugin.log(f"cl-hive: external transport DM handling error: {exc}", level="warn")
-
-
 # =============================================================================
 # INITIALIZATION
 # =============================================================================
@@ -560,7 +466,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     Note: pyln-client is inherently thread-safe (opens new socket per RPC call),
     so no RPC locking is needed. The global 'plugin' object is used directly.
     """
-    global database, config, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge, relay_mgr, phase6_optional_plugins
+    global database, config, handshake_mgr, state_manager, gossip_mgr, intent_mgr, our_pubkey, bridge, relay_mgr
 
     plugin.log("cl-hive: Initializing Swarm Intelligence layer...")
 
@@ -614,16 +520,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Initialize intent manager (Phase 3)
     # Get our pubkey for tie-breaker logic
     our_pubkey = plugin.rpc.getinfo().get('id', '')
-
-    # Detect Phase 6 sibling plugins (used for runtime capability selection)
-    phase6_optional_plugins = _detect_phase6_optional_plugins(plugin)
-    comms = phase6_optional_plugins["cl_hive_comms"]
-    plugin.log(
-        "cl-hive: Sibling plugins - "
-        f"cl-hive-comms(active={comms['active']}, installed={comms['installed']})"
-    )
-    for warning in phase6_optional_plugins.get("warnings", []):
-        plugin.log(f"cl-hive: {warning}", level="warn")
 
     # Sync gossip version from persisted state to avoid version reset on restart
     gossip_mgr.sync_version_from_state_manager(our_pubkey)
@@ -882,23 +778,12 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     strategic_positioning_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Strategic positioning manager initialized")
 
-    # Initialize Anticipatory Liquidity Manager (Phase 7.1 - Anticipatory Liquidity)
-    global anticipatory_liquidity_mgr
-    anticipatory_liquidity_mgr = AnticipatoryLiquidityManager(
-        database=database,
-        plugin=plugin,
-        state_manager=state_manager,
-        our_id=our_pubkey
-    )
-    plugin.log("cl-hive: Anticipatory liquidity manager initialized")
-
     # Initialize Traffic Intelligence Manager (Phase 14 - Traffic Intelligence)
     global traffic_intel_mgr
     traffic_intel_mgr = TrafficIntelligenceManager(
         database=database,
         plugin=plugin,
         our_pubkey=our_pubkey,
-        anticipatory_mgr=anticipatory_liquidity_mgr,
         liquidity_coordinator=liquidity_coord,
         membership_mgr=membership_mgr,
     )
@@ -924,11 +809,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         name="cl-hive-outbox-retry",
         daemon=True
     ))
-
-    # Link anticipatory manager to fee coordination for time-based fees
-    if fee_coordination_mgr:
-        fee_coordination_mgr.set_anticipatory_manager(anticipatory_liquidity_mgr)
-        plugin.log("cl-hive: Time-based fee adjustment enabled")
 
     # (Defense system removed during simplification)
 
@@ -964,7 +844,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'fee_coordination_mgr': fee_coordination_mgr,
         'rationalization_mgr': rationalization_mgr,
         'strategic_positioning_mgr': strategic_positioning_mgr,
-        'anticipatory_liquidity_mgr': anticipatory_liquidity_mgr,
         'outbox_mgr': outbox_mgr,
         'traffic_intel_mgr': traffic_intel_mgr,
         'outbox': outbox_mgr,
@@ -1002,7 +881,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'peer_reputation_mgr': peer_reputation_mgr,
         'fee_coordination_mgr': fee_coordination_mgr,
         'yield_metrics_mgr': yield_metrics_mgr,
-        'anticipatory_liquidity_mgr': anticipatory_liquidity_mgr,
         'strategic_positioning_mgr': strategic_positioning_mgr,
         'rationalization_mgr': rationalization_mgr,
         'traffic_intel_mgr': traffic_intel_mgr,
@@ -1210,8 +1088,6 @@ def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Pl
         # Fleet-Wide Intelligence
         elif msg_type == HiveMessageType.YIELD_METRICS_BATCH:
             protocol_handlers.handle_yield_metrics_batch(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.TEMPORAL_PATTERN_BATCH:
-            protocol_handlers.handle_temporal_pattern_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.CORRIDOR_VALUE_BATCH:
             protocol_handlers.handle_corridor_value_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.POSITIONING_PROPOSAL:
@@ -3655,207 +3531,6 @@ def hive_critical_velocity(plugin: Plugin, threshold_hours: int = 24):
         Dict with channels predicted to deplete or saturate within threshold.
     """
     return rpc_critical_velocity_channels(_get_hive_context(), threshold_hours=threshold_hours)
-@plugin.method("hive-report-kalman-velocity")
-def hive_report_kalman_velocity(
-    plugin: Plugin,
-    channel_id: str = "",
-    peer_id: str = "",
-    velocity_pct_per_hour: float = 0.0,
-    uncertainty: float = 0.0,
-    flow_ratio: float = 0.0,
-    confidence: float = 0.0,
-    is_regime_change: bool = False
-):
-    """
-    Report Kalman-estimated velocity from cl-revenue-ops.
-
-    Fleet members share their Kalman filter velocity estimates for
-    coordinated anticipatory liquidity predictions.
-
-    Args:
-        channel_id: Channel SCID
-        peer_id: Peer pubkey
-        velocity_pct_per_hour: Kalman velocity estimate (% change per hour)
-        uncertainty: Standard deviation of velocity estimate
-        flow_ratio: Current flow ratio estimate (-1 to 1)
-        confidence: Observation confidence (0.0-1.0)
-        is_regime_change: True if regime change detected
-
-    Returns:
-        Dict with status and acknowledgement
-    """
-    ctx = _get_hive_context()
-    if not ctx.anticipatory_manager:
-        return {"error": "Anticipatory liquidity manager not initialized"}
-
-    try:
-        # Get reporter ID from our own node
-        reporter_id = ctx.our_id or ""
-
-        success = ctx.anticipatory_manager.receive_kalman_velocity(
-            reporter_id=reporter_id,
-            channel_id=channel_id,
-            peer_id=peer_id,
-            velocity_pct_per_hour=velocity_pct_per_hour,
-            uncertainty=uncertainty,
-            flow_ratio=flow_ratio,
-            confidence=confidence,
-            is_regime_change=is_regime_change
-        )
-
-        return {
-            "status": "ok" if success else "failed",
-            "channel_id": channel_id,
-            "velocity_pct_per_hour": velocity_pct_per_hour,
-            "acknowledged": success
-        }
-    except Exception as e:
-        return {"error": f"Failed to receive Kalman velocity: {e}"}
-
-
-@plugin.method("hive-query-kalman-velocity")
-def hive_query_kalman_velocity(plugin: Plugin, channel_id: str):
-    """
-    Query aggregated Kalman velocity for a channel.
-
-    Returns consensus velocity from all fleet members who have
-    reported Kalman estimates for this channel.
-
-    Args:
-        channel_id: Channel SCID to query
-
-    Returns:
-        Dict with consensus Kalman velocity data
-    """
-    ctx = _get_hive_context()
-    if not ctx.anticipatory_manager:
-        return {"error": "Anticipatory liquidity manager not initialized"}
-
-    try:
-        result = ctx.anticipatory_manager.query_kalman_velocity(channel_id)
-        if not result:
-            return {
-                "status": "no_data",
-                "channel_id": channel_id,
-                "message": "No Kalman velocity data available for this channel"
-            }
-        return result
-    except Exception as e:
-        return {"error": f"Failed to query Kalman velocity: {e}"}
-
-
-@plugin.method("hive-detect-patterns")
-def hive_detect_patterns(plugin: Plugin, channel_id: str):
-    """
-    Detect Kalman-enhanced intra-day flow patterns for a channel.
-
-    Analyzes historical flow data to find recurring patterns within each day
-    (morning surge, lunch lull, evening peak, overnight recovery), using
-    Kalman velocity estimates for improved confidence.
-
-    Args:
-        channel_id: Channel SCID to analyze
-
-    Returns:
-        Dict with detected intra-day patterns and statistics
-    """
-    ctx = _get_hive_context()
-    if not ctx.anticipatory_manager:
-        return {"error": "Anticipatory liquidity manager not initialized"}
-
-    try:
-        patterns = ctx.anticipatory_manager.detect_intraday_patterns(channel_id)
-        return {
-            "status": "ok",
-            "channel_id": channel_id,
-            "pattern_count": len(patterns),
-            "actionable_count": sum(1 for p in patterns if p.is_actionable),
-            "patterns": [p.to_dict() for p in patterns]
-        }
-    except Exception as e:
-        return {"error": f"Failed to detect patterns: {e}"}
-
-
-@plugin.method("hive-predict-liquidity")
-def hive_predict_liquidity_intraday(
-    plugin: Plugin,
-    channel_id: str,
-    current_local_pct: float = 0.5,
-    hours_ahead: int = 12
-):
-    """
-    Get intra-day liquidity forecast for a channel.
-
-    Predicts what will happen in the next few hours based on detected
-    patterns and current Kalman velocity, with recommended actions.
-
-    Args:
-        channel_id: Channel SCID
-        current_local_pct: Current local balance percentage (0.0-1.0)
-        hours_ahead: Hours to predict ahead (default: 12)
-
-    Returns:
-        Dict with forecast and recommended actions
-    """
-    ctx = _get_hive_context()
-    if not ctx.anticipatory_manager:
-        return {"error": "Anticipatory liquidity manager not initialized"}
-
-    try:
-        current_local_pct = float(current_local_pct)
-        hours_ahead = int(hours_ahead)
-        forecast = ctx.anticipatory_manager.get_intraday_forecast(
-            channel_id, current_local_pct
-        )
-        if not forecast:
-            return {
-                "status": "no_forecast",
-                "channel_id": channel_id,
-                "message": "Insufficient data for forecast"
-            }
-        return {
-            "status": "ok",
-            **forecast.to_dict()
-        }
-    except Exception as e:
-        return {"error": f"Failed to get forecast: {e}"}
-
-
-@plugin.method("hive-anticipatory-predictions")
-def hive_anticipatory_predictions(
-    plugin: Plugin,
-    channel_id: str = None,
-    hours_ahead: int = 12,
-    min_risk: float = 0.3
-):
-    """
-    Get intra-day pattern summary for one or all channels.
-
-    Shows detected patterns, forecasts, and urgent actions needed.
-
-    Args:
-        channel_id: Optional specific channel, None for all
-        hours_ahead: Prediction horizon in hours (default: 12)
-        min_risk: Minimum risk threshold to include (default: 0.3)
-
-    Returns:
-        Dict with pattern summary and forecasts
-    """
-    ctx = _get_hive_context()
-    if not ctx.anticipatory_manager:
-        return {"error": "Anticipatory liquidity manager not initialized"}
-
-    try:
-        # Note: hours_ahead and min_risk are accepted for API compatibility
-        # but get_intraday_summary uses its own defaults internally
-        summary = ctx.anticipatory_manager.get_intraday_summary(channel_id)
-        return {
-            "status": "ok",
-            **summary
-        }
-    except Exception as e:
-        return {"error": f"Failed to get predictions: {e}"}
-
 
 # =============================================================================
 # PHASE 2 FEE COORDINATION RPC METHODS
@@ -4332,80 +4007,6 @@ def hive_pending(plugin: Plugin):
         "pending_count": len(requests),
         "pending": requests,
     }
-
-
-# =============================================================================
-# ANTICIPATORY LIQUIDITY RPC METHODS (Phase 7.1)
-# =============================================================================
-
-@plugin.method("hive-record-flow")
-def hive_record_flow(
-    plugin: Plugin,
-    channel_id: str,
-    inbound_sats: int,
-    outbound_sats: int,
-    timestamp: int = None
-):
-    """
-    Record a flow observation for pattern detection.
-
-    Called periodically (e.g., hourly) to build flow history for
-    temporal pattern detection and predictive rebalancing.
-
-    Args:
-        channel_id: Channel SCID
-        inbound_sats: Satoshis received in this period
-        outbound_sats: Satoshis sent in this period
-        timestamp: Unix timestamp (defaults to now)
-
-    Returns:
-        Dict with recording result.
-    """
-    if not anticipatory_liquidity_mgr:
-        return {"error": "Anticipatory liquidity manager not initialized"}
-
-    anticipatory_liquidity_mgr.record_flow_sample(
-        channel_id=channel_id,
-        inbound_sats=inbound_sats,
-        outbound_sats=outbound_sats,
-        timestamp=timestamp
-    )
-
-    return {
-        "status": "ok",
-        "channel_id": channel_id,
-        "net_flow": inbound_sats - outbound_sats
-    }
-
-
-@plugin.method("hive-fleet-anticipation")
-def hive_fleet_anticipation(plugin: Plugin):
-    """
-    Get fleet-wide anticipatory positioning recommendations.
-
-    Returns:
-        Dict with fleet pattern sharing status.
-    """
-    if not anticipatory_liquidity_mgr:
-        return {"error": "Anticipatory liquidity manager not initialized"}
-
-    return anticipatory_liquidity_mgr.get_patterns_summary()
-
-
-@plugin.method("hive-anticipatory-status")
-def hive_anticipatory_status(plugin: Plugin):
-    """
-    Get anticipatory liquidity manager status.
-
-    Returns operational status and configuration for diagnostics.
-
-    Returns:
-        Dict with manager status.
-    """
-    if not anticipatory_liquidity_mgr:
-        return {"error": "Anticipatory liquidity manager not initialized"}
-
-    return anticipatory_liquidity_mgr.get_status()
 
 
 # =============================================================================

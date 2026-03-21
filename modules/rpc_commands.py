@@ -40,10 +40,8 @@ class HiveContext:
     fee_coordination_mgr: Any = None  # FeeCoordinationManager (Phase 2 - Fee Coordination)
     rationalization_mgr: Any = None  # RationalizationManager (Channel Rationalization)
     strategic_positioning_mgr: Any = None  # StrategicPositioningManager (Phase 5 - Strategic Positioning)
-    anticipatory_manager: Any = None  # AnticipatoryLiquidityManager (Phase 7.1 - Anticipatory Liquidity)
     traffic_intel_mgr: Any = None  # TrafficIntelligenceManager (Phase 14 - Traffic Intelligence)
     our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
-    comms_active: bool = False
     signing_backend: str = "unknown"
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
 
@@ -121,7 +119,6 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
             "max_members": ctx.config.max_members if ctx.config else 50,
             "market_share_cap": ctx.config.market_share_cap_pct if ctx.config else 0.20,
         },
-        "comms_active": bool(ctx.comms_active),
         "signing_backend": str(ctx.signing_backend or "unknown"),
         "version": "2.2.6",
     }
@@ -1509,27 +1506,13 @@ def get_nnlb_opportunities(ctx: HiveContext, min_amount: int = 50000) -> Dict[st
             ]
         }
     """
-    if not ctx.anticipatory_manager:
-        # Fall back to liquidity coordinator
-        if not ctx.liquidity_coordinator:
-            return {"error": "Neither anticipatory manager nor liquidity coordinator initialized"}
+    if not ctx.liquidity_coordinator:
+        return {"error": "Liquidity coordinator not initialized"}
 
     try:
         opportunities = []
 
-        # Get NNLB recommendations from anticipatory manager
-        if ctx.anticipatory_manager and hasattr(ctx.anticipatory_manager, 'get_nnlb_opportunities'):
-            nnlb_opps = ctx.anticipatory_manager.get_nnlb_opportunities(min_amount)
-            for opp in nnlb_opps:
-                opportunities.append({
-                    "source_scid": opp.get('source_channel'),
-                    "sink_scid": opp.get('sink_channel'),
-                    "amount_sats": opp.get('amount_sats', 0),
-                    "estimated_cost_sats": opp.get('estimated_cost', 0),
-                    "path_hops": opp.get('path_hops', 1),
-                    "is_hive_internal": opp.get('is_hive_internal', False),
-                })
-        elif ctx.liquidity_coordinator:
+        if ctx.liquidity_coordinator:
             # Use liquidity coordinator's circular flow detection
             if hasattr(ctx.liquidity_coordinator, 'get_circular_rebalance_opportunities'):
                 circ_opps = ctx.liquidity_coordinator.get_circular_rebalance_opportunities()

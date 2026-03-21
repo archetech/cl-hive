@@ -478,7 +478,6 @@ class FeeCoordinationManager:
         state_manager: Any = None,
         liquidity_coordinator: Any = None,
         gossip_mgr: Any = None,
-        anticipatory_mgr: Any = None
     ):
         self.database = database
         self.plugin = plugin
@@ -504,10 +503,6 @@ class FeeCoordinationManager:
     def set_our_pubkey(self, pubkey: str) -> None:
         self.our_pubkey = pubkey
         self.corridor_mgr.set_our_pubkey(pubkey)
-
-    def set_anticipatory_manager(self, mgr: Any) -> None:
-        """No-op kept for caller compatibility."""
-        pass
 
     def set_fee_intelligence_mgr(self, mgr: Any) -> None:
         """Set reference to FeeIntelligenceManager for cross-system blending."""

@@ -58,7 +58,6 @@ peer_reputation_mgr = None
 yield_metrics_mgr = None
 rationalization_mgr = None
 strategic_positioning_mgr = None
-anticipatory_liquidity_mgr = None
 outbox_mgr = None
 traffic_intel_mgr = None
 outbox = None
@@ -2424,95 +2423,6 @@ def handle_yield_metrics_batch(peer_id: str, payload: Dict, plugin: Plugin) -> D
 
     # Relay to other members
     _relay_message(HiveMessageType.YIELD_METRICS_BATCH, payload, peer_id)
-
-    return {"result": "continue"}
-
-def handle_temporal_pattern_batch(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
-    """
-    Handle TEMPORAL_PATTERN_BATCH message from a hive member.
-
-    This enables fleet-wide learning about temporal flow patterns
-    for coordinated liquidity positioning and fee optimization.
-    """
-    if not anticipatory_liquidity_mgr or not database:
-        return {"result": "continue"}
-
-    # Deduplication check
-    if not _should_process_message(payload):
-        return {"result": "continue"}
-
-    # SECURITY: Timestamp freshness check
-    if not _check_timestamp_freshness(payload, MAX_INTELLIGENCE_AGE_SECONDS, "TEMPORAL_PATTERN_BATCH"):
-        return {"result": "continue"}
-
-    # Verify sender is a hive member and not banned (supports relay)
-    is_relayed = _is_relayed_message(payload)
-    if is_relayed:
-        relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
-            return {"result": "continue"}
-    else:
-        sender = database.get_member(peer_id)
-        if not sender or database.is_banned(peer_id):
-            plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH from non-member {peer_id[:16]}...", level='debug')
-            return {"result": "continue"}
-
-    # Validate payload
-    from modules.protocol import validate_temporal_pattern_batch, get_temporal_pattern_batch_signing_payload
-    if not validate_temporal_pattern_batch(payload):
-        plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH validation failed from {peer_id[:16]}...", level='debug')
-        return {"result": "continue"}
-
-    # Verify signature - reporter_id may differ from peer_id when relayed
-    reporter_id = payload.get("reporter_id", "")
-    if not is_relayed and reporter_id != peer_id:
-        plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH reporter mismatch from {peer_id[:16]}...", level='debug')
-        return {"result": "continue"}
-
-    # Verify reporter is a member
-    reporter = database.get_member(reporter_id)
-    if not reporter or database.is_banned(reporter_id):
-        plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH from non-member reporter {reporter_id[:16]}...", level='debug')
-        return {"result": "continue"}
-
-    try:
-        signing_payload = get_temporal_pattern_batch_signing_payload(payload)
-        verify_result = plugin.rpc.checkmessage(signing_payload, payload.get("signature", ""))
-        if not verify_result.get("verified"):
-            plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH signature invalid from {peer_id[:16]}...", level='debug')
-            return {"result": "continue"}
-        if verify_result.get("pubkey") != reporter_id:
-            plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH pubkey mismatch from {peer_id[:16]}...", level='debug')
-            return {"result": "continue"}
-    except Exception as e:
-        plugin.log(f"cl-hive: TEMPORAL_PATTERN_BATCH signature check error: {e}", level='debug')
-        return {"result": "continue"}
-
-    # Process each pattern entry
-    patterns = payload.get("patterns", [])
-    patterns_stored = 0
-
-    for pattern_data in patterns:
-        try:
-            result = anticipatory_liquidity_mgr.receive_pattern_from_fleet(
-                reporter_id=reporter_id,
-                pattern_data=pattern_data
-            )
-            if result:
-                patterns_stored += 1
-        except Exception as e:
-            plugin.log(f"cl-hive: Error processing temporal pattern: {e}", level='debug')
-            continue
-
-    if patterns_stored > 0:
-        relay_info = " (relayed)" if is_relayed else ""
-        plugin.log(
-            f"cl-hive: Stored {patterns_stored} temporal patterns from {reporter_id[:16]}...{relay_info}",
-            level='debug'
-        )
-
-    # Relay to other members
-    _relay_message(HiveMessageType.TEMPORAL_PATTERN_BATCH, payload, peer_id)
 
     return {"result": "continue"}
 
