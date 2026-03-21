@@ -199,7 +199,7 @@ These are non-negotiable:
 3. **No silent fund actions**: Never move funds; coordination only
 4. **Identity binding**: Sender peer_id must match claimed pubkey in payload
 5. **DoS protection**: Max 200 remote intents cached, rate limits on all loops
-6. **Hive channels always zero fees**: Channels between fleet members MUST have 0 ppm fees
+6. **Hint-only posture**: cl-hive exports hints but does not set fees, trigger rebalances, or open channels
 
 ## Planner Rules
 

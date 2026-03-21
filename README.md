@@ -97,18 +97,21 @@ See [docs/JOINING_THE_HIVE.md](docs/JOINING_THE_HIVE.md) for the full joining gu
 | `hive-fleet-health` | Fleet-wide health summary |
 | `hive-corridor-assignments` | View corridor ownership assignments |
 | `hive-rebalance-recommendations` | Get EV-positive rebalance suggestions |
+| `hive-export-hints` | Compact per-peer hints for local consumers |
 
 ## Integration with cl-revenue-ops
 
-Current integration points (via the bridge module):
+`cl-revenue-ops` polls `hive-export-hints` locally for compact per-peer coordination hints:
 
-- Coordinated corridor fee recommendations
-- Corridor ownership and competition-avoidance signals
-- Peer reputation and defense intelligence
-- Traffic and liquidity intelligence
-- Egress desaturation bias for locally-full hive exits
+- **member**: whether the peer is a fleet member
+- **corridor_role**: owner / secondary / contested / none
+- **competition_bias**: lean-in (+1) / neutral (0) / back-off (-1)
+- **peer_quality_score**: normalized 0-1
+- **traffic_confidence**: normalized 0-1
+- **rebalance_preference**: source / sink / neutral
+- **channel_open_hint**: topology-based open/neutral/avoid advisory with size bucket and reason
 
-`cl-hive` does not directly own Sling or fee execution. If a route, rebalance, or local fee change needs to happen, that work belongs in `cl-revenue-ops`.
+`cl-hive` exports hints only. It does not set fees, trigger rebalances, or open channels. All local execution belongs to `cl-revenue-ops`.
 
 ## Configuration
 

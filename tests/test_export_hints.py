@@ -349,6 +349,30 @@ class TestNoSideEffects:
         result = export_hints(ctx)
         assert "error" in result
 
+    def test_no_cln_execution_calls(self):
+        """Verify export_hints never calls setchannel, close, or fundchannel."""
+        ctx = _make_ctx()
+        # safe_plugin is the RPC proxy — verify no execution RPCs
+        export_hints(ctx)
+        if hasattr(ctx.safe_plugin, 'setchannel'):
+            ctx.safe_plugin.setchannel.assert_not_called()
+        if hasattr(ctx.safe_plugin, 'close'):
+            ctx.safe_plugin.close.assert_not_called()
+        if hasattr(ctx.safe_plugin, 'call'):
+            for call_args in ctx.safe_plugin.call.call_args_list:
+                method = call_args[0][0] if call_args[0] else ""
+                assert method not in (
+                    "fundchannel", "multifundchannel", "setchannel",
+                    "close", "revenue-policy", "revenue-rebalance",
+                ), f"export_hints called forbidden RPC: {method}"
+
+    def test_no_execution_calls_with_planner(self):
+        """Verify hints with planner still never execute."""
+        ctx = _make_planner_ctx()
+        export_hints(ctx)
+        ctx.database.add_member.assert_not_called()
+        ctx.database.remove_member.assert_not_called()
+
 
 # =============================================================================
 # FIELD RANGE VALIDATION
