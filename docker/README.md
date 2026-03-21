@@ -186,7 +186,6 @@ BACKUP_RETENTION=30  # days
 | `NETWORK_MODE` | `tor` | Network mode: `tor`, `clearnet`, or `hybrid` |
 | `ANNOUNCE_ADDR` | - | Public address (required for clearnet/hybrid) |
 | `WIREGUARD_ENABLED` | `false` | Enable WireGuard VPN |
-| `TRUSTEDCOIN_ENABLED` | `false` | Use trustedcoin instead of bcli (see below) |
 
 **Network Modes:**
 - **tor** - Tor-only, anonymous, no clearnet exposure (default)
@@ -444,50 +443,6 @@ WG_PEER_ENDPOINT=vpn.example.com:51820
 BITCOIN_RPCHOST=10.8.0.1  # Bitcoin via VPN
 ```
 
-## Trustedcoin Configuration (Optional Bitcoin Backend)
-
-Trustedcoin is an alternative Bitcoin backend that can replace the default `bcli` plugin. It uses block explorers (mempool.space, blockstream.info, etc.) to get blockchain data.
-
-### When to Use Trustedcoin
-
-- **VPS deployments** without local bitcoind
-- **Lightweight setups** to reduce resource requirements
-- **Redundancy** for explorer fallback if bitcoind fails
-
-### Operating Modes
-
-#### Explorer-Only Mode (No bitcoind required)
-
-```bash
-# .env configuration
-TRUSTEDCOIN_ENABLED=true
-
-# Leave Bitcoin RPC settings empty or commented out:
-# BITCOIN_RPCUSER=
-# BITCOIN_RPCPASSWORD=
-```
-
-#### Hybrid Mode (bitcoind + explorer fallback)
-
-```bash
-# .env configuration
-TRUSTEDCOIN_ENABLED=true
-
-# Configure Bitcoin RPC as normal:
-BITCOIN_RPCHOST=host.docker.internal
-BITCOIN_RPCPORT=8332
-BITCOIN_RPCUSER=your_rpc_username
-BITCOIN_RPCPASSWORD=your_rpc_password
-```
-
-### Security Considerations
-
-| Mode | Trust Model | Recommendation |
-|------|-------------|----------------|
-| **bcli (default)** | Trust only your bitcoind | Most secure, requires bitcoind |
-| **Hybrid** | Primarily your bitcoind, explorers as fallback | Good balance of security and reliability |
-| **Explorer-only** | Trust third-party explorers | Convenient but less secure |
-
 ## Monitoring
 
 ### Log Aggregation
@@ -666,7 +621,6 @@ docker-compose build
 | Core Lightning | v25.12.1 | Yes |
 | CLBOSS | latest (ksedgwic fork) | Yes |
 | Sling | v4.1.3 | Yes |
-| Trustedcoin | v0.8.6 | Optional |
 | c-lightning-REST | v0.10.7 | Yes |
 | cl-revenue-ops | latest (from GitHub) | Yes |
 | cl-hive | bundled | Yes |

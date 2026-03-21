@@ -132,23 +132,15 @@ mkdir -p "$LIGHTNING_DIR"
 # Validate Required Variables
 # -----------------------------------------------------------------------------
 
-# Bitcoin RPC credentials are only required if NOT using trustedcoin explorer-only mode
-if [ "${TRUSTEDCOIN_ENABLED:-false}" != "true" ]; then
-    # Standard bcli mode requires bitcoind credentials
-    if [ -z "$BITCOIN_RPCUSER" ]; then
-        echo "ERROR: BITCOIN_RPCUSER is required (or enable TRUSTEDCOIN_ENABLED for explorer-only mode)"
-        exit 1
-    fi
+# Bitcoin RPC credentials are required
+if [ -z "$BITCOIN_RPCUSER" ]; then
+    echo "ERROR: BITCOIN_RPCUSER is required"
+    exit 1
+fi
 
-    if [ -z "$BITCOIN_RPCPASSWORD" ]; then
-        echo "ERROR: BITCOIN_RPCPASSWORD is required (or enable TRUSTEDCOIN_ENABLED for explorer-only mode)"
-        exit 1
-    fi
-else
-    # Trustedcoin mode - credentials optional (for hybrid mode)
-    if [ -z "$BITCOIN_RPCUSER" ] || [ -z "$BITCOIN_RPCPASSWORD" ]; then
-        echo "INFO: Running in trustedcoin explorer-only mode (no bitcoind)"
-    fi
+if [ -z "$BITCOIN_RPCPASSWORD" ]; then
+    echo "ERROR: BITCOIN_RPCPASSWORD is required"
+    exit 1
 fi
 
 # -----------------------------------------------------------------------------
@@ -228,40 +220,6 @@ fi
 # Disable CLBOSS if requested
 if [ "${CLBOSS_ENABLED:-true}" != "true" ]; then
     echo "disable-plugin=clboss" >> "$CONFIG_FILE"
-fi
-
-# -----------------------------------------------------------------------------
-# Trustedcoin Configuration (Optional Bitcoin Backend)
-# -----------------------------------------------------------------------------
-# Trustedcoin replaces bcli for Bitcoin backend access.
-# - Explorer-only mode: No BITCOIN_RPC* settings, uses public block explorers
-# - Hybrid mode: BITCOIN_RPC* configured, bitcoind primary with explorer fallback
-#
-# When TRUSTEDCOIN_ENABLED=true:
-#   1. Disables the default bcli plugin
-#   2. Enables trustedcoin plugin
-#   3. If BITCOIN_RPCUSER is set: hybrid mode (bitcoind + explorer fallback)
-#   4. If BITCOIN_RPCUSER is empty: explorer-only mode (no bitcoind needed)
-# -----------------------------------------------------------------------------
-
-if [ "${TRUSTEDCOIN_ENABLED:-false}" = "true" ]; then
-    echo "Configuring trustedcoin as Bitcoin backend..."
-    
-    # Disable bcli (trustedcoin replaces it)
-    echo "disable-plugin=bcli" >> "$CONFIG_FILE"
-    
-    # Enable trustedcoin plugin
-    echo "plugin=/usr/local/bin/trustedcoin" >> "$CONFIG_FILE"
-    
-    # Determine mode based on whether Bitcoin RPC credentials are configured
-    if [ -n "$BITCOIN_RPCUSER" ] && [ -n "$BITCOIN_RPCPASSWORD" ]; then
-        echo "Trustedcoin mode: HYBRID (bitcoind primary, explorers fallback)"
-        # Bitcoin RPC settings already in config, trustedcoin will use them
-    else
-        echo "Trustedcoin mode: EXPLORER-ONLY (no bitcoind required)"
-        echo "WARNING: Explorer-only mode trusts third-party block explorers"
-        echo "         For maximum security, configure bitcoind for hybrid mode"
-    fi
 fi
 
 # SECURITY: Restrict config file permissions (contains RPC password)
@@ -666,12 +624,7 @@ export ADVISOR_DB_PATH="$ADVISOR_DATA_DIR/advisor.db"
 # -----------------------------------------------------------------------------
 # Wait for Bitcoin RPC (with exponential backoff)
 # -----------------------------------------------------------------------------
-# Skip if using trustedcoin in explorer-only mode (no bitcoind)
-
-if [ "${TRUSTEDCOIN_ENABLED:-false}" = "true" ] && { [ -z "$BITCOIN_RPCUSER" ] || [ -z "$BITCOIN_RPCPASSWORD" ]; }; then
-    echo "Skipping Bitcoin RPC check (trustedcoin explorer-only mode)"
-else
-    echo "Waiting for Bitcoin RPC at $BITCOIN_RPCHOST:$BITCOIN_RPCPORT..."
+echo "Waiting for Bitcoin RPC at $BITCOIN_RPCHOST:$BITCOIN_RPCPORT..."
 
     MAX_RETRIES=20
     RETRY_COUNT=0
@@ -717,7 +670,6 @@ else
         echo "Last response: $RPC_RESPONSE"
         exit 1
     fi
-fi
 
 # -----------------------------------------------------------------------------
 # Display Configuration Summary
@@ -727,15 +679,7 @@ echo ""
 echo "=== Configuration Summary ==="
 echo "Network:        $NETWORK"
 echo "Alias:          $ALIAS"
-if [ "${TRUSTEDCOIN_ENABLED:-false}" = "true" ]; then
-    if [ -n "$BITCOIN_RPCUSER" ] && [ -n "$BITCOIN_RPCPASSWORD" ]; then
-        echo "Bitcoin Backend: trustedcoin (hybrid: $BITCOIN_RPCHOST:$BITCOIN_RPCPORT + explorers)"
-    else
-        echo "Bitcoin Backend: trustedcoin (explorer-only)"
-    fi
-else
-    echo "Bitcoin Backend: bcli ($BITCOIN_RPCHOST:$BITCOIN_RPCPORT)"
-fi
+echo "Bitcoin Backend: bcli ($BITCOIN_RPCHOST:$BITCOIN_RPCPORT)"
 echo "Lightning Port: $LIGHTNING_PORT"
 echo "Network Mode:   $NETWORK_MODE"
 echo "WireGuard:      $WIREGUARD_ENABLED"
@@ -755,9 +699,6 @@ fi
 echo "  Sling:        installed"
 echo "  cl-hive:      installed"
 echo "  cl-revenue-ops: installed"
-if [ "${TRUSTEDCOIN_ENABLED:-false}" = "true" ]; then
-    echo "  trustedcoin:  enabled (replaces bcli)"
-fi
 echo "============================="
 echo ""
 

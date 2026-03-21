@@ -322,26 +322,6 @@ check_phase6_optional() {
     source "$env_file" 2>/dev/null || true
     set +a
 
-    local comms_enabled="${HIVE_COMMS_ENABLED:-false}"
-    local archon_enabled="${HIVE_ARCHON_ENABLED:-false}"
-
-    log_check "HIVE_COMMS_ENABLED"
-    if [[ "$comms_enabled" == "true" || "$comms_enabled" == "false" ]]; then
-        log_ok
-    else
-        log_error "HIVE_COMMS_ENABLED must be true or false (got: $comms_enabled)"
-    fi
-
-    log_check "HIVE_ARCHON_ENABLED"
-    if [[ "$archon_enabled" == "true" || "$archon_enabled" == "false" ]]; then
-        log_ok
-    else
-        log_error "HIVE_ARCHON_ENABLED must be true or false (got: $archon_enabled)"
-    fi
-
-    if [[ "$archon_enabled" == "true" && "$comms_enabled" != "true" ]]; then
-        log_error "HIVE_ARCHON_ENABLED=true requires HIVE_COMMS_ENABLED=true"
-    fi
 }
 
 check_resources() {

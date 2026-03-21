@@ -83,18 +83,8 @@ services:
       - WG_DNS=${WG_DNS:-}
       - WG_PEER_KEEPALIVE=${WG_PEER_KEEPALIVE:-25}
 
-      # cl-hive
-      - HIVE_GOVERNANCE_MODE=${HIVE_GOVERNANCE_MODE:-advisor}
-      - HIVE_COMMS_ENABLED=${HIVE_COMMS_ENABLED:-false}
-      - HIVE_ARCHON_ENABLED=${HIVE_ARCHON_ENABLED:-false}
-
       # CLBOSS (optional - set to false to disable)
       - CLBOSS_ENABLED=${CLBOSS_ENABLED:-true}
-
-      # Trustedcoin (optional - alternative Bitcoin backend using block explorers)
-      # When enabled without bitcoin-rpc*: explorer-only mode (no bitcoind needed)
-      # When enabled with bitcoin-rpc*: hybrid mode (bitcoind primary, explorers fallback)
-      - TRUSTEDCOIN_ENABLED=${TRUSTEDCOIN_ENABLED:-false}
 
       # Boltz Client (submarine/reverse swaps - disabled by default)
       - BOLTZ_ENABLED=${BOLTZ_ENABLED:-false}
