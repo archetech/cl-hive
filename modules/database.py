@@ -28,7 +28,7 @@ class HiveDatabase:
     SQLite database manager for the Hive plugin.
     
     Provides persistence for:
-    - Member registry (peer_id, tier, contribution, uptime)
+    - Member registry (peer_id, contribution, uptime)
     - Intent locks (conflict resolution)
     - Hive state cache (fleet topology view)
     - Contribution ledger (forwarding stats)
@@ -149,10 +149,8 @@ class HiveDatabase:
                 peer_id TEXT PRIMARY KEY,
                 tier TEXT NOT NULL DEFAULT 'member',
                 joined_at INTEGER NOT NULL,
-                promoted_at INTEGER,
                 contribution_ratio REAL DEFAULT 0.0,
                 uptime_pct REAL DEFAULT 0.0,
-                vouch_count INTEGER DEFAULT 0,
                 last_seen INTEGER,
                 metadata TEXT,
                 addresses TEXT
@@ -235,38 +233,22 @@ class HiveDatabase:
         """)
 
         # =====================================================================
-        # BAN PROPOSAL TABLES (Admin Ban)
+        # MEMBERSHIP AUDIT LOG TABLE
         # =====================================================================
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS ban_proposals (
-                proposal_id TEXT PRIMARY KEY,
-                target_peer_id TEXT NOT NULL,
-                proposer_peer_id TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                proposed_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                proposal_type TEXT NOT NULL DEFAULT 'standard'
+            CREATE TABLE IF NOT EXISTS membership_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                actor_peer_id TEXT,
+                reason TEXT,
+                timestamp INTEGER NOT NULL
             )
         """)
-        # Add proposal_type column if upgrading from older schema
-        try:
-            conn.execute(
-                "ALTER TABLE ban_proposals ADD COLUMN proposal_type TEXT NOT NULL DEFAULT 'standard'"
-            )
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS ban_votes (
-                proposal_id TEXT NOT NULL,
-                voter_peer_id TEXT NOT NULL,
-                vote TEXT NOT NULL,
-                voted_at INTEGER NOT NULL,
-                signature TEXT NOT NULL,
-                PRIMARY KEY (proposal_id, voter_peer_id)
-            )
-        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_membership_audit_peer "
+            "ON membership_audit_log(peer_id)"
+        )
 
         # =====================================================================
         # LOCAL FEE TRACKING TABLE (Settlement Phase)
@@ -594,28 +576,25 @@ class HiveDatabase:
             ON proto_outbox(peer_id, status)
         """)
     def add_member(self, peer_id: str, tier: str = 'member',
-                   joined_at: Optional[int] = None,
-                   promoted_at: Optional[int] = None) -> bool:
+                   joined_at: Optional[int] = None) -> bool:
         """
         Add a new member to the Hive.
 
         Args:
             peer_id: 66-character hex public key
-            tier: 'admin' or 'member'
             joined_at: Unix timestamp (defaults to now)
-            promoted_at: Unix timestamp if promoted to admin (None for members)
 
         Returns:
             True if successful, False if member already exists
         """
         conn = self._get_connection()
         now = int(time.time())
-        
+
         try:
             conn.execute("""
-                INSERT INTO hive_members (peer_id, tier, joined_at, promoted_at, last_seen)
-                VALUES (?, ?, ?, ?, ?)
-            """, (peer_id, tier, joined_at or now, promoted_at, now))
+                INSERT INTO hive_members (peer_id, tier, joined_at, last_seen)
+                VALUES (?, ?, ?, ?)
+            """, (peer_id, tier, joined_at or now, now))
             return True
         except sqlite3.IntegrityError:
             return False  # Already exists
@@ -633,7 +612,7 @@ class HiveDatabase:
         """Get all Hive members."""
         conn = self._get_connection()
         rows = conn.execute(
-            "SELECT * FROM hive_members ORDER BY tier, joined_at LIMIT 1000"
+            "SELECT * FROM hive_members ORDER BY joined_at LIMIT 1000"
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -643,7 +622,7 @@ class HiveDatabase:
 
         Includes peer_id and tier for each member, sorted by peer_id.
         Used to detect membership divergence between nodes and trigger
-        FULL_SYNC when tiers differ.
+        FULL_SYNC when membership lists differ.
 
         Returns:
             Hex-encoded SHA256 hash of membership state
@@ -668,11 +647,11 @@ class HiveDatabase:
         """
         Update member fields.
 
-        Allowed fields: tier, contribution_ratio, uptime_pct, vouch_count,
-                       last_seen, promoted_at, metadata, addresses
+        Allowed fields: tier, contribution_ratio, uptime_pct,
+                       last_seen, metadata, addresses
         """
-        allowed = {'tier', 'contribution_ratio', 'uptime_pct', 'vouch_count',
-                   'last_seen', 'promoted_at', 'metadata', 'addresses'}
+        allowed = {'tier', 'contribution_ratio', 'uptime_pct',
+                   'last_seen', 'metadata', 'addresses'}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         
         if not updates:
@@ -1161,63 +1140,58 @@ class HiveDatabase:
         return result.rowcount
 
     # =========================================================================
-    # BAN PROPOSALS (Admin Ban)
+    # MEMBERSHIP AUDIT LOG
     # =========================================================================
 
-    def update_ban_proposal_status(self, proposal_id: str, status: str) -> bool:
-        """Update ban proposal status (pending, approved, rejected, expired)."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.execute("""
-                UPDATE ban_proposals SET status = ? WHERE proposal_id = ?
-            """, (status, proposal_id))
-            return cursor.rowcount > 0
-        except Exception:
-            return False
-
-    def cleanup_expired_ban_proposals(self, now: int) -> int:
-        """Mark expired ban proposals and return count."""
-        conn = self._get_connection()
-        cursor = conn.execute("""
-            UPDATE ban_proposals
-            SET status = 'expired'
-            WHERE status = 'pending' AND expires_at < ?
-        """, (now,))
-        return cursor.rowcount
-
-    def prune_old_ban_data(self, older_than_days: int = 180) -> int:
+    def log_membership_event(self, event: str, peer_id: str,
+                              actor_peer_id: str = None,
+                              reason: str = None) -> bool:
         """
-        Remove old ban proposals and their votes for terminal states.
-
-        Only prunes proposals in terminal states (approved, rejected, expired).
-        Pending proposals are never pruned.
+        Record a membership lifecycle event.
 
         Args:
-            older_than_days: Remove records older than this many days
+            event: Event type (joined, approved, banned, removed, left)
+            peer_id: The member affected
+            actor_peer_id: Who initiated the action (None for self-actions)
+            reason: Optional reason string
 
         Returns:
-            Number of ban proposals deleted
+            True if recorded
         """
         conn = self._get_connection()
-        cutoff = int(time.time()) - (older_than_days * 86400)
+        now = int(time.time())
+        conn.execute("""
+            INSERT INTO membership_audit_log (event, peer_id, actor_peer_id, reason, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        """, (event, peer_id, actor_peer_id, reason, now))
+        return True
 
-        with self.transaction() as tx_conn:
-            # Delete votes for old terminal proposals first (foreign key safety)
-            tx_conn.execute("""
-                DELETE FROM ban_votes WHERE proposal_id IN (
-                    SELECT proposal_id FROM ban_proposals
-                    WHERE status IN ('approved', 'rejected', 'expired')
-                    AND proposed_at < ?
-                )
-            """, (cutoff,))
+    def get_membership_audit_log(self, peer_id: str = None,
+                                  limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get membership audit log entries.
 
-            # Delete the old terminal proposals
-            cursor = tx_conn.execute("""
-                DELETE FROM ban_proposals
-                WHERE status IN ('approved', 'rejected', 'expired')
-                AND proposed_at < ?
-            """, (cutoff,))
-            return cursor.rowcount
+        Args:
+            peer_id: Filter by peer (None for all)
+            limit: Max entries to return
+
+        Returns:
+            List of audit log entries, newest first
+        """
+        conn = self._get_connection()
+        if peer_id:
+            rows = conn.execute(
+                "SELECT * FROM membership_audit_log WHERE peer_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (peer_id, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM membership_audit_log "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     # =========================================================================
     # PEER PRESENCE
