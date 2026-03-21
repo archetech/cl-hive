@@ -1943,3 +1943,202 @@ def get_fleet_demand_forecast(ctx, hours_ahead: int = 6):
         )
     except Exception as e:
         return {"error": f"Forecast failed: {e}"}
+
+
+# =============================================================================
+# EXPORT HINTS (Local trusted integration surface for cl-revenue-ops)
+# =============================================================================
+
+_DEFAULT_HINTS_TTL = 900  # 15 minutes
+
+
+def _derive_corridor_roles(ctx: HiveContext) -> Dict[str, str]:
+    """Derive per-peer corridor role from corridor assignments.
+
+    Returns dict mapping peer_id -> one of "owner", "secondary", "contested", "none".
+    A peer is "owner" if it is the primary member on any corridor,
+    "secondary" if it appears only as secondary, and "contested" if it
+    appears as both primary and secondary on different corridors.
+    """
+    roles: Dict[str, str] = {}
+    if not ctx.fee_coordination_mgr:
+        return roles
+
+    try:
+        corridor_mgr = getattr(ctx.fee_coordination_mgr, "corridor_mgr", None)
+        if not corridor_mgr:
+            return roles
+        assignments = corridor_mgr.get_assignments()
+    except Exception:
+        return roles
+
+    for a in assignments:
+        # Primary member
+        pm = a.primary_member
+        if pm:
+            prev = roles.get(pm)
+            if prev is None:
+                roles[pm] = "owner"
+            elif prev == "secondary":
+                roles[pm] = "contested"
+        # Secondary members
+        for sm in (a.secondary_members or []):
+            prev = roles.get(sm)
+            if prev is None:
+                roles[sm] = "secondary"
+            elif prev == "owner":
+                roles[sm] = "contested"
+
+    return roles
+
+
+def _derive_competition_bias(ctx: HiveContext) -> Dict[str, int]:
+    """Derive per-peer competition bias from corridor competition levels.
+
+    Returns dict mapping peer_id -> one of -1, 0, 1.
+    -1 = high competition (back off), 0 = neutral, 1 = low competition (lean in).
+    """
+    biases: Dict[str, int] = {}
+    if not ctx.fee_coordination_mgr:
+        return biases
+
+    try:
+        corridor_mgr = getattr(ctx.fee_coordination_mgr, "corridor_mgr", None)
+        if not corridor_mgr:
+            return biases
+        assignments = corridor_mgr.get_assignments()
+    except Exception:
+        return biases
+
+    # Collect competition signals per peer (from corridors they participate in)
+    peer_signals: Dict[str, list] = {}
+    for a in assignments:
+        level = getattr(a.corridor, "competition_level", "none")
+        participants = set()
+        if a.primary_member:
+            participants.add(a.primary_member)
+        for sm in (a.secondary_members or []):
+            participants.add(sm)
+        for pid in participants:
+            peer_signals.setdefault(pid, []).append(level)
+
+    for pid, signals in peer_signals.items():
+        high_count = sum(1 for s in signals if s in ("high", "medium"))
+        low_count = sum(1 for s in signals if s in ("none", "low"))
+        if high_count > low_count:
+            biases[pid] = -1
+        elif low_count > high_count:
+            biases[pid] = 1
+        else:
+            biases[pid] = 0
+
+    return biases
+
+
+def _derive_rebalance_preferences(ctx: HiveContext) -> Dict[str, str]:
+    """Derive per-peer rebalance preference from yield metrics flow direction.
+
+    Returns dict mapping peer_id -> one of "source", "sink", "neutral".
+    """
+    prefs: Dict[str, str] = {}
+    if not ctx.yield_metrics_mgr:
+        return prefs
+
+    try:
+        metrics = ctx.yield_metrics_mgr.get_channel_yield_metrics()
+    except Exception:
+        return prefs
+
+    for m in metrics:
+        peer_id = getattr(m, "peer_id", None)
+        if not peer_id:
+            continue
+        direction = getattr(m, "flow_direction", "balanced")
+        if direction == "source":
+            prefs[peer_id] = "source"
+        elif direction == "sink":
+            prefs[peer_id] = "sink"
+        # If multiple channels to same peer, last wins (fine for hints)
+
+    return prefs
+
+
+def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dict[str, Any]:
+    """
+    Export compact short-lived per-peer hints for trusted local consumers.
+
+    This is a read-only distillation of fleet coordination state.
+    cl-revenue-ops may poll this locally and use the hints as bounded
+    soft biases in its own local decision logic.
+
+    Returns:
+        Dict with generated_at, ttl_seconds, and per-peer hints map.
+    """
+    if not ctx.database:
+        return {"error": "Hive not initialized"}
+
+    now = int(time.time())
+    hints: Dict[str, Dict[str, Any]] = {}
+
+    # Collect all known peer_ids from membership + our channel peers
+    members = ctx.database.get_all_members()
+    member_set = {m["peer_id"] for m in members}
+
+    # Pre-compute bulk lookups
+    corridor_roles = _derive_corridor_roles(ctx)
+    competition_biases = _derive_competition_bias(ctx)
+    rebalance_prefs = _derive_rebalance_preferences(ctx)
+
+    # Build the set of peers to export hints for: members + any peer
+    # we have corridor/quality/traffic data about
+    all_peers = set(member_set)
+    all_peers.update(corridor_roles.keys())
+    all_peers.update(rebalance_prefs.keys())
+
+    # Exclude ourselves
+    all_peers.discard(ctx.our_pubkey)
+
+    for peer_id in all_peers:
+        hint: Dict[str, Any] = {}
+        is_member = peer_id in member_set
+        hint["member"] = is_member
+
+        # Corridor role
+        role = corridor_roles.get(peer_id, "none")
+        hint["corridor_role"] = role
+
+        # Competition bias
+        hint["competition_bias"] = competition_biases.get(peer_id, 0)
+
+        # Peer quality score
+        if ctx.quality_scorer:
+            try:
+                qr = ctx.quality_scorer.calculate_score(peer_id, days=90)
+                if qr.confidence > 0.0:
+                    hint["peer_quality_score"] = round(qr.overall_score, 2)
+            except Exception:
+                pass
+
+        # Traffic confidence
+        if ctx.traffic_intel_mgr:
+            try:
+                profile = ctx.traffic_intel_mgr.get_aggregated_profile(peer_id)
+                if profile:
+                    hint["traffic_confidence"] = round(
+                        profile.get("confidence", 0.0), 2
+                    )
+            except Exception:
+                pass
+
+        # Rebalance preference
+        pref = rebalance_prefs.get(peer_id, "neutral")
+        hint["rebalance_preference"] = pref
+
+        hints[peer_id] = hint
+
+    return {
+        "generated_at": now,
+        "ttl_seconds": ttl_seconds,
+        "peer_count": len(hints),
+        "hints": hints,
+    }

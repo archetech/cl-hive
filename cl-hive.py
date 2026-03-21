@@ -150,6 +150,8 @@ from modules.rpc_commands import (
     report_traffic_profile as rpc_report_traffic_profile,
     get_traffic_intelligence as rpc_get_traffic_intelligence,
     get_fleet_demand_forecast as rpc_get_fleet_demand_forecast,
+    # Export hints (local trusted integration for cl-revenue-ops)
+    export_hints as rpc_export_hints,
 )
 
 # Initialize the plugin
@@ -3442,6 +3444,32 @@ def hive_fleet_demand_forecast(plugin: Plugin, hours_ahead: int = 6):
     """Get fleet-wide demand forecast."""
     ctx = _get_hive_context()
     return rpc_get_fleet_demand_forecast(ctx, hours_ahead=hours_ahead)
+
+
+@plugin.method("hive-export-hints")
+def hive_export_hints(plugin: Plugin, ttl_seconds: int = 900):
+    """
+    Export compact short-lived per-peer hints for trusted local consumers.
+
+    cl-revenue-ops polls this locally and uses the hints as bounded soft
+    biases in its own fee/rebalance logic. Read-only, no side effects.
+
+    Args:
+        ttl_seconds: Hint validity window (default: 900 = 15 minutes)
+
+    Returns:
+        Dict with generated_at, ttl_seconds, peer_count, and per-peer hints.
+
+    Permission: Any member
+    """
+    # Permission check: member
+    perm_error = _check_permission()
+    if perm_error:
+        return perm_error
+
+    return rpc_export_hints(_get_hive_context(), ttl_seconds=ttl_seconds)
+
+
 @plugin.method("hive-bump-version")
 def hive_bump_version(plugin: Plugin, version: int):
     """
