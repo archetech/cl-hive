@@ -19,7 +19,6 @@ class TestRoutingMapThreadSafety:
 
     def _make_routing_map(self):
         db = MagicMock()
-        db.get_all_route_probes.return_value = []
         plugin = MagicMock()
         return HiveRoutingMap(database=db, plugin=plugin, our_pubkey="02" + "aa" * 32)
 

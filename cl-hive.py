@@ -822,8 +822,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         plugin=plugin,
         our_pubkey=our_pubkey
     )
-    # Load existing probes from database
-    routing_map.aggregate_from_database()
     plugin.log("cl-hive: Routing map initialized")
 
     # Initialize Peer Reputation Manager (Phase 5 - Advanced Cooperation)
@@ -1232,10 +1230,6 @@ def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Pl
             protocol_handlers.handle_liquidity_need(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.LIQUIDITY_SNAPSHOT:
             protocol_handlers.handle_liquidity_snapshot(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.ROUTE_PROBE:
-            protocol_handlers.handle_route_probe(peer_id, msg_payload, plugin)
-        elif msg_type == HiveMessageType.ROUTE_PROBE_BATCH:
-            protocol_handlers.handle_route_probe_batch(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.PEER_REPUTATION_SNAPSHOT:
             protocol_handlers.handle_peer_reputation_snapshot(peer_id, msg_payload, plugin)
         # Fleet-Wide Intelligence
