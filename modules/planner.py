@@ -11,8 +11,7 @@ Security Constraints (Red Team - PHASE6_THREAT_MODEL):
 - Max 5 new unmanages per cycle (abort if exceeded)
 - All decisions logged to hive_planner_log table
 
-This ticket (6-01) implements ONLY saturation detection and guard mechanism.
-Expansion logic will be added in later tickets.
+Implements saturation detection, guard mechanism, and expansion logic.
 
 Author: Lightning Goats Team
 """
@@ -1166,11 +1165,11 @@ class Planner:
     # =========================================================================
 
     def _get_hive_members(self) -> List[str]:
-        """Get list of Hive member pubkeys (admin + member tiers)."""
+        """Get list of Hive member pubkeys."""
         if not self.db:
             return []
         members = self.db.get_all_members()
-        return [m['peer_id'] for m in members if m.get('tier') in ('admin', 'member')]
+        return [m['peer_id'] for m in members]
 
     def _has_existing_or_pending_channel(self, target: str) -> Tuple[bool, Optional[str], Optional[int], Optional[str]]:
         """
@@ -1495,7 +1494,7 @@ class Planner:
         return decisions
 
     # =========================================================================
-    # EXPANSION LOGIC (Ticket 6-02)
+    # EXPANSION LOGIC
     # =========================================================================
 
     def get_underserved_targets(self, cfg, include_low_quality: bool = False) -> List[UnderservedResult]:

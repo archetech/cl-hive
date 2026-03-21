@@ -157,7 +157,7 @@ class GossipManager:
         """
         now = int(time.time())
 
-        # Rule 3: Force on status change (bans, promotions)
+        # Rule 3: Force on status change (bans, membership changes)
         if force_status:
             self._log("Broadcast triggered: Status change (forced)")
             return True

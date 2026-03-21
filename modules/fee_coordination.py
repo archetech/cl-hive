@@ -522,7 +522,7 @@ class FeeCoordinationManager:
         if not self.database or not peer_id:
             return False
         member = self.database.get_member(peer_id)
-        return bool(member and member.get("tier") in ("admin", "member"))
+        return bool(member)
 
     def _resolve_peer_id_from_channel(self, channel_id: Optional[str]) -> str:
         """Resolve peer_id from a short_channel_id when available."""
@@ -796,7 +796,7 @@ class FeeCoordinationManager:
         # Safety: fleet member channels MUST always have 0 fees
         if self.database and peer_id:
             member = self.database.get_member(peer_id)
-            if member and member.get("tier") in ("admin", "member"):
+            if member:
                 return FeeRecommendation(
                     channel_id=channel_id,
                     peer_id=peer_id,
