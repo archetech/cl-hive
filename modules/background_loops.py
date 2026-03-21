@@ -210,7 +210,6 @@ def membership_maintenance_loop():
                 database.prune_planner_logs(older_than_days=30)
                 database.cleanup_proto_events(max_age_seconds=30 * 86400)
                 database.prune_old_flow_samples(days_to_keep=30)
-                database.prune_old_ban_data(older_than_days=180)
 
                 # Issue #38: Auto-connect to hive members we're not connected to
                 reconnected = _auto_connect_to_all_members()
@@ -224,14 +223,15 @@ def membership_maintenance_loop():
                 # polluting hive policies.
                 protocol_handlers._cleanup_ghost_members()
 
-                # Expire all still-pending ban proposals past expires_at.
-                try:
-                    expired_count = database.cleanup_expired_ban_proposals(now=int(time.time()))
-                    if expired_count > 0 and plugin:
-                        plugin.log(f"cl-hive: Expired {expired_count} ban proposal(s)", level='info')
-                except Exception as expire_err:
-                    if plugin:
-                        plugin.log(f"cl-hive: Ban proposal expiry sweep error: {expire_err}", level='warn')
+                # Expire stale pending join requests (older than 24 hours)
+                if handshake_mgr:
+                    try:
+                        expired = handshake_mgr.expire_pending_requests()
+                        if expired > 0 and plugin:
+                            plugin.log(f"cl-hive: Expired {expired} pending join request(s)", level='info')
+                    except Exception as expire_err:
+                        if plugin:
+                            plugin.log(f"cl-hive: Pending request expiry error: {expire_err}", level='warn')
 
         except Exception as e:
             if plugin:
@@ -476,26 +476,6 @@ def fee_intelligence_loop():
                         )
             except Exception as e:
                 plugin.log(f"cl-hive: State cleanup error: {e}", level='warn')
-
-            # Step 8a: Verify hive channel zero-fee policy (security check)
-            try:
-                if bridge and membership_mgr:
-                    # Get all current hive members
-                    members = membership_mgr.get_all_members()
-                    violations = []
-                    for member in members:
-                        peer_id = member.get('peer_id')
-                        if peer_id and peer_id != our_pubkey and not database.is_banned(peer_id):
-                            is_valid, reason = bridge.verify_hive_channel_zero_fees(peer_id)
-                            if not is_valid and reason not in ('no_channel', 'our_direction_not_found'):
-                                violations.append((peer_id[:16], reason))
-                    if violations:
-                        plugin.log(
-                            f"cl-hive: SECURITY WARNING - Hive channels with non-zero fees: {violations}",
-                            level='warn'
-                        )
-            except Exception as e:
-                plugin.log(f"cl-hive: Zero-fee verification error: {e}", level='debug')
 
             # Step 9: Cleanup old peer reputation (Phase 5 - Advanced Cooperation)
             try:

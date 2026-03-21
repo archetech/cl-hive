@@ -157,28 +157,6 @@ def test_get_active_members():
     assert "c" not in active
 
 
-def test_sync_bridge_policies():
-    db = MagicMock()
-    contribution_mgr = MagicMock()
-    state_manager = MagicMock()
-    config = DummyConfig()
-    bridge = MagicMock()
-    bridge.status = MagicMock()
-    bridge.status.value = "enabled"
-    bridge.set_hive_policy.return_value = True
-
-    mgr = MembershipManager(db, state_manager, contribution_mgr, bridge, config)
-
-    db.get_all_members.return_value = [
-        {"peer_id": "a", "tier": "member"},
-        {"peer_id": "b", "tier": "member"},
-    ]
-
-    synced = mgr.sync_bridge_policies()
-    assert synced == 2
-    assert bridge.set_hive_policy.call_count == 2
-
-
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

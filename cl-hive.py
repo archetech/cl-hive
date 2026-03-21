@@ -716,15 +716,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         daemon=True
     ))
 
-    # Sync bridge policies with database state on startup
-    # This ensures members have correct 0 ppm policy even if previous set_tier failed
-    try:
-        synced = membership_mgr.sync_bridge_policies()
-        if synced > 0:
-            plugin.log(f"cl-hive: Synced bridge policies for {synced} members")
-    except Exception as e:
-        plugin.log(f"cl-hive: Failed to sync bridge policies: {e}", level="warn")
-
     # Initialize local node presence for uptime tracking
     if our_pubkey:
         try:
@@ -1085,10 +1076,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     ghost_removed = protocol_handlers._cleanup_ghost_members()
     if ghost_removed > 0:
         plugin.log(f"cl-hive: Removed {ghost_removed} ghost member(s) on startup")
-
-    # Sync fee policies for existing members (Phase 4 integration)
-    if bridge and bridge.status == BridgeStatus.ENABLED:
-        protocol_handlers._sync_member_policies(plugin)
 
     # Broadcast membership to peers for consistency (Phase 5 enhancement)
     protocol_handlers._sync_membership_on_startup(plugin)
@@ -3683,13 +3670,6 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
     }
     protocol_handlers._reliable_broadcast(HiveMessageType.MEMBER_LEFT, leave_payload)
 
-    # Revert our fee policy to dynamic
-    if bridge and bridge.status == BridgeStatus.ENABLED:
-        try:
-            bridge.set_hive_policy(our_pubkey, is_member=False)
-        except Exception:
-            pass  # Best effort
-
     # Remove ourselves from the member list
     database.remove_member(our_pubkey)
     database.log_membership_event("left", our_pubkey, reason=reason)
@@ -3699,7 +3679,7 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
         "status": "left",
         "peer_id": our_pubkey,
         "reason": reason,
-        "message": "You have left the hive. Fee policies reverted to dynamic."
+        "message": "You have left the hive."
     }
 
 

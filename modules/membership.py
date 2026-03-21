@@ -44,17 +44,7 @@ class MembershipManager:
     def set_tier(self, peer_id: str) -> bool:
         """Update a peer's membership record (always member tier)."""
         updated = self.db.update_member(peer_id, tier=MEMBER_TIER)
-        if not updated:
-            return False
-
-        # All members get hive policy (0 PPM fees)
-        if self.bridge and getattr(self.bridge, "status", None) and self.bridge.status.value == "enabled":
-            try:
-                self.bridge.set_hive_policy(peer_id, is_member=True)
-            except Exception:
-                self._log(f"Bridge policy update failed for {peer_id[:16]}...", level="warn")
-
-        return True
+        return bool(updated)
 
     def add_member(self, peer_id: str, tier: str = MEMBER_TIER) -> bool:
         """Add a new member to the hive."""
@@ -71,49 +61,6 @@ class MembershipManager:
     def is_member(self, peer_id: str) -> bool:
         """Check if a peer is a hive member."""
         return self.db.get_member(peer_id) is not None
-
-    def sync_bridge_policies(self) -> int:
-        """
-        Sync bridge policies with database membership state.
-
-        Call this on startup to ensure all members have correct 0 ppm
-        fee policy applied, even if a previous set_tier() bridge call failed.
-
-        Returns:
-            Number of policies synced
-        """
-        if not self.bridge:
-            return 0
-
-        # Check if bridge is enabled
-        if not (hasattr(self.bridge, "status") and
-                self.bridge.status and
-                self.bridge.status.value == "enabled"):
-            self._log("Bridge not enabled, skipping policy sync")
-            return 0
-
-        synced = 0
-        members = self.db.get_all_members()
-
-        for member in members:
-            peer_id = member.get("peer_id")
-            if not peer_id:
-                continue
-
-            try:
-                # All members get hive policy
-                success = self.bridge.set_hive_policy(
-                    peer_id, is_member=True, bypass_rate_limit=True
-                )
-                if success:
-                    synced += 1
-            except Exception as exc:
-                self._log(f"Failed to sync policy for {peer_id[:16]}...: {exc}", level="warn")
-
-        if synced > 0:
-            self._log(f"Synced bridge policies for {synced} members")
-
-        return synced
 
     # =========================================================================
     # UPTIME TRACKING

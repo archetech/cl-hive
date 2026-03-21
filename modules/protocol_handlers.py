@@ -299,10 +299,6 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     handshake_mgr.clear_challenge(peer_id)
 
-    # Set hive fee policy for new member (0 fee to all hive members)
-    if bridge and bridge.status == BridgeStatus.ENABLED:
-        bridge.set_hive_policy(peer_id, is_member=True)
-
     # Get Hive info for WELCOME
     members = database.get_all_members()
     hive_id = "hive"
@@ -388,10 +384,6 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         f"cl-hive: WELCOME received! Joined '{hive_id}' as {tier} "
         f"(Hive has {member_count} members)"
     )
-
-    # Phase 4: Apply Hive fee policy to this peer
-    if bridge and bridge.status == BridgeStatus.ENABLED:
-        bridge.set_hive_policy(peer_id, is_member=True)
 
     # Store Hive membership info for ourselves
     if database and our_pubkey:
@@ -1793,12 +1785,6 @@ def _execute_member_removal(peer_id: str, reason: str = "removed") -> None:
         except Exception:
             pass
 
-    # 3. Revert fee policy to dynamic
-    if bridge and bridge.status == BridgeStatus.ENABLED:
-        try:
-            bridge.set_hive_policy(peer_id, is_member=False)
-        except Exception:
-            pass
 
     # 4. Force the next gossip cycle to broadcast immediately so remaining
     #    members see the updated member list without the removed peer.
@@ -1850,86 +1836,6 @@ def _cleanup_ghost_members() -> int:
             plugin.log(f"cl-hive: Ghost member cleanup error: {e}", level='debug')
 
     return removed
-
-def _sync_member_policies(plugin: Plugin) -> None:
-    """
-    Sync fee policies for all existing members on startup.
-
-    Called during initialization to ensure all members have correct
-    fee policies set in cl-revenue-ops. This handles the case where
-    the plugin was restarted or policies were reset.
-
-    Policy assignment:
-    - All members: HIVE strategy (0 PPM fees)
-    """
-    if not database or not bridge or bridge.status != BridgeStatus.ENABLED:
-        return
-
-    members = database.get_all_members()
-    synced = 0
-
-    for member in members:
-        peer_id = member["peer_id"]
-        tier = member.get("tier")
-
-        # Skip ourselves
-        if peer_id == our_pubkey:
-            continue
-
-        # SECURITY: Banned peers always get dynamic strategy
-        if database.is_banned(peer_id):
-            try:
-                bridge.set_hive_policy(peer_id, is_member=False, bypass_rate_limit=True)
-            except Exception:
-                pass
-            continue
-
-        # All members get HIVE strategy (0-fee)
-        is_hive_member = tier == MEMBER_TIER
-
-        try:
-            # Use bypass_rate_limit=True for startup sync
-            success = bridge.set_hive_policy(peer_id, is_member=is_hive_member, bypass_rate_limit=True)
-            if success:
-                synced += 1
-                plugin.log(
-                    f"cl-hive: Synced policy for {peer_id[:16]}... "
-                    f"({'hive' if is_hive_member else 'dynamic'})",
-                    level='debug'
-                )
-        except Exception as e:
-            plugin.log(
-                f"cl-hive: Failed to sync policy for {peer_id[:16]}...: {e}",
-                level='debug'
-            )
-
-    if synced > 0:
-        plugin.log(f"cl-hive: Synced fee policies for {synced} member(s)")
-
-    # Cleanup stale hive policies: peers with hive strategy in cl-revenue-ops
-    # that are no longer hive members (e.g. removal bridge call failed).
-    member_peer_ids = {m["peer_id"] for m in members}
-    try:
-        result = bridge.safe_call("revenue-policy", {"action": "list"})
-        policies = result.get("policies", [])
-        reverted = 0
-        for pol in policies:
-            pid = pol.get("peer_id", "")
-            strategy = pol.get("strategy", "")
-            if strategy == "hive" and pid and pid not in member_peer_ids and pid != our_pubkey:
-                try:
-                    bridge.set_hive_policy(pid, is_member=False, bypass_rate_limit=True)
-                    reverted += 1
-                    plugin.log(
-                        f"cl-hive: Reverted stale hive policy for non-member {pid[:16]}...",
-                        level='info'
-                    )
-                except Exception:
-                    pass
-        if reverted > 0:
-            plugin.log(f"cl-hive: Cleaned up {reverted} stale hive policy(s)")
-    except Exception as e:
-        plugin.log(f"cl-hive: Could not check for stale hive policies: {e}", level='debug')
 
 def _sync_membership_on_startup(plugin: Plugin) -> None:
     """
@@ -2028,12 +1934,7 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     database.remove_member(leaving_peer_id)
     plugin.log(f"cl-hive: Member {leaving_peer_id[:16]}... ({tier}) left the hive: {reason}")
 
-    # Revert their fee policy to dynamic if bridge is available
-    if bridge and bridge.status == BridgeStatus.ENABLED:
-        try:
-            bridge.set_hive_policy(leaving_peer_id, is_member=False)
-        except Exception as e:
-            plugin.log(f"cl-hive: Failed to revert policy for {leaving_peer_id[:16]}...: {e}", level='debug')
+
 
     # Check if hive is now headless (no members)
     all_members = database.get_all_members()

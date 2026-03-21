@@ -56,7 +56,7 @@ Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl
 | `state_manager.py` | HiveMap distributed state + anti-entropy sync |
 | `gossip.py` | Threshold-based gossip (10% capacity change) with heartbeat |
 | `intent_manager.py` | Intent Lock protocol -- Announce-Wait-Commit with tie-breaker |
-| `bridge.py` | Circuit Breaker pattern for cl-revenue-ops integration |
+| `bridge.py` | Read-only cl-revenue-ops queries (fee config, profitability, Boltz activity) |
 | `membership.py` | Single-role membership (all members equal) |
 | `governance.py` | Recommendation logging (no modes, no budget gating) |
 | `contribution.py` | Forwarding stats and anti-leech detection |
