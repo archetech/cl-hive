@@ -575,6 +575,90 @@ class HiveDatabase:
             CREATE INDEX IF NOT EXISTS idx_proto_outbox_peer
             ON proto_outbox(peer_id, status)
         """)
+
+        # =====================================================================
+        # TRAFFIC PROFILES TABLE (Traffic Intelligence)
+        # =====================================================================
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS traffic_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_id TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                profile_type TEXT DEFAULT 'unknown',
+                peak_hours_utc TEXT DEFAULT '[]',
+                quiet_hours_utc TEXT DEFAULT '[]',
+                avg_forward_size_sats REAL DEFAULT 0,
+                daily_volume_sats REAL DEFAULT 0,
+                drain_direction TEXT DEFAULT 'balanced',
+                confidence REAL DEFAULT 0.0,
+                observation_window_hours INTEGER DEFAULT 24,
+                received_at REAL NOT NULL,
+                UNIQUE(reporter_id, peer_id)
+            )
+        """)
+
+        # =====================================================================
+        # LIQUIDITY NEEDS TABLE (Liquidity Coordination)
+        # =====================================================================
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS liquidity_needs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_id TEXT NOT NULL,
+                need_type TEXT NOT NULL,
+                target_peer_id TEXT NOT NULL,
+                amount_sats INTEGER DEFAULT 0,
+                urgency TEXT DEFAULT 'low',
+                max_fee_ppm INTEGER DEFAULT 0,
+                reason TEXT DEFAULT '',
+                current_balance_pct REAL DEFAULT 0.5,
+                timestamp INTEGER NOT NULL,
+                UNIQUE(reporter_id, target_peer_id, need_type)
+            )
+        """)
+
+        # =====================================================================
+        # LEECH FLAGS TABLE (Contribution / Anti-Leech)
+        # =====================================================================
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS leech_flags (
+                peer_id TEXT PRIMARY KEY,
+                low_since_ts INTEGER NOT NULL,
+                ban_triggered INTEGER DEFAULT 0
+            )
+        """)
+
+        # =====================================================================
+        # PEER EVENTS TABLE (Quality Scorer / Peer History)
+        # =====================================================================
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS peer_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                details TEXT DEFAULT '{}',
+                reporter_id TEXT DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_peer_events_peer
+            ON peer_events(peer_id, timestamp)
+        """)
+
+        # =====================================================================
+        # MEMBER LIQUIDITY STATE TABLE (Liquidity Coordination)
+        # =====================================================================
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS member_liquidity_state (
+                member_id TEXT PRIMARY KEY,
+                depleted_count INTEGER DEFAULT 0,
+                saturated_count INTEGER DEFAULT 0,
+                rebalancing_active INTEGER DEFAULT 0,
+                rebalancing_peers TEXT DEFAULT '[]',
+                timestamp INTEGER NOT NULL
+            )
+        """)
+
     def add_member(self, peer_id: str, tier: str = 'member',
                    joined_at: Optional[int] = None) -> bool:
         """
@@ -2777,3 +2861,813 @@ class HiveDatabase:
             (peer_id,)
         ).fetchone()
         return row['cnt'] if row else 0
+
+    # =========================================================================
+    # TRAFFIC PROFILE OPERATIONS (Traffic Intelligence)
+    # =========================================================================
+
+    def save_traffic_profile(
+        self,
+        peer_id: str,
+        reporter_id: str,
+        profile_type: str = 'unknown',
+        peak_hours_utc: str = '[]',
+        quiet_hours_utc: str = '[]',
+        avg_forward_size_sats: float = 0,
+        daily_volume_sats: float = 0,
+        drain_direction: str = 'balanced',
+        confidence: float = 0.0,
+        observation_window_hours: int = 24,
+        received_at: float = 0,
+    ) -> bool:
+        """
+        Save or update a traffic profile for a peer.
+
+        Uses INSERT OR REPLACE keyed on (reporter_id, peer_id).
+
+        Args:
+            peer_id: External peer being profiled
+            reporter_id: Hive member who reported this
+            profile_type: retail | wholesale | burst | steady | mixed
+            peak_hours_utc: JSON array of peak hours
+            quiet_hours_utc: JSON array of quiet hours
+            avg_forward_size_sats: Average forward size
+            daily_volume_sats: Average daily volume
+            drain_direction: inbound_heavy | outbound_heavy | balanced
+            confidence: Profile confidence (0-1)
+            observation_window_hours: How long peer was observed
+            received_at: Unix timestamp when received
+
+        Returns:
+            True if stored successfully, False on error
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO traffic_profiles
+                    (reporter_id, peer_id, profile_type, peak_hours_utc,
+                     quiet_hours_utc, avg_forward_size_sats, daily_volume_sats,
+                     drain_direction, confidence, observation_window_hours, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (reporter_id, peer_id, profile_type, peak_hours_utc,
+                  quiet_hours_utc, avg_forward_size_sats, daily_volume_sats,
+                  drain_direction, confidence, observation_window_hours,
+                  received_at or time.time()))
+            return True
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: save_traffic_profile error: {e}",
+                    level='error'
+                )
+            return False
+
+    def get_traffic_profiles_for_peer(self, peer_id: str) -> List[Dict[str, Any]]:
+        """
+        Get all traffic profiles for a specific peer.
+
+        Args:
+            peer_id: Peer to look up
+
+        Returns:
+            List of profile dicts
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM traffic_profiles WHERE peer_id = ? ORDER BY received_at DESC",
+                (peer_id,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_traffic_profiles_for_peer error: {e}",
+                    level='error'
+                )
+            return []
+
+    def get_all_traffic_profiles(self) -> List[Dict[str, Any]]:
+        """
+        Get all stored traffic profiles.
+
+        Returns:
+            List of profile dicts
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM traffic_profiles ORDER BY received_at DESC LIMIT 5000"
+            ).fetchall()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_all_traffic_profiles error: {e}",
+                    level='error'
+                )
+            return []
+
+    def cleanup_expired_traffic_profiles(self, max_age_hours: int = 168) -> int:
+        """
+        Remove traffic profiles older than max_age_hours.
+
+        Args:
+            max_age_hours: Max age in hours (default: 168 = 7 days)
+
+        Returns:
+            Number of profiles deleted
+        """
+        conn = self._get_connection()
+        try:
+            cutoff = time.time() - (max_age_hours * 3600)
+            result = conn.execute(
+                "DELETE FROM traffic_profiles WHERE received_at < ?",
+                (cutoff,)
+            )
+            return result.rowcount
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: cleanup_expired_traffic_profiles error: {e}",
+                    level='error'
+                )
+            return 0
+
+    # =========================================================================
+    # LIQUIDITY NEEDS OPERATIONS (Liquidity Coordination)
+    # =========================================================================
+
+    def store_liquidity_need(
+        self,
+        reporter_id: str,
+        need_type: str,
+        target_peer_id: str,
+        amount_sats: int = 0,
+        urgency: str = 'low',
+        max_fee_ppm: int = 0,
+        reason: str = '',
+        current_balance_pct: float = 0.5,
+        timestamp: int = 0,
+    ) -> bool:
+        """
+        Store a liquidity need report.
+
+        Uses INSERT OR REPLACE keyed on (reporter_id, target_peer_id, need_type).
+
+        Args:
+            reporter_id: Hive member reporting the need
+            need_type: Type of need (e.g. 'inbound', 'outbound')
+            target_peer_id: Peer the need relates to
+            amount_sats: Amount needed
+            urgency: low | medium | high | critical
+            max_fee_ppm: Maximum fee willing to pay
+            reason: Human-readable reason
+            current_balance_pct: Current balance percentage
+            timestamp: Unix timestamp
+
+        Returns:
+            True if stored, False on error
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO liquidity_needs
+                    (reporter_id, need_type, target_peer_id, amount_sats,
+                     urgency, max_fee_ppm, reason, current_balance_pct, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (reporter_id, need_type, target_peer_id, amount_sats,
+                  urgency, max_fee_ppm, reason, current_balance_pct,
+                  timestamp or int(time.time())))
+            return True
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: store_liquidity_need error: {e}",
+                    level='error'
+                )
+            return False
+
+    def get_all_liquidity_needs(self, max_age_hours: int = 24) -> List[Dict[str, Any]]:
+        """
+        Get all liquidity needs within the age window.
+
+        Args:
+            max_age_hours: Only return needs newer than this (default: 24h)
+
+        Returns:
+            List of need dicts
+        """
+        conn = self._get_connection()
+        try:
+            cutoff = int(time.time()) - (max_age_hours * 3600)
+            rows = conn.execute(
+                "SELECT * FROM liquidity_needs WHERE timestamp > ? ORDER BY timestamp DESC",
+                (cutoff,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_all_liquidity_needs error: {e}",
+                    level='error'
+                )
+            return []
+
+    def get_liquidity_needs_for_reporter(self, reporter_id: str) -> List[Dict[str, Any]]:
+        """
+        Get liquidity needs from a specific reporter.
+
+        Args:
+            reporter_id: Reporter peer ID to filter by
+
+        Returns:
+            List of need dicts
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM liquidity_needs WHERE reporter_id = ? ORDER BY timestamp DESC",
+                (reporter_id,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_liquidity_needs_for_reporter error: {e}",
+                    level='error'
+                )
+            return []
+
+    def cleanup_old_liquidity_needs(self, max_age_hours: int = 24) -> int:
+        """
+        Remove liquidity needs older than max_age_hours.
+
+        Args:
+            max_age_hours: Max age in hours (default: 24)
+
+        Returns:
+            Number of needs deleted
+        """
+        conn = self._get_connection()
+        try:
+            cutoff = int(time.time()) - (max_age_hours * 3600)
+            result = conn.execute(
+                "DELETE FROM liquidity_needs WHERE timestamp < ?",
+                (cutoff,)
+            )
+            return result.rowcount
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: cleanup_old_liquidity_needs error: {e}",
+                    level='error'
+                )
+            return 0
+
+    def update_member_liquidity_state(
+        self,
+        member_id: str,
+        depleted_count: int = 0,
+        saturated_count: int = 0,
+        rebalancing_active: bool = False,
+        rebalancing_peers: list = None,
+        timestamp: int = 0,
+    ) -> bool:
+        """
+        Store or update a member's liquidity state.
+
+        Full overwrite of the member's liquidity state row.
+
+        Args:
+            member_id: Member peer ID
+            depleted_count: Number of depleted channels
+            saturated_count: Number of saturated channels
+            rebalancing_active: Whether member is currently rebalancing
+            rebalancing_peers: List of peers being rebalanced through
+            timestamp: Unix timestamp
+
+        Returns:
+            True if stored, False on error
+        """
+        conn = self._get_connection()
+        try:
+            peers_json = json.dumps(rebalancing_peers or [])
+            conn.execute("""
+                INSERT OR REPLACE INTO member_liquidity_state
+                    (member_id, depleted_count, saturated_count,
+                     rebalancing_active, rebalancing_peers, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (member_id, depleted_count, saturated_count,
+                  1 if rebalancing_active else 0, peers_json,
+                  timestamp or int(time.time())))
+            return True
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: update_member_liquidity_state error: {e}",
+                    level='error'
+                )
+            return False
+
+    def update_rebalancing_activity(
+        self,
+        member_id: str,
+        rebalancing_active: bool = False,
+        rebalancing_peers: list = None,
+    ) -> bool:
+        """
+        Targeted update of rebalancing fields only, preserving depleted/saturated counts.
+
+        If no row exists yet, creates one with zero counts.
+
+        Args:
+            member_id: Member peer ID
+            rebalancing_active: Whether member is currently rebalancing
+            rebalancing_peers: List of peers being rebalanced through
+
+        Returns:
+            True if updated, False on error
+        """
+        conn = self._get_connection()
+        try:
+            peers_json = json.dumps(rebalancing_peers or [])
+            now = int(time.time())
+
+            # Try update first (preserves depleted/saturated counts)
+            result = conn.execute("""
+                UPDATE member_liquidity_state
+                SET rebalancing_active = ?, rebalancing_peers = ?, timestamp = ?
+                WHERE member_id = ?
+            """, (1 if rebalancing_active else 0, peers_json, now, member_id))
+
+            if result.rowcount == 0:
+                # No existing row — create with zero counts
+                conn.execute("""
+                    INSERT INTO member_liquidity_state
+                        (member_id, depleted_count, saturated_count,
+                         rebalancing_active, rebalancing_peers, timestamp)
+                    VALUES (?, 0, 0, ?, ?, ?)
+                """, (member_id, 1 if rebalancing_active else 0, peers_json, now))
+
+            return True
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: update_rebalancing_activity error: {e}",
+                    level='error'
+                )
+            return False
+
+    # =========================================================================
+    # LEECH FLAG OPERATIONS (Contribution / Anti-Leech)
+    # =========================================================================
+
+    def get_leech_flag(self, peer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get leech flag for a peer.
+
+        Args:
+            peer_id: Peer to look up
+
+        Returns:
+            Dict with low_since_ts and ban_triggered, or None if no flag
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM leech_flags WHERE peer_id = ?",
+                (peer_id,)
+            ).fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_leech_flag error: {e}",
+                    level='error'
+                )
+            return None
+
+    def set_leech_flag(self, peer_id: str, low_since_ts: int,
+                       ban_triggered: bool) -> None:
+        """
+        Set or update leech flag for a peer.
+
+        Args:
+            peer_id: Peer to flag
+            low_since_ts: Unix timestamp when low contribution was first detected
+            ban_triggered: Whether a ban has been triggered
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO leech_flags (peer_id, low_since_ts, ban_triggered)
+                VALUES (?, ?, ?)
+            """, (peer_id, low_since_ts, 1 if ban_triggered else 0))
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: set_leech_flag error: {e}",
+                    level='error'
+                )
+
+    def clear_leech_flag(self, peer_id: str) -> None:
+        """
+        Remove leech flag for a peer.
+
+        Args:
+            peer_id: Peer to clear flag for
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "DELETE FROM leech_flags WHERE peer_id = ?",
+                (peer_id,)
+            )
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: clear_leech_flag error: {e}",
+                    level='error'
+                )
+
+    # =========================================================================
+    # PEER EVENT OPERATIONS (Quality Scorer / Peer History)
+    # =========================================================================
+
+    def get_peer_event_summary(self, peer_id: str, days: int = 90) -> Dict[str, Any]:
+        """
+        Get aggregated event summary for a peer.
+
+        Args:
+            peer_id: Peer to summarize
+            days: Look-back window in days (default: 90)
+
+        Returns:
+            Dict with event counts by type
+        """
+        conn = self._get_connection()
+        try:
+            cutoff = int(time.time()) - (days * 86400)
+            rows = conn.execute(
+                "SELECT event_type, COUNT(*) as cnt FROM peer_events "
+                "WHERE peer_id = ? AND timestamp > ? GROUP BY event_type",
+                (peer_id, cutoff)
+            ).fetchall()
+
+            summary = {
+                "total_events": 0,
+                "channel_opens": 0,
+                "channel_closes": 0,
+                "remote_closes": 0,
+                "local_closes": 0,
+                "forwards": 0,
+                "remote_open_count": 0,
+                "days_covered": days,
+            }
+
+            type_mapping = {
+                "channel_open": "channel_opens",
+                "channel_close": "channel_closes",
+                "remote_close": "remote_closes",
+                "local_close": "local_closes",
+                "forward": "forwards",
+                "remote_open": "remote_open_count",
+            }
+
+            for row in rows:
+                count = row['cnt']
+                summary["total_events"] += count
+                mapped_key = type_mapping.get(row['event_type'])
+                if mapped_key:
+                    summary[mapped_key] = count
+
+            return summary
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_peer_event_summary error: {e}",
+                    level='error'
+                )
+            return {
+                "total_events": 0, "channel_opens": 0, "channel_closes": 0,
+                "remote_closes": 0, "local_closes": 0, "forwards": 0,
+                "remote_open_count": 0, "days_covered": days,
+            }
+
+    def get_peer_events(
+        self,
+        peer_id: str = None,
+        event_type: str = None,
+        reporter_id: str = None,
+        days: int = 90,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get peer events with optional filters.
+
+        Args:
+            peer_id: Filter by peer (optional)
+            event_type: Filter by event type (optional)
+            reporter_id: Filter by reporter (optional)
+            days: Look-back window in days (default: 90)
+            limit: Maximum results (default: 100)
+
+        Returns:
+            List of event dicts
+        """
+        conn = self._get_connection()
+        try:
+            cutoff = int(time.time()) - (days * 86400)
+            conditions = ["timestamp > ?"]
+            params: list = [cutoff]
+
+            if peer_id:
+                conditions.append("peer_id = ?")
+                params.append(peer_id)
+            if event_type:
+                conditions.append("event_type = ?")
+                params.append(event_type)
+            if reporter_id:
+                conditions.append("reporter_id = ?")
+                params.append(reporter_id)
+
+            where = " AND ".join(conditions)
+            params.append(limit)
+
+            rows = conn.execute(
+                f"SELECT * FROM peer_events WHERE {where} "
+                f"ORDER BY timestamp DESC LIMIT ?",
+                params
+            ).fetchall()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_peer_events error: {e}",
+                    level='error'
+                )
+            return []
+
+    def get_peers_with_events(self, days: int = 90) -> List[str]:
+        """
+        Get list of unique peer IDs that have events within the time window.
+
+        Args:
+            days: Look-back window in days (default: 90)
+
+        Returns:
+            List of peer_id strings
+        """
+        conn = self._get_connection()
+        try:
+            cutoff = int(time.time()) - (days * 86400)
+            rows = conn.execute(
+                "SELECT DISTINCT peer_id FROM peer_events WHERE timestamp > ? "
+                "ORDER BY peer_id LIMIT 5000",
+                (cutoff,)
+            ).fetchall()
+            return [row['peer_id'] for row in rows]
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_peers_with_events error: {e}",
+                    level='error'
+                )
+            return []
+
+    # =========================================================================
+    # FEE REPORT OPERATIONS (Fee Coordination)
+    # =========================================================================
+
+    def get_fee_reports_for_period(self, period: str) -> List[Dict[str, Any]]:
+        """
+        Get fee intelligence reports matching an ISO week period string.
+
+        Queries the existing fee_intelligence table and maps columns to the
+        report format expected by callers.
+
+        Args:
+            period: ISO week string like "2026-W12"
+
+        Returns:
+            List of report dicts with keys: peer_id, fees_earned_sats,
+            forward_count, period, received_at
+        """
+        conn = self._get_connection()
+        try:
+            # Parse ISO week period (e.g. "2026-W12") into timestamp range
+            import datetime
+            year_str, week_str = period.split('-W')
+            year = int(year_str)
+            week = int(week_str)
+            # Monday of the given ISO week
+            week_start = datetime.datetime.strptime(
+                f"{year}-W{week:02d}-1", "%G-W%V-%u"
+            )
+            start_ts = int(week_start.timestamp())
+            end_ts = start_ts + (7 * 86400)
+
+            rows = conn.execute(
+                "SELECT target_peer_id, revenue_sats, forward_count, timestamp "
+                "FROM fee_intelligence "
+                "WHERE timestamp >= ? AND timestamp < ? "
+                "ORDER BY timestamp DESC",
+                (start_ts, end_ts)
+            ).fetchall()
+
+            return [
+                {
+                    "peer_id": row['target_peer_id'],
+                    "fees_earned_sats": row['revenue_sats'] or 0,
+                    "forward_count": row['forward_count'] or 0,
+                    "period": period,
+                    "received_at": row['timestamp'],
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_fee_reports_for_period error: {e}",
+                    level='error'
+                )
+            return []
+
+    def get_latest_fee_reports(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """
+        Get the most recent fee intelligence report for each peer.
+
+        Queries the existing fee_intelligence table and returns the latest
+        report per target_peer_id.
+
+        Args:
+            limit: Maximum number of peers to return (default: 500)
+
+        Returns:
+            List of report dicts with keys: peer_id, fees_earned_sats,
+            forward_count, period, received_at
+        """
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT target_peer_id, revenue_sats, forward_count, timestamp "
+                "FROM fee_intelligence fi "
+                "WHERE fi.timestamp = ("
+                "  SELECT MAX(fi2.timestamp) FROM fee_intelligence fi2 "
+                "  WHERE fi2.target_peer_id = fi.target_peer_id"
+                ") "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+
+            return [
+                {
+                    "peer_id": row['target_peer_id'],
+                    "fees_earned_sats": row['revenue_sats'] or 0,
+                    "forward_count": row['forward_count'] or 0,
+                    "period": "latest",
+                    "received_at": row['timestamp'],
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_latest_fee_reports error: {e}",
+                    level='error'
+                )
+            return []
+
+    # =========================================================================
+    # PLANNER BUDGET OPERATIONS
+    # =========================================================================
+
+    def get_available_budget(self, daily_budget_sats: int = 0) -> int:
+        """
+        Get available expansion budget remaining for today.
+
+        Calculates remaining budget by subtracting today's spend (from planner
+        logs) from the daily budget.
+
+        Args:
+            daily_budget_sats: Daily budget cap in sats
+
+        Returns:
+            Remaining budget in sats
+        """
+        conn = self._get_connection()
+        try:
+            today_start = int(time.time()) - (int(time.time()) % 86400)
+            row = conn.execute(
+                "SELECT COALESCE(SUM(CAST("
+                "  json_extract(details, '$.amount_sats') AS INTEGER"
+                ")), 0) as spent "
+                "FROM hive_planner_log "
+                "WHERE action_type = 'channel_open' AND result = 'success' "
+                "AND timestamp >= ?",
+                (today_start,)
+            ).fetchone()
+
+            spent = row['spent'] if row else 0
+            return max(0, daily_budget_sats - spent)
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_available_budget error: {e}",
+                    level='error'
+                )
+            return daily_budget_sats
+
+    def get_budget_summary(self, daily_budget_sats: int = 0,
+                           days: int = 1) -> Dict[str, Any]:
+        """
+        Get a budget summary for the given period.
+
+        Args:
+            daily_budget_sats: Daily budget cap in sats
+            days: Number of days to summarize (default: 1)
+
+        Returns:
+            Dict with budget info
+        """
+        conn = self._get_connection()
+        try:
+            cutoff = int(time.time()) - (days * 86400)
+            row = conn.execute(
+                "SELECT COALESCE(SUM(CAST("
+                "  json_extract(details, '$.amount_sats') AS INTEGER"
+                ")), 0) as spent, "
+                "COUNT(*) as open_count "
+                "FROM hive_planner_log "
+                "WHERE action_type = 'channel_open' AND result = 'success' "
+                "AND timestamp >= ?",
+                (cutoff,)
+            ).fetchone()
+
+            spent = row['spent'] if row else 0
+            opens = row['open_count'] if row else 0
+
+            return {
+                "daily_budget_sats": daily_budget_sats,
+                "spent_sats": spent,
+                "remaining_sats": max(0, daily_budget_sats - spent),
+                "channel_opens": opens,
+                "days": days,
+            }
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_budget_summary error: {e}",
+                    level='error'
+                )
+            return {
+                "daily_budget_sats": daily_budget_sats,
+                "spent_sats": 0,
+                "remaining_sats": daily_budget_sats,
+                "channel_opens": 0,
+                "days": days,
+            }
+
+    def get_channel_history(self, channel_id: str,
+                            hours: int = 48) -> List[Dict[str, Any]]:
+        """
+        Get channel event history from peer_events for flow velocity calculation.
+
+        Args:
+            channel_id: Channel ID (short_channel_id or peer_id)
+            hours: Look-back window in hours (default: 48)
+
+        Returns:
+            List of event dicts with timestamp and details
+        """
+        conn = self._get_connection()
+        try:
+            cutoff = int(time.time()) - (hours * 3600)
+            rows = conn.execute(
+                "SELECT * FROM peer_events "
+                "WHERE peer_id = ? AND timestamp > ? "
+                "ORDER BY timestamp ASC LIMIT 1000",
+                (channel_id, cutoff)
+            ).fetchall()
+
+            results = []
+            for row in rows:
+                entry = dict(row)
+                # Parse JSON details if present
+                details_str = entry.get('details', '{}')
+                try:
+                    details = json.loads(details_str) if details_str else {}
+                except (json.JSONDecodeError, TypeError):
+                    details = {}
+                entry.update(details)
+                results.append(entry)
+
+            return results
+        except Exception as e:
+            if self.plugin:
+                self.plugin.log(
+                    f"HiveDatabase: get_channel_history error: {e}",
+                    level='error'
+                )
+            return []
