@@ -162,7 +162,6 @@ def get_config(ctx: HiveContext) -> Dict[str, Any]:
         },
         "planner": {
             "planner_interval": ctx.config.planner_interval,
-            "planner_enable_expansions": ctx.config.planner_enable_expansions,
             "planner_min_channel_sats": ctx.config.planner_min_channel_sats,
             "planner_max_channel_sats": ctx.config.planner_max_channel_sats,
             "planner_default_channel_sats": ctx.config.planner_default_channel_sats,
@@ -282,7 +281,6 @@ def topology(ctx: HiveContext) -> Dict[str, Any]:
         "config": {
             "market_share_cap_pct": cfg.market_share_cap_pct,
             "planner_interval_seconds": cfg.planner_interval,
-            "expansions_enabled": cfg.planner_enable_expansions,
             "governance": "recommendation_only",
         }
     }

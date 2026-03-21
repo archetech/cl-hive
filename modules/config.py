@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 CONFIG_FIELD_TYPES: Dict[str, type] = {
     'membership_enabled': bool,
     'auto_join_enabled': bool,
-    'ban_autotrigger_enabled': bool,
     'member_fee_ppm': int,
     'max_members': int,
     'market_share_cap_pct': float,
@@ -28,7 +27,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
     'gossip_threshold_pct': float,
     'heartbeat_interval': int,
     'planner_interval': int,
-    'planner_enable_expansions': bool,
     'planner_min_channel_sats': int,
     'planner_max_channel_sats': int,
     'planner_default_channel_sats': int,
@@ -76,7 +74,6 @@ class HiveConfig:
     # Membership
     membership_enabled: bool = True
     auto_join_enabled: bool = False       # Auto-send HELLO on peer_connected (disabled: CLN crash bug)
-    ban_autotrigger_enabled: bool = False
 
     # Membership Economics
     member_fee_ppm: int = 0                    # 0-fee for members
@@ -95,7 +92,6 @@ class HiveConfig:
 
     # Planner (Phase 6)
     planner_interval: int = 3600               # 1 hour between planner cycles
-    planner_enable_expansions: bool = False    # Disabled by default (safety)
     planner_min_channel_sats: int = 1_000_000  # 1M sats minimum channel size
     planner_max_channel_sats: int = 50_000_000  # 50M sats maximum channel size
     planner_default_channel_sats: int = 5_000_000  # 5M sats default channel size
@@ -178,7 +174,6 @@ class HiveConfigSnapshot:
     db_path: str
     membership_enabled: bool
     auto_join_enabled: bool
-    ban_autotrigger_enabled: bool
     member_fee_ppm: int
     max_members: int
     market_share_cap_pct: float
@@ -187,7 +182,6 @@ class HiveConfigSnapshot:
     gossip_threshold_pct: float
     heartbeat_interval: int
     planner_interval: int
-    planner_enable_expansions: bool
     planner_min_channel_sats: int
     planner_max_channel_sats: int
     planner_default_channel_sats: int
@@ -205,7 +199,6 @@ class HiveConfigSnapshot:
             db_path=config.db_path,
             membership_enabled=config.membership_enabled,
             auto_join_enabled=config.auto_join_enabled,
-            ban_autotrigger_enabled=config.ban_autotrigger_enabled,
             member_fee_ppm=config.member_fee_ppm,
             max_members=config.max_members,
             market_share_cap_pct=config.market_share_cap_pct,
@@ -214,7 +207,6 @@ class HiveConfigSnapshot:
             gossip_threshold_pct=config.gossip_threshold_pct,
             heartbeat_interval=config.heartbeat_interval,
             planner_interval=config.planner_interval,
-            planner_enable_expansions=config.planner_enable_expansions,
             planner_min_channel_sats=config.planner_min_channel_sats,
             planner_max_channel_sats=config.planner_max_channel_sats,
             planner_default_channel_sats=config.planner_default_channel_sats,

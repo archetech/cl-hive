@@ -733,44 +733,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sync uptime: {e}", level="warn")
 
-    # HIVE_SAFETY: Scan existing channels to hive members and enforce 0 fee
-    # This catches cases where fees were set before joining the hive or by external tools
-    try:
-        hive_members = {m["peer_id"] for m in database.get_all_members()}
-        if hive_members:
-            channels = plugin.rpc.listpeerchannels()
-            fixed_count = 0
-            for peer in channels.get("channels", []):
-                peer_id = peer.get("peer_id")
-                if peer_id not in hive_members:
-                    continue
-                # Check if this is our channel (we set fees on our end)
-                fee_base = peer.get("fee_base_msat", 0)
-                fee_ppm = peer.get("fee_proportional_millionths", 0)
-                channel_id = peer.get("short_channel_id")
-                if channel_id and (fee_base > 0 or fee_ppm > 0):
-                    try:
-                        plugin.rpc.setchannel(
-                            id=channel_id,
-                            feebase=0,
-                            feeppm=0
-                        )
-                        fixed_count += 1
-                        plugin.log(
-                            f"cl-hive: HIVE_SAFETY: Fixed non-zero fee on channel {channel_id} to member {peer_id[:16]}... "
-                            f"(was {fee_base}msat base, {fee_ppm}ppm)",
-                            level='info'
-                        )
-                    except Exception as e:
-                        plugin.log(
-                            f"cl-hive: HIVE_SAFETY: Failed to fix fee on {channel_id}: {e}",
-                            level='warn'
-                        )
-            if fixed_count > 0:
-                plugin.log(f"cl-hive: HIVE_SAFETY: Fixed fees on {fixed_count} hive member channel(s)")
-    except Exception as e:
-        plugin.log(f"cl-hive: HIVE_SAFETY startup scan failed: {e}", level="warn")
-
     # Initialize RecommendationLogger (simplified governance)
     global recommendation_logger
     recommendation_logger = RecommendationLogger(database=database, plugin=plugin)
@@ -1366,156 +1328,15 @@ def _require_rpc(plugin_obj: Plugin):
     return plugin_obj.rpc, None
 
 
-@plugin.method("hive-getinfo")
-def hive_getinfo(plugin: Plugin):
-    """Proxy to CLN getinfo via plugin (native RPC)."""
-    rpc, err = _require_rpc(plugin)
-    if err:
-        return err
-    return rpc.getinfo()
-
-
-@plugin.method("hive-listpeers")
-def hive_listpeers(plugin: Plugin, id: str = None, level: str = None):
-    """Proxy to CLN listpeers via plugin (native RPC)."""
-    rpc, err = _require_rpc(plugin)
-    if err:
-        return err
-    params = {}
-    if isinstance(id, str):
-        id = id.strip()
-    if isinstance(level, str):
-        level = level.strip()
-    if id:
-        params["id"] = id
-    if level:
-        params["level"] = level
-    # Use raw rpc.call() to avoid pyln wrapper defaults injecting empty id="".
-    return rpc.call("listpeers", params if params else {})
-
-
-@plugin.method("hive-listpeerchannels")
-def hive_listpeerchannels(plugin: Plugin, id: str = None):
-    """Proxy to CLN listpeerchannels via plugin (native RPC)."""
-    rpc, err = _require_rpc(plugin)
-    if err:
-        return err
-    if isinstance(id, str):
-        id = id.strip()
-    # Use raw rpc.call() to avoid pyln wrapper defaults injecting empty id="".
-    return rpc.call("listpeerchannels", {"id": id} if id else {})
-
-
-@plugin.method("hive-listforwards")
-def hive_listforwards(plugin: Plugin, status: str = None):
-    """Proxy to CLN listforwards via plugin (native RPC)."""
-    rpc, err = _require_rpc(plugin)
-    if err:
-        return err
-    return rpc.listforwards(status=status) if status else rpc.listforwards()
-
-
-@plugin.method("hive-listchannels")
-def hive_listchannels(plugin: Plugin, source: str = None):
-    """Proxy to CLN listchannels via plugin (native RPC)."""
-    rpc, err = _require_rpc(plugin)
-    if err:
-        return err
-    return rpc.listchannels(source=source) if source else rpc.listchannels()
-
-
-@plugin.method("hive-listfunds")
-def hive_listfunds(plugin: Plugin):
-    """Proxy to CLN listfunds via plugin (native RPC)."""
-    rpc, err = _require_rpc(plugin)
-    if err:
-        return err
-    return rpc.listfunds()
-
-
-@plugin.method("hive-listnodes")
-def hive_listnodes(plugin: Plugin, id: str = None):
-    """Proxy to CLN listnodes via plugin (native RPC)."""
-    rpc, err = _require_rpc(plugin)
-    if err:
-        return err
-    return rpc.listnodes(id=id) if id else rpc.listnodes()
 @plugin.method("hive-connect")
 def hive_connect(plugin: Plugin, peer_id: str):
-    """Connect to a peer via plugin (native RPC)."""
+    """Connect to a peer (used during membership flow)."""
     rpc, err = _require_rpc(plugin)
     if err:
         return err
     if not peer_id:
         return {"error": "peer_id is required"}
     return rpc.connect(peer_id)
-
-
-
-@plugin.method("hive-close-channel")
-def hive_close_channel(plugin: Plugin, peer_id: str = None, channel_id: str = None, unilateraltimeout: int = None):
-    """Close a channel via plugin (native RPC)."""
-    rpc, err = _require_rpc(plugin)
-    if err:
-        return err
-    if not peer_id and not channel_id:
-        return {"error": "peer_id or channel_id is required"}
-    params = {}
-    if peer_id:
-        params["id"] = peer_id
-    if channel_id:
-        params["id"] = channel_id
-    if unilateraltimeout is not None:
-        params["unilateraltimeout"] = unilateraltimeout
-    return rpc.close(**params)
-
-
-@plugin.method("hive-setchannel")
-def hive_setchannel(plugin: Plugin, id: str = None, feebase: int = None, feeppm: int = None):
-    """Proxy to CLN setchannel with fleet fee bound enforcement."""
-    rpc, err = _require_rpc(plugin)
-    if err:
-        return err
-    if not id:
-        return {"error": "id is required"}
-
-    # Enforce fleet fee bounds on feeppm
-    from modules.fee_coordination import FLEET_FEE_FLOOR_PPM, FLEET_FEE_CEILING_PPM
-    if feeppm is not None:
-        if not isinstance(feeppm, int) or feeppm < 0:
-            return {"error": f"feeppm must be a non-negative integer, got {feeppm}"}
-        # Allow zero-fee for hive member channels, but clamp positive fees
-        if feeppm > 0:
-            feeppm = max(FLEET_FEE_FLOOR_PPM, min(FLEET_FEE_CEILING_PPM, feeppm))
-    if feebase is not None:
-        if not isinstance(feebase, int) or feebase < 0:
-            return {"error": f"feebase must be a non-negative integer, got {feebase}"}
-
-    params = {"id": id}
-    if feebase is not None:
-        params["feebase"] = feebase
-    if feeppm is not None:
-        params["feeppm"] = feeppm
-    return rpc.setchannel(**params)
-@plugin.method("hive-askrene-listlayers")
-def hive_askrene_listlayers(plugin: Plugin, layer: str = None):
-    """Proxy to askrene-listlayers via plugin (native RPC)."""
-    rpc, err = _require_rpc(plugin)
-    if err:
-        return err
-    params = {}
-    if layer:
-        params["layer"] = layer
-    return rpc.call("askrene-listlayers", params) if params else rpc.call("askrene-listlayers")
-
-
-@plugin.method("hive-askrene-listreservations")
-def hive_askrene_listreservations(plugin: Plugin):
-    """Proxy to askrene-listreservations via plugin (native RPC)."""
-    rpc, err = _require_rpc(plugin)
-    if err:
-        return err
-    return rpc.call("askrene-listreservations")
 
 
 @plugin.method("hive-health")
@@ -1742,27 +1563,6 @@ def hive_channel_opened(plugin: Plugin, peer_id: str, channel_id: str,
     # Check if peer is a hive member (internal channel)
     member = database.get_member(peer_id)
     is_hive_internal = member is not None and not database.is_banned(peer_id)
-
-    # HIVE SAFETY: Immediately set 0 fee for hive member channels
-    if is_hive_internal and plugin:
-        try:
-            # Set both base fee and ppm to 0 for hive internal channels
-            plugin.rpc.setchannel(
-                id=channel_id,
-                feebase=0,
-                feeppm=0
-            )
-            plugin.log(
-                f"cl-hive: HIVE_SAFETY: Set 0 fee on channel {channel_id} to fleet member {peer_id[:16]}...",
-                level='info'
-            )
-            result["fee_action"] = "set_zero_fee"
-        except Exception as e:
-            plugin.log(
-                f"cl-hive: Warning: Failed to set 0 fee on hive channel {channel_id}: {e}",
-                level='warn'
-            )
-            result["fee_action"] = f"failed: {e}"
 
     result["action"] = "channel_opened"
     result["is_hive_internal"] = is_hive_internal

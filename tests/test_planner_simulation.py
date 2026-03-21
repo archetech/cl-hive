@@ -115,7 +115,6 @@ def mock_config():
     """Mock config snapshot."""
     cfg = MagicMock()
     cfg.market_share_cap_pct = 0.20
-    cfg.planner_enable_expansions = True
     # Channel size options
     cfg.planner_min_channel_sats = 1_000_000  # 1M sats
     cfg.planner_max_channel_sats = 50_000_000  # 50M sats
