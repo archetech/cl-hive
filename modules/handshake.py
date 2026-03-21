@@ -13,31 +13,25 @@ Crypto Strategy:
 Join Flow (Channel-as-Proof-of-Stake):
     A node with a channel to any hive member can join:
     1. A -> B (HELLO): Candidate announces pubkey
-    2. B checks for existing channel with A
-    3. B -> A (CHALLENGE): Member sends random Nonce
-    4. A -> B (ATTEST): Candidate sends signed Manifest + Nonce
-    5. B -> A (WELCOME): New member joins as member
-
-Note: Tickets are deprecated. Channel existence serves as proof of stake.
-Having a channel demonstrates economic commitment to the network.
+    2. B stores a pending request for A (awaiting hive-approve)
+    3. Operator runs hive-approve <peer_id>
+    4. B -> A (CHALLENGE): Member sends random Nonce
+    5. A -> B (ATTEST): Candidate sends signed Manifest + Nonce
+    6. B -> A (WELCOME): New member joins as member
 """
 
 import json
 import threading
 import time
-import base64
 import hashlib
 import secrets
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 
 
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-
-# Default ticket validity period
-DEFAULT_TICKET_HOURS = 24
 
 # Nonce size in bytes (32 bytes = 64 hex chars)
 NONCE_SIZE = 32
@@ -54,63 +48,8 @@ CHALLENGE_RATE_LIMIT_SECONDS = 10  # Minimum seconds between challenges per peer
 # Plugin version for manifest
 PLUGIN_VERSION = "cl-hive v2.2.6"
 
-
-# =============================================================================
-# DATA STRUCTURES
-# =============================================================================
-
-@dataclass
-class Ticket:
-    """
-    Invitation ticket structure.
-
-    DEPRECATED: Tickets are no longer required for joining. Channel existence
-    serves as proof of stake. This class is retained for backward compatibility
-    with genesis bootstrapping and legacy flows.
-
-    A Member generates this to authorize new members to join.
-    The ticket is signed by the Member's node key.
-    """
-    admin_pubkey: str       # 66-char hex pubkey of issuing admin
-    hive_id: str            # Unique Hive identifier
-    requirements: int       # Bitmask of required features
-    issued_at: int          # Unix timestamp
-    expires_at: int         # Unix timestamp
-    signature: str          # signmessage result
-    initial_tier: str = 'member'  # Starting tier for new members
-    
-    def to_json(self) -> str:
-        """Serialize to JSON (excluding signature for signing)."""
-        data = asdict(self)
-        del data['signature']
-        return json.dumps(data, sort_keys=True, separators=(',', ':'))
-    
-    def to_base64(self) -> str:
-        """Encode full ticket (including signature) as base64."""
-        return base64.b64encode(json.dumps(asdict(self)).encode()).decode()
-    
-    # SECURITY: Maximum ticket size to prevent memory exhaustion DoS (Issue #9)
-    MAX_TICKET_SIZE = 10 * 1024  # 10KB
-
-    @classmethod
-    def from_base64(cls, encoded: str) -> 'Ticket':
-        """
-        Decode ticket from base64.
-
-        SECURITY: Enforces size limit to prevent memory exhaustion DoS.
-        """
-        # Check size before decoding
-        if len(encoded) > cls.MAX_TICKET_SIZE:
-            raise ValueError(
-                f"Ticket too large: {len(encoded)} bytes exceeds "
-                f"{cls.MAX_TICKET_SIZE} byte limit"
-            )
-        data = json.loads(base64.b64decode(encoded))
-        return cls(**data)
-    
-    def is_expired(self) -> bool:
-        """Check if ticket has expired."""
-        return time.time() > self.expires_at
+# Default pending request expiry (24 hours)
+PENDING_REQUEST_MAX_AGE = 86400
 
 
 @dataclass
@@ -157,14 +96,15 @@ class HandshakeManager:
     - Genesis (creating a new Hive as founding member)
     - Manifest creation and verification
     - Challenge-response protocol for identity proof
-    - Legacy ticket operations (deprecated)
+    - Pending join-request storage (awaiting hive-approve)
 
     Join Flow:
     Nodes join by having a channel with any existing member.
-    Channel existence serves as proof of stake - no ticket needed.
+    Channel existence serves as proof of stake. An existing member
+    must explicitly approve the join request via hive-approve.
     """
-    
-    def __init__(self, rpc_proxy, db, plugin, min_vouch_count: int = 3):
+
+    def __init__(self, rpc_proxy, db, plugin):
         """
         Initialize the handshake manager.
 
@@ -172,15 +112,14 @@ class HandshakeManager:
             rpc_proxy: ThreadSafeRpcProxy for CLN RPC calls
             db: HiveDatabase instance
             plugin: Plugin reference for logging
-            min_vouch_count: Unused (kept for interface compatibility)
         """
         self.rpc = rpc_proxy
         self.db = db
         self.plugin = plugin
-        self.min_vouch_count = min_vouch_count
         self._our_pubkey: Optional[str] = None
         self._challenge_lock = threading.Lock()
         self._pending_challenges: Dict[str, Dict[str, Any]] = {}
+        self._pending_requests: Dict[str, Dict] = {}
     
     # =========================================================================
     # IDENTITY
@@ -201,9 +140,9 @@ class HandshakeManager:
         """
         Create a new Hive with this node as the founding Member.
 
-        This bootstraps a new Hive. The founding node starts as a full
-        member and can invite others. Other nodes join by opening a
-        channel to any existing member (no tickets required).
+        This bootstraps a new Hive. The founding node starts as a member
+        and can approve others. Other nodes join by opening a channel to
+        any existing member and awaiting approval.
 
         Args:
             hive_id: Optional custom Hive ID (auto-generated if not provided)
@@ -215,171 +154,70 @@ class HandshakeManager:
             ValueError: If this node is already part of a Hive
         """
         our_pubkey = self.get_our_pubkey()
-        
+
         # Check if we're already in a Hive
         existing = self.db.get_member(our_pubkey)
         if existing:
             raise ValueError(f"Already member of Hive (tier: {existing['tier']})")
-        
+
         # Generate Hive ID if not provided
         if hive_id is None:
             hive_id = f"hive_{secrets.token_hex(8)}"
-        
-        # Create genesis ticket (self-signed)
-        now = int(time.time())
-        ticket_data = {
-            "admin_pubkey": our_pubkey,
-            "hive_id": hive_id,
-            "requirements": Requirements.NONE,
-            "issued_at": now,
-            "expires_at": now + (365 * 24 * 3600),  # 1 year validity
-            "initial_tier": "member",  # Must be in signed data for verification
-        }
-        
-        # Sign the ticket
-        ticket_json = json.dumps(ticket_data, sort_keys=True, separators=(',', ':'))
-        sig_result = self.rpc.signmessage(ticket_json)
-        signature = sig_result['zbase']
-        
-        # Create full ticket
-        genesis_ticket = Ticket(
-            **ticket_data,
-            signature=signature
-        )
 
-        # Store ourselves as founding admin
+        now = int(time.time())
+
+        # Store ourselves as founding member
         self.db.add_member(
             peer_id=our_pubkey,
-            tier='admin',
+            tier='member',
             joined_at=now,
-            promoted_at=now
         )
-        
-        # Store genesis ticket in metadata
+
+        # Store hive metadata
         self.db.update_member(
             our_pubkey,
-            metadata=json.dumps({
-                "genesis_ticket": genesis_ticket.to_base64(),
-                "hive_id": hive_id
-            })
+            metadata=json.dumps({"hive_id": hive_id})
         )
-        
+
         self.plugin.log(f"Genesis complete: Hive '{hive_id}' created")
-        
+
         return {
             "status": "genesis_complete",
             "hive_id": hive_id,
-            "admin_pubkey": our_pubkey,
-            "genesis_ticket": genesis_ticket.to_base64()
+            "member_pubkey": our_pubkey,
         }
     
     # =========================================================================
-    # TICKET OPERATIONS
+    # PENDING JOIN REQUESTS
     # =========================================================================
-    
-    def generate_invite_ticket(self,
-                                valid_hours: int = DEFAULT_TICKET_HOURS,
-                                requirements: int = Requirements.NONE,
-                                initial_tier: str = 'member') -> str:
-        """
-        Generate an invitation ticket for a new member.
 
-        Any member can generate invite tickets. New members start as 'member' tier.
+    def store_pending_request(self, peer_id: str) -> None:
+        """Store a pending join request from a peer (awaiting hive-approve)."""
+        self._pending_requests[peer_id] = {
+            "peer_id": peer_id,
+            "received_at": int(time.time()),
+            "channel_verified": True,
+        }
 
-        Args:
-            valid_hours: Hours until ticket expires
-            requirements: Bitmask of required features
-            initial_tier: Starting tier ('member' default)
+    def get_pending_requests(self) -> List[Dict]:
+        """Return all pending join requests."""
+        return list(self._pending_requests.values())
 
-        Returns:
-            Base64-encoded signed ticket
+    def pop_pending_request(self, peer_id: str) -> Optional[Dict]:
+        """Remove and return a pending request, or None if not found."""
+        return self._pending_requests.pop(peer_id, None)
 
-        Raises:
-            PermissionError: If caller is not a member
-            ValueError: If invalid initial_tier requested
-        """
-        our_pubkey = self.get_our_pubkey()
-
-        # Verify we're a member
-        member = self.db.get_member(our_pubkey)
-        if not member or member['tier'] not in ('admin', 'member'):
-            raise PermissionError("Only members can generate invite tickets")
-
-        # Validate tier
-        if initial_tier not in ('admin', 'member'):
-            raise ValueError(f"Invalid initial_tier: {initial_tier}. Use 'member' (default) or 'admin'")
-
-        # Get Hive ID from metadata
-        metadata = json.loads(member.get('metadata', '{}'))
-        hive_id = metadata.get('hive_id', 'unknown')
-
-        # Create ticket
+    def expire_pending_requests(self, max_age_seconds: int = PENDING_REQUEST_MAX_AGE) -> int:
+        """Remove pending requests older than max_age_seconds. Returns count removed."""
         now = int(time.time())
-        ticket_data = {
-            "admin_pubkey": our_pubkey,
-            "hive_id": hive_id,
-            "requirements": requirements,
-            "issued_at": now,
-            "expires_at": now + (valid_hours * 3600),
-            "initial_tier": initial_tier,
-        }
+        expired = [
+            pid for pid, req in self._pending_requests.items()
+            if now - req["received_at"] > max_age_seconds
+        ]
+        for pid in expired:
+            del self._pending_requests[pid]
+        return len(expired)
 
-        # Sign
-        ticket_json = json.dumps(ticket_data, sort_keys=True, separators=(',', ':'))
-        sig_result = self.rpc.signmessage(ticket_json)
-
-        ticket = Ticket(**ticket_data, signature=sig_result['zbase'])
-
-        tier_desc = " (BOOTSTRAP)" if initial_tier == 'member' else ""
-        self.plugin.log(f"Generated invite ticket{tier_desc} (expires in {valid_hours}h)")
-
-        return ticket.to_base64()
-    
-    def verify_ticket(self, ticket_b64: str) -> Tuple[bool, Optional[Ticket], str]:
-        """
-        Verify an invitation ticket.
-        
-        Checks:
-        1. Signature is valid (signed by admin_pubkey)
-        2. Ticket has not expired
-        3. Admin is a known member of the Hive
-        
-        Args:
-            ticket_b64: Base64-encoded ticket
-            
-        Returns:
-            Tuple of (is_valid, ticket_obj, error_message)
-        """
-        try:
-            ticket = Ticket.from_base64(ticket_b64)
-        except Exception as e:
-            return (False, None, f"Invalid ticket format: {e}")
-        
-        # Check expiry
-        if ticket.is_expired():
-            return (False, ticket, "Ticket has expired")
-        
-        # Verify signature
-        ticket_json = ticket.to_json()
-        try:
-            result = self.rpc.checkmessage(ticket_json, ticket.signature)
-            if not result.get('verified', False):
-                return (False, ticket, "Invalid signature")
-            
-            # Verify signer matches admin_pubkey
-            if result.get('pubkey') != ticket.admin_pubkey:
-                return (False, ticket, "Signature pubkey mismatch")
-                
-        except Exception as e:
-            return (False, ticket, f"Signature verification failed: {e}")
-        
-        # Verify issuer is a known member (admin or member)
-        issuer = self.db.get_member(ticket.admin_pubkey)
-        if not issuer or issuer['tier'] not in ('admin', 'member'):
-            return (False, ticket, "Unknown or non-member issuer")
-        
-        return (True, ticket, "")
-    
     # =========================================================================
     # MANIFEST OPERATIONS
     # =========================================================================
@@ -470,8 +308,8 @@ class HandshakeManager:
 
         Args:
             peer_id: Peer's public key
-            requirements: Bitmask requirements from the invite ticket
-            initial_tier: Starting tier for new member ('admin' or 'member')
+            requirements: Bitmask of required capabilities
+            initial_tier: Starting tier for new member (always 'member')
 
         Returns:
             Hex-encoded random nonce

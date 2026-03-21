@@ -1,11 +1,10 @@
 """
 Membership module for cl-hive.
 
-Implements admin/member role management, uptime tracking, and bridge policy sync.
+Implements single-role membership management, uptime tracking, and bridge policy sync.
 """
 
 import time
-from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from . import network_metrics
@@ -13,17 +12,8 @@ from . import network_metrics
 
 ACTIVE_MEMBER_WINDOW_SECONDS = 24 * 3600
 
-
-class MembershipTier(str, Enum):
-    """
-    Membership tiers.
-
-    Two-role system:
-    - ADMIN: Fleet operator. Can add/remove members via RPC.
-    - MEMBER: Regular member. Can route, participate in settlements.
-    """
-    ADMIN = "admin"
-    MEMBER = "member"
+# Single membership tier — all members have equal privileges.
+MEMBER_TIER = "member"
 
 
 class MembershipManager:
@@ -51,11 +41,9 @@ class MembershipManager:
         member = self.db.get_member(peer_id)
         return member["tier"] if member else None
 
-    def set_tier(self, peer_id: str, tier: str) -> bool:
-        now = int(time.time())
-        promoted_at = now if tier == MembershipTier.ADMIN.value else None
-
-        updated = self.db.update_member(peer_id, tier=tier, promoted_at=promoted_at)
+    def set_tier(self, peer_id: str) -> bool:
+        """Update a peer's membership record (always member tier)."""
+        updated = self.db.update_member(peer_id, tier=MEMBER_TIER)
         if not updated:
             return False
 
@@ -68,11 +56,9 @@ class MembershipManager:
 
         return True
 
-    def add_member(self, peer_id: str, tier: str = "member") -> bool:
+    def add_member(self, peer_id: str, tier: str = MEMBER_TIER) -> bool:
         """Add a new member to the hive."""
-        if tier not in (MembershipTier.ADMIN.value, MembershipTier.MEMBER.value):
-            tier = MembershipTier.MEMBER.value
-        return self.db.add_member(peer_id, tier=tier, joined_at=int(time.time()))
+        return self.db.add_member(peer_id, tier=MEMBER_TIER, joined_at=int(time.time()))
 
     def remove_member(self, peer_id: str) -> bool:
         """Remove a member from the hive."""
@@ -83,13 +69,8 @@ class MembershipManager:
         return self.db.get_all_members()
 
     def is_member(self, peer_id: str) -> bool:
-        """Check if a peer is a hive member (any tier)."""
+        """Check if a peer is a hive member."""
         return self.db.get_member(peer_id) is not None
-
-    def is_admin(self, peer_id: str) -> bool:
-        """Check if a peer is an admin."""
-        member = self.db.get_member(peer_id)
-        return bool(member and member.get("tier") == MembershipTier.ADMIN.value)
 
     def sync_bridge_policies(self) -> int:
         """
@@ -203,7 +184,7 @@ class MembershipManager:
         return list(unique)
 
     # =========================================================================
-    # ACTIVE MEMBERS & QUORUM
+    # ACTIVE MEMBERS
     # =========================================================================
 
     def get_active_members(self) -> List[str]:
