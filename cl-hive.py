@@ -685,9 +685,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     bridge = Bridge(plugin.rpc, plugin)
     bridge_status = bridge.initialize()
     
-    if bridge_status == BridgeStatus.ENABLED:
-        plugin.log(f"cl-hive: Bridge ENABLED - cl-revenue-ops {bridge._revenue_ops_version}")
-    elif bridge_status == BridgeStatus.DEGRADED:
+    if bridge_status == BridgeStatus.DEGRADED:
         plugin.log("cl-hive: Bridge DEGRADED - some features unavailable", level='warn')
     else:
         plugin.log(
