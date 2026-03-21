@@ -626,10 +626,6 @@ class FeeCoordinationManager:
             base_result["reason"] = "peer_not_found"
             return base_result
 
-        if self._is_hive_member_peer(resolved_peer_id):
-            base_result["reason"] = "hive_peer_zero_fee"
-            return base_result
-
         saturated_hive_channels = self._get_our_saturated_hive_channels()
         if not saturated_hive_channels:
             base_result["reason"] = "no_saturated_hive_egress"
@@ -788,20 +784,6 @@ class FeeCoordinationManager:
 
         Combines corridor assignment and centrality signals.
         """
-        # Safety: fleet member channels MUST always have 0 fees
-        if self.database and peer_id:
-            member = self.database.get_member(peer_id)
-            if member:
-                return FeeRecommendation(
-                    channel_id=channel_id,
-                    peer_id=peer_id,
-                    recommended_fee_ppm=0,
-                    is_primary=False,
-                    current_fee_ppm=current_fee,
-                    confidence=1.0,
-                    reason="hive_member_zero_fee",
-                )
-
         # Start with current fee
         recommended_fee = current_fee
         is_primary = False

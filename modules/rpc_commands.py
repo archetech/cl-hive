@@ -147,7 +147,6 @@ def get_config(ctx: HiveContext) -> Dict[str, Any]:
         "membership": {
             "membership_enabled": ctx.config.membership_enabled,
             "auto_join_enabled": ctx.config.auto_join_enabled,
-            "member_fee_ppm": ctx.config.member_fee_ppm,
             "max_members": ctx.config.max_members,
         },
         "protocol": {

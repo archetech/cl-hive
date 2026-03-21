@@ -474,7 +474,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     # Options removed in fleet simplification use dataclass defaults in HiveConfig.
     config = HiveConfig(
         db_path=options.get('hive-db-path', '~/.lightning/cl_hive.db'),
-        member_fee_ppm=int(options.get('hive-member-fee-ppm', '0')),
         max_members=int(options.get('hive-max-members', '50')),
         market_share_cap_pct=float(options.get('hive-market-share-cap', '0.20')),
         auto_join_enabled=_parse_bool(options.get('hive-auto-join', 'false')),

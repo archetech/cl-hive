@@ -151,13 +151,6 @@ def register_options(plugin):
     # All other options are dynamic (hot-reloadable via `lightning-cli setconfig`)
 
     plugin.add_option(
-        name='hive-member-fee-ppm',
-        default='0',
-        description='Fee charged to full Hive members (default: 0 = free)',
-        dynamic=True
-    )
-
-    plugin.add_option(
         name='hive-max-members',
         default='50',
         description='Maximum Hive members (Dunbar cap for gossip efficiency)',
@@ -216,7 +209,6 @@ def register_options(plugin):
 
 # Mapping from plugin option names to config attribute names and types
 OPTION_TO_CONFIG_MAP: Dict[str, tuple] = {
-    'hive-member-fee-ppm': ('member_fee_ppm', int),
     'hive-max-members': ('max_members', int),
     'hive-market-share-cap': ('market_share_cap_pct', float),
     'hive-auto-join': ('auto_join_enabled', bool),

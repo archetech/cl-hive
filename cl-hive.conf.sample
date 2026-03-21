@@ -1,12 +1,5 @@
-# cl-hive v0.2 Production Config (Trusted Fleet Simplification)
+# cl-hive Production Config (Trusted Fleet Coordination)
 # Copy to ~/.lightning/config or include via: include /path/to/cl-hive.conf
-
-# ============================================================================
-# MEMBERSHIP & FEES
-# ============================================================================
-
-# Fee charged to full Hive members (0 = free routing within fleet)
-hive-member-fee-ppm=0
 
 # ============================================================================
 # NETWORK LIMITS

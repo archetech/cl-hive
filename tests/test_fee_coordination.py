@@ -293,8 +293,8 @@ class TestFeeCoordinationManager:
 
         assert rec.recommended_fee_ppm <= FLEET_FEE_CEILING_PPM
 
-    def test_hive_member_zero_fee(self):
-        """Test that fleet member channels get 0 fee."""
+    def test_hive_member_gets_normal_fee(self):
+        """Membership is a trust signal, not a fee privilege — members get normal fees."""
         peer_id = "02" + "a" * 64
         self.db.members[peer_id] = {"peer_id": peer_id, "tier": "member"}
 
@@ -305,8 +305,9 @@ class TestFeeCoordinationManager:
             local_balance_pct=0.5
         )
 
-        assert rec.recommended_fee_ppm == 0
-        assert rec.reason == "hive_member_zero_fee"
+        # Member should NOT get forced 0 PPM — cl-revenue-ops decides fees locally
+        assert rec.recommended_fee_ppm >= 0
+        assert rec.reason != "hive_member_zero_fee"
 
     def test_record_routing_outcome_noop(self):
         """Test that record_routing_outcome is a no-op after simplification."""

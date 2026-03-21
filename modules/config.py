@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 CONFIG_FIELD_TYPES: Dict[str, type] = {
     'membership_enabled': bool,
     'auto_join_enabled': bool,
-    'member_fee_ppm': int,
     'max_members': int,
     'market_share_cap_pct': float,
     'intent_hold_seconds': int,
@@ -40,7 +39,6 @@ CONFIG_FIELD_TYPES: Dict[str, type] = {
 
 # Range constraints for numeric fields
 CONFIG_FIELD_RANGES: Dict[str, tuple] = {
-    'member_fee_ppm': (0, 100000),
     'max_members': (2, 100),
     'market_share_cap_pct': (0.01, 1.0),
     'intent_hold_seconds': (10, 600),
@@ -75,9 +73,6 @@ class HiveConfig:
     membership_enabled: bool = True
     auto_join_enabled: bool = False       # Auto-send HELLO on peer_connected (disabled: CLN crash bug)
 
-    # Membership Economics
-    member_fee_ppm: int = 0                    # 0-fee for members
-    
     # Ecological Limits
     max_members: int = 50                      # Dunbar cap for gossip efficiency
     market_share_cap_pct: float = 0.20         # 20% max per target (anti-monopoly)
@@ -174,7 +169,6 @@ class HiveConfigSnapshot:
     db_path: str
     membership_enabled: bool
     auto_join_enabled: bool
-    member_fee_ppm: int
     max_members: int
     market_share_cap_pct: float
     intent_hold_seconds: int
@@ -199,7 +193,6 @@ class HiveConfigSnapshot:
             db_path=config.db_path,
             membership_enabled=config.membership_enabled,
             auto_join_enabled=config.auto_join_enabled,
-            member_fee_ppm=config.member_fee_ppm,
             max_members=config.max_members,
             market_share_cap_pct=config.market_share_cap_pct,
             intent_hold_seconds=config.intent_hold_seconds,

@@ -125,7 +125,6 @@ Key options:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `hive-member-fee-ppm` | `0` | Fee between fleet members |
 | `hive-max-members` | `9` | Maximum fleet size |
 | `hive-gossip-threshold` | `0.10` | Capacity change to trigger gossip |
 | `hive-heartbeat-interval` | `300` | Heartbeat broadcast interval (seconds) |

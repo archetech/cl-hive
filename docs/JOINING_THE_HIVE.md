@@ -132,7 +132,7 @@ lightning-cli hive-members
 ## Security Notes
 
 - Keep your `hsm_secret` backed up securely
-- Fleet channels between members always use 0 fees
+- Membership actions require cryptographic signatures via CLN HSM
 - All membership actions require cryptographic signatures via CLN HSM
 
 ## Getting Help
