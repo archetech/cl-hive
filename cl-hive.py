@@ -3875,6 +3875,53 @@ def hive_genesis(plugin: Plugin, hive_id: str = None):
         return {"error": f"Genesis failed: {e}"}
 
 
+@plugin.method("hive-join")
+def hive_join(plugin: Plugin, peer_id: str):
+    """
+    Request to join a hive by sending HELLO to an existing member.
+
+    The target peer must be an existing hive member that you have a
+    channel with. After sending HELLO, wait for the member to approve
+    you via hive-approve.
+
+    Args:
+        peer_id: Public key of an existing hive member
+
+    Returns:
+        Dict with join request status.
+    """
+    if not peer_id:
+        return {"error": "peer_id is required"}
+
+    if not our_pubkey:
+        return {"error": "Plugin not initialized"}
+
+    # Check if we're already a member
+    if database and database.get_member(our_pubkey):
+        return {"error": "Already a hive member"}
+
+    try:
+        from modules.protocol import create_hello
+        hello_msg = create_hello(our_pubkey)
+        if hello_msg is None:
+            return {"error": "Failed to create HELLO message"}
+
+        plugin.rpc.call("sendcustommsg", {
+            "node_id": peer_id,
+            "msg": hello_msg.hex()
+        })
+
+        plugin.log(f"cl-hive: Sent HELLO to {peer_id[:16]}... (manual join request)")
+
+        return {
+            "status": "hello_sent",
+            "peer_id": peer_id,
+            "message": "HELLO sent. Wait for the member to run hive-approve."
+        }
+    except Exception as e:
+        return {"error": f"Failed to send HELLO: {e}"}
+
+
 @plugin.method("hive-approve")
 def hive_approve(plugin: Plugin, peer_id: str):
     """
