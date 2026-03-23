@@ -1854,19 +1854,21 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: MEMBER_LEFT sender mismatch: {peer_id[:16]}... != {leaving_peer_id[:16]}...", level='warn')
         return {"result": "continue"}
 
-    # Phase C: Persistent idempotency check
-    is_new, event_id = check_and_record(database, "MEMBER_LEFT", payload, leaving_peer_id)
-    if not is_new:
-        plugin.log(f"cl-hive: MEMBER_LEFT duplicate event {event_id}, skipping", level='debug')
-        _relay_message(HiveMessageType.MEMBER_LEFT, payload, peer_id)
-        return {"result": "continue"}
-    if event_id:
-        payload["_event_id"] = event_id
-
     # Check if member exists
     member = database.get_member(leaving_peer_id)
     if not member:
         plugin.log(f"cl-hive: MEMBER_LEFT for unknown peer {leaving_peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    if not _check_timestamp_freshness(payload, MAX_STATE_HASH_AGE_SECONDS, label="MEMBER_LEFT"):
+        return {"result": "continue"}
+
+    joined_at = member.get("joined_at")
+    if isinstance(joined_at, int) and timestamp < joined_at:
+        plugin.log(
+            f"cl-hive: MEMBER_LEFT rejected for {leaving_peer_id[:16]}... older than current membership",
+            level='debug'
+        )
         return {"result": "continue"}
 
     # Verify signature
@@ -1879,6 +1881,15 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     except Exception as e:
         plugin.log(f"cl-hive: MEMBER_LEFT signature check failed: {e}", level='warn')
         return {"result": "continue"}
+
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "MEMBER_LEFT", payload, leaving_peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: MEMBER_LEFT duplicate event {event_id}, skipping", level='debug')
+        _relay_message(HiveMessageType.MEMBER_LEFT, payload, peer_id)
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
 
     # Remove the member
     tier = member.get("tier")
@@ -1905,6 +1916,15 @@ MAX_STATE_HASH_AGE_SECONDS = 3600       # 1 hour for state hash / full sync
 MAX_INTELLIGENCE_AGE_SECONDS = 7200     # 2 hours for fee/health/liquidity reports
 MAX_CLOCK_SKEW_SECONDS = 300            # 5 minutes future tolerance
 
+def _is_valid_pubkey(pubkey: Any) -> bool:
+    """Check whether a value looks like a compressed secp256k1 pubkey."""
+    return (
+        isinstance(pubkey, str)
+        and len(pubkey) == 66
+        and pubkey[:2] in ("02", "03")
+        and all(c in "0123456789abcdef" for c in pubkey)
+    )
+
 def handle_ban(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     Handle BAN message - notification that a ban has been executed.
@@ -1920,11 +1940,53 @@ def handle_ban(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     target_peer_id = payload.get("peer_id")
     reason = payload.get("reason", "member_ban")
-    proposal_id = payload.get("proposal_id")
+    reporter_id = payload.get("reporter", peer_id)
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+    auth_fields = ("reporter", "timestamp", "signature")
+    has_any_auth = any(field in payload for field in auth_fields)
+    has_full_auth = all(field in payload for field in auth_fields)
 
     if not target_peer_id:
         plugin.log("cl-hive: BAN message missing peer_id", level='warn')
         return {"status": "ignored", "reason": "missing_peer_id"}
+
+    if has_any_auth and not has_full_auth:
+        plugin.log("cl-hive: BAN message missing auth fields", level='warn')
+        return {"status": "ignored", "reason": "malformed_auth"}
+
+    if has_full_auth:
+        if not _validate_relay_sender(peer_id, reporter_id, payload):
+            plugin.log(f"cl-hive: BAN sender mismatch: {peer_id[:16]}... != {reporter_id[:16]}...", level='warn')
+            return {"status": "ignored", "reason": "sender_mismatch"}
+
+        reporter = database.get_member(reporter_id)
+        if not reporter or database.is_banned(reporter_id):
+            plugin.log(f"cl-hive: BAN rejected from non-member {reporter_id[:16]}...", level='warn')
+            return {"status": "ignored", "reason": "sender_not_member"}
+
+        if not _check_timestamp_freshness(payload, MAX_INTENT_AGE_SECONDS, label="BAN"):
+            return {"status": "ignored", "reason": "stale"}
+
+        canonical = f"BAN:{target_peer_id}:{reason}:{timestamp}"
+        try:
+            result = plugin.rpc.checkmessage(canonical, signature)
+            if not result.get("verified") or result.get("pubkey") != reporter_id:
+                plugin.log(f"cl-hive: BAN signature invalid for {reporter_id[:16]}...", level='warn')
+                return {"status": "ignored", "reason": "invalid_signature"}
+        except Exception as e:
+            plugin.log(f"cl-hive: BAN signature check failed: {e}", level='warn')
+            return {"status": "ignored", "reason": "signature_check_failed"}
+    else:
+        if _is_relayed_message(payload):
+            plugin.log("cl-hive: BAN ignored: unsigned legacy BAN cannot be relayed", level='debug')
+            return {"status": "ignored", "reason": "legacy_relay_unsupported"}
+
+        reporter = database.get_member(peer_id)
+        if not reporter or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: BAN rejected from non-member {peer_id[:16]}...", level='warn')
+            return {"status": "ignored", "reason": "sender_not_member"}
+        reporter_id = peer_id
 
     # Already banned — nothing to do
     if database.is_banned(target_peer_id):
@@ -1932,7 +1994,7 @@ def handle_ban(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"status": "already_banned"}
 
     # Enforce the ban
-    database.add_ban(target_peer_id, reason, peer_id)
+    database.add_ban(target_peer_id, reason, reporter_id, signature=signature if has_full_auth else None)
 
     # Full removal: DB, state manager, bridge policy, and forced gossip
     _execute_member_removal(target_peer_id, reason="banned")

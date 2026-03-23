@@ -3144,8 +3144,18 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
         return {"error": "Failed to add ban", "peer_id": peer_id}
 
     # Remove member from roster after successful ban
-    database.remove_member(peer_id)
+    protocol_handlers.database = database
+    protocol_handlers._execute_member_removal(peer_id, reason="banned")
     database.log_membership_event("banned", peer_id, actor_peer_id=our_pubkey, reason=reason)
+
+    ban_payload = {
+        "peer_id": peer_id,
+        "reason": reason,
+        "reporter": our_pubkey,
+        "timestamp": now,
+        "signature": sig,
+    }
+    protocol_handlers._reliable_broadcast(HiveMessageType.BAN, ban_payload)
 
     plugin.log(f"cl-hive: Banned peer {peer_id[:16]}... reason: {reason}")
 
