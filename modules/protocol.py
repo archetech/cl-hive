@@ -85,6 +85,7 @@ class HiveMessageType(IntEnum):
     # Membership
     # 32789-32795 removed (VOUCH, PROMOTION, PROMOTION_REQUEST — membership voting)
     BAN = 32791         # Ban announcement (executed ban)
+    MEMBER_REMOVED = 32793  # Manual member removal for upgraded peers
     MEMBER_LEFT = 32797  # Member voluntarily leaving fleet
     # 32799-32801 removed (BAN_PROPOSAL, BAN_VOTE — membership voting)
 
@@ -129,6 +130,7 @@ class HiveMessageType(IntEnum):
 
 # Message types that require reliable delivery
 RELIABLE_MESSAGE_TYPES = frozenset({
+    HiveMessageType.MEMBER_REMOVED,
     HiveMessageType.MEMBER_LEFT,
     HiveMessageType.TRAFFIC_INTELLIGENCE_BATCH,
 })

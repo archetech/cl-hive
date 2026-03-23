@@ -164,3 +164,108 @@ def test_handle_member_left_rejects_pre_rejoin_event(db, mock_plugin):
 
     assert result == {"result": "continue"}
     assert db.get_member(PEER_B) is not None
+
+
+def member_removed_payload(actor: str, target: str, timestamp: int, *, joined_at_cutoff: int, reason: str = "maintenance") -> dict:
+    return {
+        "peer_id": target,
+        "actor_peer_id": actor,
+        "reason": reason,
+        "timestamp": timestamp,
+        "event_id": f"evt-{timestamp}",
+        "joined_at_cutoff": joined_at_cutoff,
+        "signature": "sig",
+    }
+
+
+def test_handle_member_removed_rejects_non_member_sender(db, mock_plugin):
+    db.add_member(PEER_B, tier="member", joined_at=100)
+    ph.database = db
+    ph.state_manager = MagicMock()
+    mock_plugin.rpc.checkmessage.return_value = {"verified": True, "pubkey": PEER_A}
+
+    result = ph.handle_member_removed(
+        PEER_A,
+        member_removed_payload(PEER_A, PEER_B, int(time.time()), joined_at_cutoff=100),
+        mock_plugin,
+    )
+
+    assert result == {"result": "continue"}
+    assert db.get_member(PEER_B) is not None
+
+
+def test_handle_member_removed_clears_state_and_records_tombstone(db, mock_plugin):
+    now = int(time.time())
+    db.add_member(PEER_A, tier="member", joined_at=90)
+    db.add_member(PEER_B, tier="member", joined_at=100)
+    ph.database = db
+    ph.state_manager = MagicMock()
+    mock_plugin.rpc.checkmessage.return_value = {"verified": True, "pubkey": PEER_A}
+
+    result = ph.handle_member_removed(
+        PEER_A,
+        member_removed_payload(PEER_A, PEER_B, now, joined_at_cutoff=100),
+        mock_plugin,
+    )
+
+    assert result == {"result": "continue"}
+    assert db.get_member(PEER_B) is None
+    ph.state_manager.remove_peer_state.assert_called_once_with(PEER_B)
+    assert db.get_membership_tombstones(limit=10)[0]["peer_id"] == PEER_B
+
+
+def test_apply_membership_sync_applies_membership_events_before_add_only_merge(db, mock_plugin):
+    db.add_member(PEER_A, tier="member", joined_at=100)
+    db.add_member(PEER_B, tier="member", joined_at=200)
+    ph.database = db
+    ph.state_manager = MagicMock()
+
+    events = [{
+        "event_id": "evt-1",
+        "peer_id": PEER_B,
+        "event": "removed",
+        "actor_peer_id": PEER_A,
+        "reason": "maintenance",
+        "timestamp": 250,
+        "joined_at_cutoff": 200,
+    }]
+    members = [{"peer_id": PEER_A, "tier": "member", "joined_at": 100}]
+
+    changed = ph._apply_membership_sync(members, PEER_A, mock_plugin, membership_events=events)
+
+    assert changed == 1
+    assert db.get_member(PEER_B) is None
+
+
+def test_handle_full_sync_applies_membership_events_before_member_merge(db, mock_plugin):
+    now = int(time.time())
+    db.add_member(PEER_A, tier="member", joined_at=100)
+    db.add_member(PEER_B, tier="member", joined_at=200)
+    ph.database = db
+    ph.gossip_mgr = MagicMock()
+    ph.gossip_mgr.process_full_sync.return_value = 0
+    ph.state_manager = MagicMock()
+    mock_plugin.rpc.checkmessage.return_value = {"verified": True, "pubkey": PEER_A}
+
+    payload = {
+        "sender_id": PEER_A,
+        "timestamp": now,
+        "signature": "signedpayload",
+        "fleet_hash": "",
+        "states": [],
+        "members": [{"peer_id": PEER_A, "tier": "member", "joined_at": 100}],
+        "membership_events": [{
+            "event_id": "evt-1",
+            "peer_id": PEER_B,
+            "event": "removed",
+            "actor_peer_id": PEER_A,
+            "reason": "maintenance",
+            "timestamp": now,
+            "joined_at_cutoff": 200,
+        }],
+    }
+
+    result = ph.handle_full_sync(PEER_A, payload, mock_plugin)
+
+    assert result == {"result": "continue"}
+    assert db.get_member(PEER_B) is None

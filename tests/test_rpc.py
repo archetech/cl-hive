@@ -354,6 +354,38 @@ class TestBanRPC:
             assert call_args[0][1]["peer_id"] == peer_id
             assert call_args[0][1]["reason"] == "test ban"
 
+    def test_hive_remove_member_broadcasts_member_removed(self, database, mock_plugin):
+        """hive-remove-member should broadcast MEMBER_REMOVED for upgraded peers."""
+        repo_root = Path(__file__).resolve().parents[1]
+        module_path = repo_root / "cl-hive.py"
+        spec = importlib.util.spec_from_file_location("cl_hive_test_module_rpc_remove", module_path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(module)
+
+        module.database = database
+        module.plugin = mock_plugin
+        module.our_pubkey = '02' + 'a' * 64
+        module.plugin.rpc.signmessage.return_value = {"zbase": "signed"}
+        module.plugin.rpc.listpeerchannels.return_value = {"channels": []}
+        module.plugin.rpc.listnodes.return_value = {"nodes": [{"alias": "peer"}]}
+
+        peer_id = '02' + 'b' * 64
+        database.add_member(module.our_pubkey, tier='member', joined_at=int(time.time()))
+        database.add_member(peer_id, tier='member', joined_at=int(time.time()))
+
+        with patch.object(module.protocol_handlers, "_execute_member_removal", MagicMock()) as removal_mock:
+            with patch.object(module.protocol_handlers, "_reliable_broadcast", MagicMock()) as broadcast_mock:
+                result = module.hive_remove_member(mock_plugin, peer_id, "maintenance", False)
+
+                assert result["status"] == "removed"
+                removal_mock.assert_called_once()
+                broadcast_mock.assert_called_once()
+                call_args = broadcast_mock.call_args
+                assert call_args[0][0] == module.HiveMessageType.MEMBER_REMOVED
+                assert call_args[0][1]["peer_id"] == peer_id
+                assert call_args[0][1]["reason"] == "maintenance"
+
 
 # =============================================================================
 # PERMISSION TESTS (Issue #25)

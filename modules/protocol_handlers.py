@@ -719,13 +719,81 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Process membership list if included (Phase 5 enhancement)
     members_synced = 0
     if database and "members" in payload:
-        members_synced = _apply_membership_sync(payload["members"], peer_id, plugin)
+        members_synced = _apply_membership_sync(
+            payload["members"],
+            peer_id,
+            plugin,
+            membership_events=payload.get("membership_events"),
+        )
 
     plugin.log(f"cl-hive: FULL_SYNC from {peer_id[:16]}...: {updated} states, {members_synced} members synced")
 
     return {"result": "continue"}
 
-def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -> int:
+def _valid_membership_tombstone_event(event: Dict[str, Any]) -> bool:
+    """Validate tombstone events carried in FULL_SYNC catch-up."""
+    if not isinstance(event, dict):
+        return False
+    if not isinstance(event.get("event_id"), str) or not event.get("event_id"):
+        return False
+    if not isinstance(event.get("peer_id"), str) or not event.get("peer_id"):
+        return False
+    if event.get("event") not in {"banned", "left", "removed"}:
+        return False
+    if not isinstance(event.get("timestamp"), int) or event.get("timestamp") <= 0:
+        return False
+    if not isinstance(event.get("joined_at_cutoff"), int) or event.get("joined_at_cutoff") < 0:
+        return False
+    actor_peer_id = event.get("actor_peer_id")
+    if actor_peer_id is not None and not isinstance(actor_peer_id, str):
+        return False
+    reason = event.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return False
+    return True
+
+def _apply_membership_events(events: list, sender_id: str, plugin: Plugin) -> int:
+    """
+    Apply membership tombstones received via FULL_SYNC catch-up.
+
+    Removes any local member whose current membership is at or before the
+    signed joined_at_cutoff. Newer rejoins are preserved.
+    """
+    if not database or not isinstance(events, list):
+        return 0
+
+    changed = 0
+    for event in events:
+        if not _valid_membership_tombstone_event(event):
+            continue
+
+        peer_id = event["peer_id"]
+        event_type = event["event"]
+        actor_peer_id = event.get("actor_peer_id") or sender_id
+        reason = event.get("reason")
+        joined_at_cutoff = int(event.get("joined_at_cutoff") or 0)
+
+        database.record_membership_tombstone(
+            event_id=event["event_id"],
+            peer_id=peer_id,
+            event=event_type,
+            actor_peer_id=actor_peer_id,
+            reason=reason,
+            timestamp=event["timestamp"],
+            joined_at_cutoff=joined_at_cutoff,
+        )
+
+        member = database.get_member(peer_id)
+        if member and int(member.get("joined_at") or 0) <= joined_at_cutoff:
+            if event_type == "banned" and not database.is_banned(peer_id):
+                database.add_ban(peer_id, reason or "member_ban", actor_peer_id)
+            _execute_member_removal(peer_id, reason=event_type)
+            changed += 1
+
+    return changed
+
+def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin,
+                           membership_events: Optional[list] = None) -> int:
     """
     Apply membership list from FULL_SYNC payload.
 
@@ -743,6 +811,7 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
     if not database or not isinstance(members_list, list):
         return 0
 
+    changed = _apply_membership_events(membership_events or [], sender_id, plugin)
     added = 0
     updated = 0
     for member_info in members_list:
@@ -804,7 +873,7 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
     if updated > 0:
         plugin.log(f"cl-hive: Membership sync: {added} added, {updated} tiers upgraded")
 
-    return added + updated
+    return changed + added + updated
 
 def _create_membership_payload() -> list:
     """
@@ -857,6 +926,8 @@ def _create_signed_full_sync_msg() -> Optional[bytes]:
     # Create base payload
     full_sync_payload = gossip_mgr.create_full_sync_payload()
     full_sync_payload["members"] = _create_membership_payload()
+    if database:
+        full_sync_payload["membership_events"] = database.get_membership_tombstones(limit=200)
 
     # Add sender identification
     full_sync_payload["sender_id"] = our_pubkey
@@ -1860,7 +1931,7 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: MEMBER_LEFT for unknown peer {leaving_peer_id[:16]}...", level='debug')
         return {"result": "continue"}
 
-    if not _check_timestamp_freshness(payload, MAX_STATE_HASH_AGE_SECONDS, label="MEMBER_LEFT"):
+    if not _check_timestamp_freshness(payload, MAX_MEMBERSHIP_EVENT_AGE_SECONDS, label="MEMBER_LEFT"):
         return {"result": "continue"}
 
     joined_at = member.get("joined_at")
@@ -1891,9 +1962,22 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if event_id:
         payload["_event_id"] = event_id
 
+    joined_at_cutoff = int(member.get("joined_at") or 0)
+    tombstone_id = payload.get("_event_id") or event_id or generate_event_id("MEMBER_LEFT", payload)
+    if tombstone_id:
+        database.record_membership_tombstone(
+            event_id=tombstone_id,
+            peer_id=leaving_peer_id,
+            event="left",
+            actor_peer_id=leaving_peer_id,
+            reason=reason,
+            timestamp=timestamp,
+            joined_at_cutoff=joined_at_cutoff,
+        )
+
     # Remove the member
     tier = member.get("tier")
-    database.remove_member(leaving_peer_id)
+    _execute_member_removal(leaving_peer_id, reason="left")
     plugin.log(f"cl-hive: Member {leaving_peer_id[:16]}... ({tier}) left the hive: {reason}")
 
 
@@ -1909,10 +1993,80 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     return {"result": "continue"}
 
+def handle_member_removed(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle MEMBER_REMOVED message - explicit operator removal for upgraded peers.
+    """
+    if not database:
+        return {"result": "continue"}
+
+    target_peer_id = payload.get("peer_id")
+    actor_peer_id = payload.get("actor_peer_id")
+    reason = payload.get("reason", "maintenance")
+    timestamp = payload.get("timestamp")
+    event_id = payload.get("event_id")
+    joined_at_cutoff = payload.get("joined_at_cutoff")
+    signature = payload.get("signature")
+
+    if not _is_valid_pubkey(target_peer_id) or not _is_valid_pubkey(actor_peer_id):
+        return {"result": "continue"}
+    if not isinstance(reason, str) or not reason:
+        return {"result": "continue"}
+    if not isinstance(timestamp, int) or timestamp <= 0:
+        return {"result": "continue"}
+    if not isinstance(event_id, str) or not event_id:
+        return {"result": "continue"}
+    if not isinstance(joined_at_cutoff, int) or joined_at_cutoff < 0:
+        return {"result": "continue"}
+    if not isinstance(signature, str) or not signature:
+        return {"result": "continue"}
+
+    if not _validate_relay_sender(peer_id, actor_peer_id, payload):
+        plugin.log(
+            f"cl-hive: MEMBER_REMOVED sender mismatch: {peer_id[:16]}... != {actor_peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    actor = database.get_member(actor_peer_id)
+    if not actor or database.is_banned(actor_peer_id):
+        plugin.log(f"cl-hive: MEMBER_REMOVED rejected from non-member {actor_peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if not _check_timestamp_freshness(payload, MAX_MEMBERSHIP_EVENT_AGE_SECONDS, label="MEMBER_REMOVED"):
+        return {"result": "continue"}
+
+    canonical = f"hive:remove:{actor_peer_id}:{target_peer_id}:{timestamp}:{reason}"
+    try:
+        result = plugin.rpc.checkmessage(canonical, signature)
+        if not result.get("verified") or result.get("pubkey") != actor_peer_id:
+            plugin.log(f"cl-hive: MEMBER_REMOVED signature invalid for {actor_peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: MEMBER_REMOVED signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    database.record_membership_tombstone(
+        event_id=event_id,
+        peer_id=target_peer_id,
+        event="removed",
+        actor_peer_id=actor_peer_id,
+        reason=reason,
+        timestamp=timestamp,
+        joined_at_cutoff=joined_at_cutoff,
+    )
+
+    member = database.get_member(target_peer_id)
+    if member and int(member.get("joined_at") or 0) <= joined_at_cutoff:
+        _execute_member_removal(target_peer_id, reason="removed")
+
+    return {"result": "continue"}
+
 # Message timestamp freshness limits (reject stale replayed messages)
 MAX_GOSSIP_AGE_SECONDS = 3600           # 1 hour for gossip
 MAX_INTENT_AGE_SECONDS = 600            # 10 minutes for intents (time-sensitive)
 MAX_STATE_HASH_AGE_SECONDS = 3600       # 1 hour for state hash / full sync
+MAX_MEMBERSHIP_EVENT_AGE_SECONDS = 30 * 86400  # 30 days for membership removals/catch-up
 MAX_INTELLIGENCE_AGE_SECONDS = 7200     # 2 hours for fee/health/liquidity reports
 MAX_CLOCK_SKEW_SECONDS = 300            # 5 minutes future tolerance
 
@@ -1943,6 +2097,7 @@ def handle_ban(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     reporter_id = payload.get("reporter", peer_id)
     timestamp = payload.get("timestamp")
     signature = payload.get("signature")
+    event_id = payload.get("event_id")
     auth_fields = ("reporter", "timestamp", "signature")
     has_any_auth = any(field in payload for field in auth_fields)
     has_full_auth = all(field in payload for field in auth_fields)
@@ -1993,8 +2148,28 @@ def handle_ban(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: BAN notification for already-banned {target_peer_id[:16]}...", level='debug')
         return {"status": "already_banned"}
 
+    current_member = database.get_member(target_peer_id)
+    joined_at_cutoff = int(current_member.get("joined_at") or 0) if current_member else 0
+    tombstone_id = event_id
+    if not tombstone_id:
+        event_payload = {
+            "peer_id": target_peer_id,
+            "reporter": reporter_id,
+            "timestamp": timestamp if isinstance(timestamp, int) else 0,
+        }
+        tombstone_id = generate_event_id("BAN", event_payload) or secrets.token_hex(16)
+
     # Enforce the ban
     database.add_ban(target_peer_id, reason, reporter_id, signature=signature if has_full_auth else None)
+    database.record_membership_tombstone(
+        event_id=tombstone_id,
+        peer_id=target_peer_id,
+        event="banned",
+        actor_peer_id=reporter_id,
+        reason=reason,
+        timestamp=timestamp if isinstance(timestamp, int) and timestamp > 0 else int(time.time()),
+        joined_at_cutoff=joined_at_cutoff,
+    )
 
     # Full removal: DB, state manager, bridge policy, and forced gossip
     _execute_member_removal(target_peer_id, reason="banned")

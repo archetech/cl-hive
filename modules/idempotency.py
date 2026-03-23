@@ -21,6 +21,8 @@ from typing import Any, Dict, Optional, Tuple
 # event identity.  Order matters for deterministic hashing.
 EVENT_ID_FIELDS: Dict[str, list] = {
     # Membership
+    "BAN": ["peer_id", "reporter", "timestamp"],
+    "MEMBER_REMOVED": ["peer_id", "actor_peer_id", "timestamp"],
     "MEMBER_LEFT": ["peer_id", "timestamp"],
     # Traffic Intelligence
     "TRAFFIC_INTELLIGENCE_BATCH": ["reporter_id", "timestamp"],
