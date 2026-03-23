@@ -20,6 +20,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import modules.protocol as protocol
+
 from modules.protocol import (
     HIVE_MAGIC,
     HiveMessageType,
@@ -370,6 +372,45 @@ class TestSerializeNoneReturn:
         else:
             # Normal case - can call .hex()
             assert isinstance(result.hex(), str)
+
+
+class TestProtocolV2Helpers:
+    """Focused tests for the strict v2 state-sync helpers."""
+
+    def test_gossip_signing_payload_v2_changes_when_addresses_change(self):
+        base_payload = {
+            "sender_id": "02" + "a" * 64,
+            "timestamp": 1711200000,
+            "version": 7,
+            "fleet_hash": "f" * 64,
+            "capacity_sats": 1000,
+            "available_sats": 500,
+            "fee_policy": {"base_fee": 1000, "fee_rate": 10},
+            "topology": ["03" + "b" * 64, "02" + "c" * 64],
+            "addresses": ["10.0.0.1:9735"],
+            "capabilities": ["mcf"],
+        }
+        changed_payload = dict(base_payload, addresses=["10.0.0.2:9735"])
+
+        base = protocol.get_gossip_signing_payload_v2(base_payload)
+        changed = protocol.get_gossip_signing_payload_v2(changed_payload)
+
+        assert base != changed
+
+    def test_state_hash_signing_payload_v2_changes_when_membership_hash_changes(self):
+        base_payload = {
+            "sender_id": "02" + "d" * 64,
+            "fleet_hash": "e" * 64,
+            "membership_hash": "1" * 64,
+            "timestamp": 1711200001,
+            "peer_count": 3,
+        }
+        changed_payload = dict(base_payload, membership_hash="2" * 64)
+
+        base = protocol.get_state_hash_signing_payload_v2(base_payload)
+        changed = protocol.get_state_hash_signing_payload_v2(changed_payload)
+
+        assert base != changed
 
 
 if __name__ == "__main__":
