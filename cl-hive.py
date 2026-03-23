@@ -1750,7 +1750,7 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
         },
         "budget": {
             "daily_budget_sats": cfg.daily_expansion_budget_sats,
-            "spent_today_sats": budget_info['today']['spent_sats'],
+            "spent_today_sats": budget_info.get('spent_sats', 0),
             "daily_remaining_sats": daily_remaining,
             "max_per_channel_sats": max_per_channel,
             "reserve_pct": cfg.budget_reserve_pct,
