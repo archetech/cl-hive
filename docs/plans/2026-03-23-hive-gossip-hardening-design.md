@@ -13,79 +13,107 @@ The 2026-03-23 gossip audit confirmed five protocol and correctness failures in 
 4. Remote state is persisted with local receipt time instead of the signed remote timestamp, so restart changes fleet hashes.
 5. State-count limits disagree across validation, processing, and reload paths.
 
-The fix must remain backward-compatible with already-deployed nodes.
+This design assumes upgraded nodes immediately reject all legacy `GOSSIP`, `STATE_HASH`, and `FULL_SYNC` traffic.
 
 ## Constraints
 
-- Keep existing message types and current signatures working during a rolling upgrade.
-- Do not preserve the audited exploit paths just to keep feature parity with old nodes.
-- Prefer additive fields that older nodes ignore cleanly.
-- Mixed fleets may degrade in catch-up quality temporarily, but upgraded nodes must not keep trusting unsafe legacy data.
+- This is an intentional protocol break for the state-sync surface.
+- `HELLO`, `CHALLENGE`, `ATTEST`, `WELCOME`, and other unrelated message types do not need to change as part of this design.
+- Upgraded nodes must not preserve any audited exploit path for compatibility.
+- Mixed fleets are expected to partition at the gossip/state-sync layer until all participating peers are upgraded.
 
 ## Approaches Considered
 
 ### 1. Strict v2-only protocol cutover
 
-Require all upgraded nodes to reject legacy `GOSSIP`, `STATE_HASH`, and `FULL_SYNC` formats unless they carry the new stronger signatures.
+Require all upgraded nodes to send and accept only a stronger v2 contract for `GOSSIP`, `STATE_HASH`, and `FULL_SYNC`.
 
-This closes the issues cleanly, but it partitions mixed fleets and does not satisfy the compatibility requirement.
+This cleanly closes the audited trust failures, makes operator expectations explicit, and is the selected approach.
 
-### 2. Additive integrity layer on top of the current protocol
+### 2. Additive integrity layer with legacy fallback
 
-Keep the existing message shapes and legacy signature checks, then add optional v2 integrity fields covering the missing content. Upgraded receivers prefer v2 proofs when present and sharply reduce what legacy payloads are allowed to mutate.
+Keep legacy messages working, add optional v2 proofs, and continue to accept reduced-trust legacy payloads during rollout.
 
-This keeps rolling upgrades possible while removing the high-severity trust failures. This is the selected approach.
+This helps rolling upgrades, but it intentionally preserves a compatibility surface around messages that were already shown to be unsafe. The user explicitly rejected this tradeoff.
 
-### 3. Immediate legacy lock-down with no richer v2 path
+### 3. Partial strictness
 
-Stop trusting legacy `FULL_SYNC` and relayed optional gossip fields immediately, but do not add stronger replacement proofs yet.
+Require v2 only for `FULL_SYNC`, but keep accepting legacy `GOSSIP` and `STATE_HASH`.
 
-This is safe, but it unnecessarily degrades convergence because upgraded peers would have no authenticated full-snapshot path during the rollout.
+This reduces some of the blast radius, but it leaves the relayed-address issue and unsigned `membership_hash` semantics in place. It is not sufficient.
 
 ## Selected Design
 
-### 1. Additive v2 integrity fields
+### 1. New required v2 contract for state-sync traffic
 
-Upgraded senders continue emitting the existing legacy signature so old nodes remain interoperable. They also add stronger v2 proof fields that old nodes ignore.
+Upgraded senders emit only the stronger v2-authenticated form of these messages. Upgraded receivers reject the message before any state mutation if the v2 contract is missing or invalid.
 
-Planned additions:
+Required fields:
 
 - `GOSSIP`
-  - Add a canonical v2 content hash that covers all trusted fields: core state, budget fields, `addresses`, and `capabilities`.
-  - Add `signature_v2` over `{sender_id, timestamp, version, fleet_hash/state_hash, content_hash_v2}`.
+  - `signature_v2`
+  - canonical content hash covering:
+    - `capacity_sats`
+    - `available_sats`
+    - `fee_policy`
+    - `topology`
+    - budget fields
+    - `addresses`
+    - `capabilities`
 - `STATE_HASH`
-  - Add `signature_v2` that covers `{sender_id, fleet_hash, membership_hash, peer_count, timestamp}`.
+  - `signature_v2`
+  - canonical signing payload covering:
+    - `sender_id`
+    - `fleet_hash`
+    - `membership_hash`
+    - `peer_count`
+    - `timestamp`
 - `FULL_SYNC`
-  - Add `states_hash_v2` over fully normalized state rows.
-  - Add `members_hash_v2` over fully normalized member rows, including `addresses`.
-  - Add `signature_v2` over `{sender_id, timestamp, states_hash_v2, members_hash_v2}`.
+  - `states_hash_v2` over fully normalized state rows
+  - `members_hash_v2` over fully normalized member rows
+  - `signature_v2` over:
+    - `sender_id`
+    - `timestamp`
+    - `states_hash_v2`
+    - `members_hash_v2`
 
-The legacy signature stays unchanged during rollout.
+The existing legacy signatures may remain in payloads temporarily for debugging or transitional observability, but upgraded receivers ignore them for trust decisions.
 
-### 2. Receiver trust policy
+### 2. Immediate receiver policy
 
-Upgraded receivers split behavior into trusted v2 and reduced-trust legacy handling.
+`GOSSIP`
 
-`GOSSIP`:
+- Reject if `signature_v2` is missing.
+- Reject if the v2 signing payload does not verify.
+- Only after v2 verification:
+  - persist `addresses`
+  - trust `capabilities`
+  - trust budget fields
+  - allow auto-connect side effects
 
-- If v2 proof is present and valid, trust the full payload.
-- If only the legacy proof is present, still accept core state from the sender, but strip unsigned optional fields before persistence and side effects.
-- Specifically: do not persist `addresses`, do not auto-connect from relayed legacy gossip, and do not trust legacy `capabilities` or budget fields for decision-making.
+`STATE_HASH`
 
-`STATE_HASH`:
+- Reject if `signature_v2` is missing.
+- Reject if `membership_hash` is missing or the v2 signing payload does not verify.
+- Treat `membership_hash` as authenticated input only in v2.
 
-- If v2 proof is present and valid, trust `membership_hash`.
-- If only the legacy proof is present, treat `membership_hash` as advisory and do not take membership actions based solely on it.
+`FULL_SYNC`
 
-`FULL_SYNC`:
+- Reject if `signature_v2`, `states_hash_v2`, or `members_hash_v2` is missing.
+- Reject if either v2 hash mismatches the provided rows.
+- Reject invalid state rows and invalid member rows before applying any mutation.
+- No legacy fallback path: legacy `FULL_SYNC` does not update sender state, foreign state, or membership.
 
-- If v2 proof is present and valid, accept full state rows and member rows after schema validation.
-- If only the legacy proof is present, do not allow the sender to mutate foreign peer state or membership.
-- Safe compatibility rule: legacy `FULL_SYNC` may update at most the sender's own state row and must ignore the `members` array entirely.
+### 3. Version signaling
 
-This preserves wire compatibility but intentionally removes unsafe legacy authority.
+The simplest cutover is to make these three message families explicitly v2-only on upgraded nodes:
 
-### 3. Validation and normalization
+- send them with envelope version `2`
+- require envelope version `2` when handling them
+
+That gives operators a clear network signal during rollout and prevents ambiguity about which contract is in force.
+
+### 4. Validation and normalization
 
 Schema validation must match the fields that receivers later trust.
 
@@ -93,10 +121,10 @@ Required hardening:
 
 - Validate member `peer_id` as an actual node pubkey before syncing membership.
 - Validate `addresses` as bounded lists of strings before persistence or auto-connect.
-- Normalize `topology`, `addresses`, and `capabilities` deterministically before hashing.
+- Normalize `topology`, `addresses`, `capabilities`, and member rows deterministically before hashing.
 - Centralize one network `MAX_FULL_SYNC_STATES` value used by both validation and processing.
 
-### 4. Persistence and restart stability
+### 5. Persistence and restart stability
 
 Remote state must preserve the sender-authored timestamp across restarts.
 
@@ -105,23 +133,27 @@ Changes:
 - Store the remote payload timestamp for remote state instead of local receipt time.
 - Thread that timestamp through `StateManager.update_peer_state()`, `StateManager.apply_full_sync()`, and `HiveDatabase.update_hive_state()`.
 - Remove the silent `LIMIT 1000` reload truncation from `get_all_hive_states()`.
-- Keep version guards, but do not rewrite `last_update` semantics during persistence.
+- Keep version guards, but do not rewrite the logical update timestamp during persistence.
 
-### 5. Testing strategy
+### 6. Testing strategy
 
-The rollout should be test-driven and mixed-fleet aware.
+The rollout should be test-driven and explicit about the intentional break.
 
 Required test coverage:
 
-- legacy vs v2 `GOSSIP` handling for relayed addresses
-- legacy vs v2 `STATE_HASH` handling for `membership_hash`
-- legacy vs v2 `FULL_SYNC` handling for foreign state rows and membership rows
-- invalid member/address rejection in membership sync
+- legacy `GOSSIP` is rejected
+- legacy `STATE_HASH` is rejected
+- legacy `FULL_SYNC` is rejected
+- valid v2 `GOSSIP` persists `addresses` and permits auto-connect
+- valid v2 `STATE_HASH` authenticates `membership_hash`
+- valid v2 `FULL_SYNC` applies authenticated foreign state and authenticated member rows
+- invalid v2 member/address rows are rejected
 - restart hash stability for remote state
 - unified FULL_SYNC state-count limits
 
 ## Rollout Notes
 
-- This design is backward-compatible at the wire level.
-- It is not legacy-feature-compatible in every case: upgraded nodes will intentionally trust less data from legacy peers until those peers also emit v2 proofs.
-- That is the correct tradeoff for the audited high-severity issues.
+- This design is not backward-compatible for the state-sync surface.
+- Upgraded nodes will refuse legacy `GOSSIP`, `STATE_HASH`, and `FULL_SYNC` immediately.
+- Operators must coordinate upgrades across the fleet before expecting normal anti-entropy and membership convergence.
+- That operational cost is justified by the audited high-severity trust failures.

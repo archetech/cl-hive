@@ -2,60 +2,60 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Harden Hive gossip/state sync against the March 23, 2026 audit findings while remaining backward-compatible with already-deployed nodes.
+**Goal:** Replace the unsafe legacy Hive state-sync contract with a strict v2-only `GOSSIP`/`STATE_HASH`/`FULL_SYNC` protocol that closes the March 23, 2026 audit findings.
 
-**Architecture:** Keep the current `GOSSIP`, `STATE_HASH`, and `FULL_SYNC` message types and legacy signatures for compatibility, but add stronger v2 integrity fields that upgraded nodes verify. Legacy payloads remain parseable, but upgraded receivers sharply reduce what legacy messages can mutate: legacy `GOSSIP` may update only core state, legacy `STATE_HASH` treats `membership_hash` as advisory, and legacy `FULL_SYNC` may update at most the sender's own state row and must ignore membership rows. Persistence is hardened so remote timestamps survive restart and state-count limits are consistent across validation and processing.
+**Architecture:** Upgraded nodes emit envelope version `2` for `GOSSIP`, `STATE_HASH`, and `FULL_SYNC`, and receivers immediately reject those messages unless the new v2-authenticated hashes and signatures are present and valid. There is no legacy fallback for these three message types. Alongside the protocol hardening, persistence is fixed so remote timestamps survive restart and all state-count boundaries use one shared limit.
 
 **Tech Stack:** Python 3.12, Core Lightning plugin (`pyln-client`), SQLite, `pytest`, `unittest.mock`
 
 ---
 
-### Task 1: Add v2 integrity helpers and shared sync limits
+### Task 1: Add v2 integrity helpers and strict protocol constants
 
 **Files:**
 - Modify: `modules/protocol.py`
-- Modify: `modules/gossip.py`
+- Modify: `tests/test_protocol.py`
 - Create: `tests/test_gossip_protocol_hardening.py`
 
 **Step 1: Write the failing helper tests**
 
-Add focused tests proving the new helpers must cover the audited fields:
+Add focused tests covering the new contract:
 
 ```python
 def test_gossip_signing_payload_v2_changes_when_addresses_change():
-    payload = {..., "addresses": ["1.2.3.4:9735"]}
-    tampered = dict(payload, addresses=["9.9.9.9:9735"])
-    assert get_gossip_signing_payload_v2(payload) != get_gossip_signing_payload_v2(tampered)
+    ...
 
 
 def test_state_hash_signing_payload_v2_changes_when_membership_hash_changes():
-    payload = {..., "membership_hash": "1" * 64}
-    tampered = dict(payload, membership_hash="2" * 64)
-    assert get_state_hash_signing_payload_v2(payload) != get_state_hash_signing_payload_v2(tampered)
+    ...
 
 
 def test_full_sync_states_hash_v2_changes_when_state_contents_change():
-    assert compute_full_sync_states_hash_v2(states_a) != compute_full_sync_states_hash_v2(states_b)
+    ...
+
+
+def test_state_sync_messages_require_envelope_version_2():
+    ...
 ```
 
 **Step 2: Run the new helper tests**
 
 Run:
-`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "payload_v2 or states_hash_v2" -v`
+`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_protocol.py tests/test_gossip_protocol_hardening.py -k "v2 or envelope_version_2" -v`
 
-Expected: FAIL because the new helpers do not exist yet.
+Expected: FAIL because the new helpers and strict version checks do not exist yet.
 
-**Step 3: Implement the minimal v2 helper layer**
+**Step 3: Implement the v2 helper layer**
 
 In `modules/protocol.py`:
 
-- Add one shared network boundary constant, for example:
+- Add one shared network boundary constant:
 
 ```python
 MAX_FULL_SYNC_STATES = 500
 ```
 
-- Add canonical v2 hashing/signing helpers:
+- Add canonical v2 helpers:
 
 ```python
 def compute_gossip_data_hash_v2(payload: Dict[str, Any]) -> str: ...
@@ -66,30 +66,36 @@ def compute_full_sync_members_hash_v2(members: list) -> str: ...
 def get_full_sync_signing_payload_v2(payload: Dict[str, Any]) -> str: ...
 ```
 
-- Normalize lists before hashing where order is not semantically important:
+- Add strict helpers:
+
+```python
+STRICT_STATE_SYNC_VERSION = 2
+
+def is_strict_state_sync_payload(payload: Dict[str, Any]) -> bool:
+    return payload.get("_envelope_version") == STRICT_STATE_SYNC_VERSION
+```
+
+- Normalize before hashing:
   - `topology`
   - `addresses`
   - `capabilities`
-
-In `modules/gossip.py`:
-
-- Import and use the shared `MAX_FULL_SYNC_STATES` instead of the local hard-coded 2000.
+  - member rows
 
 **Step 4: Re-run the helper tests**
 
 Run:
-`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "payload_v2 or states_hash_v2" -v`
+`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_protocol.py tests/test_gossip_protocol_hardening.py -k "v2 or envelope_version_2" -v`
 
 Expected: PASS.
 
 **Step 5: Commit**
 
 ```bash
-git add modules/protocol.py modules/gossip.py tests/test_gossip_protocol_hardening.py
-git commit -m "fix: add gossip sync v2 integrity helpers"
+git add modules/protocol.py tests/test_protocol.py tests/test_gossip_protocol_hardening.py
+git commit -m "fix: add strict v2 gossip sync helpers"
 ```
 
-### Task 2: Harden GOSSIP optional-field trust
+### Task 2: Reject legacy GOSSIP and require v2-authenticated optional fields
 
 **Files:**
 - Modify: `modules/protocol_handlers.py`
@@ -98,58 +104,55 @@ git commit -m "fix: add gossip sync v2 integrity helpers"
 
 **Step 1: Write the failing GOSSIP handler tests**
 
-Add tests for both compatibility modes:
+Add:
 
 ```python
-def test_legacy_relayed_gossip_drops_addresses_and_skips_autoconnect(...):
+def test_handle_gossip_rejects_legacy_payload_without_signature_v2(...):
     ...
-    assert db.get_member(sender)["addresses"] is None
-    plugin.rpc.connect.assert_not_called()
+    plugin.rpc.checkmessage.assert_not_called()
 
 
-def test_v2_relayed_gossip_with_valid_signature_v2_persists_addresses(...):
+def test_handle_gossip_rejects_envelope_v1(...):
+    ...
+
+
+def test_handle_gossip_accepts_v2_payload_and_persists_addresses(...):
     ...
     assert json.loads(db.get_member(sender)["addresses"]) == ["1.2.3.4:9735"]
 
 
-def test_legacy_gossip_ignores_capabilities_and_budget_side_fields(...):
+def test_handle_gossip_accepts_v2_payload_and_autoconnects(...):
     ...
 ```
 
-**Step 2: Run the GOSSIP hardening tests**
+**Step 2: Run the GOSSIP tests**
 
 Run:
-`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "gossip and (legacy or signature_v2)" -v`
+`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "handle_gossip" -v`
 
-Expected: FAIL because the current handler still trusts legacy optional fields.
+Expected: FAIL because the current handler still accepts legacy payloads.
 
-**Step 3: Implement legacy-safe and v2-trusted GOSSIP handling**
+**Step 3: Implement strict GOSSIP enforcement**
 
 In `modules/protocol_handlers.py`:
 
-- Add a helper that decides whether a GOSSIP payload has valid v2 proof.
-- For legacy-only payloads, build a sanitized copy before calling `gossip_mgr.process_gossip()`:
+- Add a helper to verify:
+  - envelope version `2`
+  - `signature_v2` exists
+  - `get_gossip_signing_payload_v2(payload)` verifies against `sender_id`
 
-```python
-sanitized = dict(payload)
-sanitized.pop("addresses", None)
-sanitized.pop("capabilities", None)
-sanitized.pop("budget_available_sats", None)
-sanitized.pop("budget_reserved_until", None)
-sanitized.pop("budget_last_update", None)
-```
-
-- Use the sanitized copy for persistence and side effects.
-- Do not auto-connect from legacy relayed gossip.
+- Reject before `gossip_mgr.process_gossip()` if any v2 requirement fails.
+- Reject before persistence and auto-connect if `addresses` validation fails.
+- Remove any legacy optional-field fallback logic for `GOSSIP`.
 
 In `modules/gossip.py`:
 
-- Make sure `process_gossip()` still accepts core-state updates after optional fields are stripped.
+- Keep core state processing unchanged once the handler has admitted a v2 payload.
 
-**Step 4: Re-run the GOSSIP handler tests**
+**Step 4: Re-run the GOSSIP tests**
 
 Run:
-`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "gossip and (legacy or signature_v2)" -v`
+`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "handle_gossip" -v`
 
 Expected: PASS.
 
@@ -157,76 +160,66 @@ Expected: PASS.
 
 ```bash
 git add modules/protocol_handlers.py modules/gossip.py tests/test_gossip_protocol_hardening.py
-git commit -m "fix: harden legacy gossip optional fields"
+git commit -m "fix: require v2 gossip authentication"
 ```
 
-### Task 3: Harden FULL_SYNC state and membership authority
+### Task 3: Reject legacy STATE_HASH and FULL_SYNC
 
 **Files:**
 - Modify: `modules/protocol_handlers.py`
 - Modify: `modules/protocol.py`
 - Modify: `tests/test_gossip_protocol_hardening.py`
 
-**Step 1: Write the failing FULL_SYNC tests**
+**Step 1: Write the failing STATE_HASH and FULL_SYNC tests**
 
-Add explicit mixed-fleet and v2 tests:
+Add:
 
 ```python
-def test_legacy_full_sync_only_applies_sender_row(...):
+def test_handle_state_hash_rejects_legacy_payload_without_signature_v2(...):
     ...
-    assert state_manager.get_peer_state(victim) is None
 
 
-def test_legacy_full_sync_ignores_members_array(...):
+def test_handle_state_hash_accepts_v2_payload_with_membership_hash(...):
     ...
-    assert db.get_member("not-a-pubkey") is None
 
 
-def test_v2_full_sync_applies_foreign_rows_when_hashes_verify(...):
+def test_handle_full_sync_rejects_legacy_payload_without_signature_v2(...):
     ...
-    assert state_manager.get_peer_state(victim).capacity_sats == 999999
 
 
-def test_v2_full_sync_rejects_invalid_member_pubkey(...):
+def test_handle_full_sync_rejects_envelope_v1(...):
     ...
 ```
 
-**Step 2: Run the FULL_SYNC tests**
+**Step 2: Run the strict rejection tests**
 
 Run:
-`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "full_sync or members_array" -v`
+`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "state_hash or full_sync" -v`
 
-Expected: FAIL because legacy FULL_SYNC still mutates foreign rows and membership.
+Expected: FAIL because the current handlers still accept legacy payloads.
 
-**Step 3: Implement the receiver policy**
+**Step 3: Implement strict STATE_HASH/FULL_SYNC enforcement**
 
 In `modules/protocol_handlers.py`:
 
-- Add a helper to verify FULL_SYNC `signature_v2`, `states_hash_v2`, and `members_hash_v2`.
-- For legacy-only payloads:
-  - keep `sender_id == peer_id` and member checks
-  - filter `states` down to rows where `row["peer_id"] == sender_id`
-  - ignore `members` entirely
-- For v2 payloads:
-  - validate each state row before applying
-  - validate each member row before syncing
-  - reject invalid member pubkeys and malformed addresses
+- `handle_state_hash()` must require:
+  - envelope version `2`
+  - `signature_v2`
+  - authenticated `membership_hash`
 
-Suggested structure:
+- `handle_full_sync()` must require:
+  - envelope version `2`
+  - `signature_v2`
+  - `states_hash_v2`
+  - `members_hash_v2`
 
-```python
-if has_valid_full_sync_v2(payload):
-    trusted_states = validate_v2_states(payload["states"])
-    trusted_members = validate_v2_members(payload.get("members", []))
-else:
-    trusted_states = [row for row in payload["states"] if row.get("peer_id") == sender_id]
-    trusted_members = []
-```
+- If any required v2 field is missing or invalid, reject immediately.
+- Remove all legacy fallback behavior for these three message types.
 
-**Step 4: Re-run the FULL_SYNC tests**
+**Step 4: Re-run the strict rejection tests**
 
 Run:
-`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "full_sync or members_array" -v`
+`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "state_hash or full_sync" -v`
 
 Expected: PASS.
 
@@ -234,10 +227,74 @@ Expected: PASS.
 
 ```bash
 git add modules/protocol_handlers.py modules/protocol.py tests/test_gossip_protocol_hardening.py
-git commit -m "fix: restrict legacy full sync authority"
+git commit -m "fix: reject legacy hive state sync traffic"
 ```
 
-### Task 4: Stabilize remote-state persistence and remove truncation
+### Task 4: Authenticate full state and membership rows in v2 FULL_SYNC
+
+**Files:**
+- Modify: `modules/protocol_handlers.py`
+- Modify: `modules/protocol.py`
+- Modify: `tests/test_gossip_protocol_hardening.py`
+
+**Step 1: Write the failing v2 FULL_SYNC authority tests**
+
+Add:
+
+```python
+def test_handle_full_sync_v2_applies_foreign_rows_when_hashes_verify(...):
+    ...
+
+
+def test_handle_full_sync_v2_rejects_state_hash_mismatch(...):
+    ...
+
+
+def test_handle_full_sync_v2_rejects_invalid_member_pubkey(...):
+    ...
+
+
+def test_handle_full_sync_v2_rejects_invalid_address_shape(...):
+    ...
+```
+
+**Step 2: Run the v2 FULL_SYNC tests**
+
+Run:
+`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "full_sync_v2 or hash_mismatch or invalid_member" -v`
+
+Expected: FAIL because the current FULL_SYNC integrity contract is too weak.
+
+**Step 3: Implement authenticated FULL_SYNC application**
+
+In `modules/protocol_handlers.py`:
+
+- Verify `states_hash_v2` against fully normalized state rows.
+- Verify `members_hash_v2` against fully normalized member rows.
+- Validate all state rows before applying any state mutation.
+- Validate all member rows before calling `_apply_membership_sync()`.
+- Reject the whole message on any v2 integrity or schema failure.
+
+In `modules/protocol.py`:
+
+- Make `validate_full_sync()` use the shared `MAX_FULL_SYNC_STATES`.
+- Add reusable member-row and address validators if they keep handler code smaller and cleaner.
+
+**Step 4: Re-run the v2 FULL_SYNC tests**
+
+Run:
+`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "full_sync_v2 or hash_mismatch or invalid_member" -v`
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add modules/protocol_handlers.py modules/protocol.py tests/test_gossip_protocol_hardening.py
+git commit -m "fix: authenticate full sync rows in v2"
+```
+
+### Task 5: Stabilize remote-state persistence and unify limits
 
 **Files:**
 - Modify: `modules/state_manager.py`
@@ -246,7 +303,7 @@ git commit -m "fix: restrict legacy full sync authority"
 - Modify: `tests/test_state.py`
 - Modify: `tests/test_gossip_protocol_hardening.py`
 
-**Step 1: Write the failing persistence tests**
+**Step 1: Write the failing persistence and limit tests**
 
 Add:
 
@@ -261,14 +318,14 @@ def test_get_all_hive_states_does_not_truncate_after_1000_rows(...):
     assert len(reloaded.get_all_peer_states()) == 1105
 
 
-def test_full_sync_processing_uses_shared_limit(...):
+def test_full_sync_processing_uses_protocol_limit(...):
     ...
 ```
 
 **Step 2: Run the persistence tests**
 
 Run:
-`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_state.py tests/test_gossip_protocol_hardening.py -k "restart or truncate or shared_limit" -v`
+`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_state.py tests/test_gossip_protocol_hardening.py -k "restart or truncate or protocol_limit" -v`
 
 Expected: FAIL because the current DB path rewrites timestamps and truncates reload.
 
@@ -283,22 +340,22 @@ def update_hive_state(..., version: Optional[int] = None, last_update_ts: Option
     stored_ts = last_update_ts if last_update_ts is not None else int(time.time())
 ```
 
-- Use `stored_ts` instead of unconditional `now`.
-- Remove the `LIMIT 1000` from `get_all_hive_states()`.
+- Use `stored_ts` instead of unconditional local time.
+- Remove `LIMIT 1000` from `get_all_hive_states()`.
 
 In `modules/state_manager.py`:
 
-- Pass remote timestamps through on `update_peer_state()` and `apply_full_sync()`.
+- Pass remote timestamps through `update_peer_state()` and `apply_full_sync()`.
 - Keep local-state writes using current time.
 
 In `modules/gossip.py`:
 
-- Keep using the shared `MAX_FULL_SYNC_STATES` from Task 1.
+- Import the shared `MAX_FULL_SYNC_STATES` from `modules.protocol`.
 
 **Step 4: Re-run the persistence tests**
 
 Run:
-`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_state.py tests/test_gossip_protocol_hardening.py -k "restart or truncate or shared_limit" -v`
+`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_state.py tests/test_gossip_protocol_hardening.py -k "restart or truncate or protocol_limit" -v`
 
 Expected: PASS.
 
@@ -306,56 +363,87 @@ Expected: PASS.
 
 ```bash
 git add modules/state_manager.py modules/database.py modules/gossip.py tests/test_state.py tests/test_gossip_protocol_hardening.py
-git commit -m "fix: stabilize gossip persistence across restart"
+git commit -m "fix: stabilize v2 gossip persistence"
 ```
 
-### Task 5: Add mixed-fleet verification and finalize
+### Task 6: Update send paths and final verification
 
 **Files:**
+- Modify: `modules/protocol_handlers.py`
+- Modify: `modules/gossip.py`
 - Modify: `tests/test_gossip_protocol_hardening.py`
 - Modify: `tests/test_state.py`
 
-**Step 1: Add end-to-end compatibility tests**
+**Step 1: Write the failing outbound-message tests**
 
-Add one focused test for each compatibility promise:
+Add:
 
 ```python
-def test_legacy_gossip_still_updates_core_state(...):
+def test_create_signed_gossip_msg_emits_envelope_v2_and_signature_v2(...):
     ...
 
 
-def test_legacy_state_hash_still_detects_fleet_hash_mismatch(...):
+def test_create_signed_state_hash_msg_emits_envelope_v2_and_signature_v2(...):
     ...
 
 
-def test_v2_full_sync_allows_authenticated_fleet_catchup(...):
+def test_create_signed_full_sync_msg_emits_envelope_v2_hashes_and_signature_v2(...):
     ...
 ```
 
-**Step 2: Run the focused mixed-fleet slice**
+**Step 2: Run the outbound tests**
 
 Run:
-`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "legacy or v2" -v`
+`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip_protocol_hardening.py -k "create_signed" -v`
+
+Expected: FAIL because the send paths still build the legacy contract.
+
+**Step 3: Implement outbound v2 emission**
+
+In `modules/protocol_handlers.py`:
+
+- Update `_create_signed_gossip_msg()`, `_create_signed_state_hash_msg()`, and `_create_signed_full_sync_msg()` to populate the new v2 hashes/signatures.
+- Ensure serialized envelopes use version `2` for these message types.
+
+In `modules/gossip.py`:
+
+- Keep payload construction deterministic for the new hashes.
+
+**Step 4: Run the full verification sweep**
+
+Run:
+`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_protocol.py tests/test_gossip.py tests/test_state.py tests/test_security.py tests/test_cl_hive_fixes.py tests/test_gossip_protocol_hardening.py -v`
 
 Expected: PASS.
 
-**Step 3: Run the full gossip/state/security verification sweep**
-
-Run:
-`/home/sat/bin/cl-hive/.venv/bin/python -m pytest tests/test_gossip.py tests/test_state.py tests/test_security.py tests/test_cl_hive_fixes.py tests/test_gossip_protocol_hardening.py -v`
-
-Expected: PASS.
-
-**Step 4: Commit**
+**Step 5: Commit**
 
 ```bash
-git add tests/test_gossip_protocol_hardening.py tests/test_state.py
-git commit -m "test: cover mixed-fleet gossip hardening"
+git add modules/protocol_handlers.py modules/gossip.py tests/test_gossip_protocol_hardening.py tests/test_state.py tests/test_protocol.py
+git commit -m "fix: cut over hive state sync to strict v2"
 ```
 
-**Step 5: Request review and summarize rollout risk**
+### Task 7: Review and operator handoff
 
-- Request code review before merge.
-- In the handoff summary, call out the intentional compatibility tradeoff:
-  - legacy peers still interoperate
-  - legacy peers lose authority to mutate fleet-wide sync state until upgraded
+**Files:**
+- Finalize: `docs/plans/2026-03-23-hive-gossip-hardening-design.md`
+- Finalize: `docs/plans/2026-03-23-hive-gossip-hardening.md`
+
+**Step 1: Request review**
+
+- Request code review once implementation is complete.
+
+**Step 2: Prepare rollout notes**
+
+Document:
+
+- upgraded nodes reject legacy `GOSSIP`, `STATE_HASH`, and `FULL_SYNC`
+- mixed fleets will not anti-entropy sync correctly until upgraded
+- operators must coordinate rollout before expecting normal convergence
+
+**Step 3: Verify clean branch state**
+
+Run:
+`git status --short`
+
+Expected: clean working tree.
