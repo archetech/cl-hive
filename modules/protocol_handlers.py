@@ -320,21 +320,21 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         "hive_id": hive_id,
         "member_count": len(members),
         "state_hash": state_hash,
-        "tier": initial_tier,
+        "tier": MEMBER_TIER,
     }, sort_keys=True, separators=(',', ':'))
     welcome_sig = ""
     try:
         welcome_sig = plugin.rpc.signmessage(welcome_signing_fields).get("zbase", "")
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign WELCOME: {e}", level='warn')
-    welcome_msg = create_welcome(hive_id, initial_tier, len(members), state_hash, signature=welcome_sig)
+    welcome_msg = create_welcome(hive_id, MEMBER_TIER, len(members), state_hash, signature=welcome_sig)
 
     try:
         plugin.rpc.call("sendcustommsg", {
             "node_id": peer_id,
             "msg": welcome_msg.hex()
         })
-        plugin.log(f"cl-hive: Sent WELCOME to {peer_id[:16]}... (new {initial_tier})")
+        plugin.log(f"cl-hive: Sent WELCOME to {peer_id[:16]}... (new member)")
     except Exception as e:
         plugin.log(f"cl-hive: Failed to send WELCOME: {e}", level='warn')
 

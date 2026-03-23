@@ -3080,10 +3080,9 @@ def hive_gossip_stats(plugin: Plugin):
     return {
         "our_pubkey": our_pubkey[:16] + "...",
         "gossip_manager": {
-            "broadcast_version": gossip_state["version"],
-            "last_broadcast_ago": gossip_state["last_broadcast_ago"],
-            "heartbeat_interval": gossip_state["heartbeat_interval"],
-            "active_peers": gossip_state["active_peers"]
+            "broadcast_version": gossip_state.get("version"),
+            "last_broadcast_ago": gossip_state.get("last_broadcast_ago"),
+            "heartbeat_interval": gossip_state.get("heartbeat_interval"),
         },
         "our_state": {
             "version": our_state.version if our_state else None,
