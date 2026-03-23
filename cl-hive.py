@@ -1071,6 +1071,8 @@ def _dispatch_hive_message(peer_id: str, msg_type, msg_payload: Dict, plugin: Pl
         # Membership
         elif msg_type == HiveMessageType.MEMBER_LEFT:
             protocol_handlers.handle_member_left(peer_id, msg_payload, plugin)
+        elif msg_type == HiveMessageType.MEMBER_REMOVED:
+            protocol_handlers.handle_member_removed(peer_id, msg_payload, plugin)
         elif msg_type == HiveMessageType.BAN:
             protocol_handlers.handle_ban(peer_id, msg_payload, plugin)
         # Fee Intelligence
@@ -3143,9 +3145,30 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     if not success:
         return {"error": "Failed to add ban", "peer_id": peer_id}
 
+    joined_at_cutoff = int(member.get("joined_at") or 0)
+    ban_payload = {
+        "peer_id": peer_id,
+        "reason": reason,
+        "reporter": our_pubkey,
+        "timestamp": now,
+    }
+    ban_payload["event_id"] = generate_event_id("BAN", ban_payload) or secrets.token_hex(16)
+    ban_payload["signature"] = sig
+    database.record_membership_tombstone(
+        event_id=ban_payload["event_id"],
+        peer_id=peer_id,
+        event="banned",
+        actor_peer_id=our_pubkey,
+        reason=reason,
+        timestamp=now,
+        joined_at_cutoff=joined_at_cutoff,
+    )
+
     # Remove member from roster after successful ban
-    database.remove_member(peer_id)
+    protocol_handlers.database = database
+    protocol_handlers._execute_member_removal(peer_id, reason="banned")
     database.log_membership_event("banned", peer_id, actor_peer_id=our_pubkey, reason=reason)
+    protocol_handlers._reliable_broadcast(HiveMessageType.BAN, ban_payload)
 
     plugin.log(f"cl-hive: Banned peer {peer_id[:16]}... reason: {reason}")
 
@@ -3262,6 +3285,7 @@ def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"
         return {"error": "peer_not_found", "peer_id": peer_id}
 
     target_tier = member.get("tier")
+    joined_at_cutoff = int(member.get("joined_at") or 0)
 
     # Safety check: refuse removal when the peer still has active/open channels
     # unless the caller explicitly forces it. This prevents accidentally removing
@@ -3307,7 +3331,31 @@ def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"
         }
 
     # Full removal: DB, state manager, bridge policy, and broadcast
+    timestamp = int(time.time())
+    removed_payload = {
+        "peer_id": peer_id,
+        "actor_peer_id": our_pubkey,
+        "reason": reason,
+        "timestamp": timestamp,
+        "joined_at_cutoff": joined_at_cutoff,
+    }
+    removed_payload["event_id"] = generate_event_id("MEMBER_REMOVED", removed_payload) or secrets.token_hex(16)
+    removed_payload["signature"] = plugin.rpc.signmessage(
+        f"hive:remove:{our_pubkey}:{peer_id}:{timestamp}:{reason}"
+    )["zbase"]
+    database.record_membership_tombstone(
+        event_id=removed_payload["event_id"],
+        peer_id=peer_id,
+        event="removed",
+        actor_peer_id=our_pubkey,
+        reason=reason,
+        timestamp=timestamp,
+        joined_at_cutoff=joined_at_cutoff,
+    )
+
+    protocol_handlers.database = database
     protocol_handlers._execute_member_removal(peer_id, reason)
+    protocol_handlers._reliable_broadcast(HiveMessageType.MEMBER_REMOVED, removed_payload)
     database.log_membership_event("removed", peer_id, actor_peer_id=our_pubkey, reason=reason)
 
     plugin.log(

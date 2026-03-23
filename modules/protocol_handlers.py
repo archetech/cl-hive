@@ -149,6 +149,13 @@ def handle_challenge(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not nonce:
         plugin.log(f"cl-hive: CHALLENGE from {peer_id[:16]}... missing nonce", level='warn')
         return {"result": "continue"}
+
+    if not handshake_mgr or not handshake_mgr.has_pending_outbound_hello(peer_id):
+        plugin.log(
+            f"cl-hive: CHALLENGE from {peer_id[:16]}... no pending outbound HELLO",
+            level='debug'
+        )
+        return {"result": "continue"}
     
     # Create attestation manifest
     try:
@@ -266,15 +273,73 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         handshake_mgr.clear_challenge(peer_id)
         return {"result": "continue"}
 
-    # Verification passed! Add member
-    database.add_member(
-        peer_id=peer_id,
-        tier=MEMBER_TIER,
-        joined_at=int(time.time())
-    )
+    # Get Hive info for WELCOME
+    existing_member = database.get_member(peer_id)
+    members = database.get_all_members()
+    hive_id = "hive"
+    for m in members:
+        if m.get('metadata'):
+            try:
+                metadata = json.loads(m['metadata'])
+                hive_id = metadata.get('hive_id', 'hive')
+                break
+            except (json.JSONDecodeError, TypeError):
+                continue
 
-    # Audit log
-    database.log_membership_event("joined", peer_id)
+    # Calculate real state hash via StateManager
+    if state_manager:
+        state_hash = state_manager.calculate_fleet_hash()
+    else:
+        state_hash = "0" * 64
+
+    member_count = len(members) if existing_member else len(members) + 1
+
+    # Sign and send WELCOME with actual tier
+    welcome_signing_fields = json.dumps({
+        "hive_id": hive_id,
+        "member_count": member_count,
+        "state_hash": state_hash,
+        "tier": MEMBER_TIER,
+    }, sort_keys=True, separators=(',', ':'))
+    welcome_sig = ""
+    try:
+        welcome_sig = plugin.rpc.signmessage(welcome_signing_fields).get("zbase", "")
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign WELCOME: {e}", level='warn')
+        return {"result": "continue"}
+    if not welcome_sig:
+        plugin.log("cl-hive: Failed to sign WELCOME: empty signature", level='warn')
+        return {"result": "continue"}
+    welcome_msg = create_welcome(hive_id, MEMBER_TIER, member_count, state_hash, signature=welcome_sig)
+
+    try:
+        plugin.rpc.call("sendcustommsg", {
+            "node_id": peer_id,
+            "msg": welcome_msg.hex()
+        })
+        plugin.log(f"cl-hive: Sent WELCOME to {peer_id[:16]}... (new member)")
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to send WELCOME: {e}", level='warn')
+        return {"result": "continue"}
+
+    # Verification passed and WELCOME was delivered locally. Commit membership now.
+    joined_at = int(time.time())
+    newly_added = False
+    if not existing_member:
+        newly_added = database.add_member(
+            peer_id=peer_id,
+            tier=MEMBER_TIER,
+            joined_at=joined_at
+        )
+        if not newly_added and not database.get_member(peer_id):
+            plugin.log(
+                f"cl-hive: Failed to activate member {peer_id[:16]}... after WELCOME delivery",
+                level='warn'
+            )
+            return {"result": "continue"}
+
+    if newly_added:
+        database.log_membership_event("joined", peer_id)
 
     # Phase B: persist peer capabilities from manifest features
     manifest_features = manifest_data.get("features", [])
@@ -293,50 +358,9 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Initialize presence tracking so uptime_pct starts accumulating (Issue #59)
     # The peer is connected (they just completed the handshake), so mark online
-    database.update_presence(peer_id, is_online=True, now_ts=int(time.time()), window_seconds=30 * 86400)
+    database.update_presence(peer_id, is_online=True, now_ts=joined_at, window_seconds=30 * 86400)
 
     handshake_mgr.clear_challenge(peer_id)
-
-    # Get Hive info for WELCOME
-    members = database.get_all_members()
-    hive_id = "hive"
-    for m in members:
-        if m.get('metadata'):
-            try:
-                metadata = json.loads(m['metadata'])
-                hive_id = metadata.get('hive_id', 'hive')
-                break
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-    # Calculate real state hash via StateManager
-    if state_manager:
-        state_hash = state_manager.calculate_fleet_hash()
-    else:
-        state_hash = "0" * 64
-
-    # Sign and send WELCOME with actual tier
-    welcome_signing_fields = json.dumps({
-        "hive_id": hive_id,
-        "member_count": len(members),
-        "state_hash": state_hash,
-        "tier": MEMBER_TIER,
-    }, sort_keys=True, separators=(',', ':'))
-    welcome_sig = ""
-    try:
-        welcome_sig = plugin.rpc.signmessage(welcome_signing_fields).get("zbase", "")
-    except Exception as e:
-        plugin.log(f"cl-hive: Failed to sign WELCOME: {e}", level='warn')
-    welcome_msg = create_welcome(hive_id, MEMBER_TIER, len(members), state_hash, signature=welcome_sig)
-
-    try:
-        plugin.rpc.call("sendcustommsg", {
-            "node_id": peer_id,
-            "msg": welcome_msg.hex()
-        })
-        plugin.log(f"cl-hive: Sent WELCOME to {peer_id[:16]}... (new member)")
-    except Exception as e:
-        plugin.log(f"cl-hive: Failed to send WELCOME: {e}", level='warn')
 
     # Broadcast membership update to all existing members
     _broadcast_full_sync_to_members(plugin)
@@ -695,13 +719,81 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Process membership list if included (Phase 5 enhancement)
     members_synced = 0
     if database and "members" in payload:
-        members_synced = _apply_membership_sync(payload["members"], peer_id, plugin)
+        members_synced = _apply_membership_sync(
+            payload["members"],
+            peer_id,
+            plugin,
+            membership_events=payload.get("membership_events"),
+        )
 
     plugin.log(f"cl-hive: FULL_SYNC from {peer_id[:16]}...: {updated} states, {members_synced} members synced")
 
     return {"result": "continue"}
 
-def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -> int:
+def _valid_membership_tombstone_event(event: Dict[str, Any]) -> bool:
+    """Validate tombstone events carried in FULL_SYNC catch-up."""
+    if not isinstance(event, dict):
+        return False
+    if not isinstance(event.get("event_id"), str) or not event.get("event_id"):
+        return False
+    if not isinstance(event.get("peer_id"), str) or not event.get("peer_id"):
+        return False
+    if event.get("event") not in {"banned", "left", "removed"}:
+        return False
+    if not isinstance(event.get("timestamp"), int) or event.get("timestamp") <= 0:
+        return False
+    if not isinstance(event.get("joined_at_cutoff"), int) or event.get("joined_at_cutoff") < 0:
+        return False
+    actor_peer_id = event.get("actor_peer_id")
+    if actor_peer_id is not None and not isinstance(actor_peer_id, str):
+        return False
+    reason = event.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return False
+    return True
+
+def _apply_membership_events(events: list, sender_id: str, plugin: Plugin) -> int:
+    """
+    Apply membership tombstones received via FULL_SYNC catch-up.
+
+    Removes any local member whose current membership is at or before the
+    signed joined_at_cutoff. Newer rejoins are preserved.
+    """
+    if not database or not isinstance(events, list):
+        return 0
+
+    changed = 0
+    for event in events:
+        if not _valid_membership_tombstone_event(event):
+            continue
+
+        peer_id = event["peer_id"]
+        event_type = event["event"]
+        actor_peer_id = event.get("actor_peer_id") or sender_id
+        reason = event.get("reason")
+        joined_at_cutoff = int(event.get("joined_at_cutoff") or 0)
+
+        database.record_membership_tombstone(
+            event_id=event["event_id"],
+            peer_id=peer_id,
+            event=event_type,
+            actor_peer_id=actor_peer_id,
+            reason=reason,
+            timestamp=event["timestamp"],
+            joined_at_cutoff=joined_at_cutoff,
+        )
+
+        member = database.get_member(peer_id)
+        if member and int(member.get("joined_at") or 0) <= joined_at_cutoff:
+            if event_type == "banned" and not database.is_banned(peer_id):
+                database.add_ban(peer_id, reason or "member_ban", actor_peer_id)
+            _execute_member_removal(peer_id, reason=event_type)
+            changed += 1
+
+    return changed
+
+def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin,
+                           membership_events: Optional[list] = None) -> int:
     """
     Apply membership list from FULL_SYNC payload.
 
@@ -719,6 +811,7 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
     if not database or not isinstance(members_list, list):
         return 0
 
+    changed = _apply_membership_events(membership_events or [], sender_id, plugin)
     added = 0
     updated = 0
     for member_info in members_list:
@@ -780,7 +873,7 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin) -
     if updated > 0:
         plugin.log(f"cl-hive: Membership sync: {added} added, {updated} tiers upgraded")
 
-    return added + updated
+    return changed + added + updated
 
 def _create_membership_payload() -> list:
     """
@@ -833,6 +926,8 @@ def _create_signed_full_sync_msg() -> Optional[bytes]:
     # Create base payload
     full_sync_payload = gossip_mgr.create_full_sync_payload()
     full_sync_payload["members"] = _create_membership_payload()
+    if database:
+        full_sync_payload["membership_events"] = database.get_membership_tombstones(limit=200)
 
     # Add sender identification
     full_sync_payload["sender_id"] = our_pubkey
@@ -1830,19 +1925,21 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: MEMBER_LEFT sender mismatch: {peer_id[:16]}... != {leaving_peer_id[:16]}...", level='warn')
         return {"result": "continue"}
 
-    # Phase C: Persistent idempotency check
-    is_new, event_id = check_and_record(database, "MEMBER_LEFT", payload, leaving_peer_id)
-    if not is_new:
-        plugin.log(f"cl-hive: MEMBER_LEFT duplicate event {event_id}, skipping", level='debug')
-        _relay_message(HiveMessageType.MEMBER_LEFT, payload, peer_id)
-        return {"result": "continue"}
-    if event_id:
-        payload["_event_id"] = event_id
-
     # Check if member exists
     member = database.get_member(leaving_peer_id)
     if not member:
         plugin.log(f"cl-hive: MEMBER_LEFT for unknown peer {leaving_peer_id[:16]}...", level='debug')
+        return {"result": "continue"}
+
+    if not _check_timestamp_freshness(payload, MAX_MEMBERSHIP_EVENT_AGE_SECONDS, label="MEMBER_LEFT"):
+        return {"result": "continue"}
+
+    joined_at = member.get("joined_at")
+    if isinstance(joined_at, int) and timestamp < joined_at:
+        plugin.log(
+            f"cl-hive: MEMBER_LEFT rejected for {leaving_peer_id[:16]}... older than current membership",
+            level='debug'
+        )
         return {"result": "continue"}
 
     # Verify signature
@@ -1856,9 +1953,31 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: MEMBER_LEFT signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
+    # Phase C: Persistent idempotency check
+    is_new, event_id = check_and_record(database, "MEMBER_LEFT", payload, leaving_peer_id)
+    if not is_new:
+        plugin.log(f"cl-hive: MEMBER_LEFT duplicate event {event_id}, skipping", level='debug')
+        _relay_message(HiveMessageType.MEMBER_LEFT, payload, peer_id)
+        return {"result": "continue"}
+    if event_id:
+        payload["_event_id"] = event_id
+
+    joined_at_cutoff = int(member.get("joined_at") or 0)
+    tombstone_id = payload.get("_event_id") or event_id or generate_event_id("MEMBER_LEFT", payload)
+    if tombstone_id:
+        database.record_membership_tombstone(
+            event_id=tombstone_id,
+            peer_id=leaving_peer_id,
+            event="left",
+            actor_peer_id=leaving_peer_id,
+            reason=reason,
+            timestamp=timestamp,
+            joined_at_cutoff=joined_at_cutoff,
+        )
+
     # Remove the member
     tier = member.get("tier")
-    database.remove_member(leaving_peer_id)
+    _execute_member_removal(leaving_peer_id, reason="left")
     plugin.log(f"cl-hive: Member {leaving_peer_id[:16]}... ({tier}) left the hive: {reason}")
 
 
@@ -1874,12 +1993,91 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     return {"result": "continue"}
 
+def handle_member_removed(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
+    """
+    Handle MEMBER_REMOVED message - explicit operator removal for upgraded peers.
+    """
+    if not database:
+        return {"result": "continue"}
+
+    target_peer_id = payload.get("peer_id")
+    actor_peer_id = payload.get("actor_peer_id")
+    reason = payload.get("reason", "maintenance")
+    timestamp = payload.get("timestamp")
+    event_id = payload.get("event_id")
+    joined_at_cutoff = payload.get("joined_at_cutoff")
+    signature = payload.get("signature")
+
+    if not _is_valid_pubkey(target_peer_id) or not _is_valid_pubkey(actor_peer_id):
+        return {"result": "continue"}
+    if not isinstance(reason, str) or not reason:
+        return {"result": "continue"}
+    if not isinstance(timestamp, int) or timestamp <= 0:
+        return {"result": "continue"}
+    if not isinstance(event_id, str) or not event_id:
+        return {"result": "continue"}
+    if not isinstance(joined_at_cutoff, int) or joined_at_cutoff < 0:
+        return {"result": "continue"}
+    if not isinstance(signature, str) or not signature:
+        return {"result": "continue"}
+
+    if not _validate_relay_sender(peer_id, actor_peer_id, payload):
+        plugin.log(
+            f"cl-hive: MEMBER_REMOVED sender mismatch: {peer_id[:16]}... != {actor_peer_id[:16]}...",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    actor = database.get_member(actor_peer_id)
+    if not actor or database.is_banned(actor_peer_id):
+        plugin.log(f"cl-hive: MEMBER_REMOVED rejected from non-member {actor_peer_id[:16]}...", level='warn')
+        return {"result": "continue"}
+
+    if not _check_timestamp_freshness(payload, MAX_MEMBERSHIP_EVENT_AGE_SECONDS, label="MEMBER_REMOVED"):
+        return {"result": "continue"}
+
+    canonical = f"hive:remove:{actor_peer_id}:{target_peer_id}:{timestamp}:{reason}"
+    try:
+        result = plugin.rpc.checkmessage(canonical, signature)
+        if not result.get("verified") or result.get("pubkey") != actor_peer_id:
+            plugin.log(f"cl-hive: MEMBER_REMOVED signature invalid for {actor_peer_id[:16]}...", level='warn')
+            return {"result": "continue"}
+    except Exception as e:
+        plugin.log(f"cl-hive: MEMBER_REMOVED signature check failed: {e}", level='warn')
+        return {"result": "continue"}
+
+    database.record_membership_tombstone(
+        event_id=event_id,
+        peer_id=target_peer_id,
+        event="removed",
+        actor_peer_id=actor_peer_id,
+        reason=reason,
+        timestamp=timestamp,
+        joined_at_cutoff=joined_at_cutoff,
+    )
+
+    member = database.get_member(target_peer_id)
+    if member and int(member.get("joined_at") or 0) <= joined_at_cutoff:
+        _execute_member_removal(target_peer_id, reason="removed")
+
+    return {"result": "continue"}
+
 # Message timestamp freshness limits (reject stale replayed messages)
 MAX_GOSSIP_AGE_SECONDS = 3600           # 1 hour for gossip
 MAX_INTENT_AGE_SECONDS = 600            # 10 minutes for intents (time-sensitive)
 MAX_STATE_HASH_AGE_SECONDS = 3600       # 1 hour for state hash / full sync
+MAX_MEMBERSHIP_EVENT_AGE_SECONDS = 30 * 86400  # 30 days for membership removals/catch-up
 MAX_INTELLIGENCE_AGE_SECONDS = 7200     # 2 hours for fee/health/liquidity reports
 MAX_CLOCK_SKEW_SECONDS = 300            # 5 minutes future tolerance
+
+def _is_valid_pubkey(pubkey: Any) -> bool:
+    """Check whether a value looks like a compressed secp256k1 pubkey."""
+    return (
+        isinstance(pubkey, str)
+        and len(pubkey) == 66
+        and pubkey[:2] in ("02", "03")
+        and all(c in "0123456789abcdef" for c in pubkey)
+    )
 
 def handle_ban(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
@@ -1896,19 +2094,82 @@ def handle_ban(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     target_peer_id = payload.get("peer_id")
     reason = payload.get("reason", "member_ban")
-    proposal_id = payload.get("proposal_id")
+    reporter_id = payload.get("reporter", peer_id)
+    timestamp = payload.get("timestamp")
+    signature = payload.get("signature")
+    event_id = payload.get("event_id")
+    auth_fields = ("reporter", "timestamp", "signature")
+    has_any_auth = any(field in payload for field in auth_fields)
+    has_full_auth = all(field in payload for field in auth_fields)
 
     if not target_peer_id:
         plugin.log("cl-hive: BAN message missing peer_id", level='warn')
         return {"status": "ignored", "reason": "missing_peer_id"}
+
+    if has_any_auth and not has_full_auth:
+        plugin.log("cl-hive: BAN message missing auth fields", level='warn')
+        return {"status": "ignored", "reason": "malformed_auth"}
+
+    if has_full_auth:
+        if not _validate_relay_sender(peer_id, reporter_id, payload):
+            plugin.log(f"cl-hive: BAN sender mismatch: {peer_id[:16]}... != {reporter_id[:16]}...", level='warn')
+            return {"status": "ignored", "reason": "sender_mismatch"}
+
+        reporter = database.get_member(reporter_id)
+        if not reporter or database.is_banned(reporter_id):
+            plugin.log(f"cl-hive: BAN rejected from non-member {reporter_id[:16]}...", level='warn')
+            return {"status": "ignored", "reason": "sender_not_member"}
+
+        if not _check_timestamp_freshness(payload, MAX_INTENT_AGE_SECONDS, label="BAN"):
+            return {"status": "ignored", "reason": "stale"}
+
+        canonical = f"BAN:{target_peer_id}:{reason}:{timestamp}"
+        try:
+            result = plugin.rpc.checkmessage(canonical, signature)
+            if not result.get("verified") or result.get("pubkey") != reporter_id:
+                plugin.log(f"cl-hive: BAN signature invalid for {reporter_id[:16]}...", level='warn')
+                return {"status": "ignored", "reason": "invalid_signature"}
+        except Exception as e:
+            plugin.log(f"cl-hive: BAN signature check failed: {e}", level='warn')
+            return {"status": "ignored", "reason": "signature_check_failed"}
+    else:
+        if _is_relayed_message(payload):
+            plugin.log("cl-hive: BAN ignored: unsigned legacy BAN cannot be relayed", level='debug')
+            return {"status": "ignored", "reason": "legacy_relay_unsupported"}
+
+        reporter = database.get_member(peer_id)
+        if not reporter or database.is_banned(peer_id):
+            plugin.log(f"cl-hive: BAN rejected from non-member {peer_id[:16]}...", level='warn')
+            return {"status": "ignored", "reason": "sender_not_member"}
+        reporter_id = peer_id
 
     # Already banned — nothing to do
     if database.is_banned(target_peer_id):
         plugin.log(f"cl-hive: BAN notification for already-banned {target_peer_id[:16]}...", level='debug')
         return {"status": "already_banned"}
 
+    current_member = database.get_member(target_peer_id)
+    joined_at_cutoff = int(current_member.get("joined_at") or 0) if current_member else 0
+    tombstone_id = event_id
+    if not tombstone_id:
+        event_payload = {
+            "peer_id": target_peer_id,
+            "reporter": reporter_id,
+            "timestamp": timestamp if isinstance(timestamp, int) else 0,
+        }
+        tombstone_id = generate_event_id("BAN", event_payload) or secrets.token_hex(16)
+
     # Enforce the ban
-    database.add_ban(target_peer_id, reason, peer_id)
+    database.add_ban(target_peer_id, reason, reporter_id, signature=signature if has_full_auth else None)
+    database.record_membership_tombstone(
+        event_id=tombstone_id,
+        peer_id=target_peer_id,
+        event="banned",
+        actor_peer_id=reporter_id,
+        reason=reason,
+        timestamp=timestamp if isinstance(timestamp, int) and timestamp > 0 else int(time.time()),
+        joined_at_cutoff=joined_at_cutoff,
+    )
 
     # Full removal: DB, state manager, bridge policy, and forced gossip
     _execute_member_removal(target_peer_id, reason="banned")

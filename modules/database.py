@@ -251,6 +251,26 @@ class HiveDatabase:
         )
 
         # =====================================================================
+        # MEMBERSHIP TOMBSTONES TABLE
+        # =====================================================================
+        # Durable deletion feed for membership convergence and replay safety
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS membership_tombstones (
+                event_id TEXT PRIMARY KEY,
+                peer_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                actor_peer_id TEXT,
+                reason TEXT,
+                timestamp INTEGER NOT NULL,
+                joined_at_cutoff INTEGER NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_membership_tombstones_peer "
+            "ON membership_tombstones(peer_id, timestamp DESC)"
+        )
+
+        # =====================================================================
         # LOCAL FEE TRACKING TABLE (Settlement Phase)
         # =====================================================================
         # Persists fee tracking state across restarts to prevent revenue loss
@@ -1275,6 +1295,42 @@ class HiveDatabase:
                 "ORDER BY id DESC LIMIT ?",
                 (limit,)
             ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_membership_tombstone(self, event_id: str, peer_id: str, event: str,
+                                    actor_peer_id: str = None, reason: str = None,
+                                    timestamp: int = None,
+                                    joined_at_cutoff: int = 0) -> bool:
+        """
+        Persist a membership deletion tombstone for convergence and replay safety.
+
+        Returns:
+            True if inserted, False if the tombstone already exists.
+        """
+        conn = self._get_connection()
+        ts = int(time.time()) if timestamp is None else int(timestamp)
+        cutoff = int(joined_at_cutoff or 0)
+
+        try:
+            conn.execute(
+                """INSERT INTO membership_tombstones
+                   (event_id, peer_id, event, actor_peer_id, reason, timestamp, joined_at_cutoff)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (event_id, peer_id, event, actor_peer_id, reason, ts, cutoff)
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def get_membership_tombstones(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """
+        Return durable membership tombstones, newest first.
+        """
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT * FROM membership_tombstones ORDER BY timestamp DESC, event_id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
         return [dict(row) for row in rows]
 
     # =========================================================================
