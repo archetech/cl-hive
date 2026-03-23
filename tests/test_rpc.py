@@ -326,7 +326,7 @@ class TestBanRPC:
         assert info['reason'] == 'spam'
         assert info['reporter'] == reporter
 
-    def test_hive_ban_broadcasts_signed_payload(self, database, mock_plugin):
+    def test_hive_ban_broadcasts_ban_payload(self, database, mock_plugin):
         """hive-ban should broadcast a BAN payload, not only mutate local state."""
         repo_root = Path(__file__).resolve().parents[1]
         module_path = repo_root / "cl-hive.py"
@@ -339,19 +339,20 @@ class TestBanRPC:
         module.plugin = mock_plugin
         module.our_pubkey = '02' + 'a' * 64
         module.plugin.rpc.signmessage.return_value = {"zbase": "signed"}
-        module.protocol_handlers._reliable_broadcast = MagicMock()
 
         peer_id = '02' + 'b' * 64
         database.add_member(module.our_pubkey, tier='member', joined_at=int(time.time()))
         database.add_member(peer_id, tier='member', joined_at=int(time.time()))
 
-        result = module.hive_ban(mock_plugin, peer_id, "test ban")
+        with patch.object(module.protocol_handlers, "_reliable_broadcast", MagicMock()) as broadcast_mock:
+            result = module.hive_ban(mock_plugin, peer_id, "test ban")
 
-        assert result["status"] == "banned"
-        module.protocol_handlers._reliable_broadcast.assert_called_once()
-        call_args = module.protocol_handlers._reliable_broadcast.call_args
-        assert call_args[0][0] == module.HiveMessageType.BAN
-        assert call_args[0][1]["peer_id"] == peer_id
+            assert result["status"] == "banned"
+            broadcast_mock.assert_called_once()
+            call_args = broadcast_mock.call_args
+            assert call_args[0][0] == module.HiveMessageType.BAN
+            assert call_args[0][1]["peer_id"] == peer_id
+            assert call_args[0][1]["reason"] == "test ban"
 
 
 # =============================================================================

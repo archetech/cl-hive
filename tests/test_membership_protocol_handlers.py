@@ -77,21 +77,12 @@ def attest_payload_for(pubkey: str) -> dict:
 def test_handle_challenge_requires_pending_outbound_hello(mock_plugin):
     ph.handshake_mgr = MagicMock()
     ph.handshake_mgr.has_pending_outbound_hello.return_value = False
-    ph.handshake_mgr.create_manifest.return_value = {
-        "manifest": {
-            "pubkey": PEER_B,
-            "version": "cl-hive v2.2.6",
-            "features": ["proto-v2"],
-            "timestamp": int(time.time()),
-            "nonce": "n" * 64,
-        },
-        "nonce_signature": "nonce_sig",
-        "manifest_signature": "manifest_sig",
-    }
+    ph.handshake_mgr.create_manifest = MagicMock()
 
     result = ph.handle_challenge(PEER_B, {"nonce": "n" * 64, "hive_id": "h"}, mock_plugin)
 
     assert result == {"result": "continue"}
+    ph.handshake_mgr.create_manifest.assert_not_called()
     mock_plugin.rpc.call.assert_not_called()
 
 
@@ -153,7 +144,9 @@ def test_handle_member_left_rejects_stale_timestamp(db, mock_plugin):
 
 
 def test_handle_member_left_rejects_pre_rejoin_event(db, mock_plugin):
-    db.add_member(PEER_B, tier="member", joined_at=200)
+    joined_at = int(time.time())
+    replay_timestamp = joined_at - 1
+    db.add_member(PEER_B, tier="member", joined_at=joined_at)
     ph.database = db
     ph.config = MagicMock()
     mock_plugin.rpc.checkmessage.return_value = {"verified": True, "pubkey": PEER_B}
@@ -162,7 +155,7 @@ def test_handle_member_left_rejects_pre_rejoin_event(db, mock_plugin):
         PEER_B,
         {
             "peer_id": PEER_B,
-            "timestamp": 100,
+            "timestamp": replay_timestamp,
             "reason": "old-leave",
             "signature": "sig",
         },
