@@ -149,6 +149,13 @@ def handle_challenge(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not nonce:
         plugin.log(f"cl-hive: CHALLENGE from {peer_id[:16]}... missing nonce", level='warn')
         return {"result": "continue"}
+
+    if not handshake_mgr or not handshake_mgr.has_pending_outbound_hello(peer_id):
+        plugin.log(
+            f"cl-hive: CHALLENGE from {peer_id[:16]}... no pending outbound HELLO",
+            level='debug'
+        )
+        return {"result": "continue"}
     
     # Create attestation manifest
     try:
@@ -266,15 +273,73 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         handshake_mgr.clear_challenge(peer_id)
         return {"result": "continue"}
 
-    # Verification passed! Add member
-    database.add_member(
-        peer_id=peer_id,
-        tier=MEMBER_TIER,
-        joined_at=int(time.time())
-    )
+    # Get Hive info for WELCOME
+    existing_member = database.get_member(peer_id)
+    members = database.get_all_members()
+    hive_id = "hive"
+    for m in members:
+        if m.get('metadata'):
+            try:
+                metadata = json.loads(m['metadata'])
+                hive_id = metadata.get('hive_id', 'hive')
+                break
+            except (json.JSONDecodeError, TypeError):
+                continue
 
-    # Audit log
-    database.log_membership_event("joined", peer_id)
+    # Calculate real state hash via StateManager
+    if state_manager:
+        state_hash = state_manager.calculate_fleet_hash()
+    else:
+        state_hash = "0" * 64
+
+    member_count = len(members) if existing_member else len(members) + 1
+
+    # Sign and send WELCOME with actual tier
+    welcome_signing_fields = json.dumps({
+        "hive_id": hive_id,
+        "member_count": member_count,
+        "state_hash": state_hash,
+        "tier": MEMBER_TIER,
+    }, sort_keys=True, separators=(',', ':'))
+    welcome_sig = ""
+    try:
+        welcome_sig = plugin.rpc.signmessage(welcome_signing_fields).get("zbase", "")
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to sign WELCOME: {e}", level='warn')
+        return {"result": "continue"}
+    if not welcome_sig:
+        plugin.log("cl-hive: Failed to sign WELCOME: empty signature", level='warn')
+        return {"result": "continue"}
+    welcome_msg = create_welcome(hive_id, MEMBER_TIER, member_count, state_hash, signature=welcome_sig)
+
+    try:
+        plugin.rpc.call("sendcustommsg", {
+            "node_id": peer_id,
+            "msg": welcome_msg.hex()
+        })
+        plugin.log(f"cl-hive: Sent WELCOME to {peer_id[:16]}... (new member)")
+    except Exception as e:
+        plugin.log(f"cl-hive: Failed to send WELCOME: {e}", level='warn')
+        return {"result": "continue"}
+
+    # Verification passed and WELCOME was delivered locally. Commit membership now.
+    joined_at = int(time.time())
+    newly_added = False
+    if not existing_member:
+        newly_added = database.add_member(
+            peer_id=peer_id,
+            tier=MEMBER_TIER,
+            joined_at=joined_at
+        )
+        if not newly_added and not database.get_member(peer_id):
+            plugin.log(
+                f"cl-hive: Failed to activate member {peer_id[:16]}... after WELCOME delivery",
+                level='warn'
+            )
+            return {"result": "continue"}
+
+    if newly_added:
+        database.log_membership_event("joined", peer_id)
 
     # Phase B: persist peer capabilities from manifest features
     manifest_features = manifest_data.get("features", [])
@@ -293,50 +358,9 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     # Initialize presence tracking so uptime_pct starts accumulating (Issue #59)
     # The peer is connected (they just completed the handshake), so mark online
-    database.update_presence(peer_id, is_online=True, now_ts=int(time.time()), window_seconds=30 * 86400)
+    database.update_presence(peer_id, is_online=True, now_ts=joined_at, window_seconds=30 * 86400)
 
     handshake_mgr.clear_challenge(peer_id)
-
-    # Get Hive info for WELCOME
-    members = database.get_all_members()
-    hive_id = "hive"
-    for m in members:
-        if m.get('metadata'):
-            try:
-                metadata = json.loads(m['metadata'])
-                hive_id = metadata.get('hive_id', 'hive')
-                break
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-    # Calculate real state hash via StateManager
-    if state_manager:
-        state_hash = state_manager.calculate_fleet_hash()
-    else:
-        state_hash = "0" * 64
-
-    # Sign and send WELCOME with actual tier
-    welcome_signing_fields = json.dumps({
-        "hive_id": hive_id,
-        "member_count": len(members),
-        "state_hash": state_hash,
-        "tier": MEMBER_TIER,
-    }, sort_keys=True, separators=(',', ':'))
-    welcome_sig = ""
-    try:
-        welcome_sig = plugin.rpc.signmessage(welcome_signing_fields).get("zbase", "")
-    except Exception as e:
-        plugin.log(f"cl-hive: Failed to sign WELCOME: {e}", level='warn')
-    welcome_msg = create_welcome(hive_id, MEMBER_TIER, len(members), state_hash, signature=welcome_sig)
-
-    try:
-        plugin.rpc.call("sendcustommsg", {
-            "node_id": peer_id,
-            "msg": welcome_msg.hex()
-        })
-        plugin.log(f"cl-hive: Sent WELCOME to {peer_id[:16]}... (new member)")
-    except Exception as e:
-        plugin.log(f"cl-hive: Failed to send WELCOME: {e}", level='warn')
 
     # Broadcast membership update to all existing members
     _broadcast_full_sync_to_members(plugin)
