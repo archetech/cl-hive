@@ -378,10 +378,22 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: WELCOME signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
+    # SECURITY: Verify we actually sent a HELLO to this peer (prevents unsolicited WELCOME)
+    if handshake_mgr and not handshake_mgr.has_pending_outbound_hello(peer_id):
+        plugin.log(
+            f"cl-hive: WELCOME rejected from {peer_id[:16]}... — no outbound HELLO sent to this peer",
+            level='warn'
+        )
+        return {"result": "continue"}
+
     plugin.log(
         f"cl-hive: WELCOME received! Joined '{hive_id}' as {tier} "
         f"(Hive has {member_count} members)"
     )
+
+    # Clear the outbound tracking now that we've joined
+    if handshake_mgr:
+        handshake_mgr.clear_outbound_hello(peer_id)
 
     # Store Hive membership info for ourselves
     if database and our_pubkey:

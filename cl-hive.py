@@ -984,6 +984,8 @@ def on_peer_connected(peer: dict, plugin: Plugin, **kwargs):
                 "node_id": peer_id,
                 "msg": hello_msg.hex()
             })
+            if handshake_mgr:
+                handshake_mgr.record_hello_sent(peer_id)
             plugin.log(f"cl-hive: Sent HELLO to {peer_id[:16]}... (autodiscovery)")
         except Exception as e:
             plugin.log(f"cl-hive: Failed to send autodiscovery HELLO: {e}", level='debug')
@@ -3910,6 +3912,9 @@ def hive_join(plugin: Plugin, peer_id: str):
             "node_id": peer_id,
             "msg": hello_msg.hex()
         })
+
+        if handshake_mgr:
+            handshake_mgr.record_hello_sent(peer_id)
 
         plugin.log(f"cl-hive: Sent HELLO to {peer_id[:16]}... (manual join request)")
 

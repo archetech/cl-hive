@@ -120,6 +120,7 @@ class HandshakeManager:
         self._challenge_lock = threading.Lock()
         self._pending_challenges: Dict[str, Dict[str, Any]] = {}
         self._pending_requests: Dict[str, Dict] = {}
+        self._outbound_hello_sent: Dict[str, int] = {}  # peer_id -> timestamp
     
     # =========================================================================
     # IDENTITY
@@ -217,6 +218,28 @@ class HandshakeManager:
         for pid in expired:
             del self._pending_requests[pid]
         return len(expired)
+
+    # =========================================================================
+    # OUTBOUND JOIN TRACKING
+    # =========================================================================
+
+    def record_hello_sent(self, peer_id: str) -> None:
+        """Record that we sent a HELLO to a peer (outbound join request)."""
+        self._outbound_hello_sent[peer_id] = int(time.time())
+
+    def has_pending_outbound_hello(self, peer_id: str, max_age_seconds: int = PENDING_REQUEST_MAX_AGE) -> bool:
+        """Check if we have a pending outbound HELLO to this peer."""
+        ts = self._outbound_hello_sent.get(peer_id)
+        if ts is None:
+            return False
+        if int(time.time()) - ts > max_age_seconds:
+            del self._outbound_hello_sent[peer_id]
+            return False
+        return True
+
+    def clear_outbound_hello(self, peer_id: str) -> None:
+        """Clear outbound HELLO tracking after join completes."""
+        self._outbound_hello_sent.pop(peer_id, None)
 
     # =========================================================================
     # MANIFEST OPERATIONS
