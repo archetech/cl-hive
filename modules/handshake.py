@@ -293,8 +293,8 @@ class HandshakeManager:
         manifest_json = manifest.to_json()
         
         # Sign both the nonce and the full manifest
-        nonce_sig = self.rpc.signmessage(nonce)['zbase']
-        manifest_sig = self.rpc.signmessage(manifest_json)['zbase']
+        nonce_sig = self.rpc.signmessage(nonce).get('zbase', '')
+        manifest_sig = self.rpc.signmessage(manifest_json).get('zbase', '')
         
         return {
             "manifest": asdict(manifest),
