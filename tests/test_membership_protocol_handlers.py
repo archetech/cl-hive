@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.database import HiveDatabase
+import modules.protocol as protocol
 import modules.protocol_handlers as ph
 
 
@@ -248,9 +249,11 @@ def test_handle_full_sync_applies_membership_events_before_member_merge(db, mock
     mock_plugin.rpc.checkmessage.return_value = {"verified": True, "pubkey": PEER_A}
 
     payload = {
+        "_envelope_version": protocol.STRICT_STATE_SYNC_VERSION,
         "sender_id": PEER_A,
         "timestamp": now,
         "signature": "signedpayload",
+        "signature_v2": "signedpayload",
         "fleet_hash": "",
         "states": [],
         "members": [{"peer_id": PEER_A, "tier": "member", "joined_at": 100}],
@@ -264,6 +267,11 @@ def test_handle_full_sync_applies_membership_events_before_member_merge(db, mock
             "joined_at_cutoff": 200,
         }],
     }
+    payload["states_hash_v2"] = protocol.compute_full_sync_states_hash_v2(payload["states"])
+    payload["members_hash_v2"] = protocol.compute_full_sync_members_hash_v2(payload["members"])
+    payload["membership_events_hash_v2"] = protocol.compute_full_sync_membership_events_hash_v2(
+        payload["membership_events"]
+    )
 
     result = ph.handle_full_sync(PEER_A, payload, mock_plugin)
 

@@ -80,8 +80,10 @@ def _make_v2_full_sync_payload(sender_id, envelope_version=2, states=None, membe
         "timestamp": int(time.time()),
         "states": states,
         "members": members,
+        "membership_events": [],
         "states_hash_v2": protocol.compute_full_sync_states_hash_v2(states),
         "members_hash_v2": protocol.compute_full_sync_members_hash_v2(members),
+        "membership_events_hash_v2": protocol.compute_full_sync_membership_events_hash_v2([]),
         "signature": "legacy_signature",
         "signature_v2": "strict_signature_v2",
     }
@@ -120,6 +122,7 @@ def outbound_handler_env(monkeypatch):
     database = MagicMock()
     database.is_banned.return_value = False
     database.get_all_members.return_value = []
+    database.get_membership_tombstones.return_value = []
 
     gossip_mgr = MagicMock()
 
@@ -487,6 +490,17 @@ def test_create_signed_full_sync_msg_emits_envelope_v2_hashes_and_signature_v2(o
             "addresses": json.dumps(["10.0.0.2:9735"]),
         }
     ]
+    database.get_membership_tombstones.return_value = [
+        {
+            "event_id": "evt-1",
+            "peer_id": "02" + "e" * 64,
+            "event": "removed",
+            "actor_peer_id": "02" + "f" * 64,
+            "reason": "maintenance",
+            "timestamp": 1711200250,
+            "joined_at_cutoff": 1711200200,
+        }
+    ]
     gossip_mgr.create_full_sync_payload.return_value = {
         "states": states,
         "fleet_hash": "f" * 64,
@@ -503,6 +517,9 @@ def test_create_signed_full_sync_msg_emits_envelope_v2_hashes_and_signature_v2(o
     assert payload["signature_v2"] == "strict_signature_v2"
     assert payload["states_hash_v2"] == protocol.compute_full_sync_states_hash_v2(payload["states"])
     assert payload["members_hash_v2"] == protocol.compute_full_sync_members_hash_v2(payload["members"])
+    assert payload["membership_events_hash_v2"] == protocol.compute_full_sync_membership_events_hash_v2(
+        payload["membership_events"]
+    )
     plugin.rpc.signmessage.assert_called_once_with(
         protocol.get_full_sync_signing_payload_v2(payload)
     )
@@ -557,6 +574,43 @@ def test_broadcast_member_message_preserves_v2_envelope_for_prebuilt_full_sync_b
     assert result["ok"] is True
     assert msg_type == protocol.HiveMessageType.FULL_SYNC
     assert payload["_envelope_version"] == protocol.STRICT_STATE_SYNC_VERSION
+
+
+def test_handle_full_sync_v2_rejects_membership_event_hash_mismatch(state_sync_handler_env):
+    plugin, database, gossip_mgr, _state_manager = state_sync_handler_env
+    sender_id = "02" + "a" * 64
+    payload = _make_v2_full_sync_payload(
+        sender_id,
+        members=[
+            {
+                "peer_id": "02" + "d" * 64,
+                "tier": "member",
+                "joined_at": 1711200200,
+                "addresses": ["10.0.0.2:9735"],
+                "capabilities": ["mcf"],
+            }
+        ],
+    )
+    payload["membership_events"] = [
+        {
+            "event_id": "evt-1",
+            "peer_id": "02" + "e" * 64,
+            "event": "removed",
+            "actor_peer_id": sender_id,
+            "reason": "maintenance",
+            "timestamp": 1711200250,
+            "joined_at_cutoff": 1711200200,
+        }
+    ]
+    payload["membership_events_hash_v2"] = "x" * 64
+
+    database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
+
+    result = protocol_handlers.handle_full_sync(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    plugin.rpc.checkmessage.assert_not_called()
+    gossip_mgr.process_full_sync.assert_not_called()
 
 
 def test_full_sync_processing_uses_protocol_limit():

@@ -746,6 +746,64 @@ def compute_full_sync_members_hash_v2(members: list) -> str:
     return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
 
 
+def _normalize_membership_event_row_v2(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a FULL_SYNC membership tombstone row for deterministic hashing."""
+    event_id = event.get("event_id")
+    peer_id = event.get("peer_id")
+    event_type = event.get("event")
+    timestamp = event.get("timestamp")
+    joined_at_cutoff = event.get("joined_at_cutoff")
+    actor_peer_id = event.get("actor_peer_id")
+    reason = event.get("reason")
+
+    if not isinstance(event_id, str) or not event_id:
+        raise ValueError("membership_events.event_id must be a non-empty string")
+    if not _valid_pubkey(peer_id):
+        raise ValueError("membership_events.peer_id must be a valid pubkey")
+    if event_type not in {"banned", "left", "removed"}:
+        raise ValueError("membership_events.event must be banned, left, or removed")
+    if type(timestamp) is not int or timestamp <= 0:
+        raise ValueError("membership_events.timestamp must be a positive integer")
+    if type(joined_at_cutoff) is not int or joined_at_cutoff < 0:
+        raise ValueError("membership_events.joined_at_cutoff must be a non-negative integer")
+    if actor_peer_id is None:
+        actor_peer_id = ""
+    elif not _valid_pubkey(actor_peer_id):
+        raise ValueError("membership_events.actor_peer_id must be a valid pubkey")
+    if reason is None:
+        reason = ""
+    elif not isinstance(reason, str):
+        raise ValueError("membership_events.reason must be a string")
+
+    return {
+        "event_id": event_id,
+        "peer_id": peer_id,
+        "event": event_type,
+        "actor_peer_id": actor_peer_id,
+        "reason": reason,
+        "timestamp": timestamp,
+        "joined_at_cutoff": joined_at_cutoff,
+    }
+
+
+def compute_full_sync_membership_events_hash_v2(events: list) -> str:
+    """
+    Compute a v2 deterministic hash of FULL_SYNC membership tombstone events.
+    """
+    if not isinstance(events, list):
+        raise ValueError("membership_events must be a list")
+    if not events:
+        return ""
+    if any(not isinstance(event, dict) for event in events):
+        raise ValueError("membership_events must contain only dict rows")
+
+    normalized_events = [_normalize_membership_event_row_v2(event) for event in events]
+    normalized_events.sort(key=lambda x: (x["event_id"], x["peer_id"]))
+
+    json_str = json.dumps(normalized_events, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+
+
 def compute_states_hash(states: list) -> str:
     """
     Compute a deterministic hash of the states list.
@@ -853,12 +911,14 @@ def get_full_sync_signing_payload_v2(payload: Dict[str, Any]) -> str:
     """
     states = payload.get("states", [])
     members = payload.get("members", [])
+    membership_events = payload.get("membership_events", [])
 
     signing_fields = {
         "sender_id": payload.get("sender_id", ""),
         "fleet_hash": payload.get("fleet_hash", ""),
         "states_hash": compute_full_sync_states_hash_v2(states),
         "members_hash": compute_full_sync_members_hash_v2(members),
+        "membership_events_hash": compute_full_sync_membership_events_hash_v2(membership_events),
         "timestamp": payload.get("timestamp", 0),
     }
     return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))

@@ -28,7 +28,8 @@ from modules.protocol import (
     get_full_sync_signing_payload_v2,
     get_intent_signing_payload, get_intent_abort_signing_payload,
     compute_states_hash, compute_full_sync_states_hash_v2,
-    compute_full_sync_members_hash_v2, is_strict_state_sync_payload,
+    compute_full_sync_members_hash_v2, compute_full_sync_membership_events_hash_v2,
+    is_strict_state_sync_payload,
     STRICT_STATE_SYNC_VERSION,
 )
 from modules.handshake import CHALLENGE_TTL_SECONDS
@@ -716,13 +717,18 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     signature_v2 = payload.get("signature_v2")
     states_hash_v2 = payload.get("states_hash_v2")
     members_hash_v2 = payload.get("members_hash_v2")
+    membership_events_hash_v2 = payload.get("membership_events_hash_v2")
     if not isinstance(signature_v2, str) or len(signature_v2) < 10:
         plugin.log(
             f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: missing signature_v2",
             level='warn'
         )
         return {"result": "continue"}
-    if not isinstance(states_hash_v2, str) or not isinstance(members_hash_v2, str):
+    if (
+        not isinstance(states_hash_v2, str)
+        or not isinstance(members_hash_v2, str)
+        or not isinstance(membership_events_hash_v2, str)
+    ):
         plugin.log(
             f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: missing v2 hashes",
             level='warn'
@@ -731,9 +737,13 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     states = payload.get("states", [])
     members = payload.get("members", [])
+    membership_events = payload.get("membership_events", [])
     try:
         computed_states_hash_v2 = compute_full_sync_states_hash_v2(states)
         computed_members_hash_v2 = compute_full_sync_members_hash_v2(members)
+        computed_membership_events_hash_v2 = compute_full_sync_membership_events_hash_v2(
+            membership_events
+        )
     except ValueError as e:
         plugin.log(
             f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: invalid v2 payload ({e})",
@@ -741,7 +751,11 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         )
         return {"result": "continue"}
 
-    if states_hash_v2 != computed_states_hash_v2 or members_hash_v2 != computed_members_hash_v2:
+    if (
+        states_hash_v2 != computed_states_hash_v2
+        or members_hash_v2 != computed_members_hash_v2
+        or membership_events_hash_v2 != computed_membership_events_hash_v2
+    ):
         plugin.log(
             f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: v2 hash mismatch",
             level='warn'
@@ -1021,6 +1035,9 @@ def _create_signed_full_sync_msg() -> Optional[bytes]:
     )
     full_sync_payload["members_hash_v2"] = compute_full_sync_members_hash_v2(
         full_sync_payload.get("members", [])
+    )
+    full_sync_payload["membership_events_hash_v2"] = compute_full_sync_membership_events_hash_v2(
+        full_sync_payload.get("membership_events", [])
     )
 
     # Sign the payload using the strict v2 contract.
