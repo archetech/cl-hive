@@ -111,6 +111,26 @@ def state_sync_handler_env(monkeypatch):
     return plugin, database, gossip_mgr, state_manager
 
 
+@pytest.fixture
+def outbound_handler_env(monkeypatch):
+    plugin = MagicMock()
+    plugin.log = MagicMock()
+    plugin.rpc.signmessage.return_value = {"zbase": "strict_signature_v2"}
+
+    database = MagicMock()
+    database.is_banned.return_value = False
+    database.get_all_members.return_value = []
+
+    gossip_mgr = MagicMock()
+
+    monkeypatch.setattr(protocol_handlers, "plugin", plugin)
+    monkeypatch.setattr(protocol_handlers, "database", database)
+    monkeypatch.setattr(protocol_handlers, "gossip_mgr", gossip_mgr)
+    monkeypatch.setattr(protocol_handlers, "our_pubkey", "02" + "f" * 64)
+
+    return plugin, database, gossip_mgr
+
+
 def test_handle_gossip_rejects_legacy_payload_without_signature_v2(gossip_handler_env):
     plugin, database, gossip_mgr = gossip_handler_env
     sender_id = "02" + "a" * 64
@@ -386,6 +406,106 @@ def test_handle_full_sync_v2_rejects_invalid_address_shape(state_sync_handler_en
     assert result == {"result": "continue"}
     plugin.rpc.checkmessage.assert_not_called()
     gossip_mgr.process_full_sync.assert_not_called()
+
+
+def test_create_signed_gossip_msg_emits_envelope_v2_and_signature_v2(outbound_handler_env):
+    plugin, _database, gossip_mgr = outbound_handler_env
+    gossip_mgr.create_gossip_payload.return_value = {
+        "peer_id": "02" + "f" * 64,
+        "capacity_sats": 1000,
+        "available_sats": 500,
+        "fee_policy": {"base_fee": 1000, "fee_rate": 10},
+        "topology": ["03" + "b" * 64],
+        "version": 7,
+        "timestamp": 1711200100,
+        "fleet_hash": "f" * 64,
+        "addresses": ["1.2.3.4:9735"],
+        "capabilities": ["mcf"],
+    }
+
+    message = protocol_handlers._create_signed_gossip_msg(
+        capacity_sats=1000,
+        available_sats=500,
+        fee_policy={"base_fee": 1000, "fee_rate": 10},
+        topology=["03" + "b" * 64],
+        addresses=["1.2.3.4:9735"],
+    )
+
+    msg_type, payload = protocol.deserialize(message)
+
+    assert msg_type == protocol.HiveMessageType.GOSSIP
+    assert payload["_envelope_version"] == protocol.STRICT_STATE_SYNC_VERSION
+    assert payload["signature_v2"] == "strict_signature_v2"
+    plugin.rpc.signmessage.assert_called_once_with(
+        protocol.get_gossip_signing_payload_v2(payload)
+    )
+
+
+def test_create_signed_state_hash_msg_emits_envelope_v2_and_signature_v2(outbound_handler_env, monkeypatch):
+    plugin, _database, gossip_mgr = outbound_handler_env
+    gossip_mgr.create_state_hash_payload.return_value = {
+        "fleet_hash": "f" * 64,
+        "membership_hash": "m" * 64,
+        "peer_count": 3,
+        "timestamp": 1711200200,
+    }
+    monkeypatch.setattr(protocol_handlers.time, "time", lambda: 1711200300)
+
+    message = protocol_handlers._create_signed_state_hash_msg()
+
+    msg_type, payload = protocol.deserialize(message)
+
+    assert msg_type == protocol.HiveMessageType.STATE_HASH
+    assert payload["_envelope_version"] == protocol.STRICT_STATE_SYNC_VERSION
+    assert payload["signature_v2"] == "strict_signature_v2"
+    assert payload["membership_hash"] == "m" * 64
+    plugin.rpc.signmessage.assert_called_once_with(
+        protocol.get_state_hash_signing_payload_v2(payload)
+    )
+
+
+def test_create_signed_full_sync_msg_emits_envelope_v2_hashes_and_signature_v2(outbound_handler_env, monkeypatch):
+    plugin, database, gossip_mgr = outbound_handler_env
+    states = [
+        {
+            "peer_id": "02" + "a" * 64,
+            "version": 2,
+            "timestamp": 1711200100,
+            "capacity_sats": 1000,
+            "available_sats": 500,
+            "fee_policy": {"base_fee": 1000, "fee_rate": 10},
+            "topology": ["03" + "b" * 64],
+            "addresses": ["10.0.0.1:9735"],
+            "capabilities": ["mcf"],
+        }
+    ]
+    database.get_all_members.return_value = [
+        {
+            "peer_id": "02" + "d" * 64,
+            "tier": "member",
+            "joined_at": 1711200200,
+            "addresses": json.dumps(["10.0.0.2:9735"]),
+        }
+    ]
+    gossip_mgr.create_full_sync_payload.return_value = {
+        "states": states,
+        "fleet_hash": "f" * 64,
+        "timestamp": 1711200200,
+    }
+    monkeypatch.setattr(protocol_handlers.time, "time", lambda: 1711200300)
+
+    message = protocol_handlers._create_signed_full_sync_msg()
+
+    msg_type, payload = protocol.deserialize(message)
+
+    assert msg_type == protocol.HiveMessageType.FULL_SYNC
+    assert payload["_envelope_version"] == protocol.STRICT_STATE_SYNC_VERSION
+    assert payload["signature_v2"] == "strict_signature_v2"
+    assert payload["states_hash_v2"] == protocol.compute_full_sync_states_hash_v2(payload["states"])
+    assert payload["members_hash_v2"] == protocol.compute_full_sync_members_hash_v2(payload["members"])
+    plugin.rpc.signmessage.assert_called_once_with(
+        protocol.get_full_sync_signing_payload_v2(payload)
+    )
 
 
 def test_full_sync_processing_uses_protocol_limit():

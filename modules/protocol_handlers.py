@@ -23,12 +23,13 @@ from modules.protocol import (
     validate_member_left,
     create_challenge, create_welcome,
     validate_gossip, validate_state_hash, validate_full_sync, validate_intent_abort,
-    get_gossip_signing_payload, get_gossip_signing_payload_v2,
-    get_state_hash_signing_payload, get_state_hash_signing_payload_v2,
-    get_full_sync_signing_payload, get_full_sync_signing_payload_v2,
+    get_gossip_signing_payload_v2,
+    get_state_hash_signing_payload_v2,
+    get_full_sync_signing_payload_v2,
     get_intent_signing_payload, get_intent_abort_signing_payload,
     compute_states_hash, compute_full_sync_states_hash_v2,
     compute_full_sync_members_hash_v2, is_strict_state_sync_payload,
+    STRICT_STATE_SYNC_VERSION,
 )
 from modules.handshake import CHALLENGE_TTL_SECONDS
 from modules.state_manager import StateManager
@@ -920,17 +921,29 @@ def _create_signed_full_sync_msg() -> Optional[bytes]:
     # Add sender identification
     full_sync_payload["sender_id"] = our_pubkey
     full_sync_payload["timestamp"] = int(time.time())
+    full_sync_payload["states_hash_v2"] = compute_full_sync_states_hash_v2(
+        full_sync_payload.get("states", [])
+    )
+    full_sync_payload["members_hash_v2"] = compute_full_sync_members_hash_v2(
+        full_sync_payload.get("members", [])
+    )
 
-    # Sign the payload
-    signing_payload = get_full_sync_signing_payload(full_sync_payload)
+    # Sign the payload using the strict v2 contract.
+    signing_payload = get_full_sync_signing_payload_v2(full_sync_payload)
     try:
         sig_result = plugin.rpc.signmessage(signing_payload)
-        full_sync_payload["signature"] = sig_result["zbase"]
+        signature = sig_result["zbase"]
+        full_sync_payload["signature"] = signature
+        full_sync_payload["signature_v2"] = signature
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign FULL_SYNC: {e}", level='error')
         return None
 
-    return serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
+    return serialize(
+        HiveMessageType.FULL_SYNC,
+        full_sync_payload,
+        envelope_version=STRICT_STATE_SYNC_VERSION,
+    )
 
 def _create_signed_state_hash_msg() -> Optional[bytes]:
     """
@@ -952,16 +965,22 @@ def _create_signed_state_hash_msg() -> Optional[bytes]:
     state_hash_payload["sender_id"] = our_pubkey
     state_hash_payload["timestamp"] = int(time.time())
 
-    # Sign the payload
-    signing_payload = get_state_hash_signing_payload(state_hash_payload)
+    # Sign the payload using the strict v2 contract.
+    signing_payload = get_state_hash_signing_payload_v2(state_hash_payload)
     try:
         sig_result = plugin.rpc.signmessage(signing_payload)
-        state_hash_payload["signature"] = sig_result["zbase"]
+        signature = sig_result["zbase"]
+        state_hash_payload["signature"] = signature
+        state_hash_payload["signature_v2"] = signature
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign STATE_HASH: {e}", level='error')
         return None
 
-    return serialize(HiveMessageType.STATE_HASH, state_hash_payload)
+    return serialize(
+        HiveMessageType.STATE_HASH,
+        state_hash_payload,
+        envelope_version=STRICT_STATE_SYNC_VERSION,
+    )
 
 def _get_our_addresses() -> List[str]:
     """
@@ -1070,17 +1089,24 @@ def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
 
     # Add sender identification for signature verification
     gossip_payload["sender_id"] = our_pubkey
+    gossip_payload.setdefault("fleet_hash", gossip_payload.get("state_hash", ""))
 
-    # Sign the payload (includes data hash for integrity)
-    signing_payload = get_gossip_signing_payload(gossip_payload)
+    # Sign the payload using the strict v2 contract.
+    signing_payload = get_gossip_signing_payload_v2(gossip_payload)
     try:
         sig_result = plugin.rpc.signmessage(signing_payload)
-        gossip_payload["signature"] = sig_result["zbase"]
+        signature = sig_result["zbase"]
+        gossip_payload["signature"] = signature
+        gossip_payload["signature_v2"] = signature
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign GOSSIP: {e}", level='error')
         return None
 
-    return serialize(HiveMessageType.GOSSIP, gossip_payload)
+    return serialize(
+        HiveMessageType.GOSSIP,
+        gossip_payload,
+        envelope_version=STRICT_STATE_SYNC_VERSION,
+    )
 
 def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
     """

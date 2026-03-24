@@ -244,7 +244,11 @@ VALID_WARNINGS = {
 # SERIALIZATION
 # =============================================================================
 
-def serialize(msg_type: HiveMessageType, payload: Dict[str, Any]) -> Optional[bytes]:
+def serialize(
+    msg_type: HiveMessageType,
+    payload: Dict[str, Any],
+    envelope_version: Optional[int] = None,
+) -> Optional[bytes]:
     """
     Serialize a Hive message for transmission via sendcustommsg.
     
@@ -262,10 +266,19 @@ def serialize(msg_type: HiveMessageType, payload: Dict[str, Any]) -> Optional[by
         >>> data[:4]
         b'HIVE'
     """
+    version = PROTOCOL_VERSION if envelope_version is None else envelope_version
+    if version not in SUPPORTED_VERSIONS:
+        import logging
+        logging.getLogger(__name__).warning(
+            "serialize: unsupported protocol version %s, dropping message",
+            version,
+        )
+        return None
+
     # Add message type to payload for deserialization
     envelope = {
         "type": int(msg_type),
-        "version": PROTOCOL_VERSION,
+        "version": version,
         "payload": payload
     }
     
