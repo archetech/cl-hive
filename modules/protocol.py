@@ -683,8 +683,8 @@ def _normalize_member_row_v2(member: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("member.peer_id must be a valid pubkey")
     if tier != "member":
         raise ValueError("member.tier must be 'member'")
-    if not isinstance(joined_at, int) or joined_at < 0:
-        raise ValueError("member.joined_at must be a non-negative integer")
+    if not isinstance(joined_at, int) or joined_at <= 0:
+        raise ValueError("member.joined_at must be a positive integer")
 
     return {
         "peer_id": peer_id,
