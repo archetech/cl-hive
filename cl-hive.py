@@ -3112,7 +3112,7 @@ def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     ban_message = f"BAN:{peer_id}:{reason}:{now}"
 
     try:
-        sig = plugin.rpc.signmessage(ban_message)["zbase"]
+        sig = plugin.rpc.signmessage(ban_message).get("zbase", "")
     except Exception as e:
         return {"error": f"Failed to sign ban: {e}"}
 
@@ -3207,7 +3207,7 @@ def hive_leave(plugin: Plugin, reason: str = "voluntary"):
     canonical = f"hive:leave:{our_pubkey}:{timestamp}:{reason}"
 
     try:
-        sig = plugin.rpc.signmessage(canonical)["zbase"]
+        sig = plugin.rpc.signmessage(canonical).get("zbase", "")
     except Exception as e:
         return {"error": f"Failed to sign leave message: {e}"}
 
@@ -3324,9 +3324,12 @@ def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"
         "joined_at_cutoff": joined_at_cutoff,
     }
     removed_payload["event_id"] = generate_event_id("MEMBER_REMOVED", removed_payload) or secrets.token_hex(16)
-    removed_payload["signature"] = plugin.rpc.signmessage(
-        f"hive:remove:{our_pubkey}:{peer_id}:{timestamp}:{reason}"
-    )["zbase"]
+    try:
+        removed_payload["signature"] = plugin.rpc.signmessage(
+            f"hive:remove:{our_pubkey}:{peer_id}:{timestamp}:{reason}"
+        ).get("zbase", "")
+    except Exception as e:
+        return {"error": f"Failed to sign removal: {e}"}
     database.record_membership_tombstone(
         event_id=removed_payload["event_id"],
         peer_id=peer_id,
