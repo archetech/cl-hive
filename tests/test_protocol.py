@@ -473,7 +473,7 @@ class TestProtocolV2Helpers:
             },
             {
                 "peer_id": "02" + "b" * 64,
-                "tier": "admin",
+                "tier": "member",
                 "joined_at": 1711200100,
                 "addresses": ["10.0.0.4:9735", "10.0.0.3:9735"],
                 "capabilities": ["mcf"],
@@ -512,6 +512,31 @@ class TestProtocolV2Helpers:
         with pytest.raises(ValueError):
             protocol.compute_full_sync_members_hash_v2(malformed_members)
 
+    @pytest.mark.parametrize(
+        "member_update, expected_error",
+        [
+            ({"peer_id": "not-a-pubkey"}, "member.peer_id"),
+            ({"tier": "admin"}, "member.tier"),
+            ({"joined_at": "invalid"}, "member.joined_at"),
+        ],
+    )
+    def test_full_sync_members_hash_v2_rejects_malformed_member_scalars(
+        self,
+        member_update,
+        expected_error,
+    ):
+        member = {
+            "peer_id": "02" + "a" * 64,
+            "tier": "member",
+            "joined_at": 1711200200,
+            "addresses": ["10.0.0.1:9735"],
+            "capabilities": ["mcf"],
+        }
+        member.update(member_update)
+
+        with pytest.raises(ValueError, match=expected_error):
+            protocol.compute_full_sync_members_hash_v2([member])
+
     def test_full_sync_signing_payload_v2_is_order_insensitive(self):
         payload = {
             "sender_id": "02" + "e" * 64,
@@ -545,7 +570,7 @@ class TestProtocolV2Helpers:
                 },
                 {
                     "peer_id": "02" + "b" * 64,
-                    "tier": "admin",
+                    "tier": "member",
                     "joined_at": 1711200100,
                     "addresses": ["10.0.0.4:9735", "10.0.0.3:9735"],
                     "capabilities": ["beta"],

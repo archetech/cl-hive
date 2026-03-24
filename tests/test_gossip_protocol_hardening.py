@@ -177,7 +177,7 @@ def test_full_sync_v2_helpers_are_order_insensitive_for_normalized_rows():
             },
             {
                 "peer_id": "02" + "b" * 64,
-                "tier": "admin",
+                "tier": "member",
                 "joined_at": 1711200100,
                 "addresses": ["10.0.0.4:9735", "10.0.0.3:9735"],
                 "capabilities": ["beta"],

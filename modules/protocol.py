@@ -675,10 +675,21 @@ def compute_members_hash(members: list) -> str:
 
 def _normalize_member_row_v2(member: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a FULL_SYNC member row for deterministic hashing."""
+    peer_id = member.get("peer_id")
+    tier = member.get("tier")
+    joined_at = member.get("joined_at")
+
+    if not _valid_pubkey(peer_id):
+        raise ValueError("member.peer_id must be a valid pubkey")
+    if tier != "member":
+        raise ValueError("member.tier must be 'member'")
+    if not isinstance(joined_at, int) or joined_at < 0:
+        raise ValueError("member.joined_at must be a non-negative integer")
+
     return {
-        "peer_id": member.get("peer_id", ""),
-        "tier": member.get("tier", ""),
-        "joined_at": member.get("joined_at", 0),
+        "peer_id": peer_id,
+        "tier": tier,
+        "joined_at": joined_at,
         "addresses": _normalize_string_list(member.get("addresses", []), "member.addresses"),
         "capabilities": _normalize_string_list(member.get("capabilities", []), "member.capabilities"),
     }

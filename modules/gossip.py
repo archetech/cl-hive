@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from modules.protocol import MAX_FULL_SYNC_STATES
+
 # =============================================================================
 # CONSTANTS
 # =============================================================================
@@ -30,7 +32,6 @@ DEFAULT_HEARTBEAT_INTERVAL = 300
 
 # Bounds to prevent unbounded payload growth
 MAX_TOPOLOGY_ENTRIES = 200
-MAX_FULL_SYNC_STATES = 2000
 MAX_FEE_POLICY_KEYS = 20
 MAX_GOSSIP_STRING_LEN = 256  # Pubkeys are 66 chars, channel IDs ~18
 
