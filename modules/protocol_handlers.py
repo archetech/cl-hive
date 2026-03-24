@@ -150,9 +150,14 @@ def handle_challenge(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     nonce = payload.get('nonce')
     hive_id = payload.get('hive_id')
-    
+
     if not nonce:
         plugin.log(f"cl-hive: CHALLENGE from {peer_id[:16]}... missing nonce", level='warn')
+        return {"result": "continue"}
+
+    # SECURITY: Reject challenges from banned peers
+    if database and database.is_banned(peer_id):
+        plugin.log(f"cl-hive: CHALLENGE from banned peer {peer_id[:16]}..., ignoring", level='warn')
         return {"result": "continue"}
 
     if not handshake_mgr or not handshake_mgr.has_pending_outbound_hello(peer_id):
@@ -358,8 +363,8 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
                 addrs = peers_info['peers'][0].get('netaddr', [])
                 if addrs:
                     database.update_member(peer_id, addresses=json.dumps(addrs))
-        except Exception:
-            pass  # Non-critical, will be captured on next gossip or connect
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to capture addresses for {peer_id[:16]}...: {e}", level='debug')
 
     # Initialize presence tracking so uptime_pct starts accumulating (Issue #59)
     # The peer is connected (they just completed the handshake), so mark online
@@ -924,6 +929,14 @@ def _apply_membership_sync(members_list: list, sender_id: str, plugin: Plugin,
         joined_at = member_info.get("joined_at", int(time.time()))
         addresses = member_info.get("addresses", [])
 
+        # Validate joined_at is an integer
+        if not isinstance(joined_at, int) or joined_at <= 0:
+            joined_at = int(time.time())
+
+        # Validate addresses is a list
+        if not isinstance(addresses, list):
+            addresses = []
+
         # Validate tier value (single-role model)
         if tier != "member":
             tier = "member"
@@ -1000,8 +1013,9 @@ def _create_membership_payload() -> list:
             try:
                 import json
                 member_dict["addresses"] = json.loads(addresses_json)
-            except (json.JSONDecodeError, TypeError):
-                pass
+            except (json.JSONDecodeError, TypeError) as e:
+                if plugin:
+                    plugin.log(f"cl-hive: Invalid addresses JSON for {m.get('peer_id', '?')[:16]}...: {e}", level='debug')
         # For our own entry, use current addresses
         if m["peer_id"] == our_pubkey:
             member_dict["addresses"] = _get_our_addresses()
@@ -1257,6 +1271,8 @@ def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
     plugin.log(f"cl-hive: Membership broadcast complete: {sent_count} messages sent")
 def _handle_peer_connected(peer_id: str, member: Dict):
     """Process peer connection on background thread (RPC calls inside)."""
+    if not database:
+        return
     now = int(time.time())
     database.update_member(peer_id, last_seen=now)
     database.update_presence(peer_id, is_online=True, now_ts=now, window_seconds=30 * 86400)
@@ -1270,8 +1286,9 @@ def _handle_peer_connected(peer_id: str, member: Dict):
                 if netaddr:
                     if not member.get('addresses'):
                         database.update_member(peer_id, addresses=json.dumps(netaddr))
-        except Exception:
-            pass
+        except Exception as e:
+            if plugin:
+                plugin.log(f"cl-hive: Failed to update addresses for {peer_id[:16]}...: {e}", level='debug')
 
     if plugin:
         plugin.log(f"cl-hive: Hive member {peer_id[:16]}... connected, sending STATE_HASH")
@@ -1422,6 +1439,16 @@ def handle_intent_abort(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     """
     if not intent_mgr:
         return {"result": "continue"}
+
+    # SECURITY: Verify sender is a Hive member and not banned before processing
+    if database:
+        member = database.get_member(peer_id)
+        if not member:
+            plugin.log(f"cl-hive: INTENT_ABORT from non-member {peer_id[:16]}..., ignoring", level='warn')
+            return {"result": "continue"}
+        if database.is_banned(peer_id):
+            plugin.log(f"cl-hive: INTENT_ABORT from banned member {peer_id[:16]}..., ignoring", level='warn')
+            return {"result": "continue"}
 
     # SECURITY: Validate payload structure including signature field
     if not validate_intent_abort(payload):
@@ -1593,7 +1620,8 @@ def _send_member_message_direct(
             })
             result["sent"] += 1
             shutdown_event.wait(0.02)
-        except Exception:
+        except Exception as e:
+            plugin.log(f"cl-hive: sendcustommsg to {peer_id[:16]}... failed: {e}", level='debug')
             result["failed"] += 1
 
     result["ok"] = result["failed"] == 0 if result["policy"] == "fail_closed" else True
@@ -1781,8 +1809,9 @@ def _reliable_send(msg_type: HiveMessageType, payload: Dict,
                     "node_id": peer_id,
                     "msg": msg_bytes.hex()
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            if plugin:
+                plugin.log(f"cl-hive: reliable_send fallback failed for {peer_id[:16]}...: {e}", level='debug')
 
 def _is_relayed_message(payload: Dict[str, Any]) -> bool:
     """Check if message was relayed (not direct from origin)."""
@@ -1924,23 +1953,26 @@ def _execute_member_removal(peer_id: str, reason: str = "removed") -> None:
     Shared by hive-remove-member, _cleanup_ghost_members, and ban execution.
     """
     # 1. Remove from database
+    if not database:
+        return
     database.remove_member(peer_id)
 
     # 2. Remove from in-memory state
     if state_manager:
         try:
             state_manager.remove_peer_state(peer_id)
-        except Exception:
-            pass
-
+        except Exception as e:
+            if plugin:
+                plugin.log(f"cl-hive: Failed to remove state for {peer_id[:16]}...: {e}", level='debug')
 
     # 4. Force the next gossip cycle to broadcast immediately so remaining
     #    members see the updated member list without the removed peer.
     if gossip_mgr:
         try:
             gossip_mgr.force_next_broadcast()
-        except Exception:
-            pass
+        except Exception as e:
+            if plugin:
+                plugin.log(f"cl-hive: Failed to force gossip broadcast after removing {peer_id[:16]}...: {e}", level='debug')
 
 def _cleanup_ghost_members() -> int:
     """
@@ -2041,10 +2073,14 @@ def handle_member_left(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: MEMBER_LEFT from {peer_id[:16]}... invalid payload", level='warn')
         return {"result": "continue"}
 
-    leaving_peer_id = payload["peer_id"]
-    timestamp = payload["timestamp"]
-    reason = payload["reason"]
-    signature = payload["signature"]
+    leaving_peer_id = payload.get("peer_id")
+    timestamp = payload.get("timestamp")
+    reason = payload.get("reason")
+    signature = payload.get("signature")
+
+    if not leaving_peer_id or not timestamp or not reason or not signature:
+        plugin.log(f"cl-hive: MEMBER_LEFT from {peer_id[:16]}... missing required fields", level='warn')
+        return {"result": "continue"}
 
     # Verify sender (supports relay)
     if not _validate_relay_sender(peer_id, leaving_peer_id, payload):
@@ -2685,7 +2721,7 @@ def handle_peer_reputation_snapshot(peer_id: str, payload: Dict, plugin: Plugin)
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER or database.is_banned(peer_id):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2755,7 +2791,7 @@ def handle_yield_metrics_batch(peer_id: str, payload: Dict, plugin: Plugin) -> D
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER or database.is_banned(peer_id):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2848,7 +2884,7 @@ def handle_corridor_value_batch(peer_id: str, payload: Dict, plugin: Plugin) -> 
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER or database.is_banned(peer_id):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -2936,7 +2972,7 @@ def handle_positioning_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> 
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER or database.is_banned(peer_id):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
@@ -3018,7 +3054,7 @@ def handle_coverage_analysis_batch(peer_id: str, payload: Dict, plugin: Plugin) 
     is_relayed = _is_relayed_message(payload)
     if is_relayed:
         relay_member = database.get_member(peer_id)
-        if not relay_member or relay_member.get("tier") != MEMBER_TIER:
+        if not relay_member or relay_member.get("tier") != MEMBER_TIER or database.is_banned(peer_id):
             return {"result": "continue"}
     else:
         sender = database.get_member(peer_id)
