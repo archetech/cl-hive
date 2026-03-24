@@ -447,3 +447,12 @@ Run:
 `git status --short`
 
 Expected: clean working tree.
+
+## Final Rollout Notes
+
+- Upgraded nodes now reject legacy `GOSSIP`, `STATE_HASH`, and `FULL_SYNC` immediately.
+- Mixed fleets will not anti-entropy sync correctly until all participating peers are upgraded.
+- Operators must coordinate rollout before expecting normal convergence.
+- Implementation status:
+  - branch: `codex/hive-gossip-hardening-20260323`
+  - verification sweep: `166 passed`

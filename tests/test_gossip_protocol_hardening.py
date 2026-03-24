@@ -508,6 +508,57 @@ def test_create_signed_full_sync_msg_emits_envelope_v2_hashes_and_signature_v2(o
     )
 
 
+def test_broadcast_member_message_preserves_v2_envelope_for_prebuilt_full_sync_bytes(
+    outbound_handler_env,
+    monkeypatch,
+):
+    plugin, database, gossip_mgr = outbound_handler_env
+    target_id = "02" + "a" * 64
+    database.get_all_members.return_value = [
+        {
+            "peer_id": target_id,
+            "tier": "member",
+            "joined_at": 1711200200,
+        }
+    ]
+    gossip_mgr.create_full_sync_payload.return_value = {
+        "states": [
+            {
+                "peer_id": "02" + "b" * 64,
+                "version": 2,
+                "timestamp": 1711200100,
+                "capacity_sats": 1000,
+                "available_sats": 500,
+                "fee_policy": {"base_fee": 1000, "fee_rate": 10},
+                "topology": ["03" + "c" * 64],
+                "addresses": ["10.0.0.1:9735"],
+                "capabilities": ["mcf"],
+            }
+        ],
+        "fleet_hash": "f" * 64,
+        "timestamp": 1711200200,
+    }
+    shutdown_event = MagicMock()
+    shutdown_event.wait = MagicMock()
+    monkeypatch.setattr(protocol_handlers, "shutdown_event", shutdown_event)
+    monkeypatch.setattr(protocol_handlers.time, "time", lambda: 1711200300)
+
+    full_sync_msg = protocol_handlers._create_signed_full_sync_msg()
+
+    result = protocol_handlers._broadcast_member_message(
+        message_bytes=full_sync_msg,
+        reliability="direct",
+        targets=[target_id],
+    )
+
+    sent_hex = plugin.rpc.call.call_args.args[1]["msg"]
+    msg_type, payload = protocol.deserialize(bytes.fromhex(sent_hex))
+
+    assert result["ok"] is True
+    assert msg_type == protocol.HiveMessageType.FULL_SYNC
+    assert payload["_envelope_version"] == protocol.STRICT_STATE_SYNC_VERSION
+
+
 def test_full_sync_processing_uses_protocol_limit():
     plugin = MagicMock()
     plugin.log = MagicMock()

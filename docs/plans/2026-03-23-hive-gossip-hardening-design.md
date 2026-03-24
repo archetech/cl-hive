@@ -155,5 +155,12 @@ Required test coverage:
 
 - This design is not backward-compatible for the state-sync surface.
 - Upgraded nodes will refuse legacy `GOSSIP`, `STATE_HASH`, and `FULL_SYNC` immediately.
+- Mixed fleets will not anti-entropy sync correctly until every participating node is upgraded.
 - Operators must coordinate upgrades across the fleet before expecting normal anti-entropy and membership convergence.
 - That operational cost is justified by the audited high-severity trust failures.
+
+## Implementation Status
+
+- Implemented on branch `codex/hive-gossip-hardening-20260323` on 2026-03-23.
+- Receiver hardening, persistence fixes, and outbound strict-v2 emission are complete.
+- Verification status: `166 passed` on the targeted protocol/state/security regression sweep.

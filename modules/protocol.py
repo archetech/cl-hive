@@ -266,7 +266,12 @@ def serialize(
         >>> data[:4]
         b'HIVE'
     """
-    version = PROTOCOL_VERSION if envelope_version is None else envelope_version
+    wire_payload = dict(payload)
+    if envelope_version is None:
+        version = wire_payload.pop("_envelope_version", PROTOCOL_VERSION)
+    else:
+        version = envelope_version
+        wire_payload.pop("_envelope_version", None)
     if version not in SUPPORTED_VERSIONS:
         import logging
         logging.getLogger(__name__).warning(
@@ -279,7 +284,7 @@ def serialize(
     envelope = {
         "type": int(msg_type),
         "version": version,
-        "payload": payload
+        "payload": wire_payload
     }
     
     # JSON encode
