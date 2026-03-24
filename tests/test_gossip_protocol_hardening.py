@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import modules.protocol as protocol
 import modules.protocol_handlers as protocol_handlers
+from modules.gossip import GossipManager
 
 
 def _make_v2_gossip_payload(sender_id, envelope_version=2):
@@ -385,6 +386,30 @@ def test_handle_full_sync_v2_rejects_invalid_address_shape(state_sync_handler_en
     assert result == {"result": "continue"}
     plugin.rpc.checkmessage.assert_not_called()
     gossip_mgr.process_full_sync.assert_not_called()
+
+
+def test_full_sync_processing_uses_protocol_limit():
+    plugin = MagicMock()
+    plugin.log = MagicMock()
+    state_manager = MagicMock()
+    gossip_manager = GossipManager(state_manager, plugin)
+    sender_id = "02" + "a" * 64
+    oversized_states = [
+        {
+            "peer_id": f"peer_{i:04d}",
+            "version": 1,
+            "timestamp": 1711200100,
+        }
+        for i in range(protocol.MAX_FULL_SYNC_STATES + 1)
+    ]
+
+    result = gossip_manager.process_full_sync(
+        sender_id,
+        {"states": oversized_states},
+    )
+
+    assert result == 0
+    state_manager.apply_full_sync.assert_not_called()
 
 
 def test_full_sync_states_hash_v2_changes_when_state_contents_change():
