@@ -69,9 +69,9 @@ def _make_v2_state_hash_payload(sender_id, envelope_version=2):
     }
 
 
-def _make_v2_full_sync_payload(sender_id, envelope_version=2):
-    states = []
-    members = []
+def _make_v2_full_sync_payload(sender_id, envelope_version=2, states=None, members=None):
+    states = [] if states is None else states
+    members = [] if members is None else members
     return {
         "_envelope_version": envelope_version,
         "sender_id": sender_id,
@@ -90,6 +90,7 @@ def _make_v2_full_sync_payload(sender_id, envelope_version=2):
 def state_sync_handler_env(monkeypatch):
     plugin = MagicMock()
     plugin.log = MagicMock()
+    plugin.rpc.listpeers.return_value = {"peers": []}
 
     database = MagicMock()
     database.is_banned.return_value = False
@@ -104,6 +105,7 @@ def state_sync_handler_env(monkeypatch):
     monkeypatch.setattr(protocol_handlers, "database", database)
     monkeypatch.setattr(protocol_handlers, "gossip_mgr", gossip_mgr)
     monkeypatch.setattr(protocol_handlers, "state_manager", state_manager)
+    monkeypatch.setattr(protocol_handlers, "our_pubkey", "02" + "f" * 64)
 
     return plugin, database, gossip_mgr, state_manager
 
@@ -237,6 +239,144 @@ def test_handle_full_sync_rejects_envelope_v1(state_sync_handler_env):
     plugin, database, gossip_mgr, _state_manager = state_sync_handler_env
     sender_id = "02" + "a" * 64
     payload = _make_v2_full_sync_payload(sender_id, envelope_version=1)
+
+    database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
+
+    result = protocol_handlers.handle_full_sync(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    plugin.rpc.checkmessage.assert_not_called()
+    gossip_mgr.process_full_sync.assert_not_called()
+
+
+def test_handle_full_sync_v2_applies_foreign_rows_when_hashes_verify(state_sync_handler_env):
+    plugin, database, gossip_mgr, _state_manager = state_sync_handler_env
+    sender_id = "02" + "a" * 64
+    states = [
+        {
+            "peer_id": "02" + "b" * 64,
+            "version": 2,
+            "timestamp": 1711200100,
+            "capacity_sats": 1000,
+            "available_sats": 500,
+            "fee_policy": {"base_fee": 1000, "fee_rate": 10},
+            "topology": ["03" + "c" * 64],
+            "addresses": ["10.0.0.1:9735"],
+            "capabilities": ["mcf"],
+        }
+    ]
+    members = [
+        {
+            "peer_id": "02" + "d" * 64,
+            "tier": "member",
+            "joined_at": 1711200200,
+            "addresses": ["10.0.0.2:9735"],
+            "capabilities": ["mcf"],
+        }
+    ]
+    payload = _make_v2_full_sync_payload(sender_id, states=states, members=members)
+
+    def get_member(peer):
+        if peer == sender_id:
+            return {"peer_id": sender_id, "tier": "member"}
+        return None
+
+    database.get_member.side_effect = get_member
+    plugin.rpc.checkmessage.return_value = {"verified": True, "pubkey": sender_id}
+    gossip_mgr.process_full_sync.return_value = 1
+
+    result = protocol_handlers.handle_full_sync(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    plugin.rpc.checkmessage.assert_called_once_with(
+        protocol.get_full_sync_signing_payload_v2(payload),
+        payload["signature_v2"],
+        sender_id,
+    )
+    gossip_mgr.process_full_sync.assert_called_once_with(sender_id, payload)
+    database.add_member.assert_called_once_with(
+        peer_id="02" + "d" * 64,
+        tier="member",
+        joined_at=1711200200,
+    )
+    database.update_member.assert_called_once_with(
+        "02" + "d" * 64,
+        addresses=json.dumps(["10.0.0.2:9735"]),
+    )
+
+
+def test_handle_full_sync_v2_rejects_state_hash_mismatch(state_sync_handler_env):
+    plugin, database, gossip_mgr, _state_manager = state_sync_handler_env
+    sender_id = "02" + "a" * 64
+    states = [
+        {
+            "peer_id": "02" + "b" * 64,
+            "version": 2,
+            "timestamp": 1711200100,
+            "capacity_sats": 1000,
+            "available_sats": 500,
+            "fee_policy": {"base_fee": 1000, "fee_rate": 10},
+            "topology": ["03" + "c" * 64],
+            "addresses": ["10.0.0.1:9735"],
+            "capabilities": ["mcf"],
+        }
+    ]
+    payload = _make_v2_full_sync_payload(sender_id, states=states)
+    payload["states_hash_v2"] = "x" * 64
+
+    database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
+
+    result = protocol_handlers.handle_full_sync(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    plugin.rpc.checkmessage.assert_not_called()
+    gossip_mgr.process_full_sync.assert_not_called()
+
+
+def test_handle_full_sync_v2_rejects_invalid_member_pubkey(state_sync_handler_env):
+    plugin, database, gossip_mgr, _state_manager = state_sync_handler_env
+    sender_id = "02" + "a" * 64
+    payload = _make_v2_full_sync_payload(
+        sender_id,
+        members=[
+            {
+                "peer_id": "02" + "d" * 64,
+                "tier": "member",
+                "joined_at": 1711200200,
+                "addresses": ["10.0.0.2:9735"],
+                "capabilities": ["mcf"],
+            }
+        ],
+    )
+    payload["members"][0]["peer_id"] = "not-a-pubkey"
+    payload["members_hash_v2"] = "x" * 64
+
+    database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
+
+    result = protocol_handlers.handle_full_sync(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    plugin.rpc.checkmessage.assert_not_called()
+    gossip_mgr.process_full_sync.assert_not_called()
+
+
+def test_handle_full_sync_v2_rejects_invalid_address_shape(state_sync_handler_env):
+    plugin, database, gossip_mgr, _state_manager = state_sync_handler_env
+    sender_id = "02" + "a" * 64
+    payload = _make_v2_full_sync_payload(
+        sender_id,
+        members=[
+            {
+                "peer_id": "02" + "d" * 64,
+                "tier": "member",
+                "joined_at": 1711200200,
+                "addresses": ["10.0.0.2:9735"],
+                "capabilities": ["mcf"],
+            }
+        ],
+    )
+    payload["members"][0]["addresses"] = ["invalid-address"]
+    payload["members_hash_v2"] = "d16dca6cd60cda0c08ca334a5cda9fa3517e35998bb0632cebfff0e293aff143"
 
     database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
 

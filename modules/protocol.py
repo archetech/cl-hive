@@ -475,6 +475,19 @@ def _normalize_string_list(values: Any, field_name: str) -> List[str]:
     return sorted(values)
 
 
+def _normalize_address_list(values: Any, field_name: str) -> List[str]:
+    """Return a deterministic sorted list of host:port addresses or fail closed."""
+    addresses = _normalize_string_list(values, field_name)
+    for address in addresses:
+        host, sep, port = address.rpartition(":")
+        if not sep or not host or not port.isdigit():
+            raise ValueError(f"{field_name} entries must be host:port strings")
+        port_num = int(port)
+        if port_num <= 0 or port_num > 65535:
+            raise ValueError(f"{field_name} entries must use ports 1-65535")
+    return addresses
+
+
 def compute_gossip_data_hash_v2(payload: Dict[str, Any]) -> str:
     """
     Compute a v2 hash of the GOSSIP data fields.
@@ -487,7 +500,7 @@ def compute_gossip_data_hash_v2(payload: Dict[str, Any]) -> str:
         "available_sats": payload.get("available_sats", 0),
         "fee_policy": payload.get("fee_policy", {}),
         "topology": _normalize_string_list(payload.get("topology", []), "topology"),
-        "addresses": _normalize_string_list(payload.get("addresses", []), "addresses"),
+        "addresses": _normalize_address_list(payload.get("addresses", []), "addresses"),
         "capabilities": _normalize_string_list(payload.get("capabilities", []), "capabilities"),
     }
     json_str = json.dumps(data_fields, sort_keys=True, separators=(',', ':'))
@@ -690,7 +703,7 @@ def _normalize_member_row_v2(member: Dict[str, Any]) -> Dict[str, Any]:
         "peer_id": peer_id,
         "tier": tier,
         "joined_at": joined_at,
-        "addresses": _normalize_string_list(member.get("addresses", []), "member.addresses"),
+        "addresses": _normalize_address_list(member.get("addresses", []), "member.addresses"),
         "capabilities": _normalize_string_list(member.get("capabilities", []), "member.capabilities"),
     }
 
@@ -763,7 +776,7 @@ def _normalize_state_row_v2(state: Dict[str, Any]) -> Dict[str, Any]:
         "available_sats": state.get("available_sats", 0),
         "fee_policy": state.get("fee_policy", {}),
         "topology": _normalize_string_list(state.get("topology", []), "states.topology"),
-        "addresses": _normalize_string_list(state.get("addresses", []), "states.addresses"),
+        "addresses": _normalize_address_list(state.get("addresses", []), "states.addresses"),
         "capabilities": _normalize_string_list(state.get("capabilities", []), "states.capabilities"),
         "budget_available_sats": state.get("budget_available_sats", 0),
         "budget_reserved_until": state.get("budget_reserved_until", 0),
