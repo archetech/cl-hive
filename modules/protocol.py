@@ -466,11 +466,15 @@ def compute_gossip_data_hash(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
 
 
-def _normalize_string_list(values: Any) -> List[str]:
-    """Return a deterministic sorted list of strings."""
-    if not isinstance(values, list):
+def _normalize_string_list(values: Any, field_name: str) -> List[str]:
+    """Return a deterministic sorted list of strings or fail closed."""
+    if values is None:
         return []
-    return sorted(v for v in values if isinstance(v, str))
+    if not isinstance(values, list):
+        raise ValueError(f"{field_name} must be a list of strings")
+    if any(not isinstance(v, str) for v in values):
+        raise ValueError(f"{field_name} must contain only strings")
+    return sorted(values)
 
 
 def compute_gossip_data_hash_v2(payload: Dict[str, Any]) -> str:
@@ -484,9 +488,9 @@ def compute_gossip_data_hash_v2(payload: Dict[str, Any]) -> str:
         "capacity_sats": payload.get("capacity_sats", 0),
         "available_sats": payload.get("available_sats", 0),
         "fee_policy": payload.get("fee_policy", {}),
-        "topology": _normalize_string_list(payload.get("topology", [])),
-        "addresses": _normalize_string_list(payload.get("addresses", [])),
-        "capabilities": _normalize_string_list(payload.get("capabilities", [])),
+        "topology": _normalize_string_list(payload.get("topology", []), "topology"),
+        "addresses": _normalize_string_list(payload.get("addresses", []), "addresses"),
+        "capabilities": _normalize_string_list(payload.get("capabilities", []), "capabilities"),
     }
     json_str = json.dumps(data_fields, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
@@ -677,8 +681,8 @@ def _normalize_member_row_v2(member: Dict[str, Any]) -> Dict[str, Any]:
         "peer_id": member.get("peer_id", ""),
         "tier": member.get("tier", ""),
         "joined_at": member.get("joined_at", 0),
-        "addresses": _normalize_string_list(member.get("addresses", [])),
-        "capabilities": _normalize_string_list(member.get("capabilities", [])),
+        "addresses": _normalize_string_list(member.get("addresses", []), "member.addresses"),
+        "capabilities": _normalize_string_list(member.get("capabilities", []), "member.capabilities"),
     }
 
 
@@ -686,10 +690,14 @@ def compute_full_sync_members_hash_v2(members: list) -> str:
     """
     Compute a v2 deterministic hash of the members list.
     """
-    if not isinstance(members, list) or not members:
+    if members is None or not members:
         return ""
+    if not isinstance(members, list):
+        raise ValueError("members must be a list")
+    if any(not isinstance(member, dict) for member in members):
+        raise ValueError("members must contain only dict rows")
 
-    member_rows = [_normalize_member_row_v2(m) for m in members if isinstance(m, dict)]
+    member_rows = [_normalize_member_row_v2(m) for m in members]
     member_rows.sort(key=lambda x: x["peer_id"])
 
     json_str = json.dumps(member_rows, sort_keys=True, separators=(',', ':'))
@@ -745,9 +753,9 @@ def _normalize_state_row_v2(state: Dict[str, Any]) -> Dict[str, Any]:
         "capacity_sats": state.get("capacity_sats", 0),
         "available_sats": state.get("available_sats", 0),
         "fee_policy": state.get("fee_policy", {}),
-        "topology": _normalize_string_list(state.get("topology", [])),
-        "addresses": _normalize_string_list(state.get("addresses", [])),
-        "capabilities": _normalize_string_list(state.get("capabilities", [])),
+        "topology": _normalize_string_list(state.get("topology", []), "states.topology"),
+        "addresses": _normalize_string_list(state.get("addresses", []), "states.addresses"),
+        "capabilities": _normalize_string_list(state.get("capabilities", []), "states.capabilities"),
         "budget_available_sats": state.get("budget_available_sats", 0),
         "budget_reserved_until": state.get("budget_reserved_until", 0),
         "budget_last_update": state.get("budget_last_update", 0),
@@ -759,10 +767,14 @@ def compute_full_sync_states_hash_v2(states: list) -> str:
     """
     Compute a v2 deterministic hash of the full-sync states list.
     """
-    if not isinstance(states, list) or not states:
+    if states is None or not states:
         return ""
+    if not isinstance(states, list):
+        raise ValueError("states must be a list")
+    if any(not isinstance(state, dict) for state in states):
+        raise ValueError("states must contain only dict rows")
 
-    state_rows = [_normalize_state_row_v2(s) for s in states if isinstance(s, dict)]
+    state_rows = [_normalize_state_row_v2(s) for s in states]
     state_rows.sort(key=lambda x: x["peer_id"])
 
     json_str = json.dumps(state_rows, sort_keys=True, separators=(',', ':'))
@@ -811,7 +823,7 @@ def get_full_sync_signing_payload_v2(payload: Dict[str, Any]) -> str:
 
 
 def is_strict_state_sync_payload(payload: Dict[str, Any]) -> bool:
-    return payload.get("_envelope_version") == STRICT_STATE_SYNC_VERSION
+    return isinstance(payload, dict) and payload.get("_envelope_version") == STRICT_STATE_SYNC_VERSION
 
 
 # =============================================================================

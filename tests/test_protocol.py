@@ -397,6 +397,42 @@ class TestProtocolV2Helpers:
 
         assert base != changed
 
+    def test_gossip_signing_payload_v2_is_order_insensitive(self):
+        payload = {
+            "sender_id": "02" + "a" * 64,
+            "timestamp": 1711200000,
+            "version": 7,
+            "fleet_hash": "f" * 64,
+            "capacity_sats": 1000,
+            "available_sats": 500,
+            "fee_policy": {"base_fee": 1000, "fee_rate": 10},
+            "topology": ["03" + "b" * 64, "02" + "c" * 64],
+            "addresses": ["10.0.0.2:9735", "10.0.0.1:9735"],
+            "capabilities": ["beta", "alpha"],
+        }
+        reordered = dict(
+            payload,
+            topology=list(reversed(payload["topology"])),
+            addresses=list(reversed(payload["addresses"])),
+            capabilities=list(reversed(payload["capabilities"])),
+        )
+
+        assert protocol.get_gossip_signing_payload_v2(payload) == protocol.get_gossip_signing_payload_v2(reordered)
+
+    def test_gossip_signing_payload_v2_rejects_non_string_entries(self):
+        payload = {
+            "sender_id": "02" + "a" * 64,
+            "timestamp": 1711200000,
+            "version": 7,
+            "fleet_hash": "f" * 64,
+            "topology": ["03" + "b" * 64],
+            "addresses": ["10.0.0.1:9735", 123],
+            "capabilities": ["mcf"],
+        }
+
+        with pytest.raises(ValueError, match="addresses"):
+            protocol.get_gossip_signing_payload_v2(payload)
+
     def test_state_hash_signing_payload_v2_changes_when_membership_hash_changes(self):
         base_payload = {
             "sender_id": "02" + "d" * 64,
