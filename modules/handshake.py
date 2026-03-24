@@ -42,6 +42,10 @@ CHALLENGE_TTL_SECONDS = 300
 # Cap to prevent unbounded pending challenge growth
 MAX_PENDING_CHALLENGES = 1000
 
+# Cap to prevent unbounded pending request / outbound hello growth
+MAX_PENDING_REQUESTS = 1000
+MAX_OUTBOUND_HELLOS = 1000
+
 # SECURITY (Issue #11): Per-peer rate limit for challenge generation
 CHALLENGE_RATE_LIMIT_SECONDS = 10  # Minimum seconds between challenges per peer
 
@@ -194,6 +198,12 @@ class HandshakeManager:
 
     def store_pending_request(self, peer_id: str) -> None:
         """Store a pending join request from a peer (awaiting hive-approve)."""
+        # Expire old requests and enforce size cap
+        self.expire_pending_requests()
+        if len(self._pending_requests) >= MAX_PENDING_REQUESTS:
+            oldest = min(self._pending_requests, key=lambda k: self._pending_requests[k]["received_at"])
+            del self._pending_requests[oldest]
+
         self._pending_requests[peer_id] = {
             "peer_id": peer_id,
             "received_at": int(time.time()),
@@ -225,7 +235,18 @@ class HandshakeManager:
 
     def record_hello_sent(self, peer_id: str) -> None:
         """Record that we sent a HELLO to a peer (outbound join request)."""
-        self._outbound_hello_sent[peer_id] = int(time.time())
+        # Expire old entries and enforce size cap
+        now = int(time.time())
+        if len(self._outbound_hello_sent) >= MAX_OUTBOUND_HELLOS:
+            expired = [k for k, ts in self._outbound_hello_sent.items()
+                       if now - ts > PENDING_REQUEST_MAX_AGE]
+            for k in expired:
+                del self._outbound_hello_sent[k]
+            if len(self._outbound_hello_sent) >= MAX_OUTBOUND_HELLOS:
+                oldest = min(self._outbound_hello_sent, key=self._outbound_hello_sent.get)
+                del self._outbound_hello_sent[oldest]
+
+        self._outbound_hello_sent[peer_id] = now
 
     def has_pending_outbound_hello(self, peer_id: str, max_age_seconds: int = PENDING_REQUEST_MAX_AGE) -> bool:
         """Check if we have a pending outbound HELLO to this peer."""
