@@ -433,6 +433,20 @@ class TestProtocolV2Helpers:
         with pytest.raises(ValueError, match="addresses"):
             protocol.get_gossip_signing_payload_v2(payload)
 
+    def test_gossip_signing_payload_v2_rejects_null_list_fields(self):
+        payload = {
+            "sender_id": "02" + "a" * 64,
+            "timestamp": 1711200000,
+            "version": 7,
+            "fleet_hash": "f" * 64,
+            "topology": ["03" + "b" * 64],
+            "addresses": None,
+            "capabilities": ["mcf"],
+        }
+
+        with pytest.raises(ValueError, match="addresses"):
+            protocol.get_gossip_signing_payload_v2(payload)
+
     def test_state_hash_signing_payload_v2_changes_when_membership_hash_changes(self):
         base_payload = {
             "sender_id": "02" + "d" * 64,
@@ -548,6 +562,33 @@ class TestProtocolV2Helpers:
         changed = protocol.get_full_sync_signing_payload_v2(reordered)
 
         assert base == changed
+
+    @pytest.mark.parametrize(
+        "field_name, field_value, expected_error",
+        [
+            ("states", None, "states must be a list"),
+            ("states", "", "states must be a list"),
+            ("members", None, "members must be a list"),
+            ("members", "", "members must be a list"),
+        ],
+    )
+    def test_full_sync_signing_payload_v2_rejects_null_or_non_list_collections(
+        self,
+        field_name,
+        field_value,
+        expected_error,
+    ):
+        payload = {
+            "sender_id": "02" + "e" * 64,
+            "fleet_hash": "f" * 64,
+            "timestamp": 1711200300,
+            "states": [],
+            "members": [],
+        }
+        payload[field_name] = field_value
+
+        with pytest.raises(ValueError, match=expected_error):
+            protocol.get_full_sync_signing_payload_v2(payload)
 
 
 if __name__ == "__main__":

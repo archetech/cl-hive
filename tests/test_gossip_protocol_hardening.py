@@ -117,6 +117,33 @@ def test_full_sync_signing_payload_v2_fails_closed_on_malformed_content():
         protocol.get_full_sync_signing_payload_v2(malformed_payload)
 
 
+@pytest.mark.parametrize(
+    "field_name, field_value, expected_error",
+    [
+        ("states", None, "states must be a list"),
+        ("states", "", "states must be a list"),
+        ("members", None, "members must be a list"),
+        ("members", "", "members must be a list"),
+    ],
+)
+def test_full_sync_signing_payload_v2_fails_closed_on_null_or_non_list_collections(
+    field_name,
+    field_value,
+    expected_error,
+):
+    payload = {
+        "sender_id": "02" + "f" * 64,
+        "fleet_hash": "9" * 64,
+        "timestamp": 1711200300,
+        "states": [],
+        "members": [],
+    }
+    payload[field_name] = field_value
+
+    with pytest.raises(ValueError, match=expected_error):
+        protocol.get_full_sync_signing_payload_v2(payload)
+
+
 def test_full_sync_v2_helpers_are_order_insensitive_for_normalized_rows():
     payload = {
         "sender_id": "02" + "f" * 64,

@@ -468,8 +468,6 @@ def compute_gossip_data_hash(payload: Dict[str, Any]) -> str:
 
 def _normalize_string_list(values: Any, field_name: str) -> List[str]:
     """Return a deterministic sorted list of strings or fail closed."""
-    if values is None:
-        return []
     if not isinstance(values, list):
         raise ValueError(f"{field_name} must be a list of strings")
     if any(not isinstance(v, str) for v in values):
@@ -690,10 +688,10 @@ def compute_full_sync_members_hash_v2(members: list) -> str:
     """
     Compute a v2 deterministic hash of the members list.
     """
-    if members is None or not members:
-        return ""
     if not isinstance(members, list):
         raise ValueError("members must be a list")
+    if not members:
+        return ""
     if any(not isinstance(member, dict) for member in members):
         raise ValueError("members must contain only dict rows")
 
@@ -767,10 +765,10 @@ def compute_full_sync_states_hash_v2(states: list) -> str:
     """
     Compute a v2 deterministic hash of the full-sync states list.
     """
-    if states is None or not states:
-        return ""
     if not isinstance(states, list):
         raise ValueError("states must be a list")
+    if not states:
+        return ""
     if any(not isinstance(state, dict) for state in states):
         raise ValueError("states must contain only dict rows")
 
