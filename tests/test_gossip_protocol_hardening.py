@@ -56,6 +56,58 @@ def gossip_handler_env(monkeypatch):
     return plugin, database, gossip_mgr
 
 
+def _make_v2_state_hash_payload(sender_id, envelope_version=2):
+    return {
+        "_envelope_version": envelope_version,
+        "sender_id": sender_id,
+        "fleet_hash": "f" * 64,
+        "membership_hash": "m" * 64,
+        "timestamp": int(time.time()),
+        "peer_count": 3,
+        "signature": "legacy_signature",
+        "signature_v2": "strict_signature_v2",
+    }
+
+
+def _make_v2_full_sync_payload(sender_id, envelope_version=2):
+    states = []
+    members = []
+    return {
+        "_envelope_version": envelope_version,
+        "sender_id": sender_id,
+        "fleet_hash": "",
+        "timestamp": int(time.time()),
+        "states": states,
+        "members": members,
+        "states_hash_v2": protocol.compute_full_sync_states_hash_v2(states),
+        "members_hash_v2": protocol.compute_full_sync_members_hash_v2(members),
+        "signature": "legacy_signature",
+        "signature_v2": "strict_signature_v2",
+    }
+
+
+@pytest.fixture
+def state_sync_handler_env(monkeypatch):
+    plugin = MagicMock()
+    plugin.log = MagicMock()
+
+    database = MagicMock()
+    database.is_banned.return_value = False
+
+    gossip_mgr = MagicMock()
+    gossip_mgr.process_state_hash.return_value = True
+    gossip_mgr.process_full_sync.return_value = 0
+
+    state_manager = MagicMock()
+
+    monkeypatch.setattr(protocol_handlers, "plugin", plugin)
+    monkeypatch.setattr(protocol_handlers, "database", database)
+    monkeypatch.setattr(protocol_handlers, "gossip_mgr", gossip_mgr)
+    monkeypatch.setattr(protocol_handlers, "state_manager", state_manager)
+
+    return plugin, database, gossip_mgr, state_manager
+
+
 def test_handle_gossip_rejects_legacy_payload_without_signature_v2(gossip_handler_env):
     plugin, database, gossip_mgr = gossip_handler_env
     sender_id = "02" + "a" * 64
@@ -127,6 +179,72 @@ def test_handle_gossip_accepts_v2_payload_and_autoconnects(gossip_handler_env):
     assert result == {"result": "continue"}
     assert gossip_mgr.process_gossip.call_count == 1
     plugin.rpc.connect.assert_called_once_with(f"{sender_id}@1.2.3.4:9735")
+
+
+def test_handle_state_hash_rejects_legacy_payload_without_signature_v2(state_sync_handler_env):
+    plugin, database, gossip_mgr, _state_manager = state_sync_handler_env
+    sender_id = "02" + "a" * 64
+    payload = _make_v2_state_hash_payload(sender_id)
+    payload.pop("signature_v2")
+    payload.pop("_envelope_version")
+
+    database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
+
+    result = protocol_handlers.handle_state_hash(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    plugin.rpc.checkmessage.assert_not_called()
+    gossip_mgr.process_state_hash.assert_not_called()
+
+
+def test_handle_state_hash_accepts_v2_payload_with_membership_hash(state_sync_handler_env):
+    plugin, database, gossip_mgr, _state_manager = state_sync_handler_env
+    sender_id = "02" + "a" * 64
+    payload = _make_v2_state_hash_payload(sender_id)
+
+    database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
+    plugin.rpc.checkmessage.return_value = {"verified": True, "pubkey": sender_id}
+
+    result = protocol_handlers.handle_state_hash(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    plugin.rpc.checkmessage.assert_called_once_with(
+        protocol.get_state_hash_signing_payload_v2(payload),
+        payload["signature_v2"],
+        sender_id,
+    )
+    gossip_mgr.process_state_hash.assert_called_once_with(sender_id, payload)
+    plugin.rpc.call.assert_not_called()
+
+
+def test_handle_full_sync_rejects_legacy_payload_without_signature_v2(state_sync_handler_env):
+    plugin, database, gossip_mgr, _state_manager = state_sync_handler_env
+    sender_id = "02" + "a" * 64
+    payload = _make_v2_full_sync_payload(sender_id)
+    payload.pop("signature_v2")
+    payload.pop("_envelope_version")
+
+    database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
+
+    result = protocol_handlers.handle_full_sync(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    plugin.rpc.checkmessage.assert_not_called()
+    gossip_mgr.process_full_sync.assert_not_called()
+
+
+def test_handle_full_sync_rejects_envelope_v1(state_sync_handler_env):
+    plugin, database, gossip_mgr, _state_manager = state_sync_handler_env
+    sender_id = "02" + "a" * 64
+    payload = _make_v2_full_sync_payload(sender_id, envelope_version=1)
+
+    database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
+
+    result = protocol_handlers.handle_full_sync(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    plugin.rpc.checkmessage.assert_not_called()
+    gossip_mgr.process_full_sync.assert_not_called()
 
 
 def test_full_sync_states_hash_v2_changes_when_state_contents_change():

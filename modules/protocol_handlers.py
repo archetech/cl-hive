@@ -24,9 +24,11 @@ from modules.protocol import (
     create_challenge, create_welcome,
     validate_gossip, validate_state_hash, validate_full_sync, validate_intent_abort,
     get_gossip_signing_payload, get_gossip_signing_payload_v2,
-    get_state_hash_signing_payload,
-    get_full_sync_signing_payload, get_intent_signing_payload, get_intent_abort_signing_payload,
-    compute_states_hash, is_strict_state_sync_payload,
+    get_state_hash_signing_payload, get_state_hash_signing_payload_v2,
+    get_full_sync_signing_payload, get_full_sync_signing_payload_v2,
+    get_intent_signing_payload, get_intent_abort_signing_payload,
+    compute_states_hash, compute_full_sync_states_hash_v2,
+    compute_full_sync_members_hash_v2, is_strict_state_sync_payload,
 )
 from modules.handshake import CHALLENGE_TTL_SECONDS
 from modules.state_manager import StateManager
@@ -580,21 +582,41 @@ def handle_state_hash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _check_timestamp_freshness(payload, MAX_STATE_HASH_AGE_SECONDS, "STATE_HASH"):
         return {"result": "continue"}
 
-    # SECURITY: Verify cryptographic signature
     sender_id = payload.get("sender_id")
-    signature = payload.get("signature")
-    signing_payload = get_state_hash_signing_payload(payload)
+    if not is_strict_state_sync_payload(payload):
+        plugin.log(
+            f"cl-hive: STATE_HASH rejected from {peer_id[:16]}...: strict envelope v2 required",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    signature_v2 = payload.get("signature_v2")
+    membership_hash = payload.get("membership_hash")
+    if not isinstance(signature_v2, str) or len(signature_v2) < 10:
+        plugin.log(
+            f"cl-hive: STATE_HASH rejected from {peer_id[:16]}...: missing signature_v2",
+            level='warn'
+        )
+        return {"result": "continue"}
+    if not isinstance(membership_hash, str) or not membership_hash:
+        plugin.log(
+            f"cl-hive: STATE_HASH rejected from {peer_id[:16]}...: missing membership_hash",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    signing_payload = get_state_hash_signing_payload_v2(payload)
 
     try:
-        result = plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature_v2, sender_id)
         if not result.get("verified") or result.get("pubkey") != sender_id:
             plugin.log(
-                f"cl-hive: STATE_HASH signature invalid from {peer_id[:16]}...",
+                f"cl-hive: STATE_HASH v2 signature invalid from {peer_id[:16]}...",
                 level='warn'
             )
             return {"result": "continue"}
     except Exception as e:
-        plugin.log(f"cl-hive: STATE_HASH signature check failed: {e}", level='warn')
+        plugin.log(f"cl-hive: STATE_HASH v2 signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # SECURITY: Verify sender identity matches peer_id
@@ -658,21 +680,61 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _check_timestamp_freshness(payload, MAX_STATE_HASH_AGE_SECONDS, "FULL_SYNC"):
         return {"result": "continue"}
 
-    # SECURITY: Verify cryptographic signature
     sender_id = payload.get("sender_id")
-    signature = payload.get("signature")
-    signing_payload = get_full_sync_signing_payload(payload)
+    if not is_strict_state_sync_payload(payload):
+        plugin.log(
+            f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: strict envelope v2 required",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    signature_v2 = payload.get("signature_v2")
+    states_hash_v2 = payload.get("states_hash_v2")
+    members_hash_v2 = payload.get("members_hash_v2")
+    if not isinstance(signature_v2, str) or len(signature_v2) < 10:
+        plugin.log(
+            f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: missing signature_v2",
+            level='warn'
+        )
+        return {"result": "continue"}
+    if not isinstance(states_hash_v2, str) or not isinstance(members_hash_v2, str):
+        plugin.log(
+            f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: missing v2 hashes",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    states = payload.get("states", [])
+    members = payload.get("members", [])
+    try:
+        computed_states_hash_v2 = compute_full_sync_states_hash_v2(states)
+        computed_members_hash_v2 = compute_full_sync_members_hash_v2(members)
+    except ValueError as e:
+        plugin.log(
+            f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: invalid v2 payload ({e})",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    if states_hash_v2 != computed_states_hash_v2 or members_hash_v2 != computed_members_hash_v2:
+        plugin.log(
+            f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: v2 hash mismatch",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    signing_payload = get_full_sync_signing_payload_v2(payload)
 
     try:
-        result = plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature_v2, sender_id)
         if not result.get("verified") or result.get("pubkey") != sender_id:
             plugin.log(
-                f"cl-hive: FULL_SYNC signature invalid from {peer_id[:16]}...",
+                f"cl-hive: FULL_SYNC v2 signature invalid from {peer_id[:16]}...",
                 level='warn'
             )
             return {"result": "continue"}
     except Exception as e:
-        plugin.log(f"cl-hive: FULL_SYNC signature check failed: {e}", level='warn')
+        plugin.log(f"cl-hive: FULL_SYNC v2 signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # SECURITY: Verify sender identity matches peer_id (prevent relay attacks)
@@ -684,7 +746,6 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     # SECURITY: Verify states match the signed fleet_hash (prevent state injection)
-    states = payload.get("states", [])
     fleet_hash = payload.get("fleet_hash", "")
     if states and fleet_hash:
         computed_hash = compute_states_hash(states)
