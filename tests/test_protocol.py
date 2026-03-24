@@ -519,6 +519,7 @@ class TestProtocolV2Helpers:
             ({"tier": "admin"}, "member.tier"),
             ({"joined_at": "invalid"}, "member.joined_at"),
             ({"joined_at": 0}, "member.joined_at"),
+            ({"joined_at": True}, "member.joined_at"),
         ],
     )
     def test_full_sync_members_hash_v2_rejects_malformed_member_scalars(
