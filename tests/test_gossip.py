@@ -94,3 +94,16 @@ class TestGossipPayload:
         )
         assert payload["budget_available_sats"] == 100000
         assert payload["addresses"] == ["1.2.3.4:9735"]
+
+    def test_gossip_payload_includes_fleet_hash_alias(self, gossip_manager):
+        """Strict v2 signing should receive fleet_hash alongside the legacy alias."""
+        payload = gossip_manager.create_gossip_payload(
+            our_pubkey="02" + "a" * 64,
+            capacity_sats=1000000,
+            available_sats=500000,
+            fee_policy={"base_fee": 0, "fee_rate": 100},
+            topology=["peer1"],
+        )
+
+        assert "fleet_hash" in payload
+        assert payload["fleet_hash"] == payload["state_hash"]

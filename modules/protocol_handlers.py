@@ -23,9 +23,13 @@ from modules.protocol import (
     validate_member_left,
     create_challenge, create_welcome,
     validate_gossip, validate_state_hash, validate_full_sync, validate_intent_abort,
-    get_gossip_signing_payload, get_state_hash_signing_payload,
-    get_full_sync_signing_payload, get_intent_signing_payload, get_intent_abort_signing_payload,
-    compute_states_hash,
+    get_gossip_signing_payload_v2,
+    get_state_hash_signing_payload_v2,
+    get_full_sync_signing_payload_v2,
+    get_intent_signing_payload, get_intent_abort_signing_payload,
+    compute_states_hash, compute_full_sync_states_hash_v2,
+    compute_full_sync_members_hash_v2, is_strict_state_sync_payload,
+    STRICT_STATE_SYNC_VERSION,
 )
 from modules.handshake import CHALLENGE_TTL_SECONDS
 from modules.state_manager import StateManager
@@ -483,6 +487,21 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     sender_id = payload.get("sender_id")
 
+    if not is_strict_state_sync_payload(payload):
+        plugin.log(
+            f"cl-hive: GOSSIP rejected from {peer_id[:16]}...: strict envelope v2 required",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    signature_v2 = payload.get("signature_v2")
+    if not isinstance(signature_v2, str) or len(signature_v2) < 10:
+        plugin.log(
+            f"cl-hive: GOSSIP rejected from {peer_id[:16]}...: missing signature_v2",
+            level='warn'
+        )
+        return {"result": "continue"}
+
     # SECURITY: Fast-reject ex-members before signature verification to avoid
     # graph-dependent checkmessage failures after a peer has left the hive.
     if database:
@@ -492,19 +511,25 @@ def handle_gossip(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             return {"result": "continue"}
 
     # SECURITY: Verify cryptographic signature
-    signature = payload.get("signature")
-    signing_payload = get_gossip_signing_payload(payload)
+    try:
+        signing_payload = get_gossip_signing_payload_v2(payload)
+    except ValueError as e:
+        plugin.log(
+            f"cl-hive: GOSSIP rejected from {peer_id[:16]}...: invalid v2 payload ({e})",
+            level='warn'
+        )
+        return {"result": "continue"}
 
     try:
-        result = plugin.rpc.checkmessage(signing_payload, signature, sender_id)
+        result = plugin.rpc.checkmessage(signing_payload, signature_v2, sender_id)
         if not result.get("verified") or result.get("pubkey") != sender_id:
             plugin.log(
-                f"cl-hive: GOSSIP signature invalid from {peer_id[:16]}...",
+                f"cl-hive: GOSSIP v2 signature invalid from {peer_id[:16]}...",
                 level='warn'
             )
             return {"result": "continue"}
     except Exception as e:
-        plugin.log(f"cl-hive: GOSSIP signature check failed: {e}", level='warn')
+        plugin.log(f"cl-hive: GOSSIP v2 signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # SECURITY: Validate sender (supports relay - peer_id may differ from sender_id)
@@ -582,21 +607,41 @@ def handle_state_hash(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _check_timestamp_freshness(payload, MAX_STATE_HASH_AGE_SECONDS, "STATE_HASH"):
         return {"result": "continue"}
 
-    # SECURITY: Verify cryptographic signature
     sender_id = payload.get("sender_id")
-    signature = payload.get("signature")
-    signing_payload = get_state_hash_signing_payload(payload)
+    if not is_strict_state_sync_payload(payload):
+        plugin.log(
+            f"cl-hive: STATE_HASH rejected from {peer_id[:16]}...: strict envelope v2 required",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    signature_v2 = payload.get("signature_v2")
+    membership_hash = payload.get("membership_hash")
+    if not isinstance(signature_v2, str) or len(signature_v2) < 10:
+        plugin.log(
+            f"cl-hive: STATE_HASH rejected from {peer_id[:16]}...: missing signature_v2",
+            level='warn'
+        )
+        return {"result": "continue"}
+    if not isinstance(membership_hash, str) or not membership_hash:
+        plugin.log(
+            f"cl-hive: STATE_HASH rejected from {peer_id[:16]}...: missing membership_hash",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    signing_payload = get_state_hash_signing_payload_v2(payload)
 
     try:
-        result = plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature_v2, sender_id)
         if not result.get("verified") or result.get("pubkey") != sender_id:
             plugin.log(
-                f"cl-hive: STATE_HASH signature invalid from {peer_id[:16]}...",
+                f"cl-hive: STATE_HASH v2 signature invalid from {peer_id[:16]}...",
                 level='warn'
             )
             return {"result": "continue"}
     except Exception as e:
-        plugin.log(f"cl-hive: STATE_HASH signature check failed: {e}", level='warn')
+        plugin.log(f"cl-hive: STATE_HASH v2 signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # SECURITY: Verify sender identity matches peer_id
@@ -660,21 +705,61 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if not _check_timestamp_freshness(payload, MAX_STATE_HASH_AGE_SECONDS, "FULL_SYNC"):
         return {"result": "continue"}
 
-    # SECURITY: Verify cryptographic signature
     sender_id = payload.get("sender_id")
-    signature = payload.get("signature")
-    signing_payload = get_full_sync_signing_payload(payload)
+    if not is_strict_state_sync_payload(payload):
+        plugin.log(
+            f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: strict envelope v2 required",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    signature_v2 = payload.get("signature_v2")
+    states_hash_v2 = payload.get("states_hash_v2")
+    members_hash_v2 = payload.get("members_hash_v2")
+    if not isinstance(signature_v2, str) or len(signature_v2) < 10:
+        plugin.log(
+            f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: missing signature_v2",
+            level='warn'
+        )
+        return {"result": "continue"}
+    if not isinstance(states_hash_v2, str) or not isinstance(members_hash_v2, str):
+        plugin.log(
+            f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: missing v2 hashes",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    states = payload.get("states", [])
+    members = payload.get("members", [])
+    try:
+        computed_states_hash_v2 = compute_full_sync_states_hash_v2(states)
+        computed_members_hash_v2 = compute_full_sync_members_hash_v2(members)
+    except ValueError as e:
+        plugin.log(
+            f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: invalid v2 payload ({e})",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    if states_hash_v2 != computed_states_hash_v2 or members_hash_v2 != computed_members_hash_v2:
+        plugin.log(
+            f"cl-hive: FULL_SYNC rejected from {peer_id[:16]}...: v2 hash mismatch",
+            level='warn'
+        )
+        return {"result": "continue"}
+
+    signing_payload = get_full_sync_signing_payload_v2(payload)
 
     try:
-        result = plugin.rpc.checkmessage(signing_payload, signature)
+        result = plugin.rpc.checkmessage(signing_payload, signature_v2, sender_id)
         if not result.get("verified") or result.get("pubkey") != sender_id:
             plugin.log(
-                f"cl-hive: FULL_SYNC signature invalid from {peer_id[:16]}...",
+                f"cl-hive: FULL_SYNC v2 signature invalid from {peer_id[:16]}...",
                 level='warn'
             )
             return {"result": "continue"}
     except Exception as e:
-        plugin.log(f"cl-hive: FULL_SYNC signature check failed: {e}", level='warn')
+        plugin.log(f"cl-hive: FULL_SYNC v2 signature check failed: {e}", level='warn')
         return {"result": "continue"}
 
     # SECURITY: Verify sender identity matches peer_id (prevent relay attacks)
@@ -686,7 +771,6 @@ def handle_full_sync(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     # SECURITY: Verify states match the signed fleet_hash (prevent state injection)
-    states = payload.get("states", [])
     fleet_hash = payload.get("fleet_hash", "")
     if states and fleet_hash:
         computed_hash = compute_states_hash(states)
@@ -932,17 +1016,29 @@ def _create_signed_full_sync_msg() -> Optional[bytes]:
     # Add sender identification
     full_sync_payload["sender_id"] = our_pubkey
     full_sync_payload["timestamp"] = int(time.time())
+    full_sync_payload["states_hash_v2"] = compute_full_sync_states_hash_v2(
+        full_sync_payload.get("states", [])
+    )
+    full_sync_payload["members_hash_v2"] = compute_full_sync_members_hash_v2(
+        full_sync_payload.get("members", [])
+    )
 
-    # Sign the payload
-    signing_payload = get_full_sync_signing_payload(full_sync_payload)
+    # Sign the payload using the strict v2 contract.
+    signing_payload = get_full_sync_signing_payload_v2(full_sync_payload)
     try:
         sig_result = plugin.rpc.signmessage(signing_payload)
-        full_sync_payload["signature"] = sig_result["zbase"]
+        signature = sig_result["zbase"]
+        full_sync_payload["signature"] = signature
+        full_sync_payload["signature_v2"] = signature
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign FULL_SYNC: {e}", level='error')
         return None
 
-    return serialize(HiveMessageType.FULL_SYNC, full_sync_payload)
+    return serialize(
+        HiveMessageType.FULL_SYNC,
+        full_sync_payload,
+        envelope_version=STRICT_STATE_SYNC_VERSION,
+    )
 
 def _create_signed_state_hash_msg() -> Optional[bytes]:
     """
@@ -964,16 +1060,22 @@ def _create_signed_state_hash_msg() -> Optional[bytes]:
     state_hash_payload["sender_id"] = our_pubkey
     state_hash_payload["timestamp"] = int(time.time())
 
-    # Sign the payload
-    signing_payload = get_state_hash_signing_payload(state_hash_payload)
+    # Sign the payload using the strict v2 contract.
+    signing_payload = get_state_hash_signing_payload_v2(state_hash_payload)
     try:
         sig_result = plugin.rpc.signmessage(signing_payload)
-        state_hash_payload["signature"] = sig_result["zbase"]
+        signature = sig_result["zbase"]
+        state_hash_payload["signature"] = signature
+        state_hash_payload["signature_v2"] = signature
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign STATE_HASH: {e}", level='error')
         return None
 
-    return serialize(HiveMessageType.STATE_HASH, state_hash_payload)
+    return serialize(
+        HiveMessageType.STATE_HASH,
+        state_hash_payload,
+        envelope_version=STRICT_STATE_SYNC_VERSION,
+    )
 
 def _get_our_addresses() -> List[str]:
     """
@@ -1082,17 +1184,24 @@ def _create_signed_gossip_msg(capacity_sats: int, available_sats: int,
 
     # Add sender identification for signature verification
     gossip_payload["sender_id"] = our_pubkey
+    gossip_payload.setdefault("fleet_hash", gossip_payload.get("state_hash", ""))
 
-    # Sign the payload (includes data hash for integrity)
-    signing_payload = get_gossip_signing_payload(gossip_payload)
+    # Sign the payload using the strict v2 contract.
+    signing_payload = get_gossip_signing_payload_v2(gossip_payload)
     try:
         sig_result = plugin.rpc.signmessage(signing_payload)
-        gossip_payload["signature"] = sig_result["zbase"]
+        signature = sig_result["zbase"]
+        gossip_payload["signature"] = signature
+        gossip_payload["signature_v2"] = signature
     except Exception as e:
         plugin.log(f"cl-hive: Failed to sign GOSSIP: {e}", level='error')
         return None
 
-    return serialize(HiveMessageType.GOSSIP, gossip_payload)
+    return serialize(
+        HiveMessageType.GOSSIP,
+        gossip_payload,
+        envelope_version=STRICT_STATE_SYNC_VERSION,
+    )
 
 def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
     """

@@ -345,7 +345,8 @@ class StateManager:
             fee_policy=new_state.fee_policy,
             topology=new_state.topology,
             state_hash=new_state.state_hash,
-            version=remote_version
+            version=remote_version,
+            last_update_ts=new_state.last_update,
         )
 
         self._log(f"Updated state for {peer_id[:16]}... to v{remote_version}")
@@ -614,7 +615,8 @@ class StateManager:
                 fee_policy=new_state.fee_policy,
                 topology=new_state.topology,
                 state_hash=new_state.state_hash,
-                version=remote_version
+                version=remote_version,
+                last_update_ts=new_state.last_update,
             )
 
         self._log(f"FULL_SYNC applied: {updated_count} states updated")

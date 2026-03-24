@@ -1025,7 +1025,8 @@ class HiveDatabase:
     def update_hive_state(self, peer_id: str, capacity_sats: int,
                           available_sats: int, fee_policy: Dict,
                           topology: List[str], state_hash: str,
-                          version: Optional[int] = None) -> None:
+                          version: Optional[int] = None,
+                          last_update_ts: Optional[int] = None) -> None:
         """Update local cache of a peer's Hive state.
 
         Uses version-guarded writes: only writes if the new version is
@@ -1033,7 +1034,7 @@ class HiveDatabase:
         writes from overwriting newer state after concurrent updates.
         """
         conn = self._get_connection()
-        now = int(time.time())
+        stored_ts = last_update_ts if last_update_ts is not None else int(time.time())
 
         fee_json = json.dumps(fee_policy)
         topo_json = json.dumps(topology)
@@ -1057,7 +1058,7 @@ class HiveDatabase:
             """, (
                 peer_id, capacity_sats, available_sats,
                 fee_json, topo_json,
-                now, state_hash, version
+                stored_ts, state_hash, version
             ))
         else:
             # Auto-increment for backward compatibility
@@ -1078,13 +1079,13 @@ class HiveDatabase:
             """, (
                 peer_id, capacity_sats, available_sats,
                 fee_json, topo_json,
-                now, state_hash, peer_id, peer_id
+                stored_ts, state_hash, peer_id, peer_id
             ))
     
     def get_all_hive_states(self) -> List[Dict]:
         """Get cached state for all Hive peers."""
         conn = self._get_connection()
-        rows = conn.execute("SELECT * FROM hive_state LIMIT 1000").fetchall()
+        rows = conn.execute("SELECT * FROM hive_state").fetchall()
 
         results = []
         for row in rows:

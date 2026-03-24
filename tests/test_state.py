@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.state_manager import StateManager, HivePeerState
 from modules.gossip import GossipManager, GossipState, CAPACITY_CHANGE_THRESHOLD
+from modules.database import HiveDatabase
 
 
 # =============================================================================
@@ -683,6 +684,63 @@ class TestDatabasePersistence:
         assert sm._local_state["db_peer_1"].version == 5
         assert sm._local_state["db_peer_1"].capacity_sats == 6000000
 
+    def test_remote_state_hash_survives_restart_reload(self, tmp_path, mock_plugin):
+        """Remote timestamps must survive DB persistence so fleet hash is restart-stable."""
+        db_path = str(tmp_path / "test_state_restart.db")
+        db = HiveDatabase(db_path, mock_plugin)
+        db.initialize()
+
+        peer_id = "02" + "a" * 64
+        remote_timestamp = 1711200100
+
+        state_manager = StateManager(db, mock_plugin)
+        assert state_manager.update_peer_state(
+            peer_id,
+            {
+                "capacity_sats": 5000000,
+                "available_sats": 2500000,
+                "fee_policy": {"base_fee": 1000},
+                "topology": ["03" + "b" * 64],
+                "version": 7,
+                "timestamp": remote_timestamp,
+                "state_hash": "f" * 64,
+            },
+        )
+        hash_before = state_manager.calculate_fleet_hash()
+
+        db.close_connection()
+        restarted_db = HiveDatabase(db_path, mock_plugin)
+        restarted_db.initialize()
+        restarted_state_manager = StateManager(restarted_db, mock_plugin)
+
+        hash_after = restarted_state_manager.calculate_fleet_hash()
+
+        assert hash_before == hash_after
+        assert restarted_state_manager.get_peer_state(peer_id).last_update == remote_timestamp
+
+    def test_get_all_hive_states_does_not_truncate_after_1000_rows(self, tmp_path, mock_plugin):
+        """Reload should preserve the full persisted state set, not silently cap at 1000 rows."""
+        db_path = str(tmp_path / "test_state_truncation.db")
+        db = HiveDatabase(db_path, mock_plugin)
+        db.initialize()
+
+        for i in range(1105):
+            db.update_hive_state(
+                peer_id=f"peer_{i:04d}",
+                capacity_sats=1000 + i,
+                available_sats=500 + i,
+                fee_policy={"base_fee": i},
+                topology=[f"peer_{i:04d}_ext"],
+                state_hash="",
+                version=1,
+            )
+
+        db.close_connection()
+        restarted_db = HiveDatabase(db_path, mock_plugin)
+        restarted_db.initialize()
+        restarted_state_manager = StateManager(restarted_db, mock_plugin)
+
+        assert len(restarted_state_manager.get_all_peer_states()) == 1105
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

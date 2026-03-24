@@ -43,11 +43,17 @@ SUPPORTED_VERSIONS = set(range(MIN_SUPPORTED_VERSION, MAX_SUPPORTED_VERSION + 1)
 # Maximum message size in bytes (post-hex decode)
 MAX_MESSAGE_BYTES = 65535
 
+# Shared boundary for FULL_SYNC payloads
+MAX_FULL_SYNC_STATES = 500
+
 # Maximum peer_id length (hex-encoded pubkey should be 66 chars, allow some margin)
 MAX_PEER_ID_LEN = 128
 
 # Maximum length for freeform string fields
 MAX_REASON_LEN = 512
+
+# Strict envelope version required by the hardened state-sync helpers
+STRICT_STATE_SYNC_VERSION = 2
 
 # =============================================================================
 # MESSAGE TYPES
@@ -240,7 +246,11 @@ VALID_WARNINGS = {
 # SERIALIZATION
 # =============================================================================
 
-def serialize(msg_type: HiveMessageType, payload: Dict[str, Any]) -> Optional[bytes]:
+def serialize(
+    msg_type: HiveMessageType,
+    payload: Dict[str, Any],
+    envelope_version: Optional[int] = None,
+) -> Optional[bytes]:
     """
     Serialize a Hive message for transmission via sendcustommsg.
     
@@ -258,11 +268,25 @@ def serialize(msg_type: HiveMessageType, payload: Dict[str, Any]) -> Optional[by
         >>> data[:4]
         b'HIVE'
     """
+    wire_payload = dict(payload)
+    if envelope_version is None:
+        version = wire_payload.pop("_envelope_version", PROTOCOL_VERSION)
+    else:
+        version = envelope_version
+        wire_payload.pop("_envelope_version", None)
+    if version not in SUPPORTED_VERSIONS:
+        import logging
+        logging.getLogger(__name__).warning(
+            "serialize: unsupported protocol version %s, dropping message",
+            version,
+        )
+        return None
+
     # Add message type to payload for deserialization
     envelope = {
         "type": int(msg_type),
-        "version": PROTOCOL_VERSION,
-        "payload": payload
+        "version": version,
+        "payload": wire_payload
     }
     
     # JSON encode
@@ -462,6 +486,63 @@ def compute_gossip_data_hash(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
 
 
+def _normalize_string_list(values: Any, field_name: str) -> List[str]:
+    """Return a deterministic sorted list of strings or fail closed."""
+    if not isinstance(values, list):
+        raise ValueError(f"{field_name} must be a list of strings")
+    if any(not isinstance(v, str) for v in values):
+        raise ValueError(f"{field_name} must contain only strings")
+    return sorted(values)
+
+
+def _normalize_address_list(values: Any, field_name: str) -> List[str]:
+    """Return a deterministic sorted list of host:port addresses or fail closed."""
+    addresses = _normalize_string_list(values, field_name)
+    for address in addresses:
+        host, sep, port = address.rpartition(":")
+        if not sep or not host or not port.isdigit():
+            raise ValueError(f"{field_name} entries must be host:port strings")
+        port_num = int(port)
+        if port_num <= 0 or port_num > 65535:
+            raise ValueError(f"{field_name} entries must use ports 1-65535")
+    return addresses
+
+
+def compute_gossip_data_hash_v2(payload: Dict[str, Any]) -> str:
+    """
+    Compute a v2 hash of the GOSSIP data fields.
+
+    Normalizes topology, addresses, and capabilities before hashing so the
+    signing payload is stable across ordering differences.
+    """
+    data_fields = {
+        "capacity_sats": payload.get("capacity_sats", 0),
+        "available_sats": payload.get("available_sats", 0),
+        "fee_policy": payload.get("fee_policy", {}),
+        "topology": _normalize_string_list(payload.get("topology", []), "topology"),
+        "addresses": _normalize_address_list(payload.get("addresses", []), "addresses"),
+        "capabilities": _normalize_string_list(payload.get("capabilities", []), "capabilities"),
+    }
+    json_str = json.dumps(data_fields, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+
+
+def get_gossip_signing_payload_v2(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing v2 GOSSIP messages.
+    """
+    data_hash = compute_gossip_data_hash_v2(payload)
+
+    signing_fields = {
+        "sender_id": payload.get("sender_id", ""),
+        "timestamp": payload.get("timestamp", 0),
+        "version": payload.get("version", 0),
+        "fleet_hash": payload.get("fleet_hash", ""),
+        "data_hash": data_hash,
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
 def get_gossip_signing_payload(payload: Dict[str, Any]) -> str:
     """
     Get the canonical payload string for signing GOSSIP messages.
@@ -536,6 +617,20 @@ def get_state_hash_signing_payload(payload: Dict[str, Any]) -> str:
     return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
 
 
+def get_state_hash_signing_payload_v2(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing v2 STATE_HASH messages.
+    """
+    signing_fields = {
+        "sender_id": payload.get("sender_id", ""),
+        "fleet_hash": payload.get("fleet_hash", ""),
+        "membership_hash": payload.get("membership_hash", ""),
+        "timestamp": payload.get("timestamp", 0),
+        "peer_count": payload.get("peer_count", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
 def validate_full_sync(payload: Dict[str, Any]) -> bool:
     """
     Validate FULL_SYNC payload schema.
@@ -573,7 +668,7 @@ def validate_full_sync(payload: Dict[str, Any]) -> bool:
         return False
 
     # Limit states to prevent DoS
-    if len(states) > 500:
+    if len(states) > MAX_FULL_SYNC_STATES:
         return False
 
     return True
@@ -608,6 +703,46 @@ def compute_members_hash(members: list) -> str:
     member_tuples.sort(key=lambda x: x["peer_id"])
 
     json_str = json.dumps(member_tuples, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+
+
+def _normalize_member_row_v2(member: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a FULL_SYNC member row for deterministic hashing."""
+    peer_id = member.get("peer_id")
+    tier = member.get("tier")
+    joined_at = member.get("joined_at")
+
+    if not _valid_pubkey(peer_id):
+        raise ValueError("member.peer_id must be a valid pubkey")
+    if tier != "member":
+        raise ValueError("member.tier must be 'member'")
+    if type(joined_at) is not int or joined_at <= 0:
+        raise ValueError("member.joined_at must be a positive integer")
+
+    return {
+        "peer_id": peer_id,
+        "tier": tier,
+        "joined_at": joined_at,
+        "addresses": _normalize_address_list(member.get("addresses", []), "member.addresses"),
+        "capabilities": _normalize_string_list(member.get("capabilities", []), "member.capabilities"),
+    }
+
+
+def compute_full_sync_members_hash_v2(members: list) -> str:
+    """
+    Compute a v2 deterministic hash of the members list.
+    """
+    if not isinstance(members, list):
+        raise ValueError("members must be a list")
+    if not members:
+        return ""
+    if any(not isinstance(member, dict) for member in members):
+        raise ValueError("members must contain only dict rows")
+
+    member_rows = [_normalize_member_row_v2(m) for m in members]
+    member_rows.sort(key=lambda x: x["peer_id"])
+
+    json_str = json.dumps(member_rows, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
 
 
@@ -651,6 +786,43 @@ def compute_states_hash(states: list) -> str:
     return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
 
 
+def _normalize_state_row_v2(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a FULL_SYNC state row for deterministic hashing."""
+    return {
+        "peer_id": state.get("peer_id", ""),
+        "version": state.get("version", 0),
+        "timestamp": state.get("last_update", state.get("timestamp", 0)),
+        "capacity_sats": state.get("capacity_sats", 0),
+        "available_sats": state.get("available_sats", 0),
+        "fee_policy": state.get("fee_policy", {}),
+        "topology": _normalize_string_list(state.get("topology", []), "states.topology"),
+        "addresses": _normalize_address_list(state.get("addresses", []), "states.addresses"),
+        "capabilities": _normalize_string_list(state.get("capabilities", []), "states.capabilities"),
+        "budget_available_sats": state.get("budget_available_sats", 0),
+        "budget_reserved_until": state.get("budget_reserved_until", 0),
+        "budget_last_update": state.get("budget_last_update", 0),
+        "state_hash": state.get("state_hash", ""),
+    }
+
+
+def compute_full_sync_states_hash_v2(states: list) -> str:
+    """
+    Compute a v2 deterministic hash of the full-sync states list.
+    """
+    if not isinstance(states, list):
+        raise ValueError("states must be a list")
+    if not states:
+        return ""
+    if any(not isinstance(state, dict) for state in states):
+        raise ValueError("states must contain only dict rows")
+
+    state_rows = [_normalize_state_row_v2(s) for s in states]
+    state_rows.sort(key=lambda x: x["peer_id"])
+
+    json_str = json.dumps(state_rows, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+
+
 def get_full_sync_signing_payload(payload: Dict[str, Any]) -> str:
     """
     Get the canonical payload string for signing FULL_SYNC messages.
@@ -673,6 +845,27 @@ def get_full_sync_signing_payload(payload: Dict[str, Any]) -> str:
         "timestamp": payload.get("timestamp", 0),
     }
     return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+def get_full_sync_signing_payload_v2(payload: Dict[str, Any]) -> str:
+    """
+    Get the canonical payload string for signing v2 FULL_SYNC messages.
+    """
+    states = payload.get("states", [])
+    members = payload.get("members", [])
+
+    signing_fields = {
+        "sender_id": payload.get("sender_id", ""),
+        "fleet_hash": payload.get("fleet_hash", ""),
+        "states_hash": compute_full_sync_states_hash_v2(states),
+        "members_hash": compute_full_sync_members_hash_v2(members),
+        "timestamp": payload.get("timestamp", 0),
+    }
+    return json.dumps(signing_fields, sort_keys=True, separators=(',', ':'))
+
+
+def is_strict_state_sync_payload(payload: Dict[str, Any]) -> bool:
+    return isinstance(payload, dict) and payload.get("_envelope_version") == STRICT_STATE_SYNC_VERSION
 
 
 # =============================================================================

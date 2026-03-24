@@ -113,6 +113,24 @@ class TestEnvelopeVersionInjection:
         assert msg_type == HiveMessageType.HELLO
         assert payload["_envelope_version"] == PROTOCOL_VERSION
 
+    def test_serialize_rejects_unsupported_envelope_version(self):
+        """serialize() should not emit envelopes outside SUPPORTED_VERSIONS."""
+        raw = serialize(HiveMessageType.HELLO, {"pubkey": "test"}, envelope_version=99)
+
+        assert raw is None
+
+    def test_serialize_uses_payload_envelope_version_when_present(self):
+        """serialize() should preserve injected envelope versions during rebroadcast."""
+        raw = serialize(
+            HiveMessageType.HELLO,
+            {"pubkey": "test", "_envelope_version": 2},
+        )
+
+        msg_type, payload = deserialize(raw)
+
+        assert msg_type == HiveMessageType.HELLO
+        assert payload["_envelope_version"] == 2
+
 
 # =============================================================================
 # create_hello() CHANGES

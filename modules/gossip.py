@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from modules.protocol import MAX_FULL_SYNC_STATES
+
 # =============================================================================
 # CONSTANTS
 # =============================================================================
@@ -30,7 +32,6 @@ DEFAULT_HEARTBEAT_INTERVAL = 300
 
 # Bounds to prevent unbounded payload growth
 MAX_TOPOLOGY_ENTRIES = 200
-MAX_FULL_SYNC_STATES = 2000
 MAX_FEE_POLICY_KEYS = 20
 MAX_GOSSIP_STRING_LEN = 256  # Pubkeys are 66 chars, channel IDs ~18
 
@@ -277,6 +278,8 @@ class GossipManager:
             force_version=new_version
         )
 
+        fleet_hash = self.state_manager.calculate_fleet_hash()
+
         return {
             "peer_id": our_pubkey,
             "capacity_sats": capacity_sats,
@@ -285,7 +288,8 @@ class GossipManager:
             "topology": topology.copy() if topology else [],
             "version": new_version,
             "timestamp": now,
-            "state_hash": self.state_manager.calculate_fleet_hash(),
+            "state_hash": fleet_hash,
+            "fleet_hash": fleet_hash,
             # Budget fields (Phase 8 - Hive-wide Affordability)
             "budget_available_sats": budget_available_sats,
             "budget_reserved_until": budget_reserved_until,

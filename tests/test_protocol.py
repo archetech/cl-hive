@@ -20,6 +20,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import modules.protocol as protocol
+
 from modules.protocol import (
     HIVE_MAGIC,
     HiveMessageType,
@@ -370,6 +372,250 @@ class TestSerializeNoneReturn:
         else:
             # Normal case - can call .hex()
             assert isinstance(result.hex(), str)
+
+
+class TestProtocolV2Helpers:
+    """Focused tests for the strict v2 state-sync helpers."""
+
+    def test_gossip_signing_payload_v2_changes_when_addresses_change(self):
+        base_payload = {
+            "sender_id": "02" + "a" * 64,
+            "timestamp": 1711200000,
+            "version": 7,
+            "fleet_hash": "f" * 64,
+            "capacity_sats": 1000,
+            "available_sats": 500,
+            "fee_policy": {"base_fee": 1000, "fee_rate": 10},
+            "topology": ["03" + "b" * 64, "02" + "c" * 64],
+            "addresses": ["10.0.0.1:9735"],
+            "capabilities": ["mcf"],
+        }
+        changed_payload = dict(base_payload, addresses=["10.0.0.2:9735"])
+
+        base = protocol.get_gossip_signing_payload_v2(base_payload)
+        changed = protocol.get_gossip_signing_payload_v2(changed_payload)
+
+        assert base != changed
+
+    def test_gossip_signing_payload_v2_is_order_insensitive(self):
+        payload = {
+            "sender_id": "02" + "a" * 64,
+            "timestamp": 1711200000,
+            "version": 7,
+            "fleet_hash": "f" * 64,
+            "capacity_sats": 1000,
+            "available_sats": 500,
+            "fee_policy": {"base_fee": 1000, "fee_rate": 10},
+            "topology": ["03" + "b" * 64, "02" + "c" * 64],
+            "addresses": ["10.0.0.2:9735", "10.0.0.1:9735"],
+            "capabilities": ["beta", "alpha"],
+        }
+        reordered = dict(
+            payload,
+            topology=list(reversed(payload["topology"])),
+            addresses=list(reversed(payload["addresses"])),
+            capabilities=list(reversed(payload["capabilities"])),
+        )
+
+        assert protocol.get_gossip_signing_payload_v2(payload) == protocol.get_gossip_signing_payload_v2(reordered)
+
+    def test_gossip_signing_payload_v2_rejects_non_string_entries(self):
+        payload = {
+            "sender_id": "02" + "a" * 64,
+            "timestamp": 1711200000,
+            "version": 7,
+            "fleet_hash": "f" * 64,
+            "topology": ["03" + "b" * 64],
+            "addresses": ["10.0.0.1:9735", 123],
+            "capabilities": ["mcf"],
+        }
+
+        with pytest.raises(ValueError, match="addresses"):
+            protocol.get_gossip_signing_payload_v2(payload)
+
+    def test_gossip_signing_payload_v2_rejects_null_list_fields(self):
+        payload = {
+            "sender_id": "02" + "a" * 64,
+            "timestamp": 1711200000,
+            "version": 7,
+            "fleet_hash": "f" * 64,
+            "topology": ["03" + "b" * 64],
+            "addresses": None,
+            "capabilities": ["mcf"],
+        }
+
+        with pytest.raises(ValueError, match="addresses"):
+            protocol.get_gossip_signing_payload_v2(payload)
+
+    def test_state_hash_signing_payload_v2_changes_when_membership_hash_changes(self):
+        base_payload = {
+            "sender_id": "02" + "d" * 64,
+            "fleet_hash": "e" * 64,
+            "membership_hash": "1" * 64,
+            "timestamp": 1711200001,
+            "peer_count": 3,
+        }
+        changed_payload = dict(base_payload, membership_hash="2" * 64)
+
+        base = protocol.get_state_hash_signing_payload_v2(base_payload)
+        changed = protocol.get_state_hash_signing_payload_v2(changed_payload)
+
+        assert base != changed
+
+    def test_full_sync_members_hash_v2_is_order_insensitive(self):
+        base_members = [
+            {
+                "peer_id": "02" + "a" * 64,
+                "tier": "member",
+                "joined_at": 1711200200,
+                "addresses": ["10.0.0.2:9735", "10.0.0.1:9735"],
+                "capabilities": ["beta", "alpha"],
+            },
+            {
+                "peer_id": "02" + "b" * 64,
+                "tier": "member",
+                "joined_at": 1711200100,
+                "addresses": ["10.0.0.4:9735", "10.0.0.3:9735"],
+                "capabilities": ["mcf"],
+            },
+        ]
+        reordered_members = list(reversed(base_members))
+
+        base = protocol.compute_full_sync_members_hash_v2(base_members)
+        reordered = protocol.compute_full_sync_members_hash_v2(reordered_members)
+
+        assert base == reordered
+
+    def test_full_sync_members_hash_v2_changes_when_address_list_contains_non_string(self):
+        base_members = [
+            {
+                "peer_id": "02" + "a" * 64,
+                "tier": "member",
+                "joined_at": 1711200200,
+                "addresses": ["10.0.0.1:9735"],
+                "capabilities": ["mcf"],
+            }
+        ]
+        malformed_members = [
+            {
+                "peer_id": "02" + "a" * 64,
+                "tier": "member",
+                "joined_at": 1711200200,
+                "addresses": ["10.0.0.1:9735", 123],
+                "capabilities": ["mcf"],
+            }
+        ]
+
+        base = protocol.compute_full_sync_members_hash_v2(base_members)
+
+        assert base
+        with pytest.raises(ValueError):
+            protocol.compute_full_sync_members_hash_v2(malformed_members)
+
+    @pytest.mark.parametrize(
+        "member_update, expected_error",
+        [
+            ({"peer_id": "not-a-pubkey"}, "member.peer_id"),
+            ({"tier": "admin"}, "member.tier"),
+            ({"joined_at": "invalid"}, "member.joined_at"),
+            ({"joined_at": 0}, "member.joined_at"),
+            ({"joined_at": True}, "member.joined_at"),
+        ],
+    )
+    def test_full_sync_members_hash_v2_rejects_malformed_member_scalars(
+        self,
+        member_update,
+        expected_error,
+    ):
+        member = {
+            "peer_id": "02" + "a" * 64,
+            "tier": "member",
+            "joined_at": 1711200200,
+            "addresses": ["10.0.0.1:9735"],
+            "capabilities": ["mcf"],
+        }
+        member.update(member_update)
+
+        with pytest.raises(ValueError, match=expected_error):
+            protocol.compute_full_sync_members_hash_v2([member])
+
+    def test_full_sync_signing_payload_v2_is_order_insensitive(self):
+        payload = {
+            "sender_id": "02" + "e" * 64,
+            "fleet_hash": "f" * 64,
+            "timestamp": 1711200300,
+            "states": [
+                {
+                    "peer_id": "02" + "a" * 64,
+                    "version": 1,
+                    "timestamp": 1711200100,
+                    "topology": ["03" + "b" * 64, "02" + "c" * 64],
+                    "addresses": ["10.0.0.2:9735", "10.0.0.1:9735"],
+                    "capabilities": ["beta", "alpha"],
+                },
+                {
+                    "peer_id": "02" + "d" * 64,
+                    "version": 2,
+                    "timestamp": 1711200200,
+                    "topology": ["03" + "e" * 64],
+                    "addresses": ["10.0.0.4:9735", "10.0.0.3:9735"],
+                    "capabilities": ["mcf"],
+                },
+            ],
+            "members": [
+                {
+                    "peer_id": "02" + "c" * 64,
+                    "tier": "member",
+                    "joined_at": 1711200200,
+                    "addresses": ["10.0.0.2:9735", "10.0.0.1:9735"],
+                    "capabilities": ["mcf", "alpha"],
+                },
+                {
+                    "peer_id": "02" + "b" * 64,
+                    "tier": "member",
+                    "joined_at": 1711200100,
+                    "addresses": ["10.0.0.4:9735", "10.0.0.3:9735"],
+                    "capabilities": ["beta"],
+                },
+            ],
+        }
+        reordered = dict(
+            payload,
+            states=list(reversed(payload["states"])),
+            members=list(reversed(payload["members"])),
+        )
+
+        base = protocol.get_full_sync_signing_payload_v2(payload)
+        changed = protocol.get_full_sync_signing_payload_v2(reordered)
+
+        assert base == changed
+
+    @pytest.mark.parametrize(
+        "field_name, field_value, expected_error",
+        [
+            ("states", None, "states must be a list"),
+            ("states", "", "states must be a list"),
+            ("members", None, "members must be a list"),
+            ("members", "", "members must be a list"),
+        ],
+    )
+    def test_full_sync_signing_payload_v2_rejects_null_or_non_list_collections(
+        self,
+        field_name,
+        field_value,
+        expected_error,
+    ):
+        payload = {
+            "sender_id": "02" + "e" * 64,
+            "fleet_hash": "f" * 64,
+            "timestamp": 1711200300,
+            "states": [],
+            "members": [],
+        }
+        payload[field_name] = field_value
+
+        with pytest.raises(ValueError, match=expected_error):
+            protocol.get_full_sync_signing_payload_v2(payload)
 
 
 if __name__ == "__main__":
