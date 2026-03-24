@@ -435,11 +435,16 @@ class YieldMetricsManager:
 
                 # Determine flow direction
                 flow_direction = "balanced"
-                in_sats = prof.get("in_sats", 0)
-                out_sats = prof.get("out_sats", 0)
-                if in_sats > out_sats * 1.5:
+                in_sats = prof.get("in_sats") or 0
+                out_sats = prof.get("out_sats") or 0
+                try:
+                    in_sats = int(in_sats)
+                    out_sats = int(out_sats)
+                except (TypeError, ValueError):
+                    in_sats, out_sats = 0, 0
+                if in_sats > 0 and out_sats >= 0 and in_sats > out_sats * 1.5:
                     flow_direction = "sink"
-                elif out_sats > in_sats * 1.5:
+                elif out_sats > 0 and in_sats >= 0 and out_sats > in_sats * 1.5:
                     flow_direction = "source"
 
                 yield_metric = ChannelYieldMetrics(

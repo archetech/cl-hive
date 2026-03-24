@@ -60,6 +60,19 @@ class TrafficIntelligenceManager:
         if self.plugin:
             self.plugin.log(f"cl-hive: [traffic-intel] {msg}", level=level)
 
+    @staticmethod
+    def _safe_json_loads_list(value):
+        """Parse a JSON string to a list, returning [] on any failure."""
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, list) else []
+            except (json.JSONDecodeError, TypeError):
+                return []
+        return []
+
     # -- Rate Limiting -------------------------------------------------------
 
     def _check_rate_limit(
@@ -169,14 +182,22 @@ class TrafficIntelligenceManager:
             total_weight += conf
 
             peak_str = p.get("peak_hours_utc", "[]")
-            peak = json.loads(peak_str) if isinstance(peak_str, str) else peak_str
-            for h in peak:
-                all_peak.add(h)
+            try:
+                peak = json.loads(peak_str) if isinstance(peak_str, str) else peak_str
+            except (json.JSONDecodeError, TypeError):
+                peak = []
+            if isinstance(peak, list):
+                for h in peak:
+                    all_peak.add(h)
 
             quiet_str = p.get("quiet_hours_utc", "[]")
-            quiet = json.loads(quiet_str) if isinstance(quiet_str, str) else quiet_str
-            for h in quiet:
-                all_quiet.add(h)
+            try:
+                quiet = json.loads(quiet_str) if isinstance(quiet_str, str) else quiet_str
+            except (json.JSONDecodeError, TypeError):
+                quiet = []
+            if isinstance(quiet, list):
+                for h in quiet:
+                    all_quiet.add(h)
 
             weighted_avg_size += p.get("avg_forward_size_sats", 0) * conf
             weighted_daily_vol += p.get("daily_volume_sats", 0) * conf
@@ -275,8 +296,8 @@ class TrafficIntelligenceManager:
             profiles_data.append({
                 "peer_id": p["peer_id"],
                 "profile_type": p.get("profile_type", "mixed"),
-                "peak_hours_utc": json.loads(peak) if isinstance(peak, str) else peak,
-                "quiet_hours_utc": json.loads(quiet) if isinstance(quiet, str) else quiet,
+                "peak_hours_utc": self._safe_json_loads_list(peak),
+                "quiet_hours_utc": self._safe_json_loads_list(quiet),
                 "avg_forward_size_sats": p.get("avg_forward_size_sats", 0),
                 "daily_volume_sats": p.get("daily_volume_sats", 0),
                 "drain_direction": p.get("drain_direction", "balanced"),

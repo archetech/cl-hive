@@ -220,14 +220,23 @@ OPTION_TO_CONFIG_MAP: Dict[str, tuple] = {
 
 
 def _parse_setconfig_value(value: Any, target_type: type) -> Any:
-    """Parse a setconfig value to the target type."""
+    """Parse a setconfig value to the target type.
+
+    Raises ValueError on conversion failure so callers can reject bad input.
+    """
     if target_type == bool:
         if isinstance(value, bool):
             return value
         return str(value).lower() in ('true', '1', 'yes', 'on')
     elif target_type == int:
-        return int(value)
+        try:
+            return int(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Cannot convert {value!r} to int: {e}")
     elif target_type == float:
-        return float(value)
+        try:
+            return float(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Cannot convert {value!r} to float: {e}")
     else:
         return str(value)
