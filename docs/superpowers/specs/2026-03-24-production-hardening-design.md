@@ -14,20 +14,29 @@ Module-by-module review for defensive coding. Fix crashes, not architecture.
 
 ### Tier 1 (Highest risk — large, complex)
 
-**cl-hive.py (4,245 lines):**
+**cl-hive.py (~4,245 lines):**
 - All 93 RPC handlers: null guards on globals, safe parameter parsing, error returns not crashes
-- Init sequence: verify ordering prevents use-before-init
+- Init sequence: verify ordering prevents use-before-init; verify planner.set_cooperation_modules() double-call (lines ~702, ~816) is safe if background thread runs between them
+- RPC handlers called during partial init: verify _get_hive_context() returns safe state before all managers are initialized
 - Message dispatch: verify all HiveMessageType cases are handled or explicitly ignored
 - Notification handlers (channel_opened, channel_closed, peer_connected): verify they can't crash on malformed CLN data
+- Shutdown path: verify background threads check shutdown_event before accessing globals that might be torn down
+- Silent exception swallowing: convert bare `except: pass` to `except Exception as e: log(...)` for observability
 
-**protocol_handlers.py (3,150 lines):**
+**protocol_handlers.py (~3,150 lines):**
 - Every handler function: verify payload validation before field access
 - All `database.*` calls: verify they're inside try/except or caller handles failure
 - All `plugin.rpc.*` calls: verify timeout/failure handling
 - Message relay: verify TTL, dedup, and ban checks are consistent across all handlers
 - FULL_SYNC membership merge: verify it can't corrupt local state with malformed data
 
-**database.py (3,730 lines):**
+**protocol.py (~2,515 lines):**
+- Message serialization/deserialization: verify malformed wire data can't crash deserialize()
+- Payload validation functions: verify they reject oversized/malformed inputs
+- Signature canonicalization: verify deterministic ordering
+- Rate limit constants: verify they're reasonable and actually enforced
+
+**database.py (~3,730 lines):**
 - Every method: verify returns safe defaults on exception (not None when caller expects dict)
 - Schema: verify all CREATE TABLE IF NOT EXISTS are idempotent
 - Thread safety: verify all connections use `_get_connection()` (thread-local)
@@ -36,60 +45,68 @@ Module-by-module review for defensive coding. Fix crashes, not architecture.
 
 ### Tier 2 (Medium risk — significant logic)
 
-**planner.py (1,874 lines):**
+**planner.py (~1,874 lines):**
 - Network cache refresh: verify it handles empty/malformed listchannels
 - Saturation calculation: verify division-by-zero protection on capacity=0
 - Channel sizer: verify all arithmetic is bounded (no negative sizes, no overflow)
 - Underserved targets: verify quality scorer failures don't crash the pipeline
 
-**fee_coordination.py (963 lines):**
+**state_manager.py (~742 lines):**
+- HiveMap thread safety: verify reads and writes from concurrent threads are safe
+- Gossip merge: verify version conflict resolution (higher version wins)
+- Stale entry cleanup: verify TTL enforcement
+- from_dict parsing: verify it handles missing/malformed fields gracefully
+
+**fee_coordination.py (~963 lines):**
 - Corridor identification: verify empty corridor list doesn't crash
 - Fee recommendation: verify floor/ceiling are always applied
 - Egress desaturation: verify balance percentage calculations handle 0 capacity
 
-**liquidity_coordinator.py (1,088 lines):**
+**liquidity_coordinator.py (~1,088 lines):**
 - Liquidity needs: verify amount calculations don't go negative
 - Rebalancing activity: verify state dict access is safe
 - Fleet state: verify member state updates can't corrupt the cache
 
-**background_loops.py (1,283 lines):**
-- Already audited — verify fixes from prior audit are solid
-- Check for any remaining try/except gaps in the fee_intelligence_loop (15+ ops per iteration)
+**background_loops.py (~1,283 lines):**
+- Prior audit confirmed all 6 loops have try/except and shutdown_event.wait
+- Verify fee_intelligence_loop's 15+ operations all have individual try/except
+- Verify silent continue paths (lines ~351-353, ~553-555) log at debug level
+- Verify the 50ms RPC relief yields are still present
 
-**gossip.py (551 lines):**
+**gossip.py (~551 lines):**
 - Broadcast threshold: verify division-by-zero on capacity comparisons
 - State hash: verify serialization handles missing fields gracefully
 
 ### Tier 3 (Lower risk — smaller, focused)
 
-**handshake.py (454 lines):** Verify challenge generation, manifest verification, pending request bounds
-**membership.py (196 lines):** Verify all DB calls have error handling
-**contribution.py (246 lines):** Verify rate limiting arithmetic, leech detection thresholds
-**bridge.py (589 lines):** Verify circuit breaker state transitions, timeout handling
-**fee_intelligence.py (1,163 lines):** Verify aggregation handles missing/corrupt data
-**yield_metrics.py (977 lines):** Verify flow direction calculation handles edge cases (0 in, 0 out)
-**network_metrics.py (887 lines):** Verify centrality calculations handle disconnected graphs
-**strategic_positioning.py (1,345 lines):** Verify corridor value calculations handle empty data
-**channel_rationalization.py (1,281 lines):** Verify close recommendations handle missing channels
-**quality_scorer.py (608 lines):** Verify scoring handles peers with no events
-**peer_reputation.py (516 lines):** Verify aggregation handles missing reporters
-**traffic_intelligence.py (494 lines):** Verify profile aggregation handles conflicting data
-**intent_manager.py (695 lines):** Verify lock expiry, conflict detection edge cases
-**relay.py (440 lines):** Verify dedup cleanup, TTL enforcement
-**outbox.py (225 lines):** Verify retry backoff, max retries
-**health_aggregator.py (387 lines):** Verify health scoring handles missing data
-**config.py (212 lines):** Verify hot-reload validates all field types/ranges
-**plugin_options.py (233 lines):** Verify option parsing handles invalid values
-**governance.py (83 lines):** Verify recommendation logging handles DB failures
-**log_writer.py (91 lines):** Verify batched logging handles queue overflow
-**idempotency.py (71 lines):** Verify event ID generation is deterministic
-**rpc_commands.py (2,075 lines):** Verify all exported functions return valid dicts on all code paths
+**handshake.py (~475 lines):** Verify challenge generation, manifest verification, pending request bounds, `_outbound_hello_sent` cleanup
+**membership.py (~196 lines):** Verify all DB calls have error handling
+**contribution.py (~246 lines):** Verify rate limiting arithmetic, leech detection thresholds
+**bridge.py (~589 lines):** Verify circuit breaker state transitions, timeout handling
+**fee_intelligence.py (~1,163 lines):** Verify aggregation handles missing/corrupt data
+**yield_metrics.py (~977 lines):** Verify flow direction calculation handles edge cases (0 in, 0 out)
+**network_metrics.py (~887 lines):** Verify centrality calculations handle disconnected graphs
+**strategic_positioning.py (~1,345 lines):** Verify corridor value calculations handle empty data
+**channel_rationalization.py (~1,181 lines):** Verify close recommendations handle missing channels
+**quality_scorer.py (~608 lines):** Verify scoring handles peers with no events; verify `get_peer_event_summary()` returns expected dict shape
+**peer_reputation.py (~516 lines):** Verify aggregation handles missing reporters
+**traffic_intelligence.py (~494 lines):** Verify `get_aggregated_profile()` handles `json.loads()` failure on malformed `peak_hours_utc` strings from DB; verify confidence-weighted aggregation math
+**intent_manager.py (~695 lines):** Verify lock expiry, conflict detection edge cases
+**relay.py (~440 lines):** Verify dedup cleanup, TTL enforcement
+**outbox.py (~225 lines):** Verify retry backoff, max retries
+**health_aggregator.py (~387 lines):** Verify health scoring handles missing data; verify tier thresholds are correct
+**config.py (~212 lines):** Verify hot-reload validates all field types/ranges
+**plugin_options.py (~233 lines):** Verify option parsing handles invalid values
+**governance.py (~83 lines):** Verify recommendation logging handles DB failures
+**log_writer.py (~91 lines):** Verify batched logging handles queue overflow
+**idempotency.py (~71 lines):** Verify event ID generation is deterministic
+**rpc_commands.py (~2,075 lines):** Verify all exported functions return valid dicts on all code paths; verify export_hints returns correct schema when managers are None
 
 ### Pass 1 method
 
 For each module:
 1. Read every function
-2. Identify: missing null guards, unsafe dict access, unhandled exceptions, arithmetic edge cases, race conditions
+2. Identify: missing null guards, unsafe dict access, unhandled exceptions, arithmetic edge cases, race conditions, silent exception swallowing
 3. Fix immediately — defensive coding, not redesign
 4. Run tests after each tier
 5. Commit per tier
@@ -103,7 +120,8 @@ Trace data from source to consumer. Verify the math, not just the code safety.
 **Source:** Each node observes its own channel fees and forward activity
 **Collection:** fee_intelligence.py aggregates fee profiles from fleet members
 **Processing:** fee_coordination.py identifies corridors, assigns ownership, calculates competition
-**Export:** export_hints() derives corridor_role and competition_bias per peer
+**Transformation:** rpc_commands.py `_derive_corridor_roles()` maps assignments to owner/secondary/contested/none; `_derive_competition_bias()` maps competition levels to -1/0/1
+**Export:** export_hints() attaches corridor_role and competition_bias per peer
 **Consumer:** cl_revenue_ops HiveHintAdapter.get_fee_bias() applies bounded multiplier
 
 **Verify at each stage:**
@@ -111,21 +129,28 @@ Trace data from source to consumer. Verify the math, not just the code safety.
 - Does aggregation correctly merge reports from multiple fleet members?
 - Are corridor assignments stable (not oscillating)?
 - Does competition_level correctly reflect the number of capable members?
-- Does export_hints() correctly map corridor state to the hint schema?
+- Does _derive_corridor_roles() correctly handle peers that are primary on one corridor and secondary on another (→ "contested")?
+- Does the consumer handle "contested" corridor_role correctly? (Currently gets 0 bias — verify this is intentional)
 - Does the consumer's math produce correct bias direction for -1/0/1?
+- **Critical gate:** Is `traffic_confidence` populated for all peers that have corridor/competition data? Without it, all fee hints are dead on the consumer side.
 
-### Pipeline 2: Yield Metrics → Rebalance Hints
+### Pipeline 2: Yield Metrics + Quality → Rebalance Hints
 
-**Source:** Each node observes channel balance and forward volume
-**Collection:** yield_metrics.py calculates flow direction (source/sink/balanced)
-**Export:** export_hints() derives rebalance_preference per peer
-**Consumer:** cl_revenue_ops HiveHintAdapter.get_rebalance_bias() applies bounded multiplier
+**Source:** Each node observes channel balance and forward volume via listpeerchannels/listforwards
+**Collection:** yield_metrics.py calculates flow direction (source/sink/balanced) from in_sats vs out_sats
+**Quality source:** quality_scorer.py calculates per-peer quality scores from peer event history
+**Export:** export_hints() derives rebalance_preference and peer_quality_score per peer
+**Consumer:** cl_revenue_ops HiveHintAdapter.get_rebalance_bias() combines preference + quality into bounded multiplier
 
 **Verify at each stage:**
 - Is flow direction calculated from actual in_sats vs out_sats (not just capacity)?
+- Trace full chain: listpeerchannels → profitability data → yield_metrics → flow_direction → rebalance_preference
 - Are the 1.5x thresholds for source/sink correct?
+- Does quality_scorer handle peers with zero events (should return neutral 0.5)?
 - Does export_hints() correctly map flow_direction to rebalance_preference?
+- Does export_hints() correctly gate peer_quality_score on confidence > 0?
 - Does the consumer's math produce correct bias direction for sink/source?
+- **Critical gate:** Is `traffic_confidence` populated for peers with rebalance data? Without it, all rebalance hints are dead on the consumer side.
 
 ### Pipeline 3: Planner → Channel-Open Hints
 
@@ -139,8 +164,9 @@ Trace data from source to consumer. Verify the math, not just the code safety.
 - Is the network cache based on real listchannels data?
 - Is hive share calculation correct (hive capacity / total capacity)?
 - Are underserved thresholds (5% share, 1 BTC min capacity) appropriate?
-- Does the sizer produce reasonable buckets (small/medium/large)?
 - Does confidence correctly blend quality + data availability?
+- Verify specific mappings: hive_coverage_pct >= 0.50 → always "avoid"; confidence < 0.15 → always downgrades "open" to "neutral"
+- Does the sizer produce reasonable buckets (small/medium/large)?
 - Does the consumer correctly filter by open_preference == "open"?
 
 ### Pipeline 4: Membership → Member Hints
@@ -152,7 +178,7 @@ Trace data from source to consumer. Verify the math, not just the code safety.
 **Verify:**
 - Does member flag accurately reflect database state?
 - Does the consumer correctly apply 0-PPM only when hints are fresh?
-- Does gossip oscillation protection work (hold for 2x TTL)?
+- Does gossip oscillation protection work? Code uses `ttl * 2` (2x TTL); CLAUDE.md says "one additional TTL period" — resolve discrepancy.
 
 ### Pipeline 5: Fleet Gossip → Shared State
 
@@ -165,6 +191,21 @@ Trace data from source to consumer. Verify the math, not just the code safety.
 - Does merge correctly handle version conflicts (higher version wins)?
 - Is anti-entropy (STATE_HASH) detecting divergence correctly?
 - Are stale entries cleaned up?
+- Is HiveMap thread-safe for concurrent reads from multiple background loops?
+
+### Pipeline 6: Traffic Intelligence → Confidence Gate
+
+**Source:** Each node observes traffic patterns and shares via TRAFFIC_INTELLIGENCE_BATCH
+**Collection:** traffic_intelligence.py aggregates profiles from fleet members
+**Export:** export_hints() sets traffic_confidence per peer
+**Consumer:** traffic_confidence gates ALL bias calculations in get_fee_bias() and get_rebalance_bias()
+
+**Verify:**
+- Are traffic profiles based on real forward/routing data?
+- Does aggregation correctly use confidence-weighted merging?
+- Is traffic_confidence populated for the same peer set as corridor/rebalance data?
+- If traffic_confidence is 0 or missing, does the consumer correctly neutralize all biases?
+- This is the most critical pipeline because it gates all others.
 
 ### Pass 2 method
 
@@ -173,7 +214,7 @@ For each pipeline:
 2. At each stage, verify the transformation is mathematically correct
 3. Check edge cases: empty data, single member fleet, all peers already covered
 4. Verify the export schema matches what the consumer expects
-5. Run end-to-end with the golden fixture test in cl_revenue_ops
+5. Run against the golden fixture contract test in cl_revenue_ops (`tests/test_hive_contract.py`)
 6. Document any incorrect transformations found and fix them
 
 ## Constraints
@@ -184,6 +225,7 @@ For each pipeline:
 - Commit frequently (per tier for Pass 1, per pipeline for Pass 2)
 - Run tests after every commit
 - Do not touch test files unless they test removed functionality
+- Convert bare `except: pass` to `except Exception as e: log(...)` for observability
 
 ## Success Criteria
 
@@ -191,6 +233,8 @@ After both passes:
 - Every module handles all error paths without crashing
 - Every intelligence pipeline produces correct results from real data
 - The hint export schema accurately reflects internal state
+- traffic_confidence is populated for all peers with other hint data
 - cl_revenue_ops consumes hints correctly
+- Shutdown path is safe (no crashes during graceful termination)
 - All tests pass
 - No known correctness issues remain
