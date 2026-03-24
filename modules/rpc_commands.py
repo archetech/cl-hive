@@ -2056,6 +2056,15 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
             except Exception:
                 pass
 
+        # Default traffic_confidence for peers with other hint data but no
+        # traffic profile. Without this, corridor/competition/rebalance hints
+        # are dead on the consumer side (traffic_confidence gates all biases).
+        if "traffic_confidence" not in hint:
+            if is_member:
+                hint["traffic_confidence"] = 0.5
+            elif role != "none" or peer_id in rebalance_prefs:
+                hint["traffic_confidence"] = 0.3
+
         # Rebalance preference
         pref = rebalance_prefs.get(peer_id, "neutral")
         hint["rebalance_preference"] = pref

@@ -129,10 +129,11 @@ class TestHintFields:
         result = export_hints(ctx)
         assert "peer_quality_score" not in result["hints"][PEER_A]
 
-    def test_traffic_confidence_omitted_when_no_manager(self):
+    def test_traffic_confidence_defaults_for_members_when_no_manager(self):
         ctx = _make_ctx(traffic_intel_mgr=None)
         result = export_hints(ctx)
-        assert "traffic_confidence" not in result["hints"][PEER_A]
+        # Members get default 0.5 confidence so hints aren't dead on consumer side
+        assert result["hints"][PEER_A]["traffic_confidence"] == 0.5
 
 
 # =============================================================================
@@ -313,13 +314,14 @@ class TestQualityAndTraffic:
         result = export_hints(ctx)
         assert result["hints"][PEER_A]["traffic_confidence"] == 0.74
 
-    def test_traffic_confidence_omitted_when_no_profile(self):
+    def test_traffic_confidence_defaults_for_members_when_no_profile(self):
         traffic_mgr = MagicMock()
         traffic_mgr.get_aggregated_profile.return_value = None
 
         ctx = _make_ctx(traffic_intel_mgr=traffic_mgr)
         result = export_hints(ctx)
-        assert "traffic_confidence" not in result["hints"][PEER_A]
+        # Members get default 0.5 confidence even without traffic profile
+        assert result["hints"][PEER_A]["traffic_confidence"] == 0.5
 
 
 # =============================================================================
