@@ -46,7 +46,7 @@ Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl
 4. **Recommendations**: Planner generates topology, fee, rebalancing, and positioning recommendations
 5. **Bridge**: Coordinated signals are pushed to cl-revenue-ops for local execution
 
-### Module Organization (34 modules)
+### Module Organization (31 modules)
 
 | Module | Purpose |
 |--------|---------|
@@ -64,8 +64,6 @@ Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl
 | `fee_coordination.py` | Flow corridor management and competition avoidance |
 | `fee_intelligence.py` | Fee intelligence aggregation and sharing across fleet |
 | `liquidity_coordinator.py` | Liquidity needs aggregation and rebalance assignment |
-| `anticipatory_liquidity.py` | Kalman-filtered flow prediction, temporal pattern detection |
-| `routing_intelligence.py` | Routing path intelligence sharing across fleet |
 | `traffic_intelligence.py` | Traffic profile sharing and demand forecasting |
 | `health_aggregator.py` | Fleet health scoring and NNLB status |
 | `network_metrics.py` | Network-level metrics collection |
@@ -81,15 +79,12 @@ Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl
 | `rpc_commands.py` | RPC command handler implementations |
 | `background_loops.py` | Background loop definitions (gossip, planner, fee intel, etc.) |
 | `plugin_options.py` | Plugin option registration and rate limiting |
-| `phase6_ingest.py` | Injected-packet parsing helpers |
 | `config.py` | Hot-reloadable configuration with snapshot pattern |
-| `database.py` | SQLite with WAL mode, thread-local connections, 21 tables |
+| `database.py` | SQLite with WAL mode, thread-local connections, 28 tables |
 
 ### Key Patterns
 
 **Thread Safety**:
-- `RPC_LOCK` with 10-second timeout serializes all RPC calls
-- `ThreadSafeRpcProxy` wraps the plugin.rpc object
 - Thread-local SQLite connections with WAL mode
 
 **Graceful Shutdown**:
@@ -129,7 +124,7 @@ Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl
 | `intent_monitor_loop` | Intent lock expiry and cleanup |
 | `outbox_retry_loop` | Reliable message delivery retries |
 
-### Database Tables (21)
+### Database Tables (28)
 
 | Table | Purpose |
 |-------|---------|
@@ -140,6 +135,7 @@ Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl
 | `contribution_rate_limits` | Rate limiting for contribution updates |
 | `contribution_daily_stats` | Daily contribution aggregates |
 | `membership_audit_log` | Membership event audit trail (join/leave/ban/approve) |
+| `membership_tombstones` | Removed member tombstones for anti-resurrection |
 | `hive_bans` | Active bans |
 | `local_fee_tracking` | Local fee change tracking |
 | `peer_presence` | Peer online/offline tracking |
@@ -149,11 +145,16 @@ Membership --> State Sync --> Observations --> Recommendations --> Bridge (to cl
 | `peer_fee_profiles` | Fee profiles shared by fleet members |
 | `member_health` | Fleet member health tracking |
 | `peer_reputation` | Peer reputation scores |
-| `flow_samples` | Anticipatory liquidity flow data |
+| `flow_samples` | Flow sample data |
 | `temporal_patterns` | Intra-day flow pattern data |
 | `peer_capabilities` | Peer protocol capabilities |
 | `proto_events` | Processed event IDs for idempotency |
 | `proto_outbox` | Reliable message delivery outbox |
+| `traffic_profiles` | Traffic profile data shared across fleet |
+| `liquidity_needs` | Aggregated liquidity need requests |
+| `leech_flags` | Anti-leech flag tracking |
+| `peer_events` | Peer lifecycle event log |
+| `member_liquidity_state` | Per-member liquidity state snapshots |
 
 ### Primary RPC Commands (115 total)
 
@@ -224,7 +225,7 @@ The Planner proposes topology changes but cannot open channels directly:
 
 ## Testing Conventions
 
-- Test files in `tests/` directory (43 test files)
+- Test files in `tests/` directory (38 test files)
 - Use pytest fixtures for mocking (see `conftest.py`)
 - Mock RPC calls, never hit real network
 - Test categories: unit, integration, feerate, planner, membership
@@ -235,7 +236,7 @@ The Planner proposes topology changes but cannot open channels directly:
 cl-hive/
 ├── cl-hive.py              # Main plugin entry point
 ├── cl-hive.conf.sample     # Production config sample
-├── modules/                # 34 modules
+├── modules/                # 31 modules
 │   ├── protocol.py         # Message types and encoding
 │   ├── protocol_handlers.py # Message dispatch handlers
 │   ├── handshake.py        # PKI authentication
@@ -250,8 +251,6 @@ cl-hive/
 │   ├── fee_coordination.py # Corridor fee coordination
 │   ├── fee_intelligence.py # Fee intelligence sharing
 │   ├── liquidity_coordinator.py # Liquidity needs aggregation
-│   ├── anticipatory_liquidity.py # Flow prediction
-│   ├── routing_intelligence.py  # Routing path intelligence
 │   ├── traffic_intelligence.py  # Traffic profile sharing
 │   ├── health_aggregator.py # Fleet health scoring
 │   ├── network_metrics.py  # Network metrics collection
@@ -267,11 +266,10 @@ cl-hive/
 │   ├── rpc_commands.py     # RPC command handlers
 │   ├── background_loops.py # Background loop definitions
 │   ├── plugin_options.py   # Plugin option registration
-│   ├── phase6_ingest.py    # Injected-packet parsing
 │   ├── config.py           # Configuration
-│   └── database.py         # Database layer (26 tables)
+│   └── database.py         # Database layer (28 tables)
 ├── config/                 # Config examples
-├── tests/                  # 43 test files
+├── tests/                  # 38 test files
 ├── docs/                   # Documentation
 └── docker/                 # Docker deployment
 ```
