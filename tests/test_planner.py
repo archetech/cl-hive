@@ -104,8 +104,7 @@ def mock_config():
     """Create a mock config snapshot."""
     cfg = MagicMock()
     cfg.market_share_cap_pct = 0.20  # 20%
-    # governance_mode removed in trusted fleet simplification
-    # Channel size options (new)
+    # Channel size options
     cfg.planner_min_channel_sats = 1_000_000  # 1M sats
     cfg.planner_max_channel_sats = 50_000_000  # 50M sats
     cfg.planner_default_channel_sats = 5_000_000  # 5M sats

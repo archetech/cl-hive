@@ -4144,22 +4144,6 @@ def hive_time_low_hours(plugin: Plugin, channel_id: str):
     }
 
 
-@plugin.method("hive-backfill-routing-intelligence")
-def hive_backfill_routing_intelligence(
-    plugin: Plugin,
-    days: int = 30,
-    status_filter: str = "settled"
-):
-    """
-    No-op after simplification (pheromone/stigmergy systems removed).
-    Kept for RPC compatibility.
-    """
-    return {
-        "status": "no_op",
-        "message": "Backfill no longer needed -- corridor assignments are ephemeral"
-    }
-
-
 @plugin.method("hive-routing-intelligence-status")
 def hive_routing_intelligence_status(plugin: Plugin):
     """

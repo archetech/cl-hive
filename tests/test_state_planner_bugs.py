@@ -8,7 +8,6 @@ Covers:
 - Bug: Gossip process_gossip() missing timestamp freshness check
 - Bug: Planner _propose_expansion() missing feerate gate
 - Bug: Planner cfg.market_share_cap_pct crash (direct attribute access)
-- Config: governance_mode removed in trusted fleet simplification
 """
 
 import pytest
