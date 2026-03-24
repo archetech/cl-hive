@@ -2,14 +2,131 @@
 Hardening tests for the strict v2 gossip/state-sync protocol helpers.
 """
 
+import json
 import os
 import sys
+import time
+from unittest.mock import MagicMock
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import modules.protocol as protocol
+import modules.protocol_handlers as protocol_handlers
+
+
+def _make_v2_gossip_payload(sender_id, envelope_version=2):
+    return {
+        "_envelope_version": envelope_version,
+        "sender_id": sender_id,
+        "peer_id": sender_id,
+        "timestamp": int(time.time()),
+        "version": 7,
+        "fleet_hash": "f" * 64,
+        "capacity_sats": 1000,
+        "available_sats": 500,
+        "fee_policy": {"base_fee": 1000, "fee_rate": 10},
+        "topology": ["03" + "b" * 64],
+        "addresses": ["1.2.3.4:9735"],
+        "capabilities": ["mcf"],
+        "signature": "legacy_signature",
+        "signature_v2": "strict_signature_v2",
+    }
+
+
+@pytest.fixture
+def gossip_handler_env(monkeypatch):
+    plugin = MagicMock()
+    plugin.log = MagicMock()
+    plugin.rpc.listpeers.return_value = {"peers": []}
+
+    database = MagicMock()
+    database.is_banned.return_value = False
+
+    gossip_mgr = MagicMock()
+    gossip_mgr.process_gossip.return_value = True
+
+    monkeypatch.setattr(protocol_handlers, "plugin", plugin)
+    monkeypatch.setattr(protocol_handlers, "database", database)
+    monkeypatch.setattr(protocol_handlers, "gossip_mgr", gossip_mgr)
+    monkeypatch.setattr(protocol_handlers, "relay_mgr", None)
+    monkeypatch.setattr(protocol_handlers, "our_pubkey", "02" + "f" * 64)
+
+    return plugin, database, gossip_mgr
+
+
+def test_handle_gossip_rejects_legacy_payload_without_signature_v2(gossip_handler_env):
+    plugin, database, gossip_mgr = gossip_handler_env
+    sender_id = "02" + "a" * 64
+    payload = _make_v2_gossip_payload(sender_id)
+    payload.pop("signature_v2")
+    payload.pop("_envelope_version")
+
+    database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
+
+    result = protocol_handlers.handle_gossip(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    plugin.rpc.checkmessage.assert_not_called()
+    gossip_mgr.process_gossip.assert_not_called()
+    database.update_member.assert_not_called()
+    plugin.rpc.connect.assert_not_called()
+
+
+def test_handle_gossip_rejects_envelope_v1(gossip_handler_env):
+    plugin, database, gossip_mgr = gossip_handler_env
+    sender_id = "02" + "a" * 64
+    payload = _make_v2_gossip_payload(sender_id, envelope_version=1)
+
+    database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
+
+    result = protocol_handlers.handle_gossip(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    plugin.rpc.checkmessage.assert_not_called()
+    gossip_mgr.process_gossip.assert_not_called()
+    database.update_member.assert_not_called()
+    plugin.rpc.connect.assert_not_called()
+
+
+def test_handle_gossip_accepts_v2_payload_and_persists_addresses(gossip_handler_env):
+    plugin, database, gossip_mgr = gossip_handler_env
+    sender_id = "02" + "a" * 64
+    payload = _make_v2_gossip_payload(sender_id)
+
+    database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
+    plugin.rpc.checkmessage.return_value = {"verified": True, "pubkey": sender_id}
+
+    result = protocol_handlers.handle_gossip(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    assert gossip_mgr.process_gossip.call_count == 1
+    assert gossip_mgr.process_gossip.call_args.args == (sender_id, payload)
+    plugin.rpc.checkmessage.assert_called_once_with(
+        protocol.get_gossip_signing_payload_v2(payload),
+        payload["signature_v2"],
+        sender_id,
+    )
+    database.update_member.assert_called_once_with(
+        sender_id,
+        addresses=json.dumps(["1.2.3.4:9735"]),
+    )
+
+
+def test_handle_gossip_accepts_v2_payload_and_autoconnects(gossip_handler_env):
+    plugin, database, gossip_mgr = gossip_handler_env
+    sender_id = "02" + "a" * 64
+    payload = _make_v2_gossip_payload(sender_id)
+
+    database.get_member.return_value = {"peer_id": sender_id, "tier": "member"}
+    plugin.rpc.checkmessage.return_value = {"verified": True, "pubkey": sender_id}
+
+    result = protocol_handlers.handle_gossip(sender_id, payload, plugin)
+
+    assert result == {"result": "continue"}
+    assert gossip_mgr.process_gossip.call_count == 1
+    plugin.rpc.connect.assert_called_once_with(f"{sender_id}@1.2.3.4:9735")
 
 
 def test_full_sync_states_hash_v2_changes_when_state_contents_change():
