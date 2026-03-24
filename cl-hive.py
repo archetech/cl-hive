@@ -148,6 +148,8 @@ from modules.rpc_commands import (
     get_fleet_demand_forecast as rpc_get_fleet_demand_forecast,
     # Export hints (local trusted integration for cl-revenue-ops)
     export_hints as rpc_export_hints,
+    # Routing intelligence
+    get_routing_intelligence as rpc_get_routing_intelligence,
 )
 
 # Initialize the plugin
@@ -532,7 +534,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
                 "msg": message_bytes.hex()
             })
             return True
-        except Exception:
+        except Exception as e:
+            plugin.log(f"cl-hive: relay send failed to {peer_id[:16]}...: {e}", level='debug')
             return False
 
     def _relay_get_members() -> list:
@@ -892,18 +895,18 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         try:
             if fee_coordination_mgr:
                 fee_coordination_mgr.save_state_to_database()
-        except Exception:
-            pass  # Best-effort on shutdown
+        except Exception as e:
+            plugin.log(f"cl-hive: shutdown fee_coordination save error: {e}", level='debug')
         try:
             if _msg_executor:
                 _msg_executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass  # Best-effort on shutdown
+        except Exception as e:
+            plugin.log(f"cl-hive: shutdown executor cleanup error: {e}", level='debug')
         try:
             if _batched_log_writer:
                 _batched_log_writer.stop()
-        except Exception:
-            pass  # Best-effort on shutdown
+        except Exception as e:
+            plugin.log(f"cl-hive: shutdown log writer cleanup error: {e}", level='debug')
 
     try:
         signal.signal(signal.SIGTERM, handle_shutdown_signal)
@@ -1694,7 +1697,8 @@ def hive_calculate_size(plugin: Plugin, peer_id: str, capacity_sats: int = None,
             protocol_handlers._parse_amount_msat(o.get('amount_msat', 0)) // 1000
             for o in outputs if o.get('status') == 'confirmed'
         )
-    except Exception:
+    except Exception as e:
+        plugin.log(f"cl-hive: listfunds failed in calculate-size: {e}", level='debug')
         onchain_balance = cfg.planner_default_channel_sats * 10  # Assume adequate
 
     # Get available budget (considering all constraints)
@@ -3300,7 +3304,8 @@ def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"
     if active_channel_states and not force:
         try:
             peer_alias = (plugin.rpc.listnodes(peer_id).get("nodes") or [{}])[0].get("alias")
-        except Exception:
+        except Exception as e:
+            plugin.log(f"cl-hive: alias lookup failed for {peer_id[:16]}...: {e}", level='debug')
             peer_alias = None
         return {
             "error": "active_channels_present",
