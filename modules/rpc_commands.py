@@ -2065,6 +2065,24 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
             elif role != "none" or peer_id in rebalance_prefs:
                 hint["traffic_confidence"] = 0.3
 
+        # Fleet fee median (for downstream prior initialization)
+        if ctx.fee_coordination_mgr:
+            try:
+                corridor_mgr = getattr(ctx.fee_coordination_mgr, "corridor_mgr", None)
+                if corridor_mgr:
+                    assignments = corridor_mgr.get_assignments()
+                    # Find corridors involving this peer and get their avg fee
+                    peer_fees = []
+                    for a in assignments:
+                        if a.primary_member == peer_id or peer_id in (a.secondary_members or []):
+                            if a.primary_fee_ppm > 0:
+                                peer_fees.append(a.primary_fee_ppm)
+                    if peer_fees:
+                        peer_fees.sort()
+                        hint["fleet_fee_median"] = peer_fees[len(peer_fees) // 2]
+            except Exception:
+                pass
+
         # Rebalance preference
         pref = rebalance_prefs.get(peer_id, "neutral")
         hint["rebalance_preference"] = pref
