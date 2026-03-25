@@ -1617,7 +1617,7 @@ class HiveDatabase:
             """, (peer_id, now, reason, expires_at))
             return True
         except Exception as e:
-            self.plugin.log(f"HiveDatabase: Failed to add ignored peer: {e}", level='warning')
+            self.plugin.log(f"HiveDatabase: Failed to add ignored peer: {e}", level='warn')
             return False
 
     def remove_ignored_peer(self, peer_id: str) -> bool:

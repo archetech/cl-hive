@@ -964,7 +964,7 @@ def on_peer_connected(peer: dict, plugin: Plugin, **kwargs):
             from modules.protocol import create_hello
             hello_msg = create_hello(local_pubkey)
             if hello_msg is None:
-                plugin.log("cl-hive: HELLO message too large, skipping autodiscovery", level='warning')
+                plugin.log("cl-hive: HELLO message too large, skipping autodiscovery", level='warn')
                 return
 
             plugin.rpc.call("sendcustommsg", {

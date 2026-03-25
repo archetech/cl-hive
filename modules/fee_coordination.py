@@ -409,7 +409,7 @@ class FlowCorridorManager:
 
         assignments, ts = self._assignments_snapshot
         if (not force_refresh and
-            assignments and
+            ts > 0 and
             now - ts < self._assignments_ttl):
             return list(assignments.values())
 

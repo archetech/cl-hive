@@ -1264,7 +1264,7 @@ def _broadcast_full_sync_to_members(plugin: Plugin) -> None:
     if not result["ok"]:
         plugin.log(
             f"cl-hive: Membership broadcast incomplete: {sent_count}/{result['attempted']} delivered",
-            level='warning',
+            level='warn',
         )
         return
 
@@ -1802,7 +1802,7 @@ def _reliable_send(msg_type: HiveMessageType, payload: Dict,
             msg_bytes = serialize(msg_type, payload)
             if msg_bytes is None:
                 if plugin:
-                    plugin.log(f"cl-hive: message too large, skipping send to {peer_id[:16]}", level='warning')
+                    plugin.log(f"cl-hive: message too large, skipping send to {peer_id[:16]}", level='warn')
                 return
             if plugin:
                 plugin.rpc.call("sendcustommsg", {
