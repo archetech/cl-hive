@@ -3916,6 +3916,117 @@ def hive_genesis(plugin: Plugin, hive_id: str = None):
         return {"error": f"Genesis failed: {e}"}
 
 
+@plugin.method("hive-repair-member")
+def hive_repair_member(plugin: Plugin, peer_id: str):
+    """
+    Repair a member's integration state.
+
+    Re-runs post-join setup for an existing member: populates metadata,
+    captures addresses, updates presence, and triggers a state sync.
+    Use this for members added during development or who didn't complete
+    the full handshake flow.
+
+    Args:
+        peer_id: Public key of the member to repair
+
+    Returns:
+        Dict with repair actions taken.
+    """
+    if not database or not our_pubkey:
+        return {"error": "Hive not initialized"}
+
+    perm_error = _check_permission()
+    if perm_error:
+        return perm_error
+
+    member = database.get_member(peer_id)
+    if not member:
+        return {"error": "peer_not_member", "peer_id": peer_id}
+
+    actions = []
+
+    # 1. Fix metadata (hive_id) if missing
+    if not member.get("metadata"):
+        # Get hive_id from our own or any member's metadata
+        hive_id = "hive"
+        for m in database.get_all_members():
+            if m.get("metadata"):
+                try:
+                    import json
+                    md = json.loads(m["metadata"])
+                    hive_id = md.get("hive_id", "hive")
+                    break
+                except Exception:
+                    pass
+        try:
+            import json
+            database.update_member(peer_id, metadata=json.dumps({"hive_id": hive_id}))
+            actions.append(f"metadata: set hive_id={hive_id}")
+        except Exception as e:
+            actions.append(f"metadata: failed ({e})")
+
+    # 2. Capture addresses from CLN
+    if not member.get("addresses"):
+        try:
+            import json
+            peers_info = plugin.rpc.listpeers(id=peer_id)
+            if peers_info and peers_info.get("peers"):
+                addrs = peers_info["peers"][0].get("netaddr", [])
+                if addrs:
+                    database.update_member(peer_id, addresses=json.dumps(addrs))
+                    actions.append(f"addresses: captured {len(addrs)} addresses")
+                else:
+                    actions.append("addresses: peer has no advertised addresses")
+            else:
+                actions.append("addresses: peer not connected")
+        except Exception as e:
+            actions.append(f"addresses: failed ({e})")
+
+    # 3. Update presence tracking
+    try:
+        # Check if peer is currently connected
+        peers_info = plugin.rpc.listpeers(id=peer_id)
+        is_connected = bool(
+            peers_info and peers_info.get("peers")
+            and peers_info["peers"][0].get("connected", False)
+        )
+        import time as _time
+        database.update_presence(peer_id, is_online=is_connected, now_ts=int(_time.time()), window_seconds=30 * 86400)
+        database.update_member(peer_id, last_seen=int(_time.time()))
+        actions.append(f"presence: updated (connected={is_connected})")
+    except Exception as e:
+        actions.append(f"presence: failed ({e})")
+
+    # 4. Trigger state sync
+    try:
+        state_hash_msg = protocol_handlers._create_signed_state_hash_msg()
+        if state_hash_msg:
+            plugin.rpc.call("sendcustommsg", {
+                "node_id": peer_id,
+                "msg": state_hash_msg.hex()
+            })
+            actions.append("sync: STATE_HASH sent")
+        else:
+            actions.append("sync: could not create STATE_HASH")
+    except Exception as e:
+        actions.append(f"sync: failed ({e})")
+
+    # 5. Broadcast full sync to all members
+    try:
+        protocol_handlers._broadcast_full_sync_to_members(plugin)
+        actions.append("broadcast: FULL_SYNC sent to fleet")
+    except Exception as e:
+        actions.append(f"broadcast: failed ({e})")
+
+    plugin.log(f"cl-hive: Repaired member {peer_id[:16]}...: {actions}")
+
+    return {
+        "status": "repaired",
+        "peer_id": peer_id,
+        "actions": actions,
+    }
+
+
 @plugin.method("hive-join")
 def hive_join(plugin: Plugin, peer_id: str):
     """
