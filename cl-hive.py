@@ -3965,51 +3965,66 @@ def hive_repair_member(plugin: Plugin, peer_id: str):
         except Exception as e:
             actions.append(f"metadata: failed ({e})")
 
-    # 2. Capture addresses from CLN
+    # 2. Capture addresses
+    is_self = (peer_id == our_pubkey)
     if not member.get("addresses"):
         try:
             import json
-            peers_info = plugin.rpc.call("listpeers", {"id": peer_id})
-            if peers_info and peers_info.get("peers"):
-                addrs = peers_info["peers"][0].get("netaddr", [])
-                if addrs:
-                    database.update_member(peer_id, addresses=json.dumps(addrs))
-                    actions.append(f"addresses: captured {len(addrs)} addresses")
-                else:
-                    actions.append("addresses: peer has no advertised addresses")
+            if is_self:
+                # Get our own addresses from getinfo
+                info = plugin.rpc.getinfo()
+                addrs = [b.get("address", "") for b in info.get("binding", []) if b.get("address")]
+                if not addrs:
+                    addrs = info.get("address", [])
+                    if isinstance(addrs, list):
+                        addrs = [a.get("address", "") for a in addrs if isinstance(a, dict)]
             else:
-                actions.append("addresses: peer not connected")
+                addrs = []
+                peers_info = plugin.rpc.call("listpeers", {"id": peer_id})
+                if peers_info and peers_info.get("peers"):
+                    addrs = peers_info["peers"][0].get("netaddr", [])
+
+            if addrs:
+                database.update_member(peer_id, addresses=json.dumps(addrs))
+                actions.append(f"addresses: captured {len(addrs)} addresses")
+            else:
+                actions.append("addresses: no addresses found")
         except Exception as e:
             actions.append(f"addresses: failed ({e})")
 
     # 3. Update presence tracking
     try:
-        # Check if peer is currently connected
-        peers_info = plugin.rpc.call("listpeers", {"id": peer_id})
-        is_connected = bool(
-            peers_info and peers_info.get("peers")
-            and peers_info["peers"][0].get("connected", False)
-        )
         import time as _time
+        if is_self:
+            is_connected = True  # We're always connected to ourselves
+        else:
+            peers_info = plugin.rpc.call("listpeers", {"id": peer_id})
+            is_connected = bool(
+                peers_info and peers_info.get("peers")
+                and peers_info["peers"][0].get("connected", False)
+            )
         database.update_presence(peer_id, is_online=is_connected, now_ts=int(_time.time()), window_seconds=30 * 86400)
         database.update_member(peer_id, last_seen=int(_time.time()))
         actions.append(f"presence: updated (connected={is_connected})")
     except Exception as e:
         actions.append(f"presence: failed ({e})")
 
-    # 4. Trigger state sync
-    try:
-        state_hash_msg = protocol_handlers._create_signed_state_hash_msg()
-        if state_hash_msg:
-            plugin.rpc.call("sendcustommsg", {
-                "node_id": peer_id,
-                "msg": state_hash_msg.hex()
-            })
-            actions.append("sync: STATE_HASH sent")
-        else:
-            actions.append("sync: could not create STATE_HASH")
-    except Exception as e:
-        actions.append(f"sync: failed ({e})")
+    # 4. Trigger state sync (skip for self — can't sendcustommsg to ourselves)
+    if not is_self:
+        try:
+            state_hash_msg = protocol_handlers._create_signed_state_hash_msg()
+            if state_hash_msg:
+                plugin.rpc.call("sendcustommsg", {
+                    "node_id": peer_id,
+                    "msg": state_hash_msg.hex()
+                })
+                actions.append("sync: STATE_HASH sent")
+            else:
+                actions.append("sync: could not create STATE_HASH")
+        except Exception as e:
+            actions.append(f"sync: failed ({e})")
+    else:
+        actions.append("sync: skipped (self)")
 
     # 5. Broadcast full sync to all members
     try:
