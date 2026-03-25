@@ -3969,7 +3969,7 @@ def hive_repair_member(plugin: Plugin, peer_id: str):
     if not member.get("addresses"):
         try:
             import json
-            peers_info = plugin.rpc.listpeers(id=peer_id)
+            peers_info = plugin.rpc.call("listpeers", {"id": peer_id})
             if peers_info and peers_info.get("peers"):
                 addrs = peers_info["peers"][0].get("netaddr", [])
                 if addrs:
@@ -3985,7 +3985,7 @@ def hive_repair_member(plugin: Plugin, peer_id: str):
     # 3. Update presence tracking
     try:
         # Check if peer is currently connected
-        peers_info = plugin.rpc.listpeers(id=peer_id)
+        peers_info = plugin.rpc.call("listpeers", {"id": peer_id})
         is_connected = bool(
             peers_info and peers_info.get("peers")
             and peers_info["peers"][0].get("connected", False)
