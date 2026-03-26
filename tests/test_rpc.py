@@ -16,6 +16,7 @@ import time
 
 import json
 import importlib.util
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch, PropertyMock
 
@@ -26,6 +27,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modules.database import HiveDatabase
 from modules.config import HiveConfig
 from modules.handshake import HandshakeManager
+from modules.handshake import (
+    MAX_OUTBOUND_HELLOS,
+    MAX_PENDING_CHALLENGES,
+    MAX_PENDING_REQUESTS,
+)
 from modules.membership import MembershipManager, MEMBER_TIER
 from modules.contribution import ContributionManager
 from modules.governance import RecommendationLogger
@@ -75,6 +81,48 @@ def config():
 def handshake_mgr(mock_rpc, database, mock_plugin):
     """Create a handshake manager for testing."""
     return HandshakeManager(mock_rpc, database, mock_plugin)
+
+
+def _peer_id_for_index(index: int) -> str:
+    """Return a syntactically valid pubkey for deterministic cap tests."""
+    return f"02{index:064x}"
+
+
+def _load_cl_hive_main():
+    """Import the main plugin module without executing plugin.run()."""
+    module_path = Path(__file__).resolve().parents[1] / "cl-hive.py"
+    spec = importlib.util.spec_from_file_location("cl_hive_main_test", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None
+
+    class _TestPlugin:
+        def method(self, *_args, **_kwargs):
+            return lambda fn: fn
+
+        def init(self):
+            return lambda fn: fn
+
+        def hook(self, *_args, **_kwargs):
+            return lambda fn: fn
+
+        def subscribe(self, *_args, **_kwargs):
+            return lambda fn: fn
+
+        def add_option(self, *_args, **_kwargs):
+            return None
+
+        def run(self):
+            raise AssertionError("plugin.run() should not execute during tests")
+
+    fake_pyln_client = types.ModuleType("pyln.client")
+    fake_pyln_client.Plugin = _TestPlugin
+    fake_pyln_client.RpcError = Exception
+    fake_pyln = types.ModuleType("pyln")
+    fake_pyln.client = fake_pyln_client
+
+    with patch.dict(sys.modules, {"pyln": fake_pyln, "pyln.client": fake_pyln_client}):
+        spec.loader.exec_module(module)
+    return module
 
 
 # =============================================================================
@@ -166,6 +214,64 @@ class TestApprovalFlow:
         expired = handshake_mgr.expire_pending_requests(max_age_seconds=86400)
         assert expired == 1
         assert len(handshake_mgr.get_pending_requests()) == 0
+
+    def test_pending_request_cap_removes_db_fallback_for_oldest(self, handshake_mgr):
+        """Cap eviction must delete persisted oldest requests, not just memory state."""
+        oldest_peer = _peer_id_for_index(0)
+        for index in range(MAX_PENDING_REQUESTS + 1):
+            handshake_mgr.store_pending_request(_peer_id_for_index(index))
+
+        pending = handshake_mgr.get_pending_requests()
+        assert len(pending) == MAX_PENDING_REQUESTS
+        assert oldest_peer not in {req["peer_id"] for req in pending}
+
+    def test_outbound_hello_cap_removes_db_fallback_for_oldest(self, handshake_mgr):
+        """Oldest outbound HELLO must not resurrect from DB after cap eviction."""
+        oldest_peer = _peer_id_for_index(0)
+        for index in range(MAX_OUTBOUND_HELLOS + 1):
+            handshake_mgr.record_hello_sent(_peer_id_for_index(index))
+
+        handshake_mgr._outbound_hello_sent.clear()
+
+        assert handshake_mgr.has_pending_outbound_hello(oldest_peer) is False
+
+    def test_pending_challenge_cap_removes_db_fallback_for_oldest(self, handshake_mgr):
+        """Oldest pending challenge must not resurrect from DB after cap eviction."""
+        oldest_peer = _peer_id_for_index(0)
+        for index in range(MAX_PENDING_CHALLENGES + 1):
+            handshake_mgr.generate_challenge(_peer_id_for_index(index), requirements=0, initial_tier='member')
+
+        handshake_mgr._pending_challenges.clear()
+
+        assert handshake_mgr.get_pending_challenge(oldest_peer) is None
+
+    def test_hive_approve_preserves_pending_request_when_challenge_send_fails(
+        self, database, mock_plugin, mock_rpc
+    ):
+        """A transient sendcustommsg failure should not consume the pending join request."""
+        cl_hive = _load_cl_hive_main()
+        our_pubkey = '02' + 'a' * 64
+        peer_id = '02' + 'e' * 64
+
+        database.add_member(our_pubkey, tier='member', joined_at=int(time.time()))
+        handshake_mgr = HandshakeManager(mock_rpc, database, mock_plugin)
+        handshake_mgr.store_pending_request(peer_id)
+
+        mock_plugin.rpc = MagicMock()
+        mock_plugin.rpc.call.side_effect = Exception("send failed")
+        mock_plugin.log = MagicMock()
+
+        cl_hive.database = database
+        cl_hive.handshake_mgr = handshake_mgr
+        cl_hive.our_pubkey = our_pubkey
+        cl_hive._check_permission = lambda: None
+
+        result = cl_hive.hive_approve(mock_plugin, peer_id)
+
+        assert result["error"] == "Failed to send CHALLENGE: send failed"
+        pending = handshake_mgr.get_pending_requests()
+        assert any(req["peer_id"] == peer_id for req in pending)
+        assert handshake_mgr.get_pending_challenge(peer_id) is None
 
 
 # =============================================================================

@@ -125,6 +125,15 @@ class HandshakeManager:
         self._pending_challenges: Dict[str, Dict[str, Any]] = {}
         self._pending_requests: Dict[str, Dict] = {}
         self._outbound_hello_sent: Dict[str, int] = {}  # peer_id -> timestamp
+
+    def _delete_handshake_state(self, peer_id: str, state_type: str) -> None:
+        """Best-effort delete of persisted handshake state."""
+        if not self.db:
+            return
+        try:
+            self.db.delete_handshake_state(peer_id, state_type)
+        except Exception:
+            pass
     
     # =========================================================================
     # IDENTITY
@@ -202,6 +211,7 @@ class HandshakeManager:
         if len(self._pending_requests) >= MAX_PENDING_REQUESTS:
             oldest = min(self._pending_requests, key=lambda k: self._pending_requests[k]["received_at"])
             del self._pending_requests[oldest]
+            self._delete_handshake_state(oldest, "pending_request")
 
         now = int(time.time())
         request_data = {
@@ -237,6 +247,20 @@ class HandshakeManager:
                 pass
         return list(result.values())
 
+    def get_pending_request(self, peer_id: str) -> Optional[Dict]:
+        """Return a single pending request without removing it."""
+        request = self._pending_requests.get(peer_id)
+        if request is not None:
+            return request
+        if self.db:
+            try:
+                row = self.db.get_handshake_state(peer_id, "pending_request")
+                if row and row.get("data"):
+                    return json.loads(row["data"])
+            except Exception:
+                pass
+        return None
+
     def pop_pending_request(self, peer_id: str) -> Optional[Dict]:
         """Remove and return a pending request, or None if not found."""
         result = self._pending_requests.pop(peer_id, None)
@@ -263,6 +287,7 @@ class HandshakeManager:
         ]
         for pid in expired:
             del self._pending_requests[pid]
+            self._delete_handshake_state(pid, "pending_request")
         if self.db:
             try:
                 self.db.cleanup_expired_handshake_states()
@@ -282,9 +307,11 @@ class HandshakeManager:
                        if now - ts > PENDING_REQUEST_MAX_AGE]
             for k in expired:
                 del self._outbound_hello_sent[k]
+                self._delete_handshake_state(k, "outbound_hello")
             if len(self._outbound_hello_sent) >= MAX_OUTBOUND_HELLOS:
                 oldest = min(self._outbound_hello_sent, key=self._outbound_hello_sent.get)
                 del self._outbound_hello_sent[oldest]
+                self._delete_handshake_state(oldest, "outbound_hello")
 
         self._outbound_hello_sent[peer_id] = now
 
@@ -304,6 +331,7 @@ class HandshakeManager:
         if ts is not None:
             if int(time.time()) - ts > max_age_seconds:
                 del self._outbound_hello_sent[peer_id]
+                self._delete_handshake_state(peer_id, "outbound_hello")
                 return False
             return True
         # DB fallback (post-restart)
@@ -468,12 +496,14 @@ class HandshakeManager:
                 )
                 for key, _ in oldest[: len(self._pending_challenges) - MAX_PENDING_CHALLENGES]:
                     self._pending_challenges.pop(key, None)
+                    self._delete_handshake_state(key, "pending_challenge")
 
             # Sweep expired challenges (TTL-based expiry)
             expired = [k for k, v in self._pending_challenges.items()
                        if now - v['issued_at'] > CHALLENGE_TTL_SECONDS]
             for k in expired:
                 del self._pending_challenges[k]
+                self._delete_handshake_state(k, "pending_challenge")
 
         return nonce
 
@@ -485,6 +515,7 @@ class HandshakeManager:
                 now = int(time.time())
                 if now - challenge["issued_at"] > CHALLENGE_TTL_SECONDS:
                     self._pending_challenges.pop(peer_id, None)
+                    self._delete_handshake_state(peer_id, "pending_challenge")
                     return None
                 return challenge
             # DB fallback (post-restart)

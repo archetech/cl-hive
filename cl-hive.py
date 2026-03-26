@@ -4114,8 +4114,8 @@ def hive_approve(plugin: Plugin, peer_id: str):
     if not handshake_mgr or not database:
         return {"error": "Hive not initialized"}
 
-    # Pop the pending request
-    request = handshake_mgr.pop_pending_request(peer_id)
+    # Read pending request without consuming it until the challenge is delivered.
+    request = handshake_mgr.get_pending_request(peer_id)
     if not request:
         return {"error": "no_pending_request", "peer_id": peer_id,
                 "message": "No pending join request from this peer"}
@@ -4152,8 +4152,10 @@ def hive_approve(plugin: Plugin, peer_id: str):
             "msg": challenge_msg.hex()
         })
     except Exception as e:
+        handshake_mgr.clear_challenge(peer_id)
         return {"error": f"Failed to send CHALLENGE: {e}"}
 
+    handshake_mgr.pop_pending_request(peer_id)
     database.log_membership_event("approved", peer_id, actor_peer_id=our_pubkey)
     plugin.log(f"cl-hive: Approved {peer_id[:16]}..., CHALLENGE sent")
 
