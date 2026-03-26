@@ -358,7 +358,7 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     # Capture addresses from listpeers for the new member (Issue #60)
     if plugin:
         try:
-            peers_info = plugin.rpc.listpeers(id=peer_id)
+            peers_info = plugin.rpc.call("listpeers", {"id": peer_id})
             if peers_info and peers_info.get('peers'):
                 addrs = peers_info['peers'][0].get('netaddr', [])
                 if addrs:
@@ -1280,7 +1280,7 @@ def _handle_peer_connected(peer_id: str, member: Dict):
     # Track VPN connection status + populate missing addresses (Issue #60)
     if plugin:
         try:
-            peers = plugin.rpc.listpeers(id=peer_id)
+            peers = plugin.rpc.call("listpeers", {"id": peer_id})
             if peers and peers.get('peers'):
                 netaddr = peers['peers'][0].get('netaddr', [])
                 if netaddr:

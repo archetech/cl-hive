@@ -985,7 +985,7 @@ class LiquidityCoordinator:
         ThreadSafeRpcProxy for RPC serialization.
         """
         try:
-            channels = self.plugin.rpc.listpeerchannels(id=peer_id)
+            channels = self.plugin.rpc.call("listpeerchannels", {"id": peer_id})
             our_channels = channels.get("channels", [])
 
             if not our_channels:

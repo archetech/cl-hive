@@ -3279,7 +3279,7 @@ def hive_remove_member(plugin: Plugin, peer_id: str, reason: str = "maintenance"
     # unless the caller explicitly forces it. This prevents accidentally removing
     # active external peers (e.g. cyber-hornet) from Hive membership.
     try:
-        lpc = plugin.rpc.listpeerchannels(id=peer_id)
+        lpc = plugin.rpc.call("listpeerchannels", {"id": peer_id})
         peer_channels = lpc.get("channels", []) if isinstance(lpc, dict) else []
     except Exception as e:
         return {

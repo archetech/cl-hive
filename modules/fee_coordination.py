@@ -376,7 +376,7 @@ class FlowCorridorManager:
                 if member_id == self.our_pubkey and self.plugin:
                     try:
                         for peer_id in [source, destination]:
-                            channels = self.plugin.rpc.listpeerchannels(id=peer_id)
+                            channels = self.plugin.rpc.call("listpeerchannels", {"id": peer_id})
                             for ch in channels.get("channels", []):
                                 if ch.get("state") == "CHANNELD_NORMAL":
                                     cap = ch.get("total_msat", 0) // 1000

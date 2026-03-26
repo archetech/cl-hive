@@ -1192,7 +1192,7 @@ class Planner:
             return (False, None, None, None)
 
         try:
-            peer_channels = self.plugin.rpc.listpeerchannels(id=target)
+            peer_channels = self.plugin.rpc.call("listpeerchannels", {"id": target})
             channels = peer_channels.get('channels', [])
             for ch in channels:
                 state = ch.get('state', '')
