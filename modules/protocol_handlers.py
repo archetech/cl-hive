@@ -107,7 +107,7 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     our_pubkey = handshake_mgr.get_our_pubkey()
     our_member = database.get_member(our_pubkey)
     if not our_member:
-        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... but we're not a member", level='debug')
+        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... rejected: we are not a hive member", level='info')
         return {"result": "continue"}
 
     # SECURITY: Check if peer is banned (prevents ban evasion via rejoin)
@@ -115,10 +115,42 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         plugin.log(f"cl-hive: HELLO from banned peer {peer_id[:16]}..., ignoring", level='warn')
         return {"result": "continue"}
 
-    # Check if peer is already a member
+    # Check if peer is already a member — auto-send WELCOME to heal one-sided membership
     existing_member = database.get_member(peer_id)
     if existing_member:
-        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... already a member", level='debug')
+        plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... (existing member) -- auto-sending WELCOME")
+        members = database.get_all_members()
+        hive_id = "hive"
+        for m in members:
+            if m.get('metadata'):
+                try:
+                    md = json.loads(m['metadata'])
+                    hive_id = md.get('hive_id', 'hive')
+                    break
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        if state_manager:
+            s_hash = state_manager.calculate_fleet_hash()
+        else:
+            s_hash = "0" * 64
+        member_count = len(members)
+        welcome_signing_fields = json.dumps({
+            "hive_id": hive_id,
+            "member_count": member_count,
+            "state_hash": s_hash,
+            "tier": MEMBER_TIER,
+        }, sort_keys=True, separators=(',', ':'))
+        try:
+            welcome_sig = plugin.rpc.signmessage(welcome_signing_fields).get("zbase", "")
+            if welcome_sig:
+                welcome_msg = create_welcome(hive_id, MEMBER_TIER, member_count, s_hash, signature=welcome_sig)
+                plugin.rpc.call("sendcustommsg", {
+                    "node_id": peer_id,
+                    "msg": welcome_msg.hex()
+                })
+                plugin.log(f"cl-hive: Auto-WELCOME sent to existing member {peer_id[:16]}...")
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to auto-send WELCOME to {peer_id[:16]}...: {e}", level='warn')
         return {"result": "continue"}
 
     # Check if peer has a channel with us (proof of stake)
@@ -130,7 +162,7 @@ def handle_hello(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             for ch in peer_channels
         )
         if not has_channel:
-            plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... no channel (proof of stake required)", level='debug')
+            plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... rejected: no channel with peer", level='info')
             return {"result": "continue"}
     except Exception as e:
         plugin.log(f"cl-hive: HELLO from {peer_id[:16]}... channel check failed: {e}", level='warn')
@@ -162,8 +194,9 @@ def handle_challenge(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
 
     if not handshake_mgr or not handshake_mgr.has_pending_outbound_hello(peer_id):
         plugin.log(
-            f"cl-hive: CHALLENGE from {peer_id[:16]}... no pending outbound HELLO",
-            level='debug'
+            f"cl-hive: CHALLENGE from {peer_id[:16]}... rejected: no outbound HELLO recorded "
+            f"(plugin may have restarted)",
+            level='info'
         )
         return {"result": "continue"}
     
@@ -413,9 +446,11 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
         return {"result": "continue"}
 
     # SECURITY: Verify we actually sent a HELLO to this peer (prevents unsolicited WELCOME)
-    if handshake_mgr and not handshake_mgr.has_pending_outbound_hello(peer_id):
+    # BYPASS: Accept WELCOME from peers already in our member table (heals one-sided membership)
+    peer_already_member = database.get_member(peer_id) if database else None
+    if not peer_already_member and handshake_mgr and not handshake_mgr.has_pending_outbound_hello(peer_id):
         plugin.log(
-            f"cl-hive: WELCOME rejected from {peer_id[:16]}... — no outbound HELLO sent to this peer",
+            f"cl-hive: WELCOME rejected from {peer_id[:16]}... -- no outbound HELLO sent to this peer",
             level='warn'
         )
         return {"result": "continue"}
@@ -429,17 +464,17 @@ def handle_welcome(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if handshake_mgr:
         handshake_mgr.clear_outbound_hello(peer_id)
 
-    # Store Hive membership info for ourselves
+    # Store Hive membership info (idempotent — safe for duplicate WELCOMEs)
     if database and our_pubkey:
         now = int(time.time())
-        # Start as member — single-role model, all members have equal privileges.
-        database.add_member(our_pubkey, tier='member', joined_at=now)
-        # Store hive_id in metadata
+        if not database.get_member(our_pubkey):
+            database.add_member(our_pubkey, tier='member', joined_at=now)
+        # Always update metadata (hive_id may have changed)
         database.update_member(our_pubkey, metadata=json.dumps({"hive_id": hive_id}))
         plugin.log(f"cl-hive: Stored membership (tier=member, hive_id={hive_id})")
 
-        # Add the peer that welcomed us as member.
-        database.add_member(peer_id, tier='member', joined_at=now)
+        if not database.get_member(peer_id):
+            database.add_member(peer_id, tier='member', joined_at=now)
 
     # Initiate state sync with the peer that welcomed us
     if gossip_mgr and plugin:
