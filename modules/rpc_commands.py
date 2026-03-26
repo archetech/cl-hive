@@ -1955,12 +1955,12 @@ def _derive_channel_open_hints(ctx: HiveContext) -> Dict[str, Dict[str, Any]]:
         # reason
         if rec.is_bottleneck:
             reason = "improve_coverage"
+        elif rec.hive_members_count == 0:
+            reason = "member_connectivity"
         elif rec.hive_coverage_pct >= 0.50:
             reason = "reduce_overlap"
         elif ur.hive_share_pct < 0.03:
             reason = "underserved_corridor"
-        elif rec.hive_members_count == 0:
-            reason = "member_connectivity"
         else:
             reason = "none"
 
@@ -2097,7 +2097,7 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
         if "traffic_confidence" not in hint:
             if is_member:
                 hint["traffic_confidence"] = 0.5
-            elif role != "none" or peer_id in rebalance_prefs:
+            elif role != "none" or peer_id in rebalance_prefs or "peer_quality_score" in hint:
                 hint["traffic_confidence"] = 0.3
 
         # Fleet fee median (for downstream prior initialization)

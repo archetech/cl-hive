@@ -394,6 +394,7 @@ class TestQualityAndTraffic:
 
         assert PEER_A in result["hints"]
         assert result["hints"][PEER_A]["peer_quality_score"] == 0.81
+        assert result["hints"][PEER_A]["traffic_confidence"] == 0.3
         assert result["hints"][PEER_A]["member"] is False
 
         assert PEER_B in result["hints"]
@@ -656,9 +657,9 @@ class TestChannelOpenHintDerivation:
         hints = _derive_channel_open_hints(ctx)
         assert hints[PEER_C]["reason"] == "reduce_overlap"
 
-    def test_reason_member_connectivity(self):
+    def test_reason_member_connectivity_takes_precedence_when_no_members_connected(self):
         rec = _MockExpansionRec(target=PEER_C, hive_members_count=0)
-        ur = _MockUnderservedResult(target=PEER_C, hive_share_pct=0.04)
+        ur = _MockUnderservedResult(target=PEER_C, hive_share_pct=0.0)
         ctx = _make_planner_ctx(underserved=[ur], expansion_rec=rec)
         hints = _derive_channel_open_hints(ctx)
         assert hints[PEER_C]["reason"] == "member_connectivity"
