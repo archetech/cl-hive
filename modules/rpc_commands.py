@@ -1875,16 +1875,31 @@ def _derive_rebalance_preferences(ctx: HiveContext) -> Dict[str, str]:
     except Exception:
         return prefs
 
+    peer_flow_weights: Dict[str, Dict[str, float]] = {}
     for m in metrics:
         peer_id = getattr(m, "peer_id", None)
         if not peer_id:
             continue
         direction = getattr(m, "flow_direction", "balanced")
-        if direction == "source":
+        if direction not in ("source", "sink"):
+            continue
+
+        weight = getattr(m, "volume_routed_sats", 0) or getattr(m, "flow_intensity", 0)
+        try:
+            weight = float(weight)
+        except (TypeError, ValueError):
+            weight = 0.0
+        if weight <= 0:
+            weight = 1.0
+
+        totals = peer_flow_weights.setdefault(peer_id, {"source": 0.0, "sink": 0.0})
+        totals[direction] += weight
+
+    for peer_id, totals in peer_flow_weights.items():
+        if totals["source"] > totals["sink"]:
             prefs[peer_id] = "source"
-        elif direction == "sink":
+        elif totals["sink"] > totals["source"]:
             prefs[peer_id] = "sink"
-        # If multiple channels to same peer, last wins (fine for hints)
 
     return prefs
 
@@ -2020,6 +2035,26 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
     all_peers.update(corridor_roles.keys())
     all_peers.update(rebalance_prefs.keys())
     all_peers.update(channel_open_hints.keys())
+    if ctx.quality_scorer:
+        try:
+            scored_peers = ctx.quality_scorer.get_scored_peers(days=90)
+            all_peers.update(
+                result.peer_id
+                for result in scored_peers
+                if getattr(result, "peer_id", None) and getattr(result, "confidence", 0.0) > 0.0
+            )
+        except Exception:
+            pass
+    if ctx.traffic_intel_mgr:
+        try:
+            profiles = ctx.traffic_intel_mgr.get_all_profiles()
+            all_peers.update(
+                profile.get("peer_id")
+                for profile in profiles
+                if isinstance(profile, dict) and profile.get("peer_id")
+            )
+        except Exception:
+            pass
 
     # Exclude ourselves
     all_peers.discard(ctx.our_pubkey)
@@ -2074,9 +2109,10 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
                     # Find corridors involving this peer and get their avg fee
                     peer_fees = []
                     for a in assignments:
-                        if a.primary_member == peer_id or peer_id in (a.secondary_members or []):
-                            if a.primary_fee_ppm > 0:
-                                peer_fees.append(a.primary_fee_ppm)
+                        if a.primary_member == peer_id and a.primary_fee_ppm > 0:
+                            peer_fees.append(a.primary_fee_ppm)
+                        if peer_id in (a.secondary_members or []) and a.secondary_fee_ppm > 0:
+                            peer_fees.append(a.secondary_fee_ppm)
                     if peer_fees:
                         peer_fees.sort()
                         hint["fleet_fee_median"] = peer_fees[len(peer_fees) // 2]

@@ -25,6 +25,8 @@ from modules.rpc_commands import (
     _derive_rebalance_preferences,
     _derive_channel_open_hints,
 )
+from modules.fee_coordination import CorridorAssignment, FlowCorridor
+from modules.quality_scorer import PeerQualityResult
 
 
 PEER_A = "02" + "a" * 64
@@ -241,6 +243,7 @@ class TestCompetitionBias:
 class _MockYieldMetric:
     peer_id: str
     flow_direction: str = "balanced"
+    volume_routed_sats: int = 0
 
 
 class TestRebalancePreference:
@@ -272,6 +275,24 @@ class TestRebalancePreference:
         ctx = _make_ctx(yield_metrics_mgr=mgr)
         prefs = _derive_rebalance_preferences(ctx)
         assert PEER_A not in prefs
+
+    def test_multiple_channels_use_dominant_volume_regardless_of_order(self):
+        mgr = MagicMock()
+        sink_metric = _MockYieldMetric(
+            peer_id=PEER_A, flow_direction="sink", volume_routed_sats=5_000_000
+        )
+        source_metric = _MockYieldMetric(
+            peer_id=PEER_A, flow_direction="source", volume_routed_sats=1_000_000
+        )
+        ctx = _make_ctx(yield_metrics_mgr=mgr)
+
+        mgr.get_channel_yield_metrics.return_value = [sink_metric, source_metric]
+        prefs = _derive_rebalance_preferences(ctx)
+        assert prefs[PEER_A] == "sink"
+
+        mgr.get_channel_yield_metrics.return_value = [source_metric, sink_metric]
+        prefs = _derive_rebalance_preferences(ctx)
+        assert prefs[PEER_A] == "sink"
 
 
 # =============================================================================
@@ -322,6 +343,62 @@ class TestQualityAndTraffic:
         result = export_hints(ctx)
         # Members get default 0.5 confidence even without traffic profile
         assert result["hints"][PEER_A]["traffic_confidence"] == 0.5
+
+    def test_exports_peers_with_only_quality_or_traffic_data(self):
+        db = MagicMock()
+        db.get_all_members.return_value = []
+
+        scorer = MagicMock()
+        quality_result = PeerQualityResult(
+            peer_id=PEER_A,
+            overall_score=0.81,
+            reliability_score=0.8,
+            profitability_score=0.8,
+            routing_score=0.8,
+            consistency_score=0.8,
+            confidence=0.7,
+            recommendation="good",
+            factors={},
+        )
+        scorer.get_scored_peers.return_value = [quality_result]
+
+        def _score_peer(peer_id, days=90):
+            if peer_id == PEER_A:
+                return quality_result
+            return PeerQualityResult(
+                peer_id=peer_id,
+                overall_score=0.0,
+                reliability_score=0.0,
+                profitability_score=0.0,
+                routing_score=0.0,
+                consistency_score=0.0,
+                confidence=0.0,
+                recommendation="neutral",
+                factors={},
+            )
+
+        scorer.calculate_score.side_effect = _score_peer
+
+        traffic_mgr = MagicMock()
+        traffic_mgr.get_all_profiles.return_value = [{"peer_id": PEER_B, "confidence": 0.73}]
+        traffic_mgr.get_aggregated_profile.side_effect = (
+            lambda peer_id: {"confidence": 0.73} if peer_id == PEER_B else None
+        )
+
+        ctx = _make_ctx(
+            database=db,
+            quality_scorer=scorer,
+            traffic_intel_mgr=traffic_mgr,
+        )
+        result = export_hints(ctx)
+
+        assert PEER_A in result["hints"]
+        assert result["hints"][PEER_A]["peer_quality_score"] == 0.81
+        assert result["hints"][PEER_A]["member"] is False
+
+        assert PEER_B in result["hints"]
+        assert result["hints"][PEER_B]["traffic_confidence"] == 0.73
+        assert result["hints"][PEER_B]["member"] is False
 
 
 # =============================================================================
@@ -374,6 +451,34 @@ class TestNoSideEffects:
         export_hints(ctx)
         ctx.database.add_member.assert_not_called()
         ctx.database.remove_member.assert_not_called()
+
+
+class TestFleetFeePriors:
+    """Validate fleet_fee_median export from corridor assignments."""
+
+    def test_secondary_members_use_secondary_fee_prior(self):
+        corridor_mgr = MagicMock()
+        corridor_mgr.get_assignments.return_value = [
+            CorridorAssignment(
+                corridor=FlowCorridor(
+                    source_peer_id="source",
+                    destination_peer_id="dest",
+                    capable_members=[PEER_A, PEER_B],
+                ),
+                primary_member=PEER_A,
+                secondary_members=[PEER_B],
+                primary_fee_ppm=500,
+                secondary_fee_ppm=900,
+                assignment_reason="test",
+                confidence=0.9,
+            )
+        ]
+        fee_coordination_mgr = MagicMock(corridor_mgr=corridor_mgr)
+
+        ctx = _make_ctx(fee_coordination_mgr=fee_coordination_mgr)
+        result = export_hints(ctx)
+
+        assert result["hints"][PEER_B]["fleet_fee_median"] == 900
 
 
 # =============================================================================
