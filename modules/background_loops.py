@@ -968,12 +968,12 @@ def _broadcast_our_positioning_proposals():
         # Broadcast each proposal separately (they're targeted recommendations)
         for proposal in shareable_proposals:
             msg = create_positioning_proposal(
-                target_pubkey=proposal["target_pubkey"],
-                target_alias=proposal.get("target_alias", ""),
+                target_peer_id=proposal["target_peer_id"],
+                recommended_member=proposal["recommended_member"],
+                priority_tier=proposal["priority_tier"],
+                target_capacity_sats=proposal.get("target_capacity_sats", 0),
                 reason=proposal["reason"],
-                score=proposal["score"],
-                suggested_amount_sats=proposal.get("suggested_amount_sats", 0),
-                priority=proposal.get("priority", "medium"),
+                value_score=proposal["value_score"],
                 rpc=plugin.rpc,
                 our_pubkey=our_pubkey
             )
@@ -1084,12 +1084,14 @@ def _broadcast_our_close_proposals():
         # Broadcast each proposal separately (targeted to specific member)
         for proposal in shareable_proposals:
             msg = create_close_proposal(
-                target_member=proposal["target_member"],
-                target_peer=proposal["target_peer"],
+                member_id=proposal["member_id"],
+                peer_id=proposal["peer_id"],
+                channel_id=proposal["channel_id"],
+                owner_id=proposal.get("owner_id", ""),
                 reason=proposal["reason"],
-                our_routing_share=proposal["our_routing_share"],
-                their_routing_share=proposal["their_routing_share"],
-                suggested_action=proposal.get("suggested_action", "close"),
+                freed_capacity_sats=proposal.get("freed_capacity_sats", 0),
+                member_marker_strength=proposal.get("member_marker_strength", 0.0),
+                owner_marker_strength=proposal.get("owner_marker_strength", 0.0),
                 rpc=plugin.rpc,
                 our_pubkey=our_pubkey
             )

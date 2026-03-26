@@ -3053,7 +3053,7 @@ def handle_positioning_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> 
             proposal_data=payload
         )
         if result:
-            target = payload.get("target_pubkey", "")[:16]
+            target = payload.get("target_peer_id", "")[:16]
             relay_info = " (relayed)" if is_relayed else ""
             plugin.log(
                 f"cl-hive: Stored positioning proposal from {reporter_id[:16]}...{relay_info} targeting {target}...",
@@ -3208,8 +3208,8 @@ def handle_close_proposal(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
             proposal_data=payload
         )
         if result:
-            target_member = payload.get("target_member", "")[:16]
-            target_peer = payload.get("target_peer", "")[:16]
+            target_member = payload.get("member_id", "")[:16]
+            target_peer = payload.get("peer_id", "")[:16]
             plugin.log(
                 f"cl-hive: Stored close proposal from {peer_id[:16]}... "
                 f"for {target_member}... channel to {target_peer}...",
