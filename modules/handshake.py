@@ -198,25 +198,61 @@ class HandshakeManager:
 
     def store_pending_request(self, peer_id: str) -> None:
         """Store a pending join request from a peer (awaiting hive-approve)."""
-        # Expire old requests and enforce size cap
         self.expire_pending_requests()
         if len(self._pending_requests) >= MAX_PENDING_REQUESTS:
             oldest = min(self._pending_requests, key=lambda k: self._pending_requests[k]["received_at"])
             del self._pending_requests[oldest]
 
-        self._pending_requests[peer_id] = {
+        now = int(time.time())
+        request_data = {
             "peer_id": peer_id,
-            "received_at": int(time.time()),
+            "received_at": now,
             "channel_verified": True,
         }
+        self._pending_requests[peer_id] = request_data
+
+        if self.db:
+            try:
+                self.db.upsert_handshake_state(
+                    peer_id, "pending_request",
+                    json.dumps(request_data),
+                    now, now + PENDING_REQUEST_MAX_AGE
+                )
+            except Exception:
+                pass
 
     def get_pending_requests(self) -> List[Dict]:
-        """Return all pending join requests."""
-        return list(self._pending_requests.values())
+        """Return all pending join requests (memory + DB fallback)."""
+        result = dict(self._pending_requests)
+        if self.db:
+            try:
+                for row in self.db.get_all_handshake_states("pending_request"):
+                    pid = row.get("peer_id")
+                    if pid and pid not in result:
+                        try:
+                            result[pid] = json.loads(row.get("data", "{}"))
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+            except Exception:
+                pass
+        return list(result.values())
 
     def pop_pending_request(self, peer_id: str) -> Optional[Dict]:
         """Remove and return a pending request, or None if not found."""
-        return self._pending_requests.pop(peer_id, None)
+        result = self._pending_requests.pop(peer_id, None)
+        if result is None and self.db:
+            try:
+                row = self.db.get_handshake_state(peer_id, "pending_request")
+                if row and row.get("data"):
+                    result = json.loads(row["data"])
+            except Exception:
+                pass
+        if self.db:
+            try:
+                self.db.delete_handshake_state(peer_id, "pending_request")
+            except Exception:
+                pass
+        return result
 
     def expire_pending_requests(self, max_age_seconds: int = PENDING_REQUEST_MAX_AGE) -> int:
         """Remove pending requests older than max_age_seconds. Returns count removed."""
@@ -227,6 +263,11 @@ class HandshakeManager:
         ]
         for pid in expired:
             del self._pending_requests[pid]
+        if self.db:
+            try:
+                self.db.cleanup_expired_handshake_states()
+            except Exception:
+                pass
         return len(expired)
 
     # =========================================================================
@@ -235,7 +276,6 @@ class HandshakeManager:
 
     def record_hello_sent(self, peer_id: str) -> None:
         """Record that we sent a HELLO to a peer (outbound join request)."""
-        # Expire old entries and enforce size cap
         now = int(time.time())
         if len(self._outbound_hello_sent) >= MAX_OUTBOUND_HELLOS:
             expired = [k for k, ts in self._outbound_hello_sent.items()
@@ -248,19 +288,44 @@ class HandshakeManager:
 
         self._outbound_hello_sent[peer_id] = now
 
+        if self.db:
+            try:
+                self.db.upsert_handshake_state(
+                    peer_id, "outbound_hello",
+                    json.dumps({"sent_at": now}),
+                    now, now + PENDING_REQUEST_MAX_AGE
+                )
+            except Exception:
+                pass
+
     def has_pending_outbound_hello(self, peer_id: str, max_age_seconds: int = PENDING_REQUEST_MAX_AGE) -> bool:
         """Check if we have a pending outbound HELLO to this peer."""
         ts = self._outbound_hello_sent.get(peer_id)
-        if ts is None:
-            return False
-        if int(time.time()) - ts > max_age_seconds:
-            del self._outbound_hello_sent[peer_id]
-            return False
-        return True
+        if ts is not None:
+            if int(time.time()) - ts > max_age_seconds:
+                del self._outbound_hello_sent[peer_id]
+                return False
+            return True
+        # DB fallback (post-restart)
+        if self.db:
+            try:
+                row = self.db.get_handshake_state(peer_id, "outbound_hello")
+                if row:
+                    data = json.loads(row.get("data", "{}"))
+                    self._outbound_hello_sent[peer_id] = data.get("sent_at", row.get("created_at", 0))
+                    return True
+            except Exception:
+                pass
+        return False
 
     def clear_outbound_hello(self, peer_id: str) -> None:
         """Clear outbound HELLO tracking after join completes."""
         self._outbound_hello_sent.pop(peer_id, None)
+        if self.db:
+            try:
+                self.db.delete_handshake_state(peer_id, "outbound_hello")
+            except Exception:
+                pass
 
     # =========================================================================
     # MANIFEST OPERATIONS
@@ -384,6 +449,17 @@ class HandshakeManager:
                 "initial_tier": initial_tier
             }
 
+            # Persist to DB inside lock for atomicity
+            if self.db:
+                try:
+                    self.db.upsert_handshake_state(
+                        peer_id, "pending_challenge",
+                        json.dumps(self._pending_challenges[peer_id]),
+                        now, now + CHALLENGE_TTL_SECONDS
+                    )
+                except Exception:
+                    pass
+
             # LRU eviction if over limit
             if len(self._pending_challenges) > MAX_PENDING_CHALLENGES:
                 oldest = sorted(
@@ -405,17 +481,31 @@ class HandshakeManager:
         """Get the pending challenge nonce for a peer."""
         with self._challenge_lock:
             challenge = self._pending_challenges.get(peer_id)
-            if challenge is None:
-                return None
-            # Enforce TTL - expire stale challenges
-            now = int(time.time())
-            if now - challenge["issued_at"] > CHALLENGE_TTL_SECONDS:
-                self._pending_challenges.pop(peer_id, None)
-                return None
-            return challenge
+            if challenge is not None:
+                now = int(time.time())
+                if now - challenge["issued_at"] > CHALLENGE_TTL_SECONDS:
+                    self._pending_challenges.pop(peer_id, None)
+                    return None
+                return challenge
+            # DB fallback (post-restart)
+            if self.db:
+                try:
+                    row = self.db.get_handshake_state(peer_id, "pending_challenge")
+                    if row and row.get("data"):
+                        challenge = json.loads(row["data"])
+                        self._pending_challenges[peer_id] = challenge
+                        return challenge
+                except Exception:
+                    pass
+            return None
 
     def clear_challenge(self, peer_id: str) -> None:
         """Clear the pending challenge for a peer."""
+        if self.db:
+            try:
+                self.db.delete_handshake_state(peer_id, "pending_challenge")
+            except Exception:
+                pass
         with self._challenge_lock:
             self._pending_challenges.pop(peer_id, None)
     
