@@ -261,21 +261,36 @@ class FlowCorridorManager:
 
         # Build corridors from fleet liquidity needs
         needs = self.liquidity_coordinator.get_fleet_liquidity_needs()
-        corridors = []
-        seen = set()
+        grouped: Dict[str, Dict[str, Any]] = {}
         for need in needs:
-            peer_id = need.get("target_peer_id", "")
-            if not peer_id or peer_id in seen:
+            peer_id = need.get("peer_id") or need.get("target_peer_id") or ""
+            member_id = need.get("member_id") or need.get("reporter_id") or ""
+            if not peer_id or not member_id:
                 continue
-            seen.add(peer_id)
-            members = [need.get("reporter_id", "")]
+
+            volume_sats = need.get("capacity_sats")
+            if not isinstance(volume_sats, (int, float)):
+                volume_sats = need.get("amount_sats", 0)
+
+            bucket = grouped.setdefault(peer_id, {
+                "members": [],
+                "total_volume_sats": 0,
+            })
+            if member_id not in bucket["members"]:
+                bucket["members"].append(member_id)
+            if isinstance(volume_sats, (int, float)):
+                bucket["total_volume_sats"] += int(volume_sats)
+
+        corridors = []
+        for peer_id, bucket in grouped.items():
+            members = bucket["members"]
             corridor = FlowCorridor(
                 source_peer_id=peer_id,
                 destination_peer_id=peer_id,
                 source_alias=None,
                 destination_alias=None,
                 capable_members=members,
-                total_volume_sats=need.get("amount_sats", 0),
+                total_volume_sats=bucket["total_volume_sats"],
                 competition_level=self._assess_competition_level(len(members))
             )
             corridors.append(corridor)

@@ -106,6 +106,14 @@ class MockLiquidityCoordinator:
             "amount_sats": amount_sats,
         })
 
+    def add_fleet_need(self, peer_id, member_id, capacity_sats=1_000_000, need_type="outbound"):
+        self.needs.append({
+            "peer_id": peer_id,
+            "member_id": member_id,
+            "capacity_sats": capacity_sats,
+            "need_type": need_type,
+        })
+
     def set_local_saturated_channels(self, member_id, channels):
         with self._lock:
             state = self._member_liquidity_state.setdefault(member_id, {})
@@ -198,6 +206,39 @@ class TestFlowCorridorManager:
         corridors = self.manager.identify_corridors()
         assert len(corridors) == 1
         assert corridors[0].source_peer_id == "peer1"
+
+    def test_identify_corridors_with_current_fleet_need_shape(self):
+        """Current get_fleet_liquidity_needs output must produce corridors."""
+        member_id = "02" + "a" * 64
+        self.liquidity_coord.add_fleet_need(
+            "peer1", member_id, capacity_sats=5_000_000
+        )
+
+        corridors = self.manager.identify_corridors()
+
+        assert len(corridors) == 1
+        assert corridors[0].source_peer_id == "peer1"
+        assert corridors[0].capable_members == [member_id]
+        assert corridors[0].total_volume_sats == 5_000_000
+
+    def test_identify_corridors_groups_members_by_current_fleet_need_shape(self):
+        """Multiple members on the same peer should share one corridor."""
+        member_a = "02" + "a" * 64
+        member_b = "02" + "b" * 64
+        self.liquidity_coord.add_fleet_need(
+            "peer1", member_a, capacity_sats=5_000_000
+        )
+        self.liquidity_coord.add_fleet_need(
+            "peer1", member_b, capacity_sats=3_000_000
+        )
+
+        corridors = self.manager.identify_corridors()
+
+        assert len(corridors) == 1
+        assert corridors[0].source_peer_id == "peer1"
+        assert set(corridors[0].capable_members) == {member_a, member_b}
+        assert corridors[0].total_volume_sats == 8_000_000
+        assert corridors[0].competition_level == "low"
 
     def test_assess_competition_level(self):
         """Test competition level assessment."""
