@@ -165,6 +165,22 @@ class HiveDatabase:
             pass  # Column already exists
 
         # =====================================================================
+        # HANDSHAKE STATE TABLE
+        # =====================================================================
+        # Persists in-flight handshake state so plugin restarts don't kill
+        # pending joins. Types: pending_request, outbound_hello, pending_challenge
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS handshake_state (
+                peer_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                data TEXT,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                PRIMARY KEY (peer_id, type)
+            )
+        """)
+
+        # =====================================================================
         # INTENT LOCKS TABLE
         # =====================================================================
         # Tracks Intent Lock protocol state for conflict resolution
@@ -3728,3 +3744,56 @@ class HiveDatabase:
                     level='error'
                 )
             return []
+
+    # =========================================================================
+    # HANDSHAKE STATE PERSISTENCE
+    # =========================================================================
+
+    def upsert_handshake_state(self, peer_id: str, state_type: str, data: str,
+                                created_at: int, expires_at: int) -> None:
+        """Upsert a handshake state row."""
+        conn = self._get_connection()
+        conn.execute("""
+            INSERT OR REPLACE INTO handshake_state (peer_id, type, data, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (peer_id, state_type, data, created_at, expires_at))
+        conn.commit()
+
+    def get_handshake_state(self, peer_id: str, state_type: str) -> Optional[Dict[str, Any]]:
+        """Get a handshake state row, or None if not found or expired."""
+        conn = self._get_connection()
+        now = int(time.time())
+        row = conn.execute("""
+            SELECT peer_id, type, data, created_at, expires_at
+            FROM handshake_state
+            WHERE peer_id = ? AND type = ? AND expires_at > ?
+        """, (peer_id, state_type, now)).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def delete_handshake_state(self, peer_id: str, state_type: str) -> None:
+        """Delete a handshake state row."""
+        conn = self._get_connection()
+        conn.execute("DELETE FROM handshake_state WHERE peer_id = ? AND type = ?",
+                     (peer_id, state_type))
+        conn.commit()
+
+    def get_all_handshake_states(self, state_type: str) -> List[Dict[str, Any]]:
+        """Get all non-expired handshake states of a given type."""
+        conn = self._get_connection()
+        now = int(time.time())
+        rows = conn.execute("""
+            SELECT peer_id, type, data, created_at, expires_at
+            FROM handshake_state
+            WHERE type = ? AND expires_at > ?
+        """, (state_type, now)).fetchall()
+        return [dict(r) for r in rows]
+
+    def cleanup_expired_handshake_states(self) -> int:
+        """Delete all expired handshake state rows. Returns count deleted."""
+        conn = self._get_connection()
+        now = int(time.time())
+        cursor = conn.execute("DELETE FROM handshake_state WHERE expires_at <= ?", (now,))
+        conn.commit()
+        return cursor.rowcount
