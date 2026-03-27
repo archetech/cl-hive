@@ -1,5 +1,6 @@
 """Regression tests for membership protocol handlers."""
 
+import json
 import os
 import sys
 import time
@@ -110,6 +111,34 @@ def test_handle_attest_does_not_activate_member_when_welcome_send_fails(db, mock
     assert result == {"result": "continue"}
     assert db.get_member(PEER_B) is None
     ph.handshake_mgr.clear_challenge.assert_not_called()
+
+
+def test_handle_attest_persists_hive_metadata_for_new_member(db, mock_plugin):
+    db.add_member(PEER_A, tier="member", joined_at=1)
+    db.update_member(PEER_A, metadata=json.dumps({"hive_id": "test-hive"}))
+
+    ph.database = db
+    ph.plugin = mock_plugin
+    ph.our_pubkey = PEER_A
+    ph.config = MagicMock()
+    ph.state_manager = MagicMock()
+    ph.state_manager.calculate_fleet_hash.return_value = "0" * 64
+    ph.handshake_mgr = MagicMock()
+    ph.handshake_mgr.get_pending_challenge.return_value = {
+        "nonce": "n" * 64,
+        "issued_at": int(time.time()),
+        "requirements": 0,
+        "initial_tier": "member",
+    }
+    ph.handshake_mgr.verify_manifest.return_value = (True, "")
+    ph.handshake_mgr.check_requirements.return_value = (True, [])
+
+    result = ph.handle_attest(PEER_B, attest_payload_for(PEER_B), mock_plugin)
+
+    assert result == {"result": "continue"}
+    member = db.get_member(PEER_B)
+    assert member is not None
+    assert json.loads(member["metadata"]) == {"hive_id": "test-hive"}
 
 
 def test_handle_ban_rejects_non_member_sender(db, mock_plugin):

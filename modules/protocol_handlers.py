@@ -384,6 +384,10 @@ def handle_attest(peer_id: str, payload: Dict, plugin: Plugin) -> Dict:
     if newly_added:
         database.log_membership_event("joined", peer_id)
 
+    # Store hive metadata for the admitted peer so hive-members surfaces
+    # the shared hive_id for every member, not just the founder/joiner.
+    database.update_member(peer_id, metadata=json.dumps({"hive_id": hive_id}))
+
     # Phase B: persist peer capabilities from manifest features
     manifest_features = manifest_data.get("features", [])
     database.save_peer_capabilities(peer_id, manifest_features)
