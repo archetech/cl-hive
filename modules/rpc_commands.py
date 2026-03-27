@@ -65,6 +65,20 @@ def check_permission(ctx: HiveContext, required_tier: str = 'member') -> Optiona
     return None  # Permission granted
 
 
+def _member_uptime_pct(ctx: HiveContext, peer_id: str, member_row: Dict[str, Any]) -> float:
+    """Return live member uptime as a 0-100 percentage when possible."""
+    if ctx.membership_mgr and ctx.database and peer_id and ctx.database.get_presence(peer_id):
+        try:
+            return round(ctx.membership_mgr.calculate_uptime(peer_id), 2)
+        except Exception:
+            pass
+
+    uptime_raw = member_row.get("uptime_pct", 0.0)
+    if uptime_raw <= 1.0:
+        uptime_raw = round(uptime_raw * 100, 2)
+    return uptime_raw
+
+
 # =============================================================================
 # VPN COMMANDS
 # =============================================================================
@@ -92,10 +106,7 @@ def status(ctx: HiveContext) -> Dict[str, Any]:
     if ctx.our_pubkey:
         our_member = ctx.database.get_member(ctx.our_pubkey)
         if our_member:
-            uptime_raw = our_member.get("uptime_pct", 0.0)
-            # Normalize to 0-100 scale (DB stores 0.0-1.0)
-            if uptime_raw <= 1.0:
-                uptime_raw = round(uptime_raw * 100, 2)
+            uptime_raw = _member_uptime_pct(ctx, ctx.our_pubkey, our_member)
             contribution_ratio = our_member.get("contribution_ratio", 0.0)
             # Enrich with live contribution ratio if available (Issue #59)
             if ctx.membership_mgr:
@@ -184,8 +195,12 @@ def members(ctx: HiveContext) -> Dict[str, Any]:
             peer_id = m.get("peer_id")
             if peer_id:
                 m["contribution_ratio"] = ctx.membership_mgr.calculate_contribution_ratio(peer_id)
-                # Format uptime as percentage (stored as 0.0-1.0 decimal)
-                m["uptime_pct"] = round(m.get("uptime_pct", 0.0) * 100, 2)
+                m["uptime_pct"] = _member_uptime_pct(ctx, peer_id, m)
+    else:
+        for m in all_members:
+            peer_id = m.get("peer_id")
+            if peer_id:
+                m["uptime_pct"] = _member_uptime_pct(ctx, peer_id, m)
 
     return {
         "count": len(all_members),

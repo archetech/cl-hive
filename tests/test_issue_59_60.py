@@ -27,7 +27,7 @@ from modules.database import HiveDatabase
 from modules.config import HiveConfig
 from modules.membership import MembershipManager
 from modules.contribution import ContributionManager
-from modules.rpc_commands import members, HiveContext
+from modules.rpc_commands import members, status, HiveContext
 
 
 # =============================================================================
@@ -184,6 +184,49 @@ class TestMembersUptimeFormat:
         result = members(ctx)
         member = result["members"][0]
         assert member["uptime_pct"] == 0.0
+
+    def test_members_returns_live_uptime_from_presence_without_sync(
+        self, database, membership_mgr, config, mock_plugin
+    ):
+        """members() should use live presence data, not stale hive_members.uptime_pct."""
+        now = int(time.time())
+        database.add_member(PEER_A, tier="member", joined_at=now)
+        database.update_presence(PEER_A, is_online=True, now_ts=now, window_seconds=30 * 86400)
+
+        ctx = HiveContext(
+            database=database,
+            config=config,
+            safe_plugin=mock_plugin,
+            our_pubkey="02" + "00" * 32,
+            membership_mgr=membership_mgr,
+        )
+
+        with patch("modules.membership.time.time", return_value=now + 60):
+            result = members(ctx)
+
+        member = result["members"][0]
+        assert member["uptime_pct"] == 100.0
+
+    def test_status_returns_live_uptime_from_presence_without_sync(
+        self, database, membership_mgr, config, mock_plugin
+    ):
+        """status() should surface live local uptime from presence data."""
+        now = int(time.time())
+        database.add_member(PEER_A, tier="member", joined_at=now)
+        database.update_presence(PEER_A, is_online=True, now_ts=now, window_seconds=30 * 86400)
+
+        ctx = HiveContext(
+            database=database,
+            config=config,
+            safe_plugin=mock_plugin,
+            our_pubkey=PEER_A,
+            membership_mgr=membership_mgr,
+        )
+
+        with patch("modules.membership.time.time", return_value=now + 60):
+            result = status(ctx)
+
+        assert result["membership"]["uptime_pct"] == 100.0
 
 
 # =============================================================================
