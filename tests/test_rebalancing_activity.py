@@ -282,3 +282,80 @@ class TestEnrichedNeedsIntegration:
         ]}
         needs = self.coord.assess_our_liquidity_needs(funds)
         assert needs == []
+
+
+class TestFleetCorridorNeeds:
+    """Directional corridor needs for cross-member flow coordination."""
+
+    def setup_method(self):
+        self.db = MockDatabase()
+        self.db.members = {
+            PEER1: {"peer_id": PEER1, "tier": "member"},
+            "02" + "b" * 64: {"peer_id": "02" + "b" * 64, "tier": "member"},
+            OUR_PUBKEY: {"peer_id": OUR_PUBKEY, "tier": "member"},
+        }
+        self.plugin = MockPlugin()
+        self.coord = LiquidityCoordinator(
+            database=self.db,
+            plugin=self.plugin,
+            our_pubkey=OUR_PUBKEY,
+            state_manager=MockStateManager()
+        )
+
+    def test_get_fleet_corridor_needs_derives_directional_pairs_from_raw_state(self):
+        """Saturated->depleted pairs should become directional corridor needs."""
+        self.coord.record_member_liquidity_report(
+            member_id=PEER1,
+            depleted_channels=[{
+                "peer_id": "dest-peer",
+                "local_pct": 0.05,
+                "capacity_sats": 800_000,
+            }],
+            saturated_channels=[{
+                "peer_id": "source-peer",
+                "local_pct": 0.95,
+                "capacity_sats": 1_200_000,
+            }],
+            rebalancing_active=False,
+            rebalancing_peers=[],
+        )
+
+        needs = self.coord.get_fleet_corridor_needs()
+
+        assert len(needs) == 1
+        assert needs[0]["member_id"] == PEER1
+        assert needs[0]["source_peer_id"] == "source-peer"
+        assert needs[0]["destination_peer_id"] == "dest-peer"
+        assert needs[0]["capacity_sats"] == 800_000
+
+    def test_get_fleet_corridor_needs_prefers_enriched_directional_pairs(self):
+        """Explicit enriched pairs should override raw saturated/depleted cross-products."""
+        self.coord.record_member_liquidity_report(
+            member_id=PEER1,
+            depleted_channels=[{
+                "peer_id": "raw-dest",
+                "local_pct": 0.05,
+                "capacity_sats": 800_000,
+            }],
+            saturated_channels=[{
+                "peer_id": "raw-source",
+                "local_pct": 0.95,
+                "capacity_sats": 1_200_000,
+            }],
+            rebalancing_active=False,
+            rebalancing_peers=[],
+            enriched_needs=[{
+                "source_peer_id": "enriched-source",
+                "destination_peer_id": "enriched-dest",
+                "capacity_sats": 555_000,
+                "flow_state": "source",
+            }],
+        )
+
+        needs = self.coord.get_fleet_corridor_needs()
+
+        assert len(needs) == 1
+        assert needs[0]["member_id"] == PEER1
+        assert needs[0]["source_peer_id"] == "enriched-source"
+        assert needs[0]["destination_peer_id"] == "enriched-dest"
+        assert needs[0]["capacity_sats"] == 555_000

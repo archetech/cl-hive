@@ -254,25 +254,36 @@ class FlowCorridorManager:
         """
         Identify all flow corridors the fleet can serve.
 
-        A corridor exists when 2+ members can route between same (source, dest).
+        Prefer explicit directional source->destination needs when available.
+        Legacy single-peer needs are still accepted for compatibility.
         """
         if not self.liquidity_coordinator:
             return []
 
-        # Build corridors from fleet liquidity needs
-        needs = self.liquidity_coordinator.get_fleet_liquidity_needs()
-        grouped: Dict[str, Dict[str, Any]] = {}
+        get_corridor_needs = getattr(self.liquidity_coordinator, "get_fleet_corridor_needs", None)
+        if callable(get_corridor_needs):
+            needs = get_corridor_needs()
+        else:
+            needs = self.liquidity_coordinator.get_fleet_liquidity_needs()
+
+        grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for need in needs:
-            peer_id = need.get("peer_id") or need.get("target_peer_id") or ""
+            source_peer_id = need.get("source_peer_id") or ""
+            destination_peer_id = need.get("destination_peer_id") or ""
+            if not source_peer_id and not destination_peer_id:
+                peer_id = need.get("peer_id") or need.get("target_peer_id") or ""
+                source_peer_id = peer_id
+                destination_peer_id = peer_id
             member_id = need.get("member_id") or need.get("reporter_id") or ""
-            if not peer_id or not member_id:
+            if not source_peer_id or not destination_peer_id or not member_id:
                 continue
 
             volume_sats = need.get("capacity_sats")
             if not isinstance(volume_sats, (int, float)):
                 volume_sats = need.get("amount_sats", 0)
 
-            bucket = grouped.setdefault(peer_id, {
+            key = (source_peer_id, destination_peer_id)
+            bucket = grouped.setdefault(key, {
                 "members": [],
                 "total_volume_sats": 0,
             })
@@ -282,11 +293,11 @@ class FlowCorridorManager:
                 bucket["total_volume_sats"] += int(volume_sats)
 
         corridors = []
-        for peer_id, bucket in grouped.items():
+        for (source_peer_id, destination_peer_id), bucket in grouped.items():
             members = bucket["members"]
             corridor = FlowCorridor(
-                source_peer_id=peer_id,
-                destination_peer_id=peer_id,
+                source_peer_id=source_peer_id,
+                destination_peer_id=destination_peer_id,
                 source_alias=None,
                 destination_alias=None,
                 capable_members=members,
@@ -390,7 +401,7 @@ class FlowCorridorManager:
                 # Check if this is us - we can get more detailed info
                 if member_id == self.our_pubkey and self.plugin:
                     try:
-                        for peer_id in [source, destination]:
+                        for peer_id in {source, destination}:
                             channels = self.plugin.rpc.call("listpeerchannels", {"id": peer_id})
                             for ch in channels.get("channels", []):
                                 if ch.get("state") == "CHANNELD_NORMAL":

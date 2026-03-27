@@ -972,6 +972,129 @@ class LiquidityCoordinator:
 
         return needs
 
+    def get_fleet_corridor_needs(self) -> List[Dict[str, Any]]:
+        """
+        Build directional source->destination needs for corridor coordination.
+
+        Prefers enriched directional needs reported by cl-revenue-ops. When no
+        enriched pair data is present for a member, derive coarse directional
+        pairs from saturated->depleted channel combinations.
+        """
+        needs = []
+        relevance_cache: Dict[str, float] = {}
+
+        def relevance_for(peer_id: str) -> float:
+            if peer_id not in relevance_cache:
+                relevance_cache[peer_id] = self._calculate_relevance_score(peer_id)
+            return relevance_cache[peer_id]
+
+        with self._lock:
+            state_snapshot = dict(self._member_liquidity_state)
+
+        tier_priority = {"struggling": 0, "vulnerable": 1, "stable": 2, "thriving": 3}
+        severity_priority = {"high": 0, "medium": 1, "low": 2}
+
+        for member_id, state in state_snapshot.items():
+            if member_id == self.our_pubkey:
+                continue
+
+            member_health = self.database.get_member_health(member_id)
+            health_tier = member_health.get("health_tier", "stable") if member_health else "stable"
+
+            enriched_needs = state.get("enriched_needs") or []
+            normalized_enriched = []
+            for need in enriched_needs:
+                source_peer_id = (
+                    need.get("source_peer_id")
+                    or need.get("from_peer_id")
+                    or need.get("source")
+                    or ""
+                )
+                destination_peer_id = (
+                    need.get("destination_peer_id")
+                    or need.get("to_peer_id")
+                    or need.get("destination")
+                    or ""
+                )
+                if (
+                    not source_peer_id
+                    or not destination_peer_id
+                    or source_peer_id == destination_peer_id
+                ):
+                    continue
+
+                capacity_sats = need.get("capacity_sats")
+                if not isinstance(capacity_sats, (int, float)):
+                    capacity_sats = need.get("amount_sats", 0)
+
+                priority = str(
+                    need.get("priority_tier")
+                    or need.get("urgency")
+                    or "medium"
+                ).lower()
+                severity = "high" if priority in {"critical", "high"} else "medium"
+                relevance = max(
+                    relevance_for(source_peer_id),
+                    relevance_for(destination_peer_id),
+                )
+                normalized_enriched.append({
+                    "member_id": member_id,
+                    "source_peer_id": source_peer_id,
+                    "destination_peer_id": destination_peer_id,
+                    "capacity_sats": int(capacity_sats) if isinstance(capacity_sats, (int, float)) else 0,
+                    "severity": severity,
+                    "member_health_tier": health_tier,
+                    "our_relevance": relevance,
+                })
+
+            if normalized_enriched:
+                needs.extend(normalized_enriched)
+                continue
+
+            depleted_channels = [ch for ch in state.get("depleted_channels", []) if ch.get("peer_id")]
+            saturated_channels = [ch for ch in state.get("saturated_channels", []) if ch.get("peer_id")]
+
+            for source_ch in saturated_channels:
+                source_peer_id = source_ch.get("peer_id", "")
+                source_local_pct = float(source_ch.get("local_pct", 1.0) or 1.0)
+                source_capacity = int(source_ch.get("capacity_sats", 0) or 0)
+                for dest_ch in depleted_channels:
+                    destination_peer_id = dest_ch.get("peer_id", "")
+                    if (
+                        not destination_peer_id
+                        or source_peer_id == destination_peer_id
+                    ):
+                        continue
+
+                    dest_local_pct = float(dest_ch.get("local_pct", 0.0) or 0.0)
+                    dest_capacity = int(dest_ch.get("capacity_sats", 0) or 0)
+                    severity = (
+                        "high"
+                        if source_local_pct > 0.9 or dest_local_pct < 0.1
+                        else "medium"
+                    )
+                    relevance = max(
+                        relevance_for(source_peer_id),
+                        relevance_for(destination_peer_id),
+                    )
+                    needs.append({
+                        "member_id": member_id,
+                        "source_peer_id": source_peer_id,
+                        "destination_peer_id": destination_peer_id,
+                        "capacity_sats": min(source_capacity, dest_capacity),
+                        "severity": severity,
+                        "member_health_tier": health_tier,
+                        "our_relevance": relevance,
+                    })
+
+        needs.sort(key=lambda n: (
+            tier_priority.get(n["member_health_tier"], 2),
+            severity_priority.get(n["severity"], 1),
+            -n["our_relevance"],
+            -int(n.get("capacity_sats", 0) or 0),
+        ))
+        return needs
+
     def _calculate_relevance_score(self, peer_id: str) -> float:
         """
         Calculate how relevant we are to helping with a peer.

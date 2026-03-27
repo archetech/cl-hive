@@ -99,6 +99,9 @@ class MockLiquidityCoordinator:
     def get_fleet_liquidity_needs(self):
         return self.needs
 
+    def get_fleet_corridor_needs(self):
+        return self.needs
+
     def add_need(self, target_peer_id, reporter_id, amount_sats=1_000_000):
         self.needs.append({
             "target_peer_id": target_peer_id,
@@ -112,6 +115,20 @@ class MockLiquidityCoordinator:
             "member_id": member_id,
             "capacity_sats": capacity_sats,
             "need_type": need_type,
+        })
+
+    def add_corridor_need(
+        self,
+        source_peer_id,
+        destination_peer_id,
+        member_id,
+        capacity_sats=1_000_000,
+    ):
+        self.needs.append({
+            "source_peer_id": source_peer_id,
+            "destination_peer_id": destination_peer_id,
+            "member_id": member_id,
+            "capacity_sats": capacity_sats,
         })
 
     def set_local_saturated_channels(self, member_id, channels):
@@ -239,6 +256,25 @@ class TestFlowCorridorManager:
         assert set(corridors[0].capable_members) == {member_a, member_b}
         assert corridors[0].total_volume_sats == 8_000_000
         assert corridors[0].competition_level == "low"
+
+    def test_identify_corridors_groups_directional_corridor_needs(self):
+        """Directional source->destination needs should group into real corridors."""
+        member_a = "02" + "a" * 64
+        member_b = "02" + "b" * 64
+        self.liquidity_coord.add_corridor_need(
+            "source-peer", "dest-peer", member_a, capacity_sats=5_000_000
+        )
+        self.liquidity_coord.add_corridor_need(
+            "source-peer", "dest-peer", member_b, capacity_sats=3_000_000
+        )
+
+        corridors = self.manager.identify_corridors()
+
+        assert len(corridors) == 1
+        assert corridors[0].source_peer_id == "source-peer"
+        assert corridors[0].destination_peer_id == "dest-peer"
+        assert set(corridors[0].capable_members) == {member_a, member_b}
+        assert corridors[0].total_volume_sats == 8_000_000
 
     def test_assess_competition_level(self):
         """Test competition level assessment."""
