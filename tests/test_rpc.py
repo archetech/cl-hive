@@ -96,8 +96,15 @@ def _load_cl_hive_main():
     assert spec is not None and spec.loader is not None
 
     class _TestPlugin:
-        def method(self, *_args, **_kwargs):
-            return lambda fn: fn
+        def __init__(self):
+            self.methods = {}
+
+        def method(self, name, *_args, **_kwargs):
+            def decorator(fn):
+                self.methods[name] = fn.__name__
+                return fn
+
+            return decorator
 
         def init(self):
             return lambda fn: fn
@@ -123,6 +130,12 @@ def _load_cl_hive_main():
     with patch.dict(sys.modules, {"pyln": fake_pyln, "pyln.client": fake_pyln_client}):
         spec.loader.exec_module(module)
     return module
+
+
+def test_stubbed_rebalance_rpc_not_registered():
+    mod = _load_cl_hive_main()
+
+    assert "hive-rebalance-recommendations" not in mod.plugin.methods
 
 
 # =============================================================================

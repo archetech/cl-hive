@@ -116,8 +116,6 @@ from modules.rpc_commands import (
     egress_desaturation_bias as rpc_egress_desaturation_bias,
     corridor_assignments as rpc_corridor_assignments,
     fee_coordination_status as rpc_fee_coordination_status,
-    # Rebalance
-    rebalance_recommendations as rpc_rebalance_recommendations,
     rebalance_hubs as rpc_rebalance_hubs,
     check_rebalance_conflict as rpc_check_rebalance_conflict,
     # Channel Rationalization
@@ -3745,10 +3743,6 @@ def hive_fee_coordination_status(plugin: Plugin):
 # YIELD OPTIMIZATION PHASE 3: COST REDUCTION
 # =============================================================================
 
-@plugin.method("hive-rebalance-recommendations")
-def hive_rebalance_recommendations(plugin: Plugin, prediction_hours: int = 24):
-    """Get predictive rebalance recommendations."""
-    return rpc_rebalance_recommendations(_get_hive_context(), prediction_hours=prediction_hours)
 # =============================================================================
 # CHANNEL RATIONALIZATION RPC METHODS
 # =============================================================================

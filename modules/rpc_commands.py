@@ -825,33 +825,6 @@ def fee_coordination_status(ctx: HiveContext) -> Dict[str, Any]:
 # =============================================================================
 # YIELD OPTIMIZATION PHASE 3: COST REDUCTION
 # =============================================================================
-# Reduce rebalancing costs by 50% through:
-# - Predictive rebalancing (low urgency = low fees)
-# - Fleet rebalance routing (internal paths cheaper)
-# - Circular flow detection (eliminate waste)
-
-def rebalance_recommendations(
-    ctx: HiveContext,
-    prediction_hours: int = 24
-) -> Dict[str, Any]:
-    """
-    Get predictive rebalance recommendations.
-
-    Returns:
-        Dict with rebalance recommendations sorted by urgency.
-    """
-    # Cost reduction manager removed — return empty recommendations
-    return {
-        "recommendations": [],
-        "by_urgency": {"critical": [], "high": [], "medium": [], "low": []},
-        "total_count": 0,
-        "critical_count": 0,
-        "prediction_hours": prediction_hours,
-    }
-
-
-
-
 # =============================================================================
 # CHANNEL RATIONALIZATION COMMANDS
 # =============================================================================
