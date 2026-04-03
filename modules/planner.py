@@ -912,25 +912,31 @@ class Planner:
             for dest in test_destinations:
                 try:
                     # Route without virtual channel
-                    base_result = self.plugin.rpc.call("getroutes", {
-                        "source": our_id,
-                        "destination": dest,
-                        "amount_msat": 10000000,  # 10k sats test (small to avoid MCF failures)
-                        "layers": layers_base,
-                        "maxfee_msat": 1000000,  # 1k sats max fee for 10k test  # 10k sats max fee
-                        "final_cltv": 18,
-                    })
+                    try:
+                        base_result = self.plugin.rpc.call("getroutes", {
+                            "source": our_id,
+                            "destination": dest,
+                            "amount_msat": 10000000,
+                            "layers": layers_base,
+                            "maxfee_msat": 1000000,
+                            "final_cltv": 18,
+                        })
+                    except Exception:
+                        continue
                     base_routes = base_result.get("routes", [])
 
                     # Route with virtual channel
-                    with_result = self.plugin.rpc.call("getroutes", {
-                        "source": our_id,
-                        "destination": dest,
-                        "amount_msat": 100000000,
-                        "layers": layers_with,
-                        "maxfee_msat": 1000000,  # 1k sats max fee for 10k test
-                        "final_cltv": 18,
-                    })
+                    try:
+                        with_result = self.plugin.rpc.call("getroutes", {
+                            "source": our_id,
+                            "destination": dest,
+                            "amount_msat": 10000000,
+                            "layers": layers_with,
+                            "maxfee_msat": 1000000,
+                            "final_cltv": 18,
+                        })
+                    except Exception:
+                        continue
                     with_routes = with_result.get("routes", [])
 
                     # Compare: better probability or fewer hops = improvement
