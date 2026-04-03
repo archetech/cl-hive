@@ -54,7 +54,7 @@ class AskreneLayerManager:
         self._our_id: Optional[str] = None
         self._last_refresh: float = 0
 
-    def _log(self, msg: str, level: str = "debug") -> None:
+    def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
             self.plugin.log(f"[AskreneLayerManager] {msg}", level=level)
 
