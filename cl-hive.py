@@ -190,6 +190,7 @@ traffic_intel_mgr: Optional[TrafficIntelligenceManager] = None
 health_aggregator: Optional[HealthScoreAggregator] = None
 liquidity_coord: Optional[LiquidityCoordinator] = None
 peer_reputation_mgr: Optional[PeerReputationManager] = None
+askrene_layer_mgr = None
 yield_metrics_mgr: Optional[YieldMetricsManager] = None
 fee_coordination_mgr: Optional[FeeCoordinationManager] = None
 rationalization_mgr: Optional[RationalizationManager] = None
@@ -717,6 +718,16 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     peer_reputation_mgr.aggregate_from_database()
     plugin.log("cl-hive: Peer reputation manager initialized")
 
+    # Initialize askrene layer manager (manages hive-fleet + hive-reputation layers)
+    from modules.askrene_layers import AskreneLayerManager
+    global askrene_layer_mgr
+    askrene_layer_mgr = AskreneLayerManager(
+        plugin=plugin,
+        database=database,
+        peer_reputation_mgr=peer_reputation_mgr,
+    )
+    plugin.log("cl-hive: askrene layer manager initialized")
+
     # Initialize Network Metrics Calculator (shared module)
     network_metrics.init_calculator(
         state_manager=state_manager,
@@ -865,6 +876,7 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         'fee_intel_mgr': fee_intel_mgr,
         'gossip_mgr': gossip_mgr,
         'peer_reputation_mgr': peer_reputation_mgr,
+        'askrene_layer_mgr': askrene_layer_mgr,
         'yield_metrics_mgr': yield_metrics_mgr,
         'strategic_positioning_mgr': strategic_positioning_mgr,
         'rationalization_mgr': rationalization_mgr,

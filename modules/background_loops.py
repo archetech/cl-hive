@@ -453,6 +453,14 @@ def fee_intelligence_loop():
             except Exception as e:
                 plugin.log(f"cl-hive: Peer reputation broadcast check error: {e}", level='debug')
 
+            # Step 5i: Refresh askrene fleet intelligence layers
+            try:
+                if askrene_layer_mgr:
+                    layer_results = askrene_layer_mgr.refresh_all()
+                    shutdown_event.wait(0.05)
+            except Exception as e:
+                plugin.log(f"cl-hive: askrene layer refresh error: {e}", level='debug')
+
             # Step 6: Cleanup old liquidity needs
             try:
                 deleted_needs = database.cleanup_old_liquidity_needs(max_age_hours=24)
