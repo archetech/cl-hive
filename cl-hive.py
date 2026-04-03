@@ -718,16 +718,6 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     peer_reputation_mgr.aggregate_from_database()
     plugin.log("cl-hive: Peer reputation manager initialized")
 
-    # Initialize askrene layer manager (manages hive-fleet + hive-reputation layers)
-    from modules.askrene_layers import AskreneLayerManager
-    global askrene_layer_mgr
-    askrene_layer_mgr = AskreneLayerManager(
-        plugin=plugin,
-        database=database,
-        peer_reputation_mgr=peer_reputation_mgr,
-    )
-    plugin.log("cl-hive: askrene layer manager initialized")
-
     # Initialize Network Metrics Calculator (shared module)
     network_metrics.init_calculator(
         state_manager=state_manager,
@@ -803,6 +793,20 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
 
     # Phase 3c: Wire traffic intelligence into fee coordination
     fee_coordination_mgr.set_traffic_intel_mgr(traffic_intel_mgr)
+
+    # Initialize askrene layer manager (manages hive-fleet + hive-reputation +
+    # hive-corridors + hive-traffic layers); placed after fee_coordination_mgr
+    # and traffic_intel_mgr so they can be injected immediately.
+    from modules.askrene_layers import AskreneLayerManager
+    global askrene_layer_mgr
+    askrene_layer_mgr = AskreneLayerManager(
+        plugin=plugin,
+        database=database,
+        peer_reputation_mgr=peer_reputation_mgr,
+        fee_coordination_mgr=fee_coordination_mgr,
+        traffic_intel_mgr=traffic_intel_mgr,
+    )
+    plugin.log("cl-hive: askrene layer manager initialized")
 
     # Initialize Outbox Manager (Phase D - Reliable Delivery)
     global outbox_mgr
