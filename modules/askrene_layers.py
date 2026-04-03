@@ -320,7 +320,7 @@ class AskreneLayerManager:
 
             self.plugin.rpc.call("askrene-create-layer", {"layer": self.CORRIDORS_LAYER})
 
-            assignments = self.fee_coordination_mgr.get_assignments()
+            assignments = self.fee_coordination_mgr.corridor_mgr.get_assignments()
             if not assignments:
                 return True  # Empty but valid
 
