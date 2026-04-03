@@ -22,6 +22,8 @@ class AskreneLayerManager:
 
     FLEET_LAYER = "hive-fleet"
     REPUTATION_LAYER = "hive-reputation"
+    CORRIDORS_LAYER = "hive-corridors"
+    TRAFFIC_LAYER = "hive-traffic"
 
     # Reputation thresholds for node bias
     REPUTATION_EXCELLENT = 80   # bias +5
@@ -33,16 +35,21 @@ class AskreneLayerManager:
     DISABLE_FORCE_CLOSE_THRESHOLD = 2
     DISABLE_HTLC_SUCCESS_THRESHOLD = 0.5
 
-    def __init__(self, plugin, database, peer_reputation_mgr):
+    def __init__(self, plugin, database, peer_reputation_mgr,
+                 fee_coordination_mgr=None, traffic_intel_mgr=None):
         """
         Args:
             plugin: CLN plugin reference for RPC + logging
             database: HiveDatabase for member queries
             peer_reputation_mgr: PeerReputationManager for reputation data
+            fee_coordination_mgr: FeeCoordinationManager for corridor assignments
+            traffic_intel_mgr: TrafficIntelligenceManager for traffic profiles
         """
         self.plugin = plugin
         self.database = database
         self.peer_reputation_mgr = peer_reputation_mgr
+        self.fee_coordination_mgr = fee_coordination_mgr
+        self.traffic_intel_mgr = traffic_intel_mgr
         self.available: bool = False
         self._our_id: Optional[str] = None
         self._last_refresh: float = 0
@@ -74,6 +81,8 @@ class AskreneLayerManager:
         results = {}
         results[self.FLEET_LAYER] = self._refresh_fleet_layer()
         results[self.REPUTATION_LAYER] = self._refresh_reputation_layer()
+        results[self.CORRIDORS_LAYER] = self._refresh_corridors_layer()
+        results[self.TRAFFIC_LAYER] = self._refresh_traffic_layer()
         return results
 
     # ------------------------------------------------------------------
@@ -287,4 +296,167 @@ class AskreneLayerManager:
 
         except Exception as e:
             self._log(f"Reputation layer refresh failed: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # hive-corridors layer
+    # ------------------------------------------------------------------
+
+    def _refresh_corridors_layer(self) -> bool:
+        """Create hive-corridors layer with bias for valuable flow corridors.
+
+        Biases channels serving high-value corridors so getroutes prefers
+        routing through them.  Fee overrides apply corridor-optimal fees
+        to fleet member channels.
+        """
+        if not self.plugin or not self.fee_coordination_mgr:
+            return False
+
+        try:
+            try:
+                self.plugin.rpc.call("askrene-remove-layer", {"layer": self.CORRIDORS_LAYER})
+            except Exception:
+                pass
+
+            self.plugin.rpc.call("askrene-create-layer", {"layer": self.CORRIDORS_LAYER})
+
+            assignments = self.fee_coordination_mgr.get_assignments()
+            if not assignments:
+                return True  # Empty but valid
+
+            biased = 0
+
+            # Get our channel SCIDs mapped to peer_id for corridor matching
+            channels = self.plugin.rpc.listpeerchannels()
+            peer_to_scids: Dict[str, list] = {}
+            for ch in channels.get("channels", []):
+                if ch.get("state") != "CHANNELD_NORMAL":
+                    continue
+                pid = ch.get("peer_id", "")
+                scid = ch.get("short_channel_id", "")
+                if pid and scid:
+                    peer_to_scids.setdefault(pid, []).append(scid)
+
+            for assignment in assignments:
+                corridor = assignment.corridor
+                volume = corridor.total_volume_sats
+
+                # Score by volume
+                if volume > 50_000_000:
+                    bias = 8
+                elif volume > 20_000_000:
+                    bias = 4
+                elif volume > 5_000_000:
+                    bias = 2
+                else:
+                    continue  # Not valuable enough to bias
+
+                # Bias channels to corridor source and destination peers
+                for peer_id in (corridor.source_peer_id, corridor.destination_peer_id):
+                    for scid in peer_to_scids.get(peer_id, []):
+                        for direction in (0, 1):
+                            try:
+                                self.plugin.rpc.call("askrene-bias-channel", {
+                                    "layer": self.CORRIDORS_LAYER,
+                                    "short_channel_id_dir": f"{scid}/{direction}",
+                                    "bias": bias,
+                                    "description": f"corridor vol={volume}",
+                                })
+                                biased += 1
+                            except Exception:
+                                pass
+
+            if biased > 0:
+                self._log(f"Refreshed {self.CORRIDORS_LAYER} ({biased} channel biases)")
+            return True
+
+        except Exception as e:
+            self._log(f"Corridors layer refresh failed: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # hive-traffic layer
+    # ------------------------------------------------------------------
+
+    def _refresh_traffic_layer(self) -> bool:
+        """Create hive-traffic layer with drain-direction biases.
+
+        Biases channels in the direction that helps natural rebalancing
+        based on observed traffic patterns.
+        """
+        if not self.plugin or not self.traffic_intel_mgr:
+            return False
+
+        try:
+            try:
+                self.plugin.rpc.call("askrene-remove-layer", {"layer": self.TRAFFIC_LAYER})
+            except Exception:
+                pass
+
+            self.plugin.rpc.call("askrene-create-layer", {"layer": self.TRAFFIC_LAYER})
+
+            profiles = self.traffic_intel_mgr.get_all_profiles()
+            if not profiles:
+                return True
+
+            # Get our channels for SCID lookup
+            channels = self.plugin.rpc.listpeerchannels()
+            peer_to_scids: Dict[str, list] = {}
+            for ch in channels.get("channels", []):
+                if ch.get("state") != "CHANNELD_NORMAL":
+                    continue
+                pid = ch.get("peer_id", "")
+                scid = ch.get("short_channel_id", "")
+                if pid and scid:
+                    peer_to_scids.setdefault(pid, []).append(scid)
+
+            biased = 0
+            for profile in profiles:
+                peer_id = profile.get("peer_id", "")
+                drain = profile.get("drain_direction", "balanced")
+                confidence = float(profile.get("confidence", 0))
+
+                if drain == "balanced" or confidence < 0.3:
+                    continue
+
+                # Base bias scaled by confidence
+                base_bias = int(3 * min(1.0, confidence))
+                if base_bias < 1:
+                    continue
+
+                for scid in peer_to_scids.get(peer_id, []):
+                    if drain == "inbound_heavy":
+                        # Peer sends us traffic — bias outbound to help rebalance
+                        direction = 0  # us→peer
+                    else:
+                        # outbound_heavy — bias inbound
+                        direction = 1  # peer→us
+
+                    try:
+                        self.plugin.rpc.call("askrene-bias-channel", {
+                            "layer": self.TRAFFIC_LAYER,
+                            "short_channel_id_dir": f"{scid}/{direction}",
+                            "bias": base_bias,
+                            "description": f"drain={drain} conf={confidence:.2f}",
+                        })
+                        biased += 1
+                    except Exception:
+                        pass
+
+            # Age stale traffic info (6 hour cutoff)
+            cutoff = int(time.time()) - 21600
+            try:
+                self.plugin.rpc.call("askrene-age", {
+                    "layer": self.TRAFFIC_LAYER,
+                    "cutoff": cutoff,
+                })
+            except Exception:
+                pass
+
+            if biased > 0:
+                self._log(f"Refreshed {self.TRAFFIC_LAYER} ({biased} drain biases)")
+            return True
+
+        except Exception as e:
+            self._log(f"Traffic layer refresh failed: {e}")
             return False
