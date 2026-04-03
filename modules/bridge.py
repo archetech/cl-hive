@@ -569,6 +569,24 @@ class Bridge:
         except Exception:
             return None
 
+    def get_profitability(self) -> Optional[Dict[str, Any]]:
+        """
+        Get channel profitability data from cl-revenue-ops.
+
+        Returns:
+            Dict with per-channel profitability analysis, or None if unavailable
+        """
+        if self._status == BridgeStatus.DISABLED:
+            return None
+
+        try:
+            result = self.safe_call("revenue-profitability")
+            if isinstance(result, dict) and "error" not in result:
+                return result
+            return None
+        except Exception:
+            return None
+
     # =========================================================================
     # STATUS & STATISTICS
     # =========================================================================

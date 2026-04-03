@@ -730,7 +730,8 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
     yield_metrics_mgr = YieldMetricsManager(
         database=database,
         plugin=plugin,
-        state_manager=state_manager
+        state_manager=state_manager,
+        bridge=bridge
     )
     yield_metrics_mgr.set_our_pubkey(our_pubkey)
     plugin.log("cl-hive: Yield metrics manager initialized")
