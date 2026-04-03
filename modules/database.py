@@ -526,30 +526,6 @@ class HiveDatabase:
         )
 
         # =====================================================================
-        # TEMPORAL PATTERNS TABLE (Phase 7.1 - Anticipatory Liquidity)
-        # =====================================================================
-        # Stores detected temporal patterns for liquidity prediction
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS temporal_patterns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id TEXT NOT NULL,
-                hour_of_day INTEGER,
-                day_of_week INTEGER,
-                direction TEXT NOT NULL,
-                intensity REAL NOT NULL DEFAULT 1.0,
-                confidence REAL NOT NULL DEFAULT 0.5,
-                samples INTEGER NOT NULL DEFAULT 0,
-                avg_flow_sats INTEGER NOT NULL DEFAULT 0,
-                detected_at INTEGER NOT NULL,
-                UNIQUE(channel_id, hour_of_day, day_of_week)
-            )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_temporal_patterns_channel "
-            "ON temporal_patterns(channel_id)"
-        )
-
-        # =====================================================================
         # PEER CAPABILITIES TABLE (Phase B - Version Tolerance)
         # =====================================================================
         # Stores peer feature sets and max supported protocol version

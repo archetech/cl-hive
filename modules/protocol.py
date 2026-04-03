@@ -114,7 +114,7 @@ class HiveMessageType(IntEnum):
     # Fleet-wide intelligence
     YIELD_METRICS_BATCH = 32857    # Per-channel ROI and profitability metrics
     # 32859 removed (CIRCULAR_FLOW_ALERT — fee coordination)
-    TEMPORAL_PATTERN_BATCH = 32861 # Hour/day flow patterns and predictions
+    # 32861 removed (TEMPORAL_PATTERN_BATCH — never implemented)
     CORRIDOR_VALUE_BATCH = 32863   # High-value routing corridors discovered
     POSITIONING_PROPOSAL = 32865   # Channel open recommendation for fleet coordination
     # 32867 removed (PHYSARUM_RECOMMENDATION — fee coordination)
@@ -186,11 +186,6 @@ YIELD_METRICS_BATCH_RATE_LIMIT = (1, 86400)  # 1 batch per day per sender
 MAX_YIELD_METRICS_IN_BATCH = 200             # Maximum channels in one batch
 MIN_YIELD_ROI_TO_SHARE = -100.0              # Share even underwater channels (negative ROI)
 YIELD_WEIGHTING_FACTOR = 0.4                 # How much to weight remote yield data
-
-# Temporal pattern sharing constants (Phase 14)
-TEMPORAL_PATTERN_BATCH_RATE_LIMIT = (4, 86400)  # 4 batches per day (every 6 hours)
-MAX_PATTERNS_IN_BATCH = 500                     # Maximum patterns in one batch
-MAX_TEMPORAL_PATTERNS_IN_BATCH = MAX_PATTERNS_IN_BATCH  # Alias for consistency
 MIN_PATTERN_CONFIDENCE = 0.6                    # Minimum confidence to share
 MIN_PATTERN_SAMPLES = 10                        # Minimum samples for pattern validity
 MIN_TEMPORAL_PATTERN_CONFIDENCE = MIN_PATTERN_CONFIDENCE  # Alias
@@ -1928,136 +1923,6 @@ def create_yield_metrics_batch(
 
     return serialize(HiveMessageType.YIELD_METRICS_BATCH, payload)
 
-
-# =============================================================================
-# CIRCULAR FLOW ALERT FUNCTIONS (Phase 14)
-# =============================================================================
-
-def get_temporal_pattern_batch_signing_payload(payload: Dict[str, Any]) -> str:
-    """
-    Get the canonical string to sign for TEMPORAL_PATTERN_BATCH messages.
-    """
-    patterns = payload.get("patterns", [])
-    sorted_patterns = sorted(patterns, key=lambda p: (p.get("peer_id", ""), p.get("hour_of_day", 0)))
-    patterns_str = json.dumps(sorted_patterns, sort_keys=True, separators=(',', ':'))
-    patterns_hash = hashlib.sha256(patterns_str.encode()).hexdigest()[:16]
-
-    return (
-        f"TEMPORAL_PATTERN_BATCH:"
-        f"{payload.get('reporter_id', '')}:"
-        f"{payload.get('timestamp', 0)}:"
-        f"{len(patterns)}:"
-        f"{patterns_hash}"
-    )
-
-
-def validate_temporal_pattern_batch(payload: Dict[str, Any]) -> bool:
-    """
-    Validate a TEMPORAL_PATTERN_BATCH payload.
-    """
-    reporter_id = payload.get("reporter_id")
-    if not reporter_id or not isinstance(reporter_id, str):
-        return False
-    if len(reporter_id) > MAX_PEER_ID_LEN:
-        return False
-
-    timestamp = payload.get("timestamp")
-    if not isinstance(timestamp, (int, float)):
-        return False
-    now = time.time()
-    if timestamp > now + 300:
-        return False
-    if timestamp < now - (48 * 3600):
-        return False
-
-    signature = payload.get("signature")
-    if not signature or not isinstance(signature, str):
-        return False
-
-    patterns = payload.get("patterns")
-    if not isinstance(patterns, list):
-        return False
-    if len(patterns) > MAX_PATTERNS_IN_BATCH:
-        return False
-
-    for p in patterns:
-        if not isinstance(p, dict):
-            return False
-
-        peer_id = p.get("peer_id")
-        if not peer_id or not isinstance(peer_id, str):
-            return False
-        if len(peer_id) > MAX_PEER_ID_LEN:
-            return False
-
-        hour = p.get("hour_of_day")
-        if not isinstance(hour, int) or hour < 0 or hour > 23:
-            return False
-
-        day = p.get("day_of_week")
-        if not isinstance(day, int) or day < -1 or day > 6:  # -1 = every day
-            return False
-
-        direction = p.get("direction")
-        if direction not in ("inbound", "outbound", "bidirectional"):
-            return False
-
-        intensity = p.get("intensity")
-        if not isinstance(intensity, (int, float)) or intensity < 0 or intensity > 1:
-            return False
-
-        confidence = p.get("confidence")
-        if not isinstance(confidence, (int, float)) or confidence < 0 or confidence > 1:
-            return False
-
-    return True
-
-
-def create_temporal_pattern_batch(
-    patterns: List[Dict[str, Any]],
-    rpc: Any,
-    our_pubkey: str
-) -> Optional[bytes]:
-    """
-    Create a TEMPORAL_PATTERN_BATCH message.
-
-    This message shares detected temporal flow patterns with the fleet,
-    enabling coordinated liquidity positioning and fee optimization.
-
-    Args:
-        patterns: List of pattern entries, each containing:
-            - peer_id: External peer pubkey
-            - channel_id: Channel short ID
-            - hour_of_day: 0-23 hour when pattern occurs
-            - day_of_week: 0-6 (Mon-Sun) or -1 for every day
-            - direction: inbound/outbound/bidirectional
-            - intensity: Flow intensity 0-1
-            - confidence: Pattern confidence 0-1
-            - samples: Number of samples used to detect pattern
-        rpc: CLN RPC interface for signing
-        our_pubkey: Our node's public key
-
-    Returns:
-        Serialized TEMPORAL_PATTERN_BATCH message, or None on error
-    """
-    timestamp = int(time.time())
-
-    payload = {
-        "reporter_id": our_pubkey,
-        "timestamp": timestamp,
-        "signature": "",
-        "patterns": patterns,
-    }
-
-    try:
-        signing_payload = get_temporal_pattern_batch_signing_payload(payload)
-        sign_result = rpc.signmessage(signing_payload)
-        signature = sign_result.get("signature", sign_result.get("zbase", ""))
-        payload["signature"] = signature
-    except Exception:
-        return None
-
-    return serialize(HiveMessageType.TEMPORAL_PATTERN_BATCH, payload)
 
 
 # =============================================================================

@@ -1110,16 +1110,17 @@ class Planner:
 
         # Get underwater count from bridge (revenue-profitability)
         underwater_count = 0
-        try:
-            prof_result = self.bridge.safe_call('revenue-profitability', {})
-            if prof_result and isinstance(prof_result, dict):
-                prof_channels = prof_result.get('channels', [])
-                for pch in prof_channels:
-                    if pch.get('profitability_class') in ('underwater', 'bleeder'):
-                        underwater_count += 1
-        except Exception:
-            # Bridge failure is non-fatal; default to 0
-            pass
+        if self.bridge:
+            try:
+                prof_result = self.bridge.safe_call('revenue-profitability', {})
+                if prof_result and isinstance(prof_result, dict):
+                    prof_channels = prof_result.get('channels', [])
+                    for pch in prof_channels:
+                        if pch.get('profitability_class') in ('underwater', 'bleeder'):
+                            underwater_count += 1
+            except Exception:
+                # Bridge failure is non-fatal; default to 0
+                pass
 
         underwater_pct = round(underwater_count * 100.0 / active, 1) if active > 0 else 0.0
 
