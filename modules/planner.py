@@ -904,9 +904,17 @@ class Planner:
                 return 1.0
 
             # Compare route quality with and without the virtual channel
+            # Build layer list dynamically — only include layers that exist
             improvement_count = 0
-            layers_base = ["auto.localchans", "auto.sourcefree",
-                           "hive-fleet", "hive-reputation"]
+            layers_base = ["auto.localchans", "auto.sourcefree"]
+            try:
+                existing = self.plugin.rpc.call("askrene-listlayers", {})
+                for l in existing.get("layers", []):
+                    name = l.get("layer", "")
+                    if name.startswith("hive-"):
+                        layers_base.append(name)
+            except Exception:
+                pass
             layers_with = layers_base + [temp_layer]
 
             for dest in test_destinations:
