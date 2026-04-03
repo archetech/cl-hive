@@ -43,6 +43,7 @@ class HiveContext:
     traffic_intel_mgr: Any = None  # TrafficIntelligenceManager (Phase 14 - Traffic Intelligence)
     fee_intel_mgr: Any = None  # FeeIntelligenceManager (fleet-aggregated fee intelligence)
     peer_reputation_mgr: Any = None  # PeerReputationManager (fleet-aggregated peer quality)
+    state_manager: Any = None  # StateManager (gossip state for fleet member balances)
     our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
     signing_backend: str = "unknown"
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
@@ -2160,6 +2161,19 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
                 rep = ctx.peer_reputation_mgr.get_reputation(peer_id)
                 if rep:
                     hint["reputation_score"] = rep.reputation_score
+            except Exception:
+                pass
+
+        # Fleet member gossip state (capacity, available liquidity, topology)
+        # Pushed as part of hints so cl-revenue-ops doesn't need a separate
+        # hive-fleet-balances RPC that times out under load.
+        if hint.get("member") and ctx.state_manager:
+            try:
+                peer_state = ctx.state_manager.get_peer_state(peer_id)
+                if peer_state:
+                    hint["fleet_capacity_sats"] = peer_state.capacity_sats
+                    hint["fleet_available_sats"] = peer_state.available_sats
+                    hint["fleet_topology"] = peer_state.topology[:50]
             except Exception:
                 pass
 
