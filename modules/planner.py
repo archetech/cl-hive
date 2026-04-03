@@ -1789,6 +1789,124 @@ class Planner:
         return False
 
     # =========================================================================
+    # EXPANSION PROPOSALS
+    # =========================================================================
+
+    def _propose_expansions(self, cfg, run_id: str) -> List[Dict]:
+        """
+        Evaluate underserved targets and log expansion recommendations.
+
+        Checks feerate gate, gets scored targets, and logs the top
+        MAX_EXPANSIONS_PER_CYCLE recommendations as planner decisions.
+        Does not open channels — cl-hive is hint-only.
+
+        Returns:
+            List of decision records.
+        """
+        decisions = []
+
+        # Feerate gate: block expansions when on-chain fees are too high
+        max_feerate = getattr(cfg, 'max_expansion_feerate_perkb', 5000)
+        if max_feerate != 0 and self.plugin:
+            try:
+                feerates = self.plugin.rpc.feerates("perkb")
+                opening = feerates.get("perkb", {}).get("opening")
+                if opening is not None and opening > max_feerate:
+                    self._log(
+                        f"Expansion blocked: feerate {opening} > max {max_feerate} sat/kB",
+                        level='info'
+                    )
+                    self.db.log_planner_action(
+                        action_type='expansion_blocked',
+                        result='feerate_too_high',
+                        details={
+                            'current_feerate': opening,
+                            'max_feerate': max_feerate,
+                            'run_id': run_id,
+                        }
+                    )
+                    return decisions
+            except Exception as e:
+                self._log(f"Feerate check failed: {e}", level='debug')
+
+        # Get scored underserved targets
+        try:
+            targets = self.get_underserved_targets(cfg)
+        except Exception as e:
+            self._log(f"Underserved target analysis failed: {e}", level='warn')
+            return decisions
+
+        if not targets:
+            return decisions
+
+        # Evaluate top targets (up to MAX_EXPANSIONS_PER_CYCLE)
+        proposed = 0
+        for target_result in targets:
+            if proposed >= MAX_EXPANSIONS_PER_CYCLE:
+                break
+
+            # Skip targets with pending intents
+            if self._has_pending_intent(target_result.target):
+                continue
+
+            # Skip ignored (saturated) targets
+            if target_result.target in self._ignored_peers:
+                continue
+
+            try:
+                rec = self.get_expansion_recommendation(target_result.target, cfg)
+            except Exception:
+                continue
+
+            if rec.recommendation_type != "open_channel":
+                continue
+
+            # Quality gate
+            if target_result.quality_score < MIN_QUALITY_SCORE and target_result.quality_recommendation == "avoid":
+                self._log(
+                    f"Expansion skipped for {target_result.target[:16]}: "
+                    f"quality {target_result.quality_score:.2f} < {MIN_QUALITY_SCORE}",
+                    level='debug'
+                )
+                continue
+
+            decision = {
+                'action_type': 'expansion_proposed',
+                'target': target_result.target,
+                'score': round(rec.score, 4),
+                'reasoning': rec.reasoning,
+                'competition_level': rec.competition_level,
+                'hive_coverage_pct': round(rec.hive_coverage_pct * 100, 1),
+                'quality_score': round(target_result.quality_score, 3),
+            }
+            decisions.append(decision)
+
+            self.db.log_planner_action(
+                action_type='expansion_proposed',
+                result='proposed',
+                target=target_result.target,
+                details={
+                    'score': round(rec.score, 4),
+                    'reasoning': rec.reasoning,
+                    'competition_level': rec.competition_level,
+                    'hive_coverage_pct': round(rec.hive_coverage_pct * 100, 1),
+                    'network_channels': rec.network_channels,
+                    'quality_score': round(target_result.quality_score, 3),
+                    'run_id': run_id,
+                }
+            )
+
+            self._log(
+                f"Expansion proposed: {target_result.target[:16]}... "
+                f"(score={rec.score:.1f}, competition={rec.competition_level}, "
+                f"coverage={rec.hive_coverage_pct:.0%})",
+                level='info'
+            )
+            proposed += 1
+
+        return decisions
+
+    # =========================================================================
     # RUN CYCLE
     # =========================================================================
 
@@ -1837,6 +1955,10 @@ class Planner:
             # Release over-ignored peers (best effort)
             release_decisions = self._release_saturation(cfg, run_id)
             decisions.extend(release_decisions)
+
+            # Propose expansions to underserved targets
+            expansion_decisions = self._propose_expansions(cfg, run_id)
+            decisions.extend(expansion_decisions)
 
             self._log(f"Planner cycle complete (run_id={run_id}): {len(decisions)} decisions")
             self.db.log_planner_action(
