@@ -461,6 +461,30 @@ def fee_intelligence_loop():
             except Exception as e:
                 plugin.log(f"cl-hive: askrene layer refresh error: {e}", level='debug')
 
+            # Step 5j: Push hints to CLN datastore for cl-revenue-ops
+            # This avoids cross-plugin RPC round-trips — cl-revenue-ops reads
+            # from datastore (fast local RPC) instead of calling hive-export-hints.
+            try:
+                if plugin and database:
+                    from modules import rpc_commands
+                    ctx = None
+                    try:
+                        # Use the same context builder as the RPC handler
+                        import cl_hive  # noqa: deferred import
+                        ctx = cl_hive._get_hive_context()
+                    except Exception:
+                        pass
+                    if ctx:
+                        hints = rpc_commands.export_hints(ctx)
+                        if hints and isinstance(hints, dict):
+                            plugin.rpc.datastore(
+                                key=["hive", "hints"],
+                                string=json.dumps(hints),
+                                mode="create-or-replace",
+                            )
+            except Exception as e:
+                plugin.log(f"cl-hive: datastore hint push failed: {e}", level='debug')
+
             # Step 6: Cleanup old liquidity needs
             try:
                 deleted_needs = database.cleanup_old_liquidity_needs(max_age_hours=24)
