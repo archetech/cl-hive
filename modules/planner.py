@@ -915,9 +915,9 @@ class Planner:
                     base_result = self.plugin.rpc.call("getroutes", {
                         "source": our_id,
                         "destination": dest,
-                        "amount_msat": 100000000,  # 100k sats test
+                        "amount_msat": 10000000,  # 10k sats test (small to avoid MCF failures)
                         "layers": layers_base,
-                        "maxfee_msat": 10000000,  # 10k sats max fee
+                        "maxfee_msat": 1000000,  # 1k sats max fee for 10k test  # 10k sats max fee
                         "final_cltv": 18,
                     })
                     base_routes = base_result.get("routes", [])
@@ -928,7 +928,7 @@ class Planner:
                         "destination": dest,
                         "amount_msat": 100000000,
                         "layers": layers_with,
-                        "maxfee_msat": 10000000,
+                        "maxfee_msat": 1000000,  # 1k sats max fee for 10k test
                         "final_cltv": 18,
                     })
                     with_routes = with_result.get("routes", [])
