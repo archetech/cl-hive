@@ -442,6 +442,17 @@ def fee_intelligence_loop():
             except Exception as e:
                 plugin.log(f"cl-hive: Traffic intelligence broadcast check error: {e}", level='debug')
 
+            # Step 5h: Broadcast peer reputation (Daily)
+            try:
+                today = time.strftime("%Y-%m-%d")
+                last_rep_broadcast = getattr(_broadcast_our_peer_reputation, '_last_broadcast', None)
+                if last_rep_broadcast != today:
+                    _broadcast_our_peer_reputation()
+                    _broadcast_our_peer_reputation._last_broadcast = today
+                    shutdown_event.wait(0.05)
+            except Exception as e:
+                plugin.log(f"cl-hive: Peer reputation broadcast check error: {e}", level='debug')
+
             # Step 6: Cleanup old liquidity needs
             try:
                 deleted_needs = database.cleanup_old_liquidity_needs(max_age_hours=24)
@@ -821,6 +832,198 @@ def _broadcast_our_traffic_intelligence():
                 plugin.log("cl-hive: Broadcast traffic intelligence to fleet", level='debug')
     except Exception as e:
         plugin.log(f"cl-hive: Traffic intelligence broadcast error: {e}", level='warn')
+
+
+def _broadcast_our_peer_reputation():
+    """
+    Collect peer reputation observations and broadcast to hive.
+
+    Called daily by the intelligence broadcast loop.
+    Gathers per-peer channel health, HTLC success rates, and volume
+    from local RPC data, then broadcasts a single
+    PEER_REPUTATION_SNAPSHOT message.
+    """
+    if not peer_reputation_mgr or not plugin or not database or not our_pubkey:
+        return
+
+    try:
+        from modules.protocol import (
+            get_peer_reputation_snapshot_signing_payload,
+            create_peer_reputation_snapshot,
+        )
+
+        # Get hive member IDs to exclude
+        members = database.get_all_members()
+        member_ids = {m.get("peer_id") for m in members}
+
+        # Get channel data
+        try:
+            peer_channels = plugin.rpc.listpeerchannels()
+        except Exception:
+            return
+        all_channels = peer_channels.get("channels", [])
+
+        # Get peer connection status
+        try:
+            peers_info = plugin.rpc.listpeers()
+            connected_peers = {
+                p.get("id") for p in peers_info.get("peers", [])
+                if p.get("connected")
+            }
+        except Exception:
+            connected_peers = set()
+
+        # Get 7-day forwards for HTLC success rate and volume
+        seven_days_ago = int(time.time()) - (7 * 24 * 3600)
+
+        try:
+            settled = plugin.rpc.listforwards(status="settled")
+            settled_list = settled.get("forwards", [])
+        except Exception:
+            settled_list = []
+
+        try:
+            failed = plugin.rpc.listforwards(status="failed")
+            failed_list = failed.get("forwards", [])
+        except Exception:
+            failed_list = []
+
+        # Count settled/failed per outbound peer channel
+        peer_settled: Dict[str, int] = {}
+        peer_volume: Dict[str, int] = {}
+        for fwd in settled_list:
+            if fwd.get("received_time", 0) < seven_days_ago:
+                continue
+            out_ch = fwd.get("out_channel", "")
+            if out_ch:
+                peer_settled[out_ch] = peer_settled.get(out_ch, 0) + 1
+                peer_volume[out_ch] = peer_volume.get(out_ch, 0) + (fwd.get("out_msat", 0) // 1000)
+
+        peer_failed: Dict[str, int] = {}
+        for fwd in failed_list:
+            if fwd.get("received_time", 0) < seven_days_ago:
+                continue
+            out_ch = fwd.get("out_channel", "")
+            if out_ch:
+                peer_failed[out_ch] = peer_failed.get(out_ch, 0) + 1
+
+        # Get current block height once for channel age calculation
+        current_height = 943506
+        try:
+            info = plugin.rpc.getinfo()
+            current_height = info.get("blockheight", current_height)
+        except Exception:
+            pass
+
+        # Group channels by peer, compute per-peer observations
+        peer_channels_map: Dict[str, List[Dict]] = {}
+        for ch in all_channels:
+            if ch.get("state") != "CHANNELD_NORMAL":
+                continue
+            pid = ch.get("peer_id")
+            if not pid or pid in member_ids:
+                continue
+            peer_channels_map.setdefault(pid, []).append(ch)
+
+        peers_data = []
+        for pid, chs in peer_channels_map.items():
+            # Channel age: oldest channel
+            max_age_days = 0
+            force_close_count = 0
+            total_settled = 0
+            total_failed = 0
+            total_volume = 0
+
+            for ch in chs:
+                scid = ch.get("short_channel_id", "")
+                # Approximate channel age from short_channel_id block height
+                if scid and "x" in scid:
+                    try:
+                        block_height = int(scid.split("x")[0])
+                        blocks_old = max(0, current_height - block_height)
+                        age_days = (blocks_old * 10) // (60 * 24)
+                        max_age_days = max(max_age_days, age_days)
+                    except (ValueError, IndexError):
+                        pass
+
+                total_settled += peer_settled.get(scid, 0)
+                total_failed += peer_failed.get(scid, 0)
+                total_volume += peer_volume.get(scid, 0)
+
+            # Count force closes across ALL channel states for this peer
+            for ch_any in all_channels:
+                if ch_any.get("peer_id") != pid:
+                    continue
+                state = ch_any.get("state", "")
+                if "ONCHAIN" in state or "CLOSINGD" in state:
+                    closer = ch_any.get("closer", "")
+                    if closer == "remote":
+                        force_close_count += 1
+
+            total_attempts = total_settled + total_failed
+            htlc_success = (total_settled / total_attempts) if total_attempts > 0 else 1.0
+
+            peers_data.append({
+                "peer_id": pid,
+                "uptime_pct": 1.0 if pid in connected_peers else 0.5,
+                "response_time_ms": 0,
+                "force_close_count": force_close_count,
+                "fee_stability": 1.0,
+                "htlc_success_rate": round(htlc_success, 4),
+                "channel_age_days": max_age_days,
+                "total_routed_sats": total_volume,
+                "warnings": [],
+                "observation_days": 7,
+            })
+
+        if not peers_data:
+            return
+
+        # Truncate to protocol limit
+        if len(peers_data) > 200:
+            peers_data = peers_data[:200]
+
+        timestamp = int(time.time())
+
+        # Build payload for signing
+        payload = {
+            "reporter_id": our_pubkey,
+            "timestamp": timestamp,
+            "peers": peers_data,
+        }
+
+        signing_msg = get_peer_reputation_snapshot_signing_payload(payload)
+        try:
+            sig_result = plugin.rpc.signmessage(signing_msg)
+            signature = sig_result['zbase']
+        except Exception as e:
+            plugin.log(f"cl-hive: Failed to sign peer reputation snapshot: {e}", level='error')
+            return
+
+        msg = create_peer_reputation_snapshot(
+            reporter_id=our_pubkey,
+            timestamp=timestamp,
+            signature=signature,
+            peers=peers_data,
+        )
+
+        if msg:
+            result = protocol_handlers._broadcast_member_message(
+                message_bytes=msg,
+                reliability="direct",
+                failure_policy="best_effort",
+                log_label="peer_reputation",
+            )
+            if result["sent"] > 0:
+                plugin.log(
+                    f"cl-hive: Broadcast peer reputation snapshot "
+                    f"({len(peers_data)} peers to {result['sent']} members)",
+                    level='debug'
+                )
+
+    except Exception as e:
+        if plugin:
+            plugin.log(f"cl-hive: Peer reputation broadcast error: {e}", level='warn')
 
 
 def _broadcast_our_yield_metrics():
