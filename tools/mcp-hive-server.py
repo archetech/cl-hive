@@ -323,7 +323,7 @@ class NodeConnection:
     lightning_dir: str = "/home/clightning/.lightning"
     network: str = "regtest"
     omit_network_flag: bool = False
-    _semaphore: Optional[asyncio.Semaphore] = field(default=None, repr=False)
+    _semaphore: Optional[asyncio.Semaphore] = field(default=None, repr=False, compare=False)
 
     async def connect(self):
         """Initialize the HTTP client (if using REST)."""
@@ -404,8 +404,8 @@ class NodeConnection:
             except Exception:
                 body = {"error": e.response.text.strip()} if e.response.text else {}
             error_msg = (
-                body.get("message")
-                or body.get("error")
+                body.get("message")  # CLN REST error format: {"code": ..., "message": "..."}
+                or body.get("error")  # fallback plain error
                 or str(e)
                 or f"HTTP {e.response.status_code} from {self.name}"
             )
