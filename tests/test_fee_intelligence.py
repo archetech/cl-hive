@@ -77,6 +77,9 @@ class MockDatabase:
     def get_helping_members(self):
         return [h for h in self.member_health.values() if h.get("can_help_others")]
 
+    def get_all_members(self):
+        return [{"peer_id": pid, **info} for pid, info in self.members.items()]
+
 
 class TestHealthReportPayload:
     """Test HEALTH_REPORT payload validation."""

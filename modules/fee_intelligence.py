@@ -354,6 +354,7 @@ class FeeIntelligenceManager:
                 by_peer[peer_id] = []
             by_peer[peer_id].append(report)
 
+        fleet_size = len(self.db.get_all_members()) if self.db else 0
         updated = 0
         for peer_id, reports in by_peer.items():
             if not reports:
@@ -392,7 +393,7 @@ class FeeIntelligenceManager:
             )
 
             # Calculate confidence based on reporter count and data freshness
-            confidence = self._calculate_confidence(reports, len(reporters))
+            confidence = self._calculate_confidence(reports, len(reporters), fleet_size=fleet_size)
 
             # Update the profile in database
             self.db.update_peer_fee_profile(
@@ -507,7 +508,8 @@ class FeeIntelligenceManager:
     def _calculate_confidence(
         self,
         reports: List[Dict[str, Any]],
-        reporter_count: int
+        reporter_count: int,
+        fleet_size: int = 0,
     ) -> float:
         """
         Calculate confidence score for fee profile.
@@ -520,6 +522,7 @@ class FeeIntelligenceManager:
         Args:
             reports: List of fee intelligence reports
             reporter_count: Number of unique reporters
+            fleet_size: Current fleet member count (0 = use fixed denominator)
 
         Returns:
             Confidence score (0-1)
@@ -527,8 +530,17 @@ class FeeIntelligenceManager:
         if not reports:
             return 0.0
 
-        # Reporter count factor (3+ reporters = full confidence from this factor)
-        reporter_factor = min(1.0, reporter_count / 3.0)
+        # Reporter count factor — scale by fleet size.
+        # Not every member has channels to every peer, so we use 60% of
+        # potential reporters (fleet - 1) as "full coverage".  Capped at 5
+        # for large fleets (diminishing returns).
+        #   fleet=2 → denom=2,  fleet=4 → denom=2,  fleet=7+ → denom=~4-5
+        if fleet_size >= 2:
+            potential = (fleet_size - 1) * 0.6  # 60% of pool = full confidence
+            reporter_denom = max(2.0, min(potential, 5.0))
+        else:
+            reporter_denom = 3.0                # legacy / unknown fleet
+        reporter_factor = min(1.0, reporter_count / reporter_denom)
 
         # Freshness factor (average age, newer is better)
         now = int(time.time())
@@ -536,9 +548,16 @@ class FeeIntelligenceManager:
         avg_age_hours = sum(ages) / len(ages) if ages else 24
         freshness_factor = max(0.0, 1.0 - (avg_age_hours / 24))  # Decay over 24h
 
-        # Volume factor (more observations = higher confidence)
+        # Volume factor — scale expectation by fleet size.  Smaller fleets
+        # have fewer forwarding paths, so fewer aggregate observations.
+        # 15 forwards per member, capped at 100 for large fleets.
+        #   fleet=2 → 30,  fleet=4 → 60,  fleet=7+ → 100
+        if fleet_size >= 2:
+            volume_denom = min(100.0, max(20.0, fleet_size * 15.0))
+        else:
+            volume_denom = 100.0                # legacy / unknown fleet
         total_forwards = sum(r.get("forward_count", 0) for r in reports)
-        volume_factor = min(1.0, total_forwards / 100)  # 100+ forwards = full
+        volume_factor = min(1.0, total_forwards / volume_denom)
 
         # Weighted average
         confidence = (
