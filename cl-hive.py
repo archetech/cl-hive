@@ -3098,6 +3098,43 @@ def hive_gossip_stats(plugin: Plugin):
         },
         "peer_states": peer_versions
     }
+@plugin.method("hive-fleet-balances")
+def hive_fleet_balances(plugin: Plugin):
+    """
+    Get fleet member channel balances from gossip state.
+
+    Returns per-member capacity, available liquidity, and topology
+    (list of external peers each member connects to).  Designed for
+    cl-revenue-ops to size fleet rebalances without overloading
+    any intermediary member's channels.
+
+    Returns:
+        Dict with members list and our pubkey.
+    """
+    if not state_manager or not our_pubkey:
+        return {"error": "state_manager_unavailable"}
+
+    all_states = state_manager.get_all_peer_states()
+    members = []
+    for state in all_states:
+        if state.peer_id == our_pubkey:
+            continue
+        members.append({
+            "peer_id": state.peer_id,
+            "capacity_sats": state.capacity_sats,
+            "available_sats": state.available_sats,
+            "topology": state.topology[:50],  # Cap topology list
+            "version": state.version,
+            "last_update": state.last_update,
+        })
+
+    return {
+        "our_pubkey": our_pubkey,
+        "members": members,
+        "count": len(members),
+    }
+
+
 @plugin.method("hive-ban")
 def hive_ban(plugin: Plugin, peer_id: str, reason: str):
     """
