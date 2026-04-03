@@ -835,6 +835,130 @@ class Planner:
             self._log(f"Error getting corridor value: {e}", level='debug')
             return 1.0, "unknown"
 
+    def _score_routing_improvement(self, target: str, cfg) -> float:
+        """Score how much a virtual channel to target would improve routing.
+
+        Creates a temporary askrene layer with a virtual channel to the
+        target, calls getroutes to high-value destinations, and measures
+        whether routes improve (lower fees, fewer hops).
+
+        Returns:
+            Score multiplier (1.0 = no improvement, up to 1.5 for significant gains).
+        """
+        if not self.plugin:
+            return 1.0
+
+        our_id = None
+        try:
+            info = self.plugin.rpc.getinfo()
+            our_id = info.get("id")
+        except Exception:
+            return 1.0
+        if not our_id:
+            return 1.0
+
+        temp_layer = f"hive-expansion-test-{target[:8]}"
+
+        try:
+            # Create temporary layer with virtual channel
+            self.plugin.rpc.call("askrene-create-layer", {"layer": temp_layer})
+            virtual_scid = "999x999x0"
+            self.plugin.rpc.call("askrene-create-channel", {
+                "layer": temp_layer,
+                "source": our_id,
+                "destination": target,
+                "short_channel_id": virtual_scid,
+                "capacity_msat": "5000000000",  # 5M sats virtual capacity
+            })
+            # Set reasonable fees on the virtual channel
+            for direction in (0, 1):
+                self.plugin.rpc.call("askrene-update-channel", {
+                    "layer": temp_layer,
+                    "short_channel_id_dir": f"{virtual_scid}/{direction}",
+                    "fee_base_msat": 0,
+                    "fee_proportional_millionths": 100,
+                    "cltv_expiry_delta": 18,
+                })
+
+            # Pick a few well-known high-value destinations to test routes
+            # Use peers from our own channels that have high capacity
+            test_destinations = []
+            try:
+                channels = self.plugin.rpc.listpeerchannels()
+                peers_by_cap = []
+                for ch in channels.get("channels", []):
+                    if ch.get("state") != "CHANNELD_NORMAL":
+                        continue
+                    pid = ch.get("peer_id", "")
+                    total = ch.get("total_msat", 0)
+                    if isinstance(total, str):
+                        total = int(total.rstrip("msat"))
+                    if pid and pid != target:
+                        peers_by_cap.append((total, pid))
+                peers_by_cap.sort(reverse=True)
+                test_destinations = [pid for _, pid in peers_by_cap[:3]]
+            except Exception:
+                pass
+
+            if not test_destinations:
+                return 1.0
+
+            # Compare route quality with and without the virtual channel
+            improvement_count = 0
+            layers_base = ["auto.localchans", "auto.sourcefree",
+                           "hive-fleet", "hive-reputation"]
+            layers_with = layers_base + [temp_layer]
+
+            for dest in test_destinations:
+                try:
+                    # Route without virtual channel
+                    base_result = self.plugin.rpc.call("getroutes", {
+                        "source": our_id,
+                        "destination": dest,
+                        "amount_msat": 100000000,  # 100k sats test
+                        "layers": layers_base,
+                        "maxfee_msat": 10000000,  # 10k sats max fee
+                        "final_cltv": 18,
+                    })
+                    base_routes = base_result.get("routes", [])
+
+                    # Route with virtual channel
+                    with_result = self.plugin.rpc.call("getroutes", {
+                        "source": our_id,
+                        "destination": dest,
+                        "amount_msat": 100000000,
+                        "layers": layers_with,
+                        "maxfee_msat": 10000000,
+                        "final_cltv": 18,
+                    })
+                    with_routes = with_result.get("routes", [])
+
+                    # Compare: better probability or fewer hops = improvement
+                    base_prob = base_result.get("probability_ppm", 0)
+                    with_prob = with_result.get("probability_ppm", 0)
+
+                    base_hops = len(base_routes[0].get("path", [])) if base_routes else 99
+                    with_hops = len(with_routes[0].get("path", [])) if with_routes else 99
+
+                    if with_prob > base_prob * 1.1 or with_hops < base_hops:
+                        improvement_count += 1
+
+                except Exception:
+                    continue
+
+            # Score: 1.0 base, +0.15 per destination that improved, max 1.5
+            score = 1.0 + (improvement_count * 0.15)
+            return min(1.5, score)
+
+        except Exception:
+            return 1.0
+        finally:
+            # Always clean up temporary layer
+            try:
+                self.plugin.rpc.call("askrene-remove-layer", {"layer": temp_layer})
+            except Exception:
+                pass
+
     def get_expansion_recommendation(
         self,
         target: str,
@@ -884,6 +1008,15 @@ class Planner:
         # DECISION LOGIC
         reasoning_parts = []
         recommendation_type = "open_channel"
+
+        # Routing improvement bonus: does this target create better paths?
+        routing_multiplier = self._score_routing_improvement(target, cfg)
+        if routing_multiplier > 1.0:
+            adjusted_score *= routing_multiplier
+            reasoning_parts.append(
+                f"Virtual channel test shows {(routing_multiplier-1)*100:.0f}% "
+                f"routing improvement"
+            )
 
         # Check 1: Majority coverage - sufficient coverage exists
         if hive_coverage_pct >= HIVE_COVERAGE_MAJORITY_PCT:
