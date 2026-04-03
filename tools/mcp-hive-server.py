@@ -55,7 +55,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -323,6 +323,7 @@ class NodeConnection:
     lightning_dir: str = "/home/clightning/.lightning"
     network: str = "regtest"
     omit_network_flag: bool = False
+    _semaphore: Optional[asyncio.Semaphore] = field(default=None, repr=False)
 
     async def connect(self):
         """Initialize the HTTP client (if using REST)."""
@@ -366,10 +367,21 @@ class NodeConnection:
             await self.client.aclose()
 
     async def call(self, method: str, params: Dict = None) -> Dict:
-        """Call a CLN RPC method via REST or docker exec."""
+        """Call a CLN RPC method via REST or docker exec.
+
+        When a semaphore is attached, at most N calls proceed concurrently
+        per node — all others queue transparently.
+        """
         if not _check_method_allowed(method):
             return {"error": f"Method '{method}' not in allowlist"}
 
+        if self._semaphore:
+            async with self._semaphore:
+                return await self._call_dispatch(method, params)
+        return await self._call_dispatch(method, params)
+
+    async def _call_dispatch(self, method: str, params: Dict = None) -> Dict:
+        """Internal dispatch — REST or Docker exec."""
         # Docker exec mode (for Polar)
         if self.docker_container:
             return await self._call_docker(method, params)
@@ -391,10 +403,9 @@ class NodeConnection:
                 body = e.response.json()
             except Exception:
                 body = {"error": e.response.text.strip()} if e.response.text else {}
-            # Extract the actual CLN error message from the response body
             error_msg = (
-                body.get("message")  # CLN REST error format: {"code": ..., "message": "..."}
-                or body.get("error")  # fallback plain error
+                body.get("message")
+                or body.get("error")
                 or str(e)
                 or f"HTTP {e.response.status_code} from {self.name}"
             )
@@ -466,7 +477,6 @@ class HiveFleet:
 
     def __init__(self):
         self.nodes: Dict[str, NodeConnection] = {}
-        self._node_semaphores: Dict[str, asyncio.Semaphore] = {}
         self._max_concurrent_per_node = 5
 
     def load_config(self, config_path: str):
@@ -506,23 +516,26 @@ class HiveFleet:
 
             if node_mode == "docker":
                 # Docker exec mode
+                sem = asyncio.Semaphore(self._max_concurrent_per_node)
                 node = NodeConnection(
                     name=node_config["name"],
                     docker_container=node_config.get("docker_container"),
                     lightning_dir=node_config.get("lightning_dir", global_lightning_dir),
                     network=node_config.get("network", global_network),
-                    omit_network_flag=bool(node_config.get("omit_network_flag", False))
+                    omit_network_flag=bool(node_config.get("omit_network_flag", False)),
+                    _semaphore=sem,
                 )
             else:
                 # REST mode (default)
+                sem = asyncio.Semaphore(self._max_concurrent_per_node)
                 node = NodeConnection(
                     name=node_config["name"],
                     rest_url=node_config.get("rest_url"),
                     rune=node_config.get("rune"),
-                    ca_cert=node_config.get("ca_cert")
+                    ca_cert=node_config.get("ca_cert"),
+                    _semaphore=sem,
                 )
             self.nodes[node.name] = node
-            self._node_semaphores[node.name] = asyncio.Semaphore(self._max_concurrent_per_node)
 
         logger.info(f"Loaded {len(self.nodes)} nodes from config (global_mode={global_mode})")
 
@@ -544,15 +557,15 @@ class HiveFleet:
         return self.nodes.get(name)
 
     async def call_all(self, method: str, params: Dict = None, timeout: float = 30.0) -> Dict[str, Any]:
-        """Call an RPC method on all nodes in parallel."""
+        """Call an RPC method on all nodes in parallel.
+
+        Per-node concurrency is enforced inside NodeConnection.call().
+        """
         async def call_with_timeout(name: str, node: NodeConnection) -> tuple:
-            sem = self._node_semaphores.get(name)
             try:
-                if sem:
-                    async with sem:
-                        result = await asyncio.wait_for(node.call(method, params), timeout=timeout)
-                else:
-                    result = await asyncio.wait_for(node.call(method, params), timeout=timeout)
+                result = await asyncio.wait_for(
+                    node.call(method, params), timeout=timeout
+                )
                 return (name, result)
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout calling {method} on {name}")
