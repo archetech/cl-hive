@@ -41,6 +41,7 @@ class HiveContext:
     rationalization_mgr: Any = None  # RationalizationManager (Channel Rationalization)
     strategic_positioning_mgr: Any = None  # StrategicPositioningManager (Phase 5 - Strategic Positioning)
     traffic_intel_mgr: Any = None  # TrafficIntelligenceManager (Phase 14 - Traffic Intelligence)
+    fee_intel_mgr: Any = None  # FeeIntelligenceManager (fleet-aggregated fee intelligence)
     peer_reputation_mgr: Any = None  # PeerReputationManager (fleet-aggregated peer quality)
     our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
     signing_backend: str = "unknown"
@@ -2088,6 +2089,36 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
                 hint["traffic_confidence"] = 0.5
             elif role != "none" or peer_id in rebalance_prefs or "peer_quality_score" in hint:
                 hint["traffic_confidence"] = 0.3
+
+        # Traffic profile data (peak hours, drain direction)
+        if ctx.traffic_intel_mgr:
+            try:
+                profiles = ctx.traffic_intel_mgr.get_all_profiles(peer_id=peer_id)
+                if profiles:
+                    # Use highest-confidence profile
+                    best = max(profiles, key=lambda p: float(p.get("confidence", 0)))
+                    peak = best.get("peak_hours_utc")
+                    if isinstance(peak, list) and peak:
+                        hint["peak_hours_utc"] = [int(h) for h in peak[:6]]
+                    drain = best.get("drain_direction")
+                    if drain in ("inbound_heavy", "outbound_heavy", "balanced"):
+                        hint["drain_direction"] = drain
+            except Exception:
+                pass
+
+        # Fee intelligence (elasticity, optimal fee estimate)
+        if ctx.fee_intel_mgr:
+            try:
+                profile = ctx.fee_intel_mgr.get_aggregated_profile(peer_id)
+                if profile:
+                    elasticity = profile.get("estimated_elasticity")
+                    if isinstance(elasticity, (int, float)):
+                        hint["fee_elasticity"] = round(float(elasticity), 3)
+                    optimal = profile.get("optimal_fee_estimate")
+                    if isinstance(optimal, (int, float)) and optimal > 0:
+                        hint["optimal_fee_estimate_ppm"] = int(optimal)
+            except Exception:
+                pass
 
         # Fleet fee median (for downstream prior initialization)
         if ctx.fee_coordination_mgr:
