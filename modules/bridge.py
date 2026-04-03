@@ -530,6 +530,9 @@ class Bridge:
         """
         Get fee configuration from cl-revenue-ops.
 
+        Prefers CLN datastore (fast local read). Falls back to
+        cross-plugin revenue-status RPC if datastore empty.
+
         Returns:
             Dict with min/max fee bounds and midpoint, or None if unavailable
         """
@@ -537,7 +540,23 @@ class Bridge:
             return None
 
         try:
-            result = self.safe_call("revenue-status")
+            # Priority 1: Read from CLN datastore (fast, no cross-plugin RPC)
+            result = None
+            try:
+                import json as _json
+                ds = self.rpc.listdatastore(key=["revenue", "status"])
+                entries = ds.get("datastore", [])
+                if entries:
+                    data_str = entries[0].get("string", "")
+                    if data_str:
+                        result = _json.loads(data_str)
+            except Exception:
+                pass
+
+            # Priority 2: Fall back to cross-plugin RPC
+            if result is None:
+                result = self.safe_call("revenue-status")
+
             operator_values = (
                 result.get("operator_controls", {}).get("values", {})
                 if isinstance(result, dict)
