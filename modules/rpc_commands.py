@@ -41,6 +41,7 @@ class HiveContext:
     rationalization_mgr: Any = None  # RationalizationManager (Channel Rationalization)
     strategic_positioning_mgr: Any = None  # StrategicPositioningManager (Phase 5 - Strategic Positioning)
     traffic_intel_mgr: Any = None  # TrafficIntelligenceManager (Phase 14 - Traffic Intelligence)
+    peer_reputation_mgr: Any = None  # PeerReputationManager (fleet-aggregated peer quality)
     our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
     signing_backend: str = "unknown"
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
@@ -2110,6 +2111,26 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
         # Rebalance preference
         pref = rebalance_prefs.get(peer_id, "neutral")
         hint["rebalance_preference"] = pref
+
+        # Network centrality (routing importance)
+        try:
+            from . import network_metrics as nm
+            calculator = nm.get_calculator()
+            if calculator:
+                metrics = calculator.get_member_metrics(peer_id)
+                if metrics:
+                    hint["external_centrality"] = round(metrics.external_centrality, 6)
+        except Exception:
+            pass
+
+        # Peer reputation score (fleet-aggregated quality)
+        if ctx.peer_reputation_mgr:
+            try:
+                rep = ctx.peer_reputation_mgr.get_reputation(peer_id)
+                if rep:
+                    hint["reputation_score"] = rep.reputation_score
+            except Exception:
+                pass
 
         # Channel-opening advisory hint (omitted if no topology data)
         ch_hint = channel_open_hints.get(peer_id)

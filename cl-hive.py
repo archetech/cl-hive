@@ -365,6 +365,7 @@ def _get_hive_context() -> HiveContext:
         rationalization_mgr=_rationalization_mgr,
         strategic_positioning_mgr=_strategic_positioning_mgr,
         traffic_intel_mgr=traffic_intel_mgr,
+        peer_reputation_mgr=peer_reputation_mgr if peer_reputation_mgr is not None else None,
         signing_backend="none",
         our_id=_our_pubkey or "",
         log=_log,
