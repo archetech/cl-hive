@@ -31,9 +31,16 @@ class AskreneLayerManager:
     REPUTATION_POOR = 30        # bias -3
     REPUTATION_BAD = 15         # bias -5
 
-    # Reputation thresholds for node disabling
-    DISABLE_FORCE_CLOSE_THRESHOLD = 2
-    DISABLE_HTLC_SUCCESS_THRESHOLD = 0.5
+    # Reputation thresholds for node disabling (softened from original 2/0.5)
+    DISABLE_FORCE_CLOSE_THRESHOLD = 3
+    DISABLE_HTLC_SUCCESS_THRESHOLD = 0.3
+
+    # Disabled peers re-enable after this many seconds (7 days).
+    # Prevents permanent blacklisting from transient issues.
+    DISABLE_EXPIRY_SECONDS = 7 * 86400
+    # After expiry, grace period before re-disabling (24 hours).
+    # Gives the peer a chance to improve their metrics.
+    DISABLE_COOLDOWN_SECONDS = 86400
 
     def __init__(self, plugin, database, peer_reputation_mgr,
                  fee_coordination_mgr=None, traffic_intel_mgr=None):
@@ -53,6 +60,14 @@ class AskreneLayerManager:
         self.available: bool = False
         self._our_id: Optional[str] = None
         self._last_refresh: float = 0
+        # peer_id -> unix timestamp when the disable was first applied.
+        # Peers are re-enabled after DISABLE_EXPIRY_SECONDS.
+        self._disabled_since: Dict[str, float] = {}
+        # peer_id -> unix timestamp when cooldown started (post-expiry grace).
+        # During cooldown, peer uses negative bias instead of full disable.
+        self._cooldown_until: Dict[str, float] = {}
+        # Peers flagged for closure recommendation (consumed by export-hints)
+        self._closure_candidates: Dict[str, Dict[str, Any]] = {}
 
     def _log(self, msg: str, level: str = "info") -> None:
         if self.plugin:
@@ -225,8 +240,9 @@ class AskreneLayerManager:
     def _refresh_reputation_layer(self) -> bool:
         """Recreate hive-reputation layer with peer quality biases.
 
-        - disable-node for peers with bad reputation (high force closes, low HTLC success)
+        - disable-node for peers with bad reputation (with TTL expiry)
         - bias-node scaled by reputation score
+        - track closure candidates for capacity planner consumption
         """
         if not self.plugin or not self.peer_reputation_mgr:
             return False
@@ -235,27 +251,77 @@ class AskreneLayerManager:
             self._recreate_layer(self.REPUTATION_LAYER)
 
             all_reps = self.peer_reputation_mgr.get_all_reputations()
+            now = time.time()
             disabled = 0
             biased = 0
+            new_closures: Dict[str, Dict[str, Any]] = {}
+
+            # Prune expired cooldowns
+            self._cooldown_until = {
+                pid: ts for pid, ts in self._cooldown_until.items()
+                if ts > now
+            }
 
             for peer_id, rep in all_reps.items():
-                # Disable nodes with dangerous behavior
-                if (rep.total_force_closes >= self.DISABLE_FORCE_CLOSE_THRESHOLD
-                        or rep.avg_htlc_success < self.DISABLE_HTLC_SUCCESS_THRESHOLD):
-                    try:
-                        self.plugin.rpc.call("askrene-disable-node", {
-                            "layer": self.REPUTATION_LAYER,
-                            "node": peer_id,
-                        })
-                        disabled += 1
-                        self._log(
-                            f"Disabled {peer_id[:12]}... "
-                            f"(force_closes={rep.total_force_closes}, "
-                            f"htlc_success={rep.avg_htlc_success:.2f})",
-                        )
-                    except Exception:
+                is_bad = (rep.total_force_closes >= self.DISABLE_FORCE_CLOSE_THRESHOLD
+                          or rep.avg_htlc_success < self.DISABLE_HTLC_SUCCESS_THRESHOLD)
+
+                if is_bad:
+                    # Track as closure candidate regardless of disable state
+                    new_closures[peer_id] = {
+                        "force_closes": rep.total_force_closes,
+                        "htlc_success": rep.avg_htlc_success,
+                        "reputation_score": rep.reputation_score,
+                        "reason": (
+                            f"force_closes={rep.total_force_closes}"
+                            if rep.total_force_closes >= self.DISABLE_FORCE_CLOSE_THRESHOLD
+                            else f"htlc_success={rep.avg_htlc_success:.0%}"
+                        ),
+                    }
+
+                    # In cooldown grace period — use negative bias, not disable
+                    if peer_id in self._cooldown_until:
+                        # Fall through to bias logic below
                         pass
-                    continue  # Don't bias a disabled node
+                    elif peer_id in self._disabled_since:
+                        if now - self._disabled_since[peer_id] >= self.DISABLE_EXPIRY_SECONDS:
+                            # Expired — re-enable with grace period
+                            del self._disabled_since[peer_id]
+                            self._cooldown_until[peer_id] = now + self.DISABLE_COOLDOWN_SECONDS
+                            self._log(
+                                f"Re-enabled {peer_id[:12]}... after "
+                                f"{self.DISABLE_EXPIRY_SECONDS // 86400}d expiry "
+                                f"({self.DISABLE_COOLDOWN_SECONDS // 3600}h cooldown)",
+                            )
+                            # Fall through to bias
+                        else:
+                            # Still within disable window
+                            try:
+                                self.plugin.rpc.call("askrene-disable-node", {
+                                    "layer": self.REPUTATION_LAYER,
+                                    "node": peer_id,
+                                })
+                                disabled += 1
+                            except Exception:
+                                pass
+                            continue
+                    else:
+                        # First time flagged — disable and record
+                        self._disabled_since[peer_id] = now
+                        try:
+                            self.plugin.rpc.call("askrene-disable-node", {
+                                "layer": self.REPUTATION_LAYER,
+                                "node": peer_id,
+                            })
+                            disabled += 1
+                            self._log(
+                                f"Disabled {peer_id[:12]}... "
+                                f"(force_closes={rep.total_force_closes}, "
+                                f"htlc_success={rep.avg_htlc_success:.2f})",
+                            )
+                        except Exception:
+                            pass
+                        continue
 
                 # Bias by reputation score
                 score = rep.reputation_score
@@ -283,6 +349,8 @@ class AskreneLayerManager:
                     except Exception:
                         pass
 
+            self._closure_candidates = new_closures
+
             # Age stale reputation info (1 hour cutoff)
             cutoff = int(time.time()) - 3600
             try:
@@ -293,16 +361,25 @@ class AskreneLayerManager:
             except Exception:
                 pass
 
-            if disabled > 0 or biased > 0:
+            if disabled > 0 or biased > 0 or new_closures:
                 self._log(
                     f"Refreshed {self.REPUTATION_LAYER} "
-                    f"({disabled} disabled, {biased} biased)",
+                    f"({disabled} disabled, {biased} biased, "
+                    f"{len(new_closures)} closure candidates)",
                 )
             return True
 
         except Exception as e:
             self._log(f"Reputation layer refresh failed: {e}")
             return False
+
+    def get_closure_candidates(self) -> Dict[str, Dict[str, Any]]:
+        """Return peers flagged for channel closure recommendation.
+
+        Keyed by peer_id with force_closes, htlc_success, reputation_score,
+        and reason. Consumed by hive-export-hints for capacity planner scoring.
+        """
+        return dict(self._closure_candidates)
 
     # ------------------------------------------------------------------
     # hive-corridors layer

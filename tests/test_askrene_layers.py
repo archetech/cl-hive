@@ -135,7 +135,7 @@ class TestReputationLayer:
         plugin.rpc.call.return_value = {}
 
         reps = {
-            "bad_peer": MockReputation(score=10, force_closes=3, htlc_success=0.3),
+            "bad_peer": MockReputation(score=10, force_closes=3, htlc_success=0.2),
             "good_peer": MockReputation(score=85, force_closes=0, htlc_success=0.99),
         }
 
@@ -159,6 +159,72 @@ class TestReputationLayer:
         ]
         assert len(bias_calls) == 2  # in + out
         assert all(c[0][1]["bias"] == 5 for c in bias_calls)
+
+    def test_borderline_peer_not_disabled(self):
+        """Softened thresholds: 2 force closes or 40% HTLC success shouldn't disable."""
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+
+        reps = {
+            "borderline": MockReputation(score=25, force_closes=2, htlc_success=0.4),
+        }
+
+        mgr = AskreneLayerManager(plugin, MockDatabase(), MockPeerReputationMgr(reps))
+        mgr._refresh_reputation_layer()
+
+        disable_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c[0][0] == "askrene-disable-node"
+        ]
+        assert len(disable_calls) == 0
+
+    def test_disabled_peer_reenables_after_expiry(self):
+        """Peers re-enable after DISABLE_EXPIRY_SECONDS."""
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+
+        reps = {
+            "bad_peer": MockReputation(score=10, force_closes=5, htlc_success=0.1),
+        }
+
+        mgr = AskreneLayerManager(plugin, MockDatabase(), MockPeerReputationMgr(reps))
+
+        # First refresh: peer gets disabled
+        mgr._refresh_reputation_layer()
+        assert "bad_peer" in mgr._disabled_since
+
+        # Simulate expiry by backdating the timestamp
+        mgr._disabled_since["bad_peer"] = time.time() - mgr.DISABLE_EXPIRY_SECONDS - 1
+
+        plugin.rpc.call.reset_mock()
+        plugin.rpc.call.return_value = {}
+        mgr._refresh_reputation_layer()
+
+        # Should NOT have called disable-node this time (expired)
+        disable_calls = [
+            c for c in plugin.rpc.call.call_args_list
+            if c[0][0] == "askrene-disable-node"
+        ]
+        assert len(disable_calls) == 0
+        assert "bad_peer" not in mgr._disabled_since
+
+    def test_closure_candidates_tracked(self):
+        """Bad peers are tracked as closure candidates."""
+        plugin = MagicMock()
+        plugin.rpc.call.return_value = {}
+
+        reps = {
+            "bad_peer": MockReputation(score=10, force_closes=4, htlc_success=0.1),
+            "good_peer": MockReputation(score=85, force_closes=0, htlc_success=0.99),
+        }
+
+        mgr = AskreneLayerManager(plugin, MockDatabase(), MockPeerReputationMgr(reps))
+        mgr._refresh_reputation_layer()
+
+        closures = mgr.get_closure_candidates()
+        assert "bad_peer" in closures
+        assert "good_peer" not in closures
+        assert closures["bad_peer"]["force_closes"] == 4
 
     def test_no_reputation_data_succeeds(self):
         plugin = MagicMock()
