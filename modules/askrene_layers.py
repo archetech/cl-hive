@@ -72,6 +72,23 @@ class AskreneLayerManager:
         """Whether askrene is usable on this CLN version."""
         return self.available
 
+    def _recreate_layer(self, layer: str) -> None:
+        """Create a fresh askrene layer without noisy remove-layer errors."""
+        existing = set()
+        try:
+            result = self.plugin.rpc.call("askrene-listlayers", {})
+            existing = {
+                item.get("layer")
+                for item in result.get("layers", [])
+                if item.get("layer")
+            }
+        except Exception:
+            pass
+
+        if layer in existing:
+            self.plugin.rpc.call("askrene-remove-layer", {"layer": layer})
+        self.plugin.rpc.call("askrene-create-layer", {"layer": layer})
+
     def refresh_all(self) -> Dict[str, bool]:
         """Refresh all managed layers.
 
@@ -102,13 +119,7 @@ class AskreneLayerManager:
             return False
 
         try:
-            # Remove and recreate
-            try:
-                self.plugin.rpc.call("askrene-remove-layer", {"layer": self.FLEET_LAYER})
-            except Exception:
-                pass
-
-            self.plugin.rpc.call("askrene-create-layer", {"layer": self.FLEET_LAYER})
+            self._recreate_layer(self.FLEET_LAYER)
 
             our_id = self._get_our_id()
             if not our_id:
@@ -221,12 +232,7 @@ class AskreneLayerManager:
             return False
 
         try:
-            try:
-                self.plugin.rpc.call("askrene-remove-layer", {"layer": self.REPUTATION_LAYER})
-            except Exception:
-                pass
-
-            self.plugin.rpc.call("askrene-create-layer", {"layer": self.REPUTATION_LAYER})
+            self._recreate_layer(self.REPUTATION_LAYER)
 
             all_reps = self.peer_reputation_mgr.get_all_reputations()
             disabled = 0
@@ -313,12 +319,7 @@ class AskreneLayerManager:
             return False
 
         try:
-            try:
-                self.plugin.rpc.call("askrene-remove-layer", {"layer": self.CORRIDORS_LAYER})
-            except Exception:
-                pass
-
-            self.plugin.rpc.call("askrene-create-layer", {"layer": self.CORRIDORS_LAYER})
+            self._recreate_layer(self.CORRIDORS_LAYER)
 
             assignments = self.fee_coordination_mgr.corridor_mgr.get_assignments()
             if not assignments:
@@ -388,12 +389,7 @@ class AskreneLayerManager:
             return False
 
         try:
-            try:
-                self.plugin.rpc.call("askrene-remove-layer", {"layer": self.TRAFFIC_LAYER})
-            except Exception:
-                pass
-
-            self.plugin.rpc.call("askrene-create-layer", {"layer": self.TRAFFIC_LAYER})
+            self._recreate_layer(self.TRAFFIC_LAYER)
 
             profiles = self.traffic_intel_mgr.get_all_profiles()
             if not profiles:
