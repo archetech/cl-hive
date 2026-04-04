@@ -44,6 +44,7 @@ class HiveContext:
     fee_intel_mgr: Any = None  # FeeIntelligenceManager (fleet-aggregated fee intelligence)
     peer_reputation_mgr: Any = None  # PeerReputationManager (fleet-aggregated peer quality)
     state_manager: Any = None  # StateManager (gossip state for fleet member balances)
+    askrene_layer_mgr: Any = None  # AskreneLayerManager (reputation closure candidates)
     our_id: str = ""  # Our node pubkey (alias for our_pubkey for consistency)
     signing_backend: str = "unknown"
     log: Callable[[str, str], None] = None  # Logger function: (msg, level) -> None
@@ -2181,6 +2182,13 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
         ch_hint = channel_open_hints.get(peer_id)
         if ch_hint:
             hint["channel_open_hint"] = ch_hint
+
+        # Closure recommendation from reputation layer
+        if ctx.askrene_layer_mgr:
+            closure_info = ctx.askrene_layer_mgr.get_closure_candidates().get(peer_id)
+            if closure_info:
+                hint["closure_recommended"] = True
+                hint["closure_reason"] = closure_info.get("reason", "")
 
         hints[peer_id] = hint
 

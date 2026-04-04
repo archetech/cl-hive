@@ -368,6 +368,7 @@ def _get_hive_context() -> HiveContext:
         fee_intel_mgr=fee_intel_mgr if fee_intel_mgr is not None else None,
         peer_reputation_mgr=peer_reputation_mgr if peer_reputation_mgr is not None else None,
         state_manager=state_manager if state_manager is not None else None,
+        askrene_layer_mgr=askrene_layer_mgr if askrene_layer_mgr is not None else None,
         signing_backend="none",
         our_id=_our_pubkey or "",
         log=_log,
