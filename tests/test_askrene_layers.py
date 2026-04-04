@@ -83,6 +83,40 @@ class TestFleetLayer:
         assert "askrene-bias-node" in methods
         assert "askrene-age" in methods
 
+    def test_skips_remove_when_layer_missing(self):
+        plugin = MagicMock()
+        plugin.rpc.getinfo.return_value = {"id": "our_id"}
+        plugin.rpc.listpeerchannels.return_value = {
+            "channels": [
+                {
+                    "state": "CHANNELD_NORMAL",
+                    "peer_id": "fleet_a",
+                    "short_channel_id": "100x1x0",
+                    "to_us_msat": 500000000,
+                    "total_msat": 1000000000,
+                }
+            ]
+        }
+
+        calls = []
+
+        def _rpc_call(method, payload):
+            calls.append((method, payload))
+            if method == "askrene-listlayers":
+                return {"layers": []}
+            return {}
+
+        plugin.rpc.call.side_effect = _rpc_call
+
+        db = MockDatabase(members=[{"peer_id": "fleet_a"}])
+        mgr = AskreneLayerManager(plugin, db, MockPeerReputationMgr())
+        result = mgr._refresh_fleet_layer()
+
+        assert result is True
+        methods = [method for method, _ in calls]
+        assert "askrene-listlayers" in methods
+        assert "askrene-remove-layer" not in methods
+
     def test_fails_gracefully_when_askrene_unavailable(self):
         plugin = MagicMock()
         plugin.rpc.getinfo.return_value = {"id": "our_id"}
