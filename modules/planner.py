@@ -1023,14 +1023,11 @@ class Planner:
         reasoning_parts = []
         recommendation_type = "open_channel"
 
-        # Routing improvement bonus: does this target create better paths?
-        routing_multiplier = self._score_routing_improvement(target, cfg)
-        if routing_multiplier > 1.0:
-            adjusted_score *= routing_multiplier
-            reasoning_parts.append(
-                f"Virtual channel test shows {(routing_multiplier-1)*100:.0f}% "
-                f"routing improvement"
-            )
+        # Routing improvement scoring disabled — creating temporary askrene
+        # layers with virtual channels triggers askrene crashes that take
+        # down lightningd.  Re-enable when CLN fixes the askrene stability
+        # issues (tracked in ElementsProject/lightning#9032).
+        # routing_multiplier = self._score_routing_improvement(target, cfg)
 
         # Check 1: Majority coverage - sufficient coverage exists
         if hive_coverage_pct >= HIVE_COVERAGE_MAJORITY_PCT:
