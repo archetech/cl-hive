@@ -469,21 +469,31 @@ def fee_intelligence_loop():
                     from modules import rpc_commands
                     ctx = None
                     try:
-                        # Use the same context builder as the RPC handler
                         import cl_hive  # noqa: deferred import
                         ctx = cl_hive._get_hive_context()
-                    except Exception:
-                        pass
+                    except Exception as ctx_err:
+                        plugin.log(f"cl-hive: hint push - context build failed: {ctx_err}", level='info')
                     if ctx:
                         hints = rpc_commands.export_hints(ctx)
                         if hints and isinstance(hints, dict):
-                            plugin.rpc.datastore(
-                                key=["hive", "hints"],
-                                string=json.dumps(hints),
-                                mode="create-or-replace",
-                            )
+                            hints_json = json.dumps(hints)
+                            # CLN datastore has a size limit per entry (~1MB).
+                            # If hints are too large, log and skip.
+                            if len(hints_json) > 900_000:
+                                plugin.log(
+                                    f"cl-hive: hint push skipped — {len(hints_json)} bytes exceeds safe limit",
+                                    level='info',
+                                )
+                            else:
+                                plugin.rpc.datastore(
+                                    key=["hive", "hints"],
+                                    string=hints_json,
+                                    mode="create-or-replace",
+                                )
+                    else:
+                        plugin.log("cl-hive: hint push skipped — no context available", level='debug')
             except Exception as e:
-                plugin.log(f"cl-hive: datastore hint push failed: {e}", level='debug')
+                plugin.log(f"cl-hive: datastore hint push failed: {e}", level='info')
 
             # Step 6: Cleanup old liquidity needs
             try:

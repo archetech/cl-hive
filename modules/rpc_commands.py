@@ -2021,9 +2021,22 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
     rebalance_prefs = _derive_rebalance_preferences(ctx)
     channel_open_hints = _derive_channel_open_hints(ctx)
 
-    # Build the set of peers to export hints for: members + any peer
-    # we have corridor/quality/traffic data about
+    # Include our own channel peers so consumers get hints for every active channel
+    channel_peers = set()
+    try:
+        pcs = ctx.safe_plugin.rpc.listpeerchannels()
+        for ch in pcs.get("channels", []):
+            if ch.get("state") == "CHANNELD_NORMAL":
+                pid = ch.get("peer_id")
+                if pid:
+                    channel_peers.add(pid)
+    except Exception:
+        pass
+
+    # Build the set of peers to export hints for: members + channel peers +
+    # any peer we have corridor/quality/traffic data about
     all_peers = set(member_set)
+    all_peers.update(channel_peers)
     all_peers.update(corridor_roles.keys())
     all_peers.update(rebalance_prefs.keys())
     all_peers.update(channel_open_hints.keys())
@@ -2091,6 +2104,9 @@ def export_hints(ctx: HiveContext, ttl_seconds: int = _DEFAULT_HINTS_TTL) -> Dic
                 hint["traffic_confidence"] = 0.5
             elif role != "none" or peer_id in rebalance_prefs or "peer_quality_score" in hint:
                 hint["traffic_confidence"] = 0.3
+            elif peer_id in channel_peers:
+                # Active channel peers get a baseline so biases aren't dead
+                hint["traffic_confidence"] = 0.2
 
         # Traffic profile data (peak hours, drain direction)
         if ctx.traffic_intel_mgr:
