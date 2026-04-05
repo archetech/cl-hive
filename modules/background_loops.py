@@ -469,8 +469,20 @@ def fee_intelligence_loop():
                     from modules import rpc_commands
                     ctx = None
                     try:
-                        import cl_hive  # noqa: deferred import
-                        ctx = cl_hive._get_hive_context()
+                        ctx = rpc_commands.HiveContext(
+                            database=database,
+                            config=config,
+                            safe_plugin=plugin,
+                            our_pubkey=our_pubkey or "",
+                            planner=planner,
+                            traffic_intel_mgr=globals().get('traffic_intel_mgr'),
+                            fee_intel_mgr=globals().get('fee_intel_mgr'),
+                            peer_reputation_mgr=globals().get('peer_reputation_mgr'),
+                            askrene_layer_mgr=globals().get('askrene_layer_mgr'),
+                            state_manager=globals().get('state_manager'),
+                            liquidity_coordinator=globals().get('liquidity_coord'),
+                            log=lambda msg, level='info': plugin.log(msg, level=level),
+                        )
                     except Exception as ctx_err:
                         plugin.log(f"cl-hive: hint push - context build failed: {ctx_err}", level='info')
                     if ctx:
