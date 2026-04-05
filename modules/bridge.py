@@ -569,7 +569,7 @@ class Bridge:
             min_fee = fb.get("min_fee_ppm", 0)
             max_fee = fb.get("max_fee_ppm", 5000)
             mid_fee = fb.get("mid_fee_ppm", (min_fee + max_fee) // 2)
-            return {"min_fee_ppm": min_fee, "max_fee_ppm": max_fee, "mid_fee_ppm": mid_fee}
+            return {"min_fee_ppm": min_fee, "max_fee_ppm": max_fee, "midpoint_ppm": mid_fee}
 
         try:
             # Priority 1: Read from CLN datastore (fast, no cross-plugin RPC)

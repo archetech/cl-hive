@@ -200,7 +200,7 @@ class TestFeeBoundsFromDatastore:
 
         result = bridge.get_fee_config()
 
-        assert result == {"min_fee_ppm": 25, "max_fee_ppm": 1200, "mid_fee_ppm": 612}
+        assert result == {"min_fee_ppm": 25, "max_fee_ppm": 1200, "midpoint_ppm": 612}
         # Only 1 listdatastore call (fee-bounds); revenue-status never read
         assert mock_rpc.listdatastore.call_count == 1
         mock_rpc.call.assert_not_called()
