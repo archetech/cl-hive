@@ -523,6 +523,30 @@ class Bridge:
             raise
     
     # =========================================================================
+    # DATASTORE HELPERS
+    # =========================================================================
+
+    def _read_datastore_json(self, key: list, max_age_seconds: int) -> Optional[Dict[str, Any]]:
+        """Read and validate a JSON datastore entry.
+
+        Returns parsed dict if entry exists and timestamp is within max_age_seconds.
+        Returns None if missing, stale, or on any error.
+        """
+        try:
+            import json as _json
+            ds = self.rpc.listdatastore(key=key)
+            entries = ds.get("datastore", [])
+            if not entries:
+                return None
+            data = _json.loads(entries[0].get("string", "{}"))
+            age = int(time.time()) - data.get("timestamp", 0)
+            if age > max_age_seconds:
+                return None
+            return data
+        except Exception:
+            return None
+
+    # =========================================================================
     # REVENUE-OPS INTEGRATION (read-only queries)
     # =========================================================================
 
@@ -530,14 +554,22 @@ class Bridge:
         """
         Get fee configuration from cl-revenue-ops.
 
-        Prefers CLN datastore (fast local read). Falls back to
-        cross-plugin revenue-status RPC if datastore empty.
+        Prefers dedicated fee-bounds datastore key (fastest). Falls back to
+        CLN datastore revenue-status, then cross-plugin RPC.
 
         Returns:
             Dict with min/max fee bounds and midpoint, or None if unavailable
         """
         if self._status == BridgeStatus.DISABLED:
             return None
+
+        # Priority 0: Dedicated fee-bounds key (simplest, most reliable)
+        fb = self._read_datastore_json(["revenue", "fee-bounds"], max_age_seconds=120)
+        if fb is not None:
+            min_fee = fb.get("min_fee_ppm", 0)
+            max_fee = fb.get("max_fee_ppm", 5000)
+            mid_fee = fb.get("mid_fee_ppm", (min_fee + max_fee) // 2)
+            return {"min_fee_ppm": min_fee, "max_fee_ppm": max_fee, "midpoint_ppm": mid_fee}
 
         try:
             # Priority 1: Read from CLN datastore (fast, no cross-plugin RPC)
@@ -592,14 +624,54 @@ class Bridge:
         """
         Get channel profitability data from cl-revenue-ops.
 
+        Priority 1: Read from datastore (fast, no cross-plugin RPC)
+        Priority 2: Cross-plugin RPC fallback
+
         Returns:
             Dict with per-channel profitability analysis, or None if unavailable
         """
         if self._status == BridgeStatus.DISABLED:
             return None
 
+        # Priority 1: Datastore (10 min staleness = 2x the 5-min write cycle)
+        ds_data = self._read_datastore_json(
+            ["revenue", "profitability-summary"], max_age_seconds=600
+        )
+        if ds_data is not None:
+            return ds_data
+
+        # Priority 2: Cross-plugin RPC fallback
         try:
             result = self.safe_call("revenue-profitability")
+            if isinstance(result, dict) and "error" not in result:
+                return result
+            return None
+        except Exception:
+            return None
+
+    def get_dashboard(self, window_days: int = 30) -> Optional[Dict[str, Any]]:
+        """
+        Get financial dashboard from cl-revenue-ops.
+
+        Priority 1: Read from datastore (fast, no cross-plugin RPC)
+        Priority 2: Cross-plugin RPC fallback
+
+        Returns:
+            Dict with 30-day P&L snapshot, or None if unavailable
+        """
+        if self._status == BridgeStatus.DISABLED:
+            return None
+
+        # Priority 1: Datastore (10 min staleness = 2x the 5-min write cycle)
+        ds_data = self._read_datastore_json(
+            ["revenue", "dashboard"], max_age_seconds=600
+        )
+        if ds_data is not None:
+            return ds_data
+
+        # Priority 2: Cross-plugin RPC fallback
+        try:
+            result = self.safe_call("revenue-dashboard", window_days=window_days)
             if isinstance(result, dict) and "error" not in result:
                 return result
             return None
