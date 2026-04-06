@@ -25,7 +25,7 @@
 services:
   cln:
     # Pre-built image from GitHub Container Registry (no compilation needed)
-    image: ghcr.io/lightning-goats/cl-hive-node:${CL_HIVE_VERSION:-latest}
+    image: ghcr.io/archetech/cl-hive-node:${CL_HIVE_VERSION:-latest}
     container_name: cl-hive-node
     restart: unless-stopped
 

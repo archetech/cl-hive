@@ -589,10 +589,10 @@ Pre-built multi-architecture images are available on GitHub Container Registry:
 
 ```bash
 # Pull latest stable release
-docker pull ghcr.io/lightning-goats/cl-hive-node:latest
+docker pull ghcr.io/archetech/cl-hive-node:latest
 
 # Pull specific version
-docker pull ghcr.io/lightning-goats/cl-hive-node:2.2.1
+docker pull ghcr.io/archetech/cl-hive-node:2.2.1
 
 # Available architectures:
 # - linux/amd64 (x86_64)
