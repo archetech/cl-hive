@@ -455,10 +455,9 @@ class YieldMetricsManager:
                 elif out_sats > 0 and in_sats >= 0 and out_sats > in_sats * 1.5:
                     flow_direction = "source"
 
-                # Use total_contribution_sats (max of earned vs sourced) for
-                # yield valuation so inbound gateway channels are properly valued.
-                # Fall back to fees_earned_sats for backward compatibility.
-                revenue_sats = prof.get("total_contribution_sats") or prof.get("fees_earned_sats", 0)
+                # Revenue = exit fees earned only (no double-counting of sourced).
+                # total_contribution_sats is for classification/protection, not revenue.
+                revenue_sats = prof.get("fees_earned_sats", 0)
                 try:
                     revenue_sats = int(revenue_sats)
                 except (TypeError, ValueError):
