@@ -110,8 +110,21 @@ See [docs/JOINING_THE_HIVE.md](docs/JOINING_THE_HIVE.md) for the full joining gu
 - **traffic_confidence**: normalized 0-1
 - **rebalance_preference**: source / sink / neutral
 - **channel_open_hint**: topology-based open/neutral/avoid advisory with size bucket and reason
+- **closure_candidates**: peers flagged by fleet intelligence for potential closure
+
+Hints are exported for **all channel peers** (not just planner targets), ensuring every active channel has fleet intelligence available. Channel peers without full traffic profiles receive a baseline `traffic_confidence=0.2`.
+
+`cl-hive` also pushes hints to the CLN datastore (`hive/hints`) for cross-plugin consumption. The push builds a `HiveContext` directly from injected dependencies (not via module import, since CLN plugins run as `__main__`).
 
 `cl-hive` exports hints only. It does not set fees, trigger rebalances, or open channels. All local execution belongs to `cl-revenue-ops`.
+
+### Datastore IPC
+
+`cl-hive` reads profitability, dashboard, and fee-bounds data from `cl-revenue-ops` via the CLN datastore, enabling rich intelligence without cross-plugin RPC calls:
+
+- `revenue/profitability-summary` — channel-level profitability snapshots
+- `revenue/dashboard` — fleet financial overview
+- `revenue/fee-bounds` — current fee range constraints
 
 ## Configuration
 
