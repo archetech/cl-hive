@@ -399,8 +399,16 @@ class YieldMetricsManager:
                 try:
                     prof_result = self.bridge.get_profitability()
                     if prof_result:
-                        for ch_prof in prof_result.get("channels", []):
-                            profitability_data[ch_prof.get("channel_id")] = ch_prof
+                        channels_data = prof_result.get("channels", {})
+                        if isinstance(channels_data, dict):
+                            # Datastore format: {scid: {metrics...}}
+                            profitability_data = channels_data
+                        elif isinstance(channels_data, list):
+                            # RPC list format: [{channel_id: scid, ...}]
+                            for ch_prof in channels_data:
+                                cid = ch_prof.get("channel_id")
+                                if cid:
+                                    profitability_data[cid] = ch_prof
                 except Exception:
                     pass
 
@@ -447,14 +455,23 @@ class YieldMetricsManager:
                 elif out_sats > 0 and in_sats >= 0 and out_sats > in_sats * 1.5:
                     flow_direction = "source"
 
+                # Use total_contribution_sats (max of earned vs sourced) for
+                # yield valuation so inbound gateway channels are properly valued.
+                # Fall back to fees_earned_sats for backward compatibility.
+                revenue_sats = prof.get("total_contribution_sats") or prof.get("fees_earned_sats", 0)
+                try:
+                    revenue_sats = int(revenue_sats)
+                except (TypeError, ValueError):
+                    revenue_sats = 0
+
                 yield_metric = ChannelYieldMetrics(
                     channel_id=scid,
                     peer_id=peer_id,
                     peer_alias=peer_alias,
                     capacity_sats=capacity_sats,
                     local_balance_sats=local_sats,
-                    routing_revenue_sats=prof.get("fees_earned_sats", 0),
-                    forward_count=prof.get("forward_count", 0),
+                    routing_revenue_sats=revenue_sats,
+                    forward_count=prof.get("total_forward_count") or prof.get("forward_count", 0),
                     period_days=period_days,
                     open_cost_sats=prof.get("open_cost_sats", 0),
                     rebalance_cost_sats=prof.get("rebalance_cost_sats", 0),
